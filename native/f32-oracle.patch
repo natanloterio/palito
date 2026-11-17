@@ -1,0 +1,80 @@
+diff --git a/ggml/src/ggml-cpu/CMakeLists.txt b/ggml/src/ggml-cpu/CMakeLists.txt
+index 8327c52e6..4fdf46dec 100644
+--- a/ggml/src/ggml-cpu/CMakeLists.txt
++++ b/ggml/src/ggml-cpu/CMakeLists.txt
+@@ -716,6 +716,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+ 
+     message(STATUS "Adding CPU backend variant ${GGML_CPU_NAME}: ${ARCH_FLAGS} ${ARCH_DEFINITIONS}")
+     target_sources(${GGML_CPU_NAME} PRIVATE ${GGML_CPU_SOURCES})
++    if (NOT EXISTS "${GGML_F32_REFERENCE_SOURCE}")
++        message(FATAL_ERROR "This correctness-only build needs GGML_F32_REFERENCE_SOURCE")
++    endif()
++    target_sources(${GGML_CPU_NAME} PRIVATE "${GGML_F32_REFERENCE_SOURCE}")
+     target_compile_options(${GGML_CPU_NAME} PRIVATE ${ARCH_FLAGS})
+     target_compile_definitions(${GGML_CPU_NAME} PRIVATE ${ARCH_DEFINITIONS})
+ 
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index a76af8487..e42cd1328 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -16,6 +16,8 @@
+ #include "common.h"
+ #include "tiled/tiled.h"
+ 
++bool local_f32_matmul(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++
+ #if defined(_MSC_VER) || defined(__MINGW32__)
+ #include <malloc.h> // using malloc.h with MSC/MINGW
+ #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
+@@ -1264,6 +1266,9 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+ void ggml_compute_forward_mul_mat(
+         const struct ggml_compute_params * params,
+               struct ggml_tensor * dst) {
++    if (local_f32_matmul(params, dst)) {
++        return;
++    }
+ 
+     const struct ggml_tensor * src0 = dst->src[0];
+     const struct ggml_tensor * src1 = dst->src[1];
+@@ -1566,6 +1571,9 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
+ static void ggml_compute_forward_mul_mat_id(
+         const struct ggml_compute_params * params,
+               struct ggml_tensor * dst) {
++    if (local_f32_matmul(params, dst)) {
++        return;
++    }
+ 
+     const struct ggml_tensor * src0 = dst->src[0];
+     const struct ggml_tensor * src1 = dst->src[1];
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 297834001..604c50c0b 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -10,6 +10,8 @@
+ #include <string>
+ #include <vector>
+ 
++extern "C" const char * local_f32_oracle_id(void);
++
+ #ifdef GGML_USE_CPU_HBM
+ #    include "hbm.h"
+ #endif
+@@ -229,7 +231,7 @@ ggml_backend_t ggml_backend_cpu_init(void) {
+     ctx->work_size           = 0;
+     ctx->abort_callback      = NULL;
+     ctx->abort_callback_data = NULL;
+-    ctx->use_ref             = false;
++    ctx->use_ref             = true;
+ 
+     ggml_backend_t cpu_backend = new ggml_backend {
+         /* .guid    = */ ggml_backend_cpu_guid(),
+@@ -680,6 +682,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
+     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
+         return (void *)ggml_backend_cpu_set_use_ref;
+     }
++    if (strcmp(name, "local_f32_oracle_id") == 0) {
++        return (void *)local_f32_oracle_id;
++    }
+ 
+     // threadpool - TODO:  move to ggml-base
+     if (strcmp(name, "ggml_threadpool_new") == 0) {

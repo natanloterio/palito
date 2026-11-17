@@ -1,0 +1,1 @@
+Explain why moving model weights between CPU memory and GPU memory can make local language model inference slower. Distinguish prompt processing from generating one token at a time, and describe how a small reproducible benchmark can help identify the bottleneck.

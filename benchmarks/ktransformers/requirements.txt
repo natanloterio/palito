@@ -1,0 +1,2 @@
+# The meta-package also carries a required part of the split CUDA payload.
+ktransformers[sglang]==0.7.2

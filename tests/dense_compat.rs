@@ -247,8 +247,8 @@ fn qwen35_lifecycle(cuda: bool) {
     let path = std::env::var_os("QWEN35_GGUF").expect("set the GGUF fixture path");
     let config = Config {
         context_tokens: 32,
-        batch_tokens: 16,
-        prefill_chunk: 8,
+        batch_tokens: if cuda { 32 } else { 16 },
+        prefill_chunk: if cuda { 17 } else { 8 },
         threads: 4,
     };
     let path = Path::new(&path);
@@ -268,6 +268,29 @@ fn qwen35_lifecycle(cuda: bool) {
     };
     exercise(backend.as_mut(), &[248044, 248046, 248063, 248064, 248065]);
     exercise_recurrent_chunks(backend.as_mut());
+    if cuda {
+        let phrase = backend.tokenize("A completely different prefix.").unwrap();
+        let tokens: Vec<_> = phrase.into_iter().cycle().take(32).collect();
+        backend.reset().unwrap();
+        backend.evaluate(&tokens[..31], 0).unwrap();
+        backend.evaluate(&tokens[31..], 31).unwrap();
+        let expected = backend.logits().unwrap().to_vec();
+        backend.reset().unwrap();
+        for (i, token) in tokens.iter().enumerate() {
+            backend
+                .evaluate(std::slice::from_ref(token), i as u32)
+                .unwrap();
+        }
+        assert!(
+            backend
+                .logits()
+                .unwrap()
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "DeltaNet panel and fused attention changed the continuation logits"
+        );
+    }
 }
 
 #[test]

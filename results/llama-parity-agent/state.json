@@ -1,5 +1,5 @@
 {
-  "status": "256-token-same-expert-resource-diagnosis-complete",
+  "status": "decode-fusion-package-admitted",
   "baseline": {
     "gpu": "RTX 5090 GPU-b4828435-6fb3-e121-e748-0f048de52fef",
     "model": "models/benchmark-qwen3/gguf/Qwen3-30B-A3B-Q4_K_M.gguf",
@@ -108,5 +108,78 @@
   "medium_same_expert_schedule": {"result":"Test-only GPU schedule exactly matched the CPU oracle and intact guards on frozen L0/T256: 20 pairs, 87 live entries instead of 107. No shared-weight MMA3 kernel or timing result yet. No GPU compute processes at the post-run check.", "log":"same-expert-schedule-l0.log", "identities":"same-expert-schedule-identities.sha256"},
   "medium_same_expert_development": {"result":"Shared-weight tile64 matched frozen projections, activation and downstream output with guards, but the complete L0/T256 panel regressed from 1.236672 ms to 1.582016 ms (0.782x). Rejected; no held-out timing or dispatch.", "log":"same-expert-panel-l0.log", "identities":"same-expert-panel-identities.sha256"},
   "medium_same_expert_resources": {"result":"Compared with baseline, the shared-weight kernel increased from 64 to 102 registers/thread and from 5888 to 10240 shared bytes, with zero local bytes on both. Predicted active 128-thread CTAs fell from 8 to 4 per SM. The result establishes a resource trade-off, not measured stall causality.", "log":"same-expert-resources.log"},
-  "next_action": "Screen a resource-balanced same-expert mapping with eight warps splitting the 64 columns, so each lane holds the original number of accumulators. Query driver resources first; then use the same frozen L0/T256 complete-panel 1.10x gate. Do not retry the rejected 128-thread mapping."
+  "medium_same_expert_warp8": {
+    "hypothesis": "An eight-warp (256-thread) same-expert mapping splits paired 64-column descriptors across warps (16x16 per warp, preserving 24 accumulators/lane) and splits 32-column singletons across all eight warps (16x8 per warp), recovering SM warp residency while sharing one 32-row weight tile per same-expert pair.",
+    "resources": {"result": "Single-body residual_matmul_mma3_same_expert_warp8 uses 56 registers/thread, 10496 shared bytes, 0 local bytes, and 4 predicted 256-thread CTAs/SM (1024 active threads/SM, matching baseline 8x128 and rows64 4x256, vs 512 active threads/SM on the 102-reg 128-thread mapping).", "log": "same-expert-warp8-resources.log"},
+    "development": {"result": "Bitwise exact against frozen L0/T256 gate/up/down digests, SwiGLU activation, downstream output, quantizer and schedule guards. Improved over the 128-thread mapping (1.582016 ms -> 1.325536 ms), but complete L0/T256 panel still regressed against baseline (1.232768 ms baseline vs 1.325536 ms candidate, 0.930x; replaced path 0.806912 ms vs 0.914208 ms, 0.883x), below the 1.10x gate. Rejected; no held-out run or dispatch.", "log": "same-expert-warp8-panel-l0.log", "identities": "same-expert-warp8-identities.sha256"}
+  },
+  "dense_splitk_experiment": {
+    "hypothesis": "Dense prefill MMA3 launches with <=512 base CTAs underutilize the RTX 5090's 170 SMs and expose the ~100-200 us single-CTA serial K loop. Splitting K across power-of-two slices (k_slice >= 128, up to 1024 CTAs) into existing workspace scratch (<=4 MiB, L2-resident) with a deterministic increasing-slice coalesced reduction fills a single GPU wave without adding reservation.",
+    "resources": {"result": "residual_matmul_mma3_splitk uses 66 registers/thread, 5888 shared bytes, 0 local bytes, and 7 predicted 128-thread CTAs/SM (1190 concurrent CTAs across 170 SMs).", "log": "dense-splitk-resources.log"},
+    "development": {"result": "All 9 targeted (splits >= 2) L0 projections passed >=1.10x preparation-inclusive with intact partial/output guards: T46 Q/K/V/O 2.088x/6.384x/7.097x/3.620x (complete panel 3.730x); T256 K/V/O 2.933x/2.802x/1.199x (complete panel 1.358x); T512 K/V 2.011x/1.834x (complete panel 1.120x). Untargeted splits=1 projections remained bitwise exact; worst max_abs vs F32 dropped or matched (<=4.17e-7).", "logs": ["dense-splitk-t46.log", "dense-splitk-t256.log", "dense-splitk-t512.log"], "identities": "dense-splitk-identities.sha256"},
+    "heldout": {"result": "Frozen binary passed all 18 targeted held-out projections across L37 and L47 at T46/T256/T512: T46 panels 3.768x (L37) and 3.721x (L47); T256 panels 1.358x (L37) and 1.358x (L47); T512 panels 1.129x (L37) and 1.122x (L47). Worst max_abs 1.22e-4, min cosine 0.999999999999749.", "logs": ["dense-splitk-heldout-l37-t46.log", "dense-splitk-heldout-l47-t46.log", "dense-splitk-heldout-l37-t256.log", "dense-splitk-heldout-l47-t256.log", "dense-splitk-heldout-l37-t512.log", "dense-splitk-heldout-l47-t512.log"]}
+  },
+  "attention_even_extension": {
+    "result": "Extending bitwise-preserving attention_fused_query_pair to even lengths >=32 matched all captured outputs bitwise with intact guards: L0 T46 1.332x, L0 T256 1.854x; held-out L37 T46 1.332x, L37 T256 1.840x.",
+    "logs": ["attention-pair-l0-t46.log", "attention-pair-l0-t256.log", "attention-pair-l37-t46.log", "attention-pair-l37-t256.log"],
+    "identities": "attention-pair-short-medium-identities.sha256"
+  },
+  "splitk_package": {
+    "binary": "target/llama-parity-splitk/release/local-inference",
+    "sha256": "8823cf8027befcef8c87108fd9a215aa9e8091796a281ea49770b302a0fe9e07",
+    "features": ["cuda-mma3-splitk-research", "cuda-mma3-dense-wide-rows-research", "cuda-attention-query-pair-even-research"],
+    "quality": "Passed all 990 full-vocabulary snapshots and 30 independent generations against both fresh f32-tiled (max_abs 0.0007615 <= 0.01, min_cosine 0.99999999964 >= 0.99999, 0 argmax/gen mismatches, 132/132 short fallback snapshots bitwise) and fresh accepted-mma3 (max_abs 0.0009174, min_cosine 0.99999999936, 0 argmax/gen mismatches). Reservation unchanged at 18855091776 bytes.",
+    "quality_evidence": ["results/llama-parity-agent/splitk-package-quality.log", "results/llama-parity-agent/splitk-package-quality-comparison.json"],
+    "abba": "Against admitted pair-package (ce4ca2d4...): 46-token prefill 1.425x/1.425x and complete short request 1.250x/1.249x in both orders (>=1.10x package gate passed); 256-token prefill 1.141x/1.140x (request 1.099x/1.097x); 512-token prefill and request 1.072x/1.070x; 31-step decode 1.001x/1.000x. Identical generated IDs and reservation.",
+    "abba_evidence": "results/llama-parity-agent/splitk-package-abba/summary.json",
+    "admission": {
+      "capacity": "Batch 31/32/46/128/255 and exact 1024 context all passed quality, reservation, one-over and poison/reset gates; batch 31 remained 100% bitwise exact.",
+      "capacity_evidence": "results/llama-parity-agent/splitk-capacity-summary.log",
+      "sanitizers": "Scoped batch-32 real-model memcheck (18 launches: 0 errors), racecheck (9 launches: 0 hazards), synccheck (9 launches: 0 errors); strict Clippy and fmt clean.",
+      "sanitizer_evidence": ["results/llama-parity-agent/splitk-sanitized-memcheck.log", "results/llama-parity-agent/splitk-sanitized-racecheck.log", "results/llama-parity-agent/splitk-sanitized-synccheck.log"],
+      "identities": "results/llama-parity-agent/splitk-package-identities.sha256"
+    },
+    "decision": "Admitted as new opt-in research comparator (target/llama-parity-splitk/release/local-inference). Default dispatch and accepted binary unchanged."
+  },
+  "decode_fusion_experiment": {
+    "hypothesis": "Single-token decode launches separate Q/K/V packed matvecs (3 graph nodes), separate Q/K head_norm, rotary and cache_kv (5 graph nodes), and a 256-thread 80-barrier router. Fusing Q/K/V packed matvecs, fusing 128-dim head_norm+RoPE+KV-cache, and replacing 128-expert top-8 routing with a barrier-free 1-warp register shuffle preserve exact IEEE-754 bits and combine with held-out-validated packed-decode-gate-up.",
+    "development": {"result": "On frozen L0/T46 positions 0 and 45, all four components were bitwise exact with intact guards: matvec_packed_qkv 1.457x/1.484x, qkv_head_norm_rope_cache 1.879x/1.843x, router_warp128 1.882x/1.812x; residual_normalize reached 0.861x/1.385x and was rejected (<1.10x at pos 0).", "log": "decode-fusion-l0.log", "identities": "decode-fusion-identities.sha256"},
+    "heldout": {"result": "Frozen binary on held-out L47/T46 positions 0 and 45 passed all three surviving components bitwise with guards: matvec_packed_qkv 1.406x/1.472x, qkv_head_norm_rope_cache 1.972x/2.928x, router_warp128 1.849x/1.860x.", "log": "decode-fusion-l47.log"}
+  },
+  "decode_fusion_package": {
+    "binary": "target/llama-parity-decode-fusion/release/local-inference",
+    "sha256": "8c3a2bd966c2e6f25ba6167c4147eb0ad7d4b7dd3b388ff0204e3fc83c6c8f1d",
+    "features": ["cuda-decode-fusion-research", "cuda-packed-gate-up-research"],
+    "quality": "990/990 bitwise digest matches and 30/30 independent generation matches against admitted splitk-package (retaining max_abs 0.0007615 <= 0.01 and min_cosine 0.99999999964 >= 0.99999 against fresh f32-tiled). Reservation unchanged at 18855091776 bytes.",
+    "quality_evidence": ["results/llama-parity-agent/decode-fusion-package-quality.log", "results/llama-parity-agent/decode-fusion-package-quality-comparison.log"],
+    "abba": "Against admitted splitk-package (8823cf80...): 31-step decode 1.277x/1.278x (128.67->100.76 ms / 128.69->100.69 ms, ~307.9 tok/s) and complete decode request 1.277x/1.278x in both orders (>=1.10x package gate passed); short request 1.098x/1.098x (decode 1.263x); prefill request 1.051x/1.052x (decode 1.183x); long request 1.002x/1.002x. Identical generated IDs and reservation.",
+    "abba_evidence": "results/llama-parity-agent/decode-fusion-package-abba/summary.json",
+    "admission": {
+      "capacity": "Batch 31/32/46/128/255 all matched splitk-package bitwise on every snapshot and generation with identical reservation and passing 1024-context/one-over/poison/reset checks.",
+      "capacity_evidence": "results/llama-parity-agent/decode-fusion-capacity-summary.log",
+      "sanitizers": "Real-model memcheck (24 launches across new kernels: 0 errors), plus per-kernel racecheck (0 hazards) and synccheck (0 errors) across matvec_packed_qkv, matvec_packed_gate_up, router_warp128, and qkv_head_norm_rope_cache_decode; strict Clippy and fmt clean.",
+      "sanitizer_evidence": ["results/llama-parity-agent/decode-fusion-sanitized-memcheck.log", "results/llama-parity-agent/decode-fusion-racecheck-matvec_packed_qkv.log", "results/llama-parity-agent/decode-fusion-racecheck-matvec_packed_gate_up.log", "results/llama-parity-agent/decode-fusion-racecheck-router_warp128.log", "results/llama-parity-agent/decode-fusion-racecheck-qkv_head_norm_rope_cache_decode.log"],
+      "identities": "results/llama-parity-agent/decode-fusion-package-identities.sha256"
+    },
+    "decision": "Admitted as new opt-in research comparator (target/llama-parity-decode-fusion/release/local-inference). Default dispatch and accepted binary unchanged."
+  },
+  "decode_fusion_profiles": {
+    "decode_trace": "results/llama-parity-agent/decode-fusion-nodes.txt",
+    "short_trace": "results/llama-parity-agent/decode-fusion-short.txt",
+    "summary": "In 64-step decode, remaining time is matvec_packed_f32 (23.1%: O, router F32 matvec, output head), matvec_packed_gate_up (22.3%), normalize (14.2%), matvec_packed_down_warp (12.3%), matvec_packed_qkv (11.8%), attention_fused_decode (6.7%), router_warp128 (4.3%), qkv_head_norm_rope_cache_decode (2.5%). In 46-token prefill, dense Split-K dropped all dense Q/K/V/O projections to 5.43 ms/request while grouped expert residual_matmul_mma3 is 34.72 ms/request (80% of 46-token prefill)."
+  },
+  "decode_fusion_matched": {
+    "evidence": "results/llama-parity-agent/decode-fusion-matched/summary.json",
+    "log": "results/llama-parity-agent/decode-fusion-matched.log",
+    "boundary": "Fresh two-round interleaved matched wall-clock harness (R1 rust->llama, R2 llama->rust; 3 warmups, 7 measured per arm; cold reset included; fixed continuation IDs; separate free-greedy verification).",
+    "decision": "Substantial progress over prior pair-package matched baseline (0.206-0.211x / 0.240x / 0.204-0.205x prefill, 0.677x decode), but parity (>=1.05x) not yet reached: Rust/llama.cpp ratios across R1/R2 are 0.304x/0.297x (46 prefill: 43.40/43.38 ms vs 13.21/12.88 ms), 0.271x/0.272x (256 prefill: 94.45/94.40 ms vs 25.61/25.66 ms), 0.219x/0.220x (512 prefill: 147.40/147.36 ms vs 32.35/32.43 ms), and 0.863x/0.864x (31-step decode: 101.11/100.95 ms vs 87.21/87.22 ms; 1-token TTFT 0.895x). Free-greedy IDs match exactly on short/prefill/long and first differ at zero-based index 18 on 32-step decode, unchanged from accepted MMA3."
+  },
+  "true_pipeline_experiment": {
+    "hypothesis": "Issue volatile ld.global.ca packed weight loads into registers alongside cp.async activation loads before mma.sync and defer shared weight stores until after compute.",
+    "resources": {"result": "80 registers/thread, 11776 shared bytes, 0 local bytes, 6 predicted 128-thread blocks/SM.", "log": "true-pipeline-resources.log"},
+    "result": "Bitwise exact across all tested panels with intact guards: L0/T46 passed at 1.140x (0.8145->0.7145 ms), but L0/T256 reached 1.021x (1.2306->1.2048 ms) and held-out L47/T46 reached 1.067x (0.5430->0.5088 ms), below 1.10x. Rejected; test-only.",
+    "logs": ["true-pipeline-panel-l0-t46.log", "true-pipeline-panel-l0-t256.log", "true-pipeline-panel-l47-t46.log"],
+    "identities": "true-pipeline-identities.sha256"
+  },
+  "next_action": "Close the remaining 1.21x decode gap (101.0 ms -> <=83.0 ms) by screening 1-warp-per-row barrier-free matvec_packed_gate_up_warp and matvec_packed_qkv_warp plus fused router F32 matvec+top8 on L0/T46 and held-out L47/T46, and screen fused/split-K grouped expert prefill designs against the 34.7 ms / 62 ms / 83 ms expert MMA3 bottleneck."
 }

@@ -131,7 +131,6 @@ pub(in crate::cuda) fn open(
     let ptx = cache::compile(
         options.kernel_cache_dir.as_deref(),
         concat!(
-            "#define CUDA_PACKED_DECODE 1\n",
             include_str!("../../kernels.cu"),
             "\n#define CUDA_REGISTER_PREFILL 1\n",
             include_str!("../../prefill.cu"),
@@ -154,7 +153,6 @@ pub(in crate::cuda) fn open(
         "prefill_matmul",
         "prefill_matmul_ref2x16",
         "matvec",
-        "matvec_packed_f32",
         "normalize",
         "residual",
         "swiglu",
@@ -294,14 +292,9 @@ macro_rules! project {
     }};
     ($model:ident, $t:expr, $x:ident, $y:ident) => {{
         let t = $t;
-        let kernel = if matches!(t.kind, 12 | 14) && t.width % 256 == 0 {
-            "matvec_packed_f32"
-        } else {
-            "matvec"
-        };
         launch!(
             $model,
-            kernel,
+            "matvec",
             (t.rows as u32, 1, 1),
             &t.bytes,
             &t.kind,

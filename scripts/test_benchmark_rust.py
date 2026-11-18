@@ -7,6 +7,24 @@ from validate_rust_logits import compare_logits
 
 
 class IndependentBenchmarkTests(unittest.TestCase):
+    def test_paired_cuda_baseline_profile_is_explicit_and_stable(self):
+        labels = ["a1", "b1", "b2", "a2"]
+        report = {"controls": {"batch": 512, "chunk": 512, "matmul": "f32-tiled",
+                               "decode_graph": True},
+                  "results": {"case": {"memory": {"numerical_reservation_bytes": 100}}}}
+        reports = {label: deepcopy(report) for label in labels}
+        provenance = {label: {"models": {}, "affinity": [0]} for label in labels}
+        options = dict(candidate_decode_graph=True, candidate_batch=512, candidate_chunk=512)
+        with self.assertRaises(ValueError):
+            validate_controls(reports, provenance, "f32-tiled", **options)
+        options.update(baseline_matmul="f32-tiled", baseline_decode_graph=True)
+        validate_controls(reports, provenance, "f32-tiled", **options)
+        for field, value in [("matmul", "f32"), ("decode_graph", False), ("batch", 128)]:
+            changed = deepcopy(reports)
+            changed["a2"]["controls"][field] = value
+            with self.assertRaises(ValueError):
+                validate_controls(changed, provenance, "f32-tiled", **options)
+
     def test_graph_and_batch_changes_require_explicit_bounded_paired_controls(self):
         labels = ["a1", "b1", "b2", "a2"]
         report = {"controls": {"batch": 128, "chunk": 128, "matmul": "f32"},

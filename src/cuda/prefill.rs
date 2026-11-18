@@ -5,6 +5,10 @@ use serde_json::json;
 use std::time::Instant;
 
 const DECODE_CHECK_SOURCE: &str = r#"
+extern "C" __global__ void half_decode_check(const u8 *input, unsigned int *bits) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < 65536) bits[i] = __float_as_uint(half_value(input + i * 2));
+}
 template<int Kind, int KTile>
 __device__ void check_projection_decode(const u8 *w, int *status, int width, int rows,
                                         float *workspace) {
@@ -61,6 +65,27 @@ enum Mode {
     Register64x16,
     Register32x32,
     Register64x32,
+    Reference2x8,
+    Reference2x16,
+    Reference4x16,
+    Reuse2x16,
+    Reuse4x8,
+    Reuse4x16,
+    Reuse4x8Rows4,
+    ReferencePacked2x16,
+    ReferenceUnroll2,
+    ReferenceUnroll4,
+    ReferenceUnroll8,
+    ReferenceUnroll16,
+    ReferenceCompact2x16,
+    ReferenceCompact2x8,
+    Reference64Lanes2x8,
+    Reference64Lanes2x16,
+    Reference32Lanes4x4,
+    Reference32Lanes4x8,
+    ReferenceStatic,
+    ReferenceInterleaved8,
+    ReferenceInterleaved16,
 }
 
 const REGISTER_MODES: &[Mode] = &[
@@ -72,6 +97,31 @@ const REGISTER_MODES: &[Mode] = &[
 
 impl Harness {
     pub(super) fn new() -> Result<Self> {
+        Self::with_normalized_attention(false)
+    }
+
+    fn with_normalized_attention(normalize: bool) -> Result<Self> {
+        Self::with_attention_options(normalize, false)
+    }
+
+    fn with_attention_options(normalize: bool, reuse: bool) -> Result<Self> {
+        Self::compile(normalize, reuse, false, false)
+    }
+
+    pub(super) fn with_packed_reduction() -> Result<Self> {
+        Self::compile(false, false, true, false)
+    }
+
+    pub(super) fn with_admitted_attention() -> Result<Self> {
+        Self::compile(true, true, false, true)
+    }
+
+    fn compile(
+        normalize: bool,
+        reuse: bool,
+        packed_reduction: bool,
+        block_reduction: bool,
+    ) -> Result<Self> {
         let context = CudaContext::new(0).map_err(failure)?;
         let major = context
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
@@ -80,13 +130,41 @@ impl Harness {
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
             .map_err(failure)?;
         let source = format!(
-            "#define CUDA_M8_PROTOTYPES 1\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n#define CUDA_M8_PROTOTYPES 1\n#define CUDA_NATIVE_HALF 1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            if block_reduction {
+                "#define CUDA_BLOCK_REDUCTION_RESEARCH 1"
+            } else {
+                ""
+            },
+            if normalize {
+                "#define CUDA_NORMALIZED_ATTENTION 1"
+            } else {
+                ""
+            },
+            if reuse {
+                "#define CUDA_ATTENTION_REUSE_RESEARCH 1"
+            } else {
+                ""
+            },
+            if packed_reduction {
+                "#define CUDA_PACKED_REDUCTION_RESEARCH 1"
+            } else {
+                ""
+            },
             include_str!("kernels.cu"),
             include_str!("prefill.cu"),
             include_str!("attention.cu"),
             include_str!("tiles8.cu"),
             include_str!("rows2.cu"),
             include_str!("tensorcore.cu"),
+            include_str!("residual.cu"),
+            include_str!("residual_tile.cu"),
+            include_str!("residual_precise.cu"),
+            include_str!("residual_mma.cu"),
+            include_str!("residual_pipeline.cu"),
+            include_str!("residual_block.cu"),
+            include_str!("grouping_parallel.cu"),
+            include_str!("fp16_projection.cu"),
             DECODE_CHECK_SOURCE,
         );
         let ptx = compile_ptx_with_opts(
@@ -102,11 +180,14 @@ impl Harness {
         let functions = [
             "matvec",
             "matvec_packed_f32",
+            "matvec_packed_down_two_row",
+            "matvec_packed_down_warp",
             "prefill_matmul",
             "group_experts",
             "grouped_matmul",
             "prefill_matmul8",
             "attention_fused",
+            "attention_fused_query_pair",
             "attention_scores",
             "attention_values",
             "prefill_matmul_rows2",
@@ -122,14 +203,97 @@ impl Harness {
             "prefill_matmul_tf32x3_tiled",
             "grouped_matmul_tf32x3_tiled",
             "projection_decode_check",
+            "half_decode_check",
+            "residual_quantize32",
+            "residual_quantize32_precise3",
+            "residual_quantize32_precise1",
+            "residual_packed_quant_check",
+            "residual_matmul_mma3",
+            "residual_matmul_mma3_gate_up_q4",
+            "residual_matmul_mma3_rows64",
+            "residual_matmul_mma3_compact8",
+            "matvec_packed_gate_up",
+            "matvec_packed_k_pair",
+            "residual_matmul_mma3_registers",
+            "residual_matmul_mma3_planar_q4",
+            "residual_matmul_mma3_sync_k64",
+            "residual_matmul_mma3_mixed",
+            "residual_matmul_mma3_same_expert",
+            "residual_matmul_mma1",
+            "residual_matmul_mma3_skip_empty",
+            "residual_matmul_mma3_cached_scales",
+            "projection_fp16_control",
+            "projection_fp16_packed",
+            "residual_matmul_mma3_cols8",
+            "residual_matmul_mma3_wide8",
+            "residual_matmul_mma3_cols16",
+            "residual_matmul_mma3_wide16",
+            "residual_matmul_mma3_pipeline",
+            "residual_quantize256_precise3",
+            "residual_matmul_mma3_block",
+            "residual_int8_dot",
+            "residual_f32_dot",
+            "residual_tf32x4_dot",
+            "residual_matmul32",
             "prefill_matmul_reg64x16",
             "prefill_matmul_reg32x32",
             "prefill_matmul_reg64x32",
             "group_experts_reg32",
+            "group_parallel_count32",
+            "group_parallel_emit32",
+            "group_parallel_emit8",
+            "group_parallel_mixed_schedule",
+            "group_parallel_same_expert_schedule",
             "grouped_matmul_reg32x32",
+            "prefill_matmul_ref2x8",
+            "prefill_matmul_ref2x16",
+            "prefill_matmul_ref4x16",
+            "prefill_matmul_reuse2x16",
+            "prefill_matmul_reuse4x8",
+            "prefill_matmul_reuse4x16",
+            "prefill_matmul_reuse4x8_r4",
+            "prefill_matmul_refpacked2x16",
+            "prefill_matmul_ref2x16_u2",
+            "prefill_matmul_ref2x16_u4",
+            "prefill_matmul_ref2x16_u8",
+            "prefill_matmul_ref2x16_u16",
+            "prefill_matmul_refcompact2x16",
+            "prefill_matmul_refcompact2x8",
+            "prefill_matmul_ref64_2x8",
+            "prefill_matmul_ref64_2x16",
+            "prefill_matmul_ref32_4x4",
+            "prefill_matmul_ref32_4x8",
+            "prefill_matmul_ref2048",
+            "prefill_matmul_ref4096",
+            "prefill_matmul_refinterleave2x16",
+            "prefill_matmul_refinterleave2x8",
+            "grouped_matmul_reg32_counted",
+            "grouped_gate_up_reg32x32",
+            "grouped_matmul_coalesced_k32",
+            "grouped_matmul_coalesced_k64",
+            "grouped_matmul_coalesced_k128",
+            "grouped_matmul_balanced32",
+            "grouped_matmul_wide64",
+            "grouped_matmul_balanced64",
+            "grouped_matmul_balanced128",
+            "grouped_matmul_unroll2",
+            "grouped_matmul_unroll4",
+            "grouped_matmul_unroll8",
+            "grouped_matmul_unroll16",
+            "grouped_matmul_unroll32",
+            "grouped_gate_up_reg16_counted",
+            "grouped_gate_up_reg16_k32",
+            "swiglu",
+            "normalize",
         ]
         .into_iter()
-        .map(|name| Ok((name, module.load_function(name).map_err(failure)?)))
+        .chain(block_reduction.then_some("normalize_retained2048"))
+        .map(|name| {
+            let function = module
+                .load_function(name)
+                .map_err(|error| failure(format!("{name}: {error}")))?;
+            Ok((name, function))
+        })
         .collect::<Result<_>>()?;
         let stream = context.default_stream();
         let ids = stream.clone_htod(&[0i32]).map_err(failure)?;
@@ -161,10 +325,30 @@ impl Harness {
                 8 + token * tensor.rows as usize..8 + (token + count) * tensor.rows as usize,
             );
             let tile = match mode {
-                Mode::Tiled | Mode::Rows2 => 4,
+                Mode::Tiled | Mode::Rows2 | Mode::Reference32Lanes4x4 => 4,
                 Mode::WideTiled | Mode::Staged | Mode::Tf32x3 | Mode::StagedTf32x3 => 8,
                 Mode::Register64x16 => 16,
                 Mode::Register32x32 | Mode::Register64x32 => 32,
+                Mode::Reference2x8
+                | Mode::Reuse4x8
+                | Mode::Reuse4x8Rows4
+                | Mode::ReferenceCompact2x8
+                | Mode::ReferenceInterleaved8
+                | Mode::Reference64Lanes2x8
+                | Mode::Reference32Lanes4x8 => 8,
+                Mode::Reference2x16
+                | Mode::Reference4x16
+                | Mode::Reuse2x16
+                | Mode::Reuse4x16
+                | Mode::ReferencePacked2x16
+                | Mode::ReferenceUnroll2
+                | Mode::ReferenceUnroll4
+                | Mode::ReferenceUnroll8
+                | Mode::ReferenceUnroll16
+                | Mode::ReferenceCompact2x16
+                | Mode::ReferenceStatic
+                | Mode::ReferenceInterleaved16
+                | Mode::Reference64Lanes2x16 => 16,
                 _ => 1,
             };
             let tiled = tile > 1;
@@ -178,6 +362,35 @@ impl Harness {
                 Mode::Register64x16 => "prefill_matmul_reg64x16",
                 Mode::Register32x32 => "prefill_matmul_reg32x32",
                 Mode::Register64x32 => "prefill_matmul_reg64x32",
+                Mode::Reference2x8 => "prefill_matmul_ref2x8",
+                Mode::Reference2x16 => "prefill_matmul_ref2x16",
+                Mode::Reference4x16 => "prefill_matmul_ref4x16",
+                Mode::Reuse2x16 => "prefill_matmul_reuse2x16",
+                Mode::Reuse4x8 => "prefill_matmul_reuse4x8",
+                Mode::Reuse4x16 => "prefill_matmul_reuse4x16",
+                Mode::Reuse4x8Rows4 => "prefill_matmul_reuse4x8_r4",
+                Mode::ReferencePacked2x16 => "prefill_matmul_refpacked2x16",
+                Mode::ReferenceUnroll2 => "prefill_matmul_ref2x16_u2",
+                Mode::ReferenceUnroll4 => "prefill_matmul_ref2x16_u4",
+                Mode::ReferenceUnroll8 => "prefill_matmul_ref2x16_u8",
+                Mode::ReferenceUnroll16 => "prefill_matmul_ref2x16_u16",
+                Mode::ReferenceCompact2x16 => "prefill_matmul_refcompact2x16",
+                Mode::ReferenceCompact2x8 => "prefill_matmul_refcompact2x8",
+                Mode::Reference64Lanes2x8 => "prefill_matmul_ref64_2x8",
+                Mode::Reference64Lanes2x16 => "prefill_matmul_ref64_2x16",
+                Mode::Reference32Lanes4x4 => "prefill_matmul_ref32_4x4",
+                Mode::Reference32Lanes4x8 => "prefill_matmul_ref32_4x8",
+                Mode::ReferenceInterleaved8 => "prefill_matmul_refinterleave2x8",
+                Mode::ReferenceInterleaved16 => "prefill_matmul_refinterleave2x16",
+                Mode::ReferenceStatic => match tensor.width {
+                    2048 => "prefill_matmul_ref2048",
+                    4096 => "prefill_matmul_ref4096",
+                    _ => {
+                        return Err(failure(
+                            "fixed-width dense trial requires width 2048 or 4096",
+                        ));
+                    }
+                },
                 _ => "matvec",
             };
             let cfg = LaunchConfig {
@@ -187,6 +400,27 @@ impl Harness {
                         Mode::Staged => 32,
                         Mode::Register64x16 | Mode::Register64x32 => 64,
                         Mode::Register32x32 => 32,
+                        Mode::Reference2x8
+                        | Mode::Reference2x16
+                        | Mode::Reuse2x16
+                        | Mode::ReferencePacked2x16
+                        | Mode::ReferenceUnroll2
+                        | Mode::ReferenceUnroll4
+                        | Mode::ReferenceUnroll8
+                        | Mode::ReferenceUnroll16
+                        | Mode::ReferenceCompact2x16
+                        | Mode::ReferenceCompact2x8
+                        | Mode::ReferenceStatic
+                        | Mode::ReferenceInterleaved8
+                        | Mode::ReferenceInterleaved16
+                        | Mode::Reference64Lanes2x8
+                        | Mode::Reference64Lanes2x16 => 2,
+                        Mode::Reference4x16
+                        | Mode::Reuse4x8
+                        | Mode::Reuse4x16
+                        | Mode::Reuse4x8Rows4
+                        | Mode::Reference32Lanes4x4
+                        | Mode::Reference32Lanes4x8 => 4,
                         Mode::Tf32x3 | Mode::StagedTf32x3 => 128,
                         _ => 1,
                     }),
@@ -195,7 +429,15 @@ impl Harness {
                 ),
                 block_dim: (
                     match mode {
-                        Mode::Register64x16 | Mode::Register32x32 => 128,
+                        Mode::Register64x16
+                        | Mode::Register32x32
+                        | Mode::Reuse2x16
+                        | Mode::Reuse4x8Rows4
+                        | Mode::Reference64Lanes2x8
+                        | Mode::Reference64Lanes2x16
+                        | Mode::Reference32Lanes4x4
+                        | Mode::Reference32Lanes4x8 => 128,
+                        Mode::Reference4x16 => 512,
                         _ => 256,
                     },
                     1,
@@ -463,6 +705,114 @@ fn register_prefill_tiles_match_cpu_ordered_f32_and_guards() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "reference-order dense tiles; serial CUDA release correctness"]
+fn reference_order_prefill_matches_legacy_bits_cpu_and_guards() -> Result<()> {
+    check_reference_prefill_modes(&[
+        Mode::Tiled,
+        Mode::Reference2x8,
+        Mode::Reference2x16,
+        Mode::Reference4x16,
+        Mode::Reuse2x16,
+        Mode::Reuse4x8,
+        Mode::Reuse4x16,
+        Mode::Reuse4x8Rows4,
+        Mode::ReferencePacked2x16,
+        Mode::ReferenceUnroll2,
+        Mode::ReferenceUnroll4,
+        Mode::ReferenceUnroll8,
+        Mode::ReferenceUnroll16,
+        Mode::ReferenceCompact2x16,
+        Mode::ReferenceCompact2x8,
+        Mode::Reference64Lanes2x8,
+        Mode::Reference64Lanes2x16,
+        Mode::Reference32Lanes4x4,
+        Mode::Reference32Lanes4x8,
+    ])
+}
+
+#[test]
+#[ignore = "all half bit patterns; serial CUDA release correctness"]
+fn native_half_decode_preserves_all_legacy_bits() -> Result<()> {
+    let harness = Harness::new()?;
+    let input: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+    let input = harness.stream.clone_htod(&input).map_err(failure)?;
+    let mut bits = harness.stream.alloc_zeros::<u32>(65536).map_err(failure)?;
+    launch!(harness, "half_decode_check", (256, 1, 1), &input, &mut bits);
+    let bits = harness.stream.clone_dtoh(&bits).map_err(failure)?;
+    for (h, actual) in bits.into_iter().enumerate() {
+        let h = h as u32;
+        let sign = (h & 0x8000) << 16;
+        let exponent = (h >> 10) & 31;
+        let fraction = h & 1023;
+        let expected = if exponent == 0 {
+            let value = fraction as f32 * (1.0 / 16_777_216.0);
+            if sign == 0 { value } else { -value }
+        } else {
+            f32::from_bits(sign | ((exponent + 112) << 23) | (fraction << 13))
+        };
+        assert_eq!(actual, expected.to_bits(), "half bits {h:04x}");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "selected reference-order dense kernels; serial CUDA release correctness"]
+fn interleaved_reference_prefill_matches_legacy_bits_cpu_and_guards() -> Result<()> {
+    check_reference_prefill_modes(&[
+        Mode::Tiled,
+        Mode::Reference2x16,
+        Mode::ReferenceInterleaved8,
+        Mode::ReferenceInterleaved16,
+    ])
+}
+
+fn check_reference_prefill_modes(modes: &[Mode]) -> Result<()> {
+    check_reference_prefill_shapes(
+        modes,
+        &[
+            (256, 1, 1),
+            (768, 7, 17),
+            (2048, 33, 33),
+            (4096, 3, 7),
+            (65, 256, 3),
+            (257, 256, 2),
+            (256, 3, 257),
+        ],
+    )
+}
+
+#[test]
+#[ignore = "fixed-width reference-order dense kernels; serial CUDA release correctness"]
+fn fixed_width_reference_prefill_matches_legacy_bits_cpu_and_guards() -> Result<()> {
+    check_reference_prefill_shapes(
+        &[Mode::Tiled, Mode::Reference2x16, Mode::ReferenceStatic],
+        &[
+            (2048, 1, 1),
+            (2048, 3, 17),
+            (2048, 33, 257),
+            (4096, 1, 7),
+            (4096, 3, 33),
+            (4096, 33, 17),
+        ],
+    )
+}
+
+fn check_reference_prefill_shapes(modes: &[Mode], shapes: &[(usize, usize, usize)]) -> Result<()> {
+    let harness = Harness::new()?;
+    for kind in [12, 14] {
+        for &(width, rows, tokens) in shapes {
+            let tensor = packed_fixture(kind, width, rows, 1);
+            let input = inputs(width, tokens);
+            let expected = cpu_product(&tensor, &input, rows);
+            let tensor = DeviceTensor::upload(tensor, &harness.stream)?;
+            let x = harness.stream.clone_htod(&input).map_err(failure)?;
+            harness.check_modes(&tensor, &x, &expected, tokens, modes, true)?;
+        }
+    }
+    Ok(())
+}
+
 fn check_tensorcore_tiles(kernel: &'static str, rounded: bool) -> Result<()> {
     let harness = Harness::new()?;
     for kind in [0, 1, 6, 8, 12, 14] {
@@ -658,6 +1008,60 @@ fn register_grouped_tiles_preserve_assignments_tails_guards_and_cpu() -> Result<
     check_grouped_projection("grouped_matmul_reg32x32", 32, 32, false)
 }
 
+#[test]
+#[ignore = "count-aware register tiles; serial CUDA release correctness"]
+fn counted_grouped_tiles_preserve_assignments_tails_guards_and_cpu() -> Result<()> {
+    check_grouped_projection("grouped_matmul_reg32_counted", 32, 32, false)
+}
+
+#[test]
+#[ignore = "coalesced grouped staging and K tiles; serial CUDA release correctness"]
+fn coalesced_grouped_tiles_preserve_assignments_tails_guards_and_cpu() -> Result<()> {
+    for kernel in [
+        "grouped_matmul_coalesced_k32",
+        "grouped_matmul_coalesced_k64",
+        "grouped_matmul_coalesced_k128",
+    ] {
+        check_grouped_projection(kernel, 32, 32, false)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "balanced and wider expert mappings; serial CUDA release correctness"]
+fn balanced_grouped_tiles_preserve_assignments_tails_guards_and_cpu() -> Result<()> {
+    for (kernel, rows) in [
+        ("grouped_matmul_balanced32", 32),
+        ("grouped_matmul_wide64", 64),
+        ("grouped_matmul_balanced64", 64),
+        ("grouped_matmul_balanced128", 128),
+    ] {
+        check_grouped_projection(kernel, rows, 32, false)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "ordered partially unrolled expert loops; serial CUDA release correctness"]
+fn unrolled_grouped_tiles_preserve_assignments_tails_guards_and_cpu() -> Result<()> {
+    for kernel in [
+        "grouped_matmul_unroll2",
+        "grouped_matmul_unroll4",
+        "grouped_matmul_unroll8",
+        "grouped_matmul_unroll16",
+        "grouped_matmul_unroll32",
+    ] {
+        check_grouped_projection(kernel, 32, 32, false)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "selected unroll8 expert kernel; serial CUDA release and sanitizers"]
+fn unroll8_grouped_tiles_preserve_assignments_tails_guards_and_cpu() -> Result<()> {
+    check_grouped_projection("grouped_matmul_unroll8", 32, 32, false)
+}
+
 fn check_grouped_projection(
     kernel: &'static str,
     row_tile: u32,
@@ -678,8 +1082,13 @@ fn check_grouped_projection(
             (9, 3, 5, 768, 35, true),
             (17, 2, 3, 512, 129, true),
         ];
-        let register_skew = (group_tile == 32).then_some((65, 2, 7, 256, 33, true));
-        for (tokens, used, experts, width, rows, skewed) in cases.into_iter().chain(register_skew) {
+        let register_cases = if group_tile == 32 {
+            vec![(65, 2, 7, 256, 33, true), (17, 2, 3, 257, 256, true)]
+        } else {
+            vec![]
+        };
+        for (tokens, used, experts, width, rows, skewed) in cases.into_iter().chain(register_cases)
+        {
             let slots = (tokens * used).min((tokens * used).div_ceil(group_tile) + experts - 1);
             let selected: Vec<i32> = (0..tokens)
                 .flat_map(|t| {
@@ -775,12 +1184,23 @@ fn check_grouped_projection(
                         .arg(&descriptors)
                         .arg(&nu)
                         .arg(&batched);
-                    // Descriptor and output views are guarded; register32 needs
-                    // four warps, while all existing grouped modes need eight.
                     unsafe {
                         args.launch(LaunchConfig {
                             grid_dim: ((rows as u32).div_ceil(row_tile), slots as u32, 1),
-                            block_dim: (if group_tile == 32 { 128 } else { 256 }, 1, 1),
+                            block_dim: (
+                                if group_tile == 32
+                                    && !matches!(
+                                        kernel,
+                                        "grouped_matmul_wide64" | "grouped_matmul_balanced128"
+                                    )
+                                {
+                                    128
+                                } else {
+                                    256
+                                },
+                                1,
+                                1,
+                            ),
                             shared_mem_bytes: 0,
                         })
                     }
@@ -853,6 +1273,106 @@ fn fused_attention_matches_unfused_at_causal_and_context_boundaries() -> Result<
     let harness = Harness::new()?;
     check_attention(&harness, 1)?;
     check_attention(&harness, 128)
+}
+
+#[test]
+#[ignore = "CUDA attention structural experiment; complete outputs and isolated timing, serial GPU"]
+fn normalized_attention_preserves_bits_and_measures_complete_heads() -> Result<()> {
+    compare_attention_options(false)
+}
+
+#[test]
+#[ignore = "CUDA attention reuse experiment; complete outputs and isolated timing, serial GPU"]
+fn reused_attention_preserves_bits_and_measures_complete_heads() -> Result<()> {
+    compare_attention_options(true)
+}
+
+fn compare_attention_options(reuse: bool) -> Result<()> {
+    let normalized = Harness::with_attention_options(true, reuse)?;
+    for tokens in [1, 7, 128, 512] {
+        check_attention(&normalized, tokens)?;
+    }
+    let harnesses = [Harness::with_normalized_attention(reuse)?, normalized];
+    let (heads, kv_heads, dim, tokens, context) = (32usize, 4usize, 128usize, 512usize, 1024usize);
+    let queries = inputs(heads * dim, tokens);
+    let keys = inputs(kv_heads * dim, context);
+    let values: Vec<_> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v * ((i % 7) as f32 - 3.0))
+        .collect();
+    let mut buffers = Vec::new();
+    for harness in &harnesses {
+        buffers.push((
+            harness.stream.clone_htod(&queries).map_err(failure)?,
+            harness.stream.clone_htod(&keys).map_err(failure)?,
+            harness.stream.clone_htod(&values).map_err(failure)?,
+            harness
+                .stream
+                .alloc_zeros::<f32>(queries.len())
+                .map_err(failure)?,
+        ));
+    }
+    let mut samples = [Vec::new(), Vec::new()];
+    let (d, h, k, count) = (dim as i32, heads as i32, kv_heads as i32, 1i32);
+    for repetition in 0..10 {
+        for slot in 0..2 {
+            let index = (repetition + slot) % 2;
+            let harness = &harnesses[index];
+            let (q, keys, values, output) = &mut buffers[index];
+            let start = harness
+                .stream
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(failure)?;
+            launch!(
+                harness,
+                "attention_fused",
+                (heads as u32, tokens as u32, 1),
+                &*q,
+                &*keys,
+                &*values,
+                output,
+                &d,
+                &h,
+                &k,
+                &count
+            );
+            let end = harness
+                .stream
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(failure)?;
+            end.synchronize().map_err(failure)?;
+            if repetition >= 3 {
+                samples[index].push(start.elapsed_ms(&end).map_err(failure)?);
+            }
+        }
+    }
+    let expected = harnesses[0]
+        .stream
+        .clone_dtoh(&buffers[0].3)
+        .map_err(failure)?;
+    let actual = harnesses[1]
+        .stream
+        .clone_dtoh(&buffers[1].3)
+        .map_err(failure)?;
+    assert!(
+        actual
+            .iter()
+            .zip(&expected)
+            .all(|(&a, &b)| a.is_finite() && a.to_bits() == b.to_bits())
+    );
+    println!(
+        "NORMALIZED_ATTENTION {}",
+        json!({
+            "heads":heads,"kv_heads":kv_heads,"dim":dim,"tokens":tokens,
+            "output_values":actual.len(),"bitwise_equal":true,
+            "reference_cuda_event_ms":samples[0],"normalized_cuda_event_ms":samples[1],
+            "boundary_fixtures":48,
+            "reuse_query_and_reduce_max":reuse,
+            "scope":"Synthetic complete attention; not full-model or inference-speed admission"
+        })
+    );
+    Ok(())
 }
 
 fn check_attention(harness: &Harness, tokens: usize) -> Result<()> {
@@ -992,6 +1512,7 @@ fn benchmark_prefill_modes(modes: &[Mode], token_counts: &[usize], exact: bool) 
         &[(2048, 768), (768, 2048), (2048, 4096)],
         exact,
         false,
+        exact,
     )
 }
 
@@ -1034,6 +1555,71 @@ fn benchmark_register_shapes(shapes: &[(usize, usize)], token_counts: &[usize]) 
         shapes,
         false,
         true,
+        false,
+    )
+}
+
+#[test]
+#[ignore = "queries driver resource limits; serial release --nocapture"]
+fn reference_order_dense_kernel_resources() -> Result<()> {
+    let harness = Harness::new()?;
+    for (name, threads) in [
+        ("prefill_matmul_ref2x8", 256),
+        ("prefill_matmul_ref2x16", 256),
+        ("prefill_matmul_ref4x16", 512),
+        ("prefill_matmul_reuse2x16", 128),
+        ("prefill_matmul_reuse4x8", 256),
+        ("prefill_matmul_reuse4x16", 256),
+        ("prefill_matmul_reuse4x8_r4", 128),
+        ("prefill_matmul_refpacked2x16", 256),
+        ("prefill_matmul_ref2x16_u2", 256),
+        ("prefill_matmul_ref2x16_u4", 256),
+        ("prefill_matmul_ref2x16_u8", 256),
+        ("prefill_matmul_ref2x16_u16", 256),
+        ("prefill_matmul_refcompact2x16", 256),
+        ("prefill_matmul_refcompact2x8", 256),
+        ("prefill_matmul_ref64_2x8", 128),
+        ("prefill_matmul_ref64_2x16", 128),
+        ("prefill_matmul_ref32_4x4", 128),
+        ("prefill_matmul_ref32_4x8", 128),
+        ("prefill_matmul_ref2048", 256),
+        ("prefill_matmul_ref4096", 256),
+        ("prefill_matmul_refinterleave2x16", 256),
+        ("prefill_matmul_refinterleave2x8", 256),
+    ] {
+        let function = &harness.functions[name];
+        println!(
+            "DENSE_RESOURCES {}",
+            json!({
+                "kernel":name,
+                "registers_per_thread":function.num_regs().map_err(failure)?,
+                "static_shared_bytes":function.shared_size_bytes().map_err(failure)?,
+                "local_bytes_per_thread":function.local_size_bytes().map_err(failure)?,
+                "driver_predicted_max_blocks_per_sm":function
+                    .occupancy_max_active_blocks_per_multiprocessor(threads, 0, None)
+                    .map_err(failure)?,
+                "threads":threads,
+                "measured_occupancy":false,
+            })
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "reference-order dense trials; serial release --nocapture"]
+fn benchmark_reference_order_prefill() -> Result<()> {
+    benchmark_prefill_shapes(
+        &[
+            Mode::Reference2x16,
+            Mode::ReferenceInterleaved8,
+            Mode::ReferenceInterleaved16,
+        ],
+        &[256, 512],
+        &[(2048, 4096), (4096, 2048), (2048, 512)],
+        true,
+        false,
+        false,
     )
 }
 
@@ -1043,6 +1629,7 @@ fn benchmark_prefill_shapes(
     shapes: &[(usize, usize)],
     exact: bool,
     register_contract: bool,
+    cpu_reference: bool,
 ) -> Result<()> {
     let harness = Harness::new()?;
     for kind in [12, 14] {
@@ -1050,7 +1637,7 @@ fn benchmark_prefill_shapes(
             for &tokens in token_counts {
                 let tensor = packed_fixture(kind, width, rows, 1);
                 let input = inputs(width, tokens);
-                let expected = exact.then(|| cpu_product(&tensor, &input, rows));
+                let expected = cpu_reference.then(|| cpu_product(&tensor, &input, rows));
                 let t = DeviceTensor::upload(tensor, &harness.stream)?;
                 let x = harness.stream.clone_htod(&input).map_err(failure)?;
                 let expected = if let Some(expected) = expected {

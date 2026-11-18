@@ -24,7 +24,7 @@ fn project(
     let mut y = output.slice_mut(8..8 + selections * tensor.rows as usize);
     let cfg = LaunchConfig {
         grid_dim: (tensor.rows as u32 + extra_rows, selections as u32, 1),
-        block_dim: (256, 1, 1),
+        block_dim: (if name == "matvec_packed_k_pair" { 128 } else { 256 }, 1, 1),
         shared_mem_bytes: 0,
     };
     let mut args = harness.stream.launch_builder(&harness.functions[name]);
@@ -37,8 +37,7 @@ fn project(
         .arg(ids)
         .arg(&moe)
         .arg(&batched);
-    // Both kernels use one CTA per (row, selection), with exactly 256 threads.
-    // Only the candidate is overlaunched, to exercise its uniform row guard.
+    // Candidate overlaunches exercise the uniform row guard.
     unsafe { args.launch(cfg) }.map_err(failure)?;
     Ok(())
 }
@@ -64,6 +63,204 @@ fn read_output(harness: &Harness, output: &CudaSlice<f32>) -> Result<Vec<f32>> {
         "suffix guard"
     );
     Ok(values[8..values.len() - 8].to_vec())
+}
+
+pub(super) fn benchmark_down(
+    h: &Harness,
+    tensor: &DeviceTensor,
+    input: &[f32],
+    routing: &[i32],
+    position: usize,
+    capture_hash: &str,
+) -> Result<()> {
+    let input = guarded_input(h, input)?;
+    let ids = h.stream.clone_htod(routing).map_err(failure)?;
+    let count = tensor.rows as usize * routing.len();
+    let mut outputs = [
+        super::residual::matrix_output(h, count)?,
+        super::residual::matrix_output(h, count)?,
+        super::residual::matrix_output(h, count)?,
+    ];
+    let run = |arm: usize, output: &mut CudaSlice<f32>| -> Result<()> {
+        if arm == 0 {
+            return project(
+                h,
+                "matvec_packed_f32",
+                tensor,
+                &input,
+                output,
+                &ids,
+                1,
+                1,
+                0,
+            );
+        }
+        let (kernel, rows_per_block) = if arm == 1 {
+            ("matvec_packed_down_two_row", 2)
+        } else {
+            ("matvec_packed_down_warp", 8)
+        };
+        let x = input.slice(8..input.len() - 8);
+        let mut y = output.slice_mut(8..8 + count);
+        launch!(
+            h,
+            kernel,
+            (
+                (tensor.rows as u32).div_ceil(rows_per_block),
+                routing.len() as u32,
+                1
+            ),
+            &tensor.bytes,
+            &tensor.kind,
+            &x,
+            &mut y,
+            &tensor.rows,
+            &ids
+        );
+        Ok(())
+    };
+    for (arm, output) in outputs.iter_mut().enumerate() {
+        run(arm, output)?;
+    }
+    let flag = h.stream.alloc_zeros::<i32>(1).map_err(failure)?;
+    let base = super::residual::read_matrix_output(h, &flag, &outputs[0])?;
+    for output in &outputs[1..] {
+        let candidate = super::residual::read_matrix_output(h, &flag, output)?;
+        assert!(
+            base.iter()
+                .zip(&candidate)
+                .all(|(&a, &b)| a.to_bits() == b.to_bits())
+        );
+    }
+    let mut samples = [Vec::new(), Vec::new(), Vec::new()];
+    for repetition in 0..10 {
+        for slot in 0..3 {
+            let i = (repetition + slot) % 3;
+            let start = h
+                .stream
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(failure)?;
+            run(i, &mut outputs[i])?;
+            let end = h
+                .stream
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(failure)?;
+            end.synchronize().map_err(failure)?;
+            if repetition >= 3 {
+                samples[i].push(start.elapsed_ms(&end).map_err(failure)?);
+            }
+        }
+    }
+    println!(
+        "PACKED_DOWN_SCREEN {}",
+        json!({
+            "capture_sha256":capture_hash, "position":position, "kind":tensor.kind, "ids":routing,
+            "output_sha256":super::model_replay::float_hash(&base), "exact":true,
+            "baseline_ms":samples[0], "staged_ms":samples[1], "warp_ms":samples[2],
+            "repetitions":7, "warmups":3,
+        })
+    );
+    Ok(())
+}
+
+pub(super) fn benchmark_gate_up(
+    h: &Harness,
+    gate: &DeviceTensor,
+    up: &DeviceTensor,
+    input: &[f32],
+    routing: &[i32],
+    position: usize,
+    capture_hash: &str,
+) -> Result<()> {
+    assert_eq!((gate.width, up.width), (2048, 2048));
+    assert_eq!(gate.rows, up.rows);
+    assert!(matches!(gate.kind, 12 | 14) && matches!(up.kind, 12 | 14));
+    let input = guarded_input(h, input)?;
+    let ids = h.stream.clone_htod(routing).map_err(failure)?;
+    let count = gate.rows as usize * routing.len();
+    let mut scratch = guarded_output(h, count)?;
+    let mut outputs = [guarded_output(h, count)?, guarded_output(h, count)?];
+    let mut run = |arm: usize, output: &mut CudaSlice<f32>| -> Result<()> {
+        if arm == 0 {
+            project(h, "matvec_packed_f32", gate, &input, output, &ids, 1, 0, 0)?;
+            project(h, "matvec_packed_f32", up, &input, &mut scratch, &ids, 1, 0, 0)?;
+            let mut y = output.slice_mut(8..8 + count);
+            let u = scratch.slice(8..8 + count);
+            let count_i32 = count as i32;
+            launch!(h, "swiglu", ((count as u32).div_ceil(256), 1, 1),
+                &mut y, &u, &count_i32);
+        } else {
+            let x = input.slice(8..input.len() - 8);
+            let mut y = output.slice_mut(8..8 + count);
+            launch!(h, "matvec_packed_gate_up", (gate.rows as u32 + 1, routing.len() as u32, 1),
+                &gate.bytes, &gate.kind, &up.bytes, &up.kind, &x, &mut y, &gate.rows, &ids);
+        }
+        Ok(())
+    };
+    let mut samples = [Vec::new(), Vec::new()];
+    for repetition in 0..10 {
+        for slot in 0..2 {
+            let arm = (repetition + slot) % 2;
+            let start = h.stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(failure)?;
+            run(arm, &mut outputs[arm])?;
+            let end = h.stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(failure)?;
+            end.synchronize().map_err(failure)?;
+            if repetition >= 3 {
+                samples[arm].push(start.elapsed_ms(&end).map_err(failure)?);
+            }
+        }
+    }
+    read_output(h, &scratch)?;
+    let baseline = read_output(h, &outputs[0])?;
+    let candidate = read_output(h, &outputs[1])?;
+    assert!(baseline.iter().zip(&candidate).all(|(&a, &b)| a.is_finite() && a.to_bits() == b.to_bits()));
+    println!(
+        "PACKED_GATE_UP_SCREEN {}",
+        json!({"capture_sha256":capture_hash, "position":position, "kinds":[gate.kind, up.kind],
+            "activation_sha256":super::model_replay::float_hash(&baseline), "exact":true,
+            "baseline_ms":samples[0], "fused_ms":samples[1], "repetitions":7, "warmups":3})
+    );
+    Ok(())
+}
+
+pub(super) fn benchmark_k_pair(
+    h: &Harness,
+    tensor: &DeviceTensor,
+    input: &[f32],
+    tensor_name: &str,
+    position: usize,
+    capture_hash: &str,
+) -> Result<()> {
+    let input = guarded_input(h, input)?;
+    let ids = h.stream.clone_htod(&[0i32]).map_err(failure)?;
+    let mut outputs = [
+        guarded_output(h, tensor.rows as usize)?,
+        guarded_output(h, tensor.rows as usize)?,
+    ];
+    let kernels = ["matvec_packed_f32", "matvec_packed_k_pair"];
+    let mut samples = [Vec::new(), Vec::new()];
+    for repetition in 0..10 {
+        for slot in 0..2 {
+            let arm = (repetition + slot) % 2;
+            let start = h.stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(failure)?;
+            project(h, kernels[arm], tensor, &input, &mut outputs[arm], &ids, 0, 0, arm as u32)?;
+            let end = h.stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(failure)?;
+            end.synchronize().map_err(failure)?;
+            if repetition >= 3 {
+                samples[arm].push(start.elapsed_ms(&end).map_err(failure)?);
+            }
+        }
+    }
+    let baseline = read_output(h, &outputs[0])?;
+    let candidate = read_output(h, &outputs[1])?;
+    assert!(baseline.iter().zip(&candidate).all(|(&a, &b)| a.is_finite() && a.to_bits() == b.to_bits()));
+    println!(
+        "PACKED_K_PAIR_SCREEN {}",
+        json!({"capture_sha256":capture_hash, "position":position, "tensor":tensor_name,
+            "kind":tensor.kind,"output_sha256":super::model_replay::float_hash(&baseline), "exact":true,
+            "baseline_ms":samples[0], "pair_ms":samples[1], "repetitions":7, "warmups":3})
+    );
+    Ok(())
 }
 
 fn decoded_weights(tensor: &Tensor) -> Vec<f32> {
@@ -480,6 +677,9 @@ fn packed_decode_real_model_abba_trial() -> Result<()> {
             "model_identity": "canonical_path_size_mtime_not_content_hash",
             "cases": cases_path, "cases_sha256": format!("{:x}", Sha256::digest(&cases_bytes)),
             "prototype_source_sha256": format!("{:x}", Sha256::digest(prototype_source)),
+            "baseline_matvec_override": "matvec",
+            "candidate_matvec_override": "matvec_packed_f32",
+            "both_variants_explicitly_installed_and_recaptured": true,
             "baseline_source_sha256": format!("{:x}", Sha256::digest(concat!(
                 include_str!("kernels.cu"), "\n", include_str!("prefill.cu"), "\n",
                 include_str!("attention.cu"), "\n", include_str!("decode.cu")
@@ -523,34 +723,36 @@ fn packed_decode_real_model_abba_trial() -> Result<()> {
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
             .map_err(failure)?;
         let install_start = Instant::now();
-        let prototype_module = if candidate {
-            let ptx = compile_ptx_with_opts(
-                prototype_source,
-                CompileOptions {
-                    fmad: Some(false),
-                    options: vec![format!("--gpu-architecture=compute_{major}{minor}")],
-                    ..Default::default()
-                },
-            )
-            .map_err(failure)?;
-            let module = context.load_module(ptx).map_err(failure)?;
-            backend.functions.insert(
-                "matvec",
-                module.load_function("matvec_packed_f32").map_err(failure)?,
-            );
-            recapture_decode_graph(&mut backend)?;
-            Some(module)
+        let ptx = compile_ptx_with_opts(
+            prototype_source,
+            CompileOptions {
+                fmad: Some(false),
+                options: vec![format!("--gpu-architecture=compute_{major}{minor}")],
+                ..Default::default()
+            },
+        )
+        .map_err(failure)?;
+        let trial_module = context.load_module(ptx).map_err(failure)?;
+        let kernel = if candidate {
+            "matvec_packed_f32"
         } else {
-            None
+            "matvec"
         };
+        // Override both arms: F32Tiled may itself select packed decode in the
+        // future, but the A phases must still execute the legacy implementation.
+        backend.functions.insert(
+            "matvec",
+            trial_module.load_function(kernel).map_err(failure)?,
+        );
+        recapture_decode_graph(&mut backend)?;
         let install_ns = install_start.elapsed().as_nanos();
         println!(
             "PACKED_DECODE_TRIAL {}",
             json!({
                 "kind": "phase", "phase": phase, "phase_index": phase_index,
-                "candidate": candidate, "kernel": if candidate { "matvec_packed_f32" } else { "matvec" },
-                "load_ns": load_ns, "prototype_compile_install_recapture_ns": install_ns,
-                "graph_recaptured_after_replacement": candidate,
+                "candidate": candidate, "kernel": kernel,
+                "load_ns": load_ns, "kernel_compile_install_recapture_ns": install_ns,
+                "graph_recaptured_after_replacement": true,
                 "compute_capability": [major, minor], "device_name": context.name().map_err(failure)?,
                 "backend": backend.info(), "memory": backend.memory_usage(),
             })
@@ -608,7 +810,7 @@ fn packed_decode_real_model_abba_trial() -> Result<()> {
         let stream = executor.backend.stream.clone();
         stream.synchronize().map_err(failure)?;
         drop(executor);
-        drop(prototype_module);
+        drop(trial_module);
         stream.synchronize().map_err(failure)?;
         drop(stream);
         drop(context);

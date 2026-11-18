@@ -124,7 +124,9 @@ struct ModelArgs {
     #[cfg(feature = "cuda")]
     #[arg(long)]
     cuda_kernel_cache: Option<PathBuf>,
-    /// Prompt projection mode; tiled modes change only experts, default preserves F32 arithmetic.
+    /// CUDA matrix profile; default f32 keeps its existing kernels and arithmetic.
+    /// f32-tiled selects measured F32 prefill/decode kernels without activation quantization.
+    /// residual-int8-research is opt-in approximate prefill, not quality-admitted.
     #[cfg(feature = "cuda")]
     #[arg(long, value_enum, default_value_t = local_inference::cuda::CudaMatmul::F32)]
     cuda_matmul: local_inference::cuda::CudaMatmul,

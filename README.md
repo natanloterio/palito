@@ -6,6 +6,10 @@ external benchmark reference. The earlier shared-kernel control-plane code is
 retained under [benchmarks/legacy](benchmarks/legacy), not compiled. Its historical
 performance results do not measure this independent engine.
 
+See the [architecture reference](../docs/architecture.md) for execution flows,
+ownership/resource boundaries, performance evidence, and design extension points.
+The [standalone master Mermaid chart](../docs/architecture.mmd) is editable.
+
 ## Default CPU execution scope
 
 - One dense, decoder-only `llama` architecture model, one sequence, CPU execution.
@@ -77,10 +81,22 @@ and CUDA 13 NVRTC libraries on `LD_LIBRARY_PATH`.
   Internal chunks contain at most 512 tokens; larger public batches are split.
   Default MoE assignments are grouped by expert in four-assignment tiles, then
   scattered back and combined in the original top-k order. Explicit
-  `--cuda-matmul f32-tiled` uses staged eight-assignment expert tiles, retaining
-  ordinary F32 dense projections. It changes reduction order, not storage or
-  arithmetic precision. Single-token calls retain the
-  existing decode path. Fused attention keeps scores in shared memory when the
+  `--cuda-matmul f32-tiled` uses 32-assignment register expert tiles for chunks
+  of at least 256 tokens at the measured width-2048/hidden-768, 128-expert/top-8
+  shape, when all three expert projections in the layer are Q4_K/Q6_K. Other
+  chunks, shapes, and formats retain staged eight-assignment expert tiles.
+  Register experts compute 8, 16, or 32 assignments according to each descriptor's
+  actual count, without changing its 32-assignment layout or allocations.
+  Their K=32 tiles stage contiguous input columns and reuse the existing
+  warp-broadcast packed decoder, preserving increasing-K F32 accumulation.
+  Eight-way inner-loop unrolling retains that per-output accumulation order.
+  At chunks >=256, Q4_K/Q6_K dense projections with input/output widths
+  2048/4096, 4096/2048, or 2048/512 use reference-order 2-row/16-token tiles;
+  other dense projections retain their existing implementation. Packed-load F32
+  Q4_K/Q6_K matrix-vector kernels serve decode and final logits; other formats
+  retain the scalar decoder. Packed decode changes reduction order, not precision;
+  activations are not quantized. Default `f32` keeps its existing kernels.
+  Fused attention keeps scores in shared memory when the
   configured context is <=1024 and head dimension <=256; larger configurations
   retain the original score-buffer implementation. Persistent batched activations,
   grouping, routing, and fallback score buffers are included in device admission.
@@ -99,6 +115,26 @@ and CUDA 13 NVRTC libraries on `LD_LIBRARY_PATH`.
   It **fails** the strict real-model MoE logit gate (0.08683 maximum error versus
   the 0.01 limit), despite matching bounded generated IDs. Do not treat it as
   quality-equivalent or select it solely for its faster prefill timing.
+- `--cuda-matmul residual-int8-research` is an explicitly unadmitted arithmetic
+  experiment, not a recommended inference profile. At chunks >=256, supported
+  block-aligned Q4_K/Q6_K projections use two-component activation quantization
+  and shared-memory DP4A tiles. Expert gate/up/down switch together only when
+  all three qualify. Smaller chunks and unsupported projections explicitly keep
+  the `f32-tiled` path; decode, router, final logits and KV storage remain F32.
+  One peak-sized quantization workspace is reused across stages and layers, with
+  Q/K/V and gate/up each sharing prepared components. Its two byte arrays and
+  component scales/sums are included in admission: **7,864,320 extra bytes**
+  for Qwen3 batch512, not four retained stage allocations. Nonfinite conversion
+  or reconstruction/dot overflow poisons the request and requires reset.
+  Existing `f32`/`f32-tiled` compilation inputs and numerical behavior are
+  unchanged. See the [full-model quality evidence](results/cuda-runtime-m8-int8-model/quality-summary.json)
+  before considering this research flag; matrix-corpus speed is not quality
+  or end-to-end admission.
+  **Rejected by full-model quality gates:** 330 of 462 vocabulary comparisons
+  fail; maximum error **5.963800** exceeds 0.01 and minimum cosine **0.986610**
+  is below 0.99999. All 14 fixed 32-token generated sequences match, which does
+  not override the failed logits. The 132 short-chunk fallback comparisons
+  remain bit-exact. No performance acceptance or promotion follows this result.
 - `--backend reference` is a slow, independently computed packed CPU oracle for
   these model layouts, including MoE. It is not the optimized default CPU engine
   and does not provide its numerical-memory budget, prefix cache, or speculation.
@@ -253,9 +289,68 @@ and three sanitizers pass. The faster `tf32x3-tiled` experiment **fails quality*
 Retuned llama.cpp remains substantially faster; defaults are unchanged.
 
 The [M8 implementation plan](benchmarks/cuda-runtime-m8-plan.md) separates
-F32-quality structural optimization from experimental arithmetic. First-wave
-register-tiled prefill, packed F32 decode, and four-product TF32 controls are
-test-only prototypes, not new production precision modes or accepted speedups.
+F32-quality structural optimization from experimental arithmetic. Packed F32
+decode, measured-shape reference-order dense tiles, and count-aware grouped
+register prefill are enabled only by the existing opt-in `f32-tiled` profile.
+The earlier serial-K dense register candidate failed full-model quality and
+remains test-only, as do four-product TF32 controls. There are no new production
+precision modes.
+The [first-wave paired results](results/cuda-runtime-m8-wave1/paired-public-profile/paired.json)
+show Qwen3 short-context decode improving from about **110 to 165 tok/s** with
+graphs, without activation quantization or an owned-buffer increase. That wave
+left prefill-512 at about 893 ms. Full-vector/ID checks, held-out prompts, and all three
+sanitizers pass; default F32 kernels remain unchanged. This is not llama.cpp parity.
+
+The [second-wave paired results](results/cuda-runtime-m8-wave2/paired-public-profile/paired.json)
+reduce MoE 256/512-token prefill from **470/894 ms to 383/682 ms**
+(**1.23x/1.31x**) against that accepted first wave. Decode stays about 165 tok/s;
+dense performance is unchanged. All 88 full-vector quality comparisons are
+bitwise equal, generated IDs match, and all three sanitizers pass.
+The 512-token MoE profile reserves **10,656 extra bytes**, counted in admission
+and allocation. Its profile still attributed 92.5% of kernel time to projections.
+
+The [third-wave checkpoint](results/cuda-runtime-m8-wave3/checkpoint.json) accepts
+reference-order dense tiles and count-aware expert computation.
+[Fresh paired results](results/cuda-runtime-m8-wave3/paired-public-profile/paired.json)
+reduce MoE 256/512-token prefill from **384/683 ms to 317/562 ms**
+(**1.21x/1.21x**) against the accepted second wave. Decode stays about 165 tok/s;
+owned-buffer memory is unchanged. All 128 full-vector comparisons are bitwise
+equal, IDs match, and all three sanitizers pass. The new dense tiles preserve the
+legacy accumulation/reduction order rather than relaxing numerical gates.
+Gate/up fusion was bit-exact but slower and remains prototype-only.
+Its profile attributed 91.1% of kernel time to projections, including
+298 ms of grouped experts and 203 ms of tiled dense projections. Expert
+decode/reuse and resource-balanced fusion were the next experiments.
+
+The [fourth-wave checkpoint](results/cuda-runtime-m8-wave4/checkpoint.json) accepts
+coalesced K=32 expert tiles. Fresh public ABBA reduces MoE 256/512-token prefill
+from **317/564 ms to 291/528 ms** (**1.089x/1.068x**) against accepted wave3.
+All **152 full-vector comparisons are bitwise identical**, generated IDs match,
+memory is unchanged, and decode remains about 165 tok/s. Tests and all three
+sanitizers pass; default F32 PTX is unchanged. Smaller fused gate/up tiles are
+correct and faster than the old fusion, but still slower than the new separate
+projections, so fusion remains disabled. A fresh profile reduces expert kernels
+from 298 to 259 ms; projections still account for 90.4% of kernel time.
+
+The [fifth-wave checkpoint](results/cuda-runtime-m8-wave5/checkpoint.json) accepts
+eight-way expert-loop unrolling, not the wider or fully active tile prototypes.
+Fresh ABBA reduces MoE 256/512-token prefill from **292/528 ms to 277/507 ms**
+(**1.053x/1.041x**) against accepted wave4. All **176 full-vector comparisons
+are bitwise identical**, IDs match, memory is unchanged, and short-context
+decode remains about 165 tok/s. Tests and all three sanitizers pass.
+Expert kernel time falls from 259 to 238 ms; dense tiles remain about 204 ms.
+The planned 450-ms prefill goal remains unmet; there is no new llama.cpp
+comparison or parity claim.
+
+The [sixth-wave checkpoint](results/cuda-runtime-m8-wave6c/checkpoint.json) accepts
+bit-exact native half-scale conversion in `f32-tiled`, not the experimental dense
+schedules. All **65,536 half-bit patterns** preserve legacy conversion bits;
+**200 full-vector comparisons** are bitwise identical. Fresh public ABBA reduces
+MoE 256/512-token prefill from **278/508 ms to 272/498 ms** and improves
+short-context decode from **164.39 to 170.49 tok/s**, with unchanged owned memory.
+Tests and all three sanitizers pass; default F32 PTX is unchanged. Dense reuse,
+compact reductions, fixed widths and interleaving were rejected rather than
+promoted on synthetic timings. The 450-ms goal remains about 48 ms away.
 
 For bounded, local GPU prefill diagnostics:
 
@@ -269,6 +364,253 @@ target/release/examples/cuda-capture \
 
 The input is a JSON token-ID array; `--cases` also accepts named precision cases
 and creates a new output directory with one JSONL file per case.
+
+`--stages` optionally limits projection stages; routing is always retained.
+Omitting it preserves the original all-stage capture. Unknown/duplicate stages
+are errors, and stage-selection storage counts against the capture budget.
+
+For research-only replay of actual Qwen3-30B-A3B packed weights and captured
+operands, capture **every** position of one 256/512-token chunk, for example:
+
+```sh
+target/release/examples/cuda-capture \
+  --model models/benchmark-qwen3/gguf/Qwen3-30B-A3B-Q4_K_M.gguf \
+  --ids prompt512-ids.json --layers 0 --positions "$(seq -s, 0 511)" \
+  --stages attn_norm,Qproj,Kproj,Vproj,attn_attended,attn_output,ffn_norm,ffn_gate,ffn_up,ffn_down_inp,ffn_down \
+  --batch 512 --chunk 512 --matmul f32-tiled --max-bytes 134217728 \
+  --output model-capture.jsonl
+
+M8_REPLAY_MODEL=models/benchmark-qwen3/gguf/Qwen3-30B-A3B-Q4_K_M.gguf \
+M8_REPLAY_MODEL_SHA256=44a80615da6ba15e6ad960b411aaab164c499564b8e2322fe5daf1a3c5e9ae15 \
+M8_REPLAY_CAPTURE=model-capture.jsonl M8_REPLAY_LAYER=0 \
+cargo test --release --locked --features cuda --lib \
+  benchmark_model_projection_replay -- --ignored --nocapture --test-threads=1
+```
+
+Run GPU work serially with the CUDA 13 library path configured as above. The
+ignored replay test is deliberately shape-bounded to this model's seven
+Q/K/V/output and expert gate/up/down projections, and to captures starting at
+position 0. It rejects missing positions or wrong widths, validates routing
+descriptors, and requires every structural candidate output bit to match its
+captured production result before reporting CUDA-event samples. Model, capture,
+packed tensor, input, output and source hashes identify the corpus. Captures are
+bounded to 512MiB files. The existing GGUF parser loads the full packed model on
+the host (transient memory can approach twice its file size); only the selected
+layer's seven tensors are retained, and one tensor at a time is uploaded.
+Model loading, parsing, hashing, copies and correctness checks are outside kernel
+timings; grouping is reported separately. This diagnoses real-operand execution,
+not end-to-end speed or acceptance of any approximate arithmetic. Production
+defaults, allocations and numerical kernels are unchanged.
+
+With the same `M8_REPLAY_*` environment, replace the replay test name with
+`benchmark_residual_model_primitives` to run bounded arithmetic research.
+It prepares two signed INT8 activation components per 32 values, once per input
+stage (shared across Q/K/V and across gate/up). GPU components, scales and sums
+must match the CPU quantization oracle bit-for-bit. Packed Q4_K DP4A includes
+minima/activation-sum corrections; Q6_K retains signed scales. Zero/subnormal
+blocks are supported; nonfinite inputs and reconstruction/dot overflows fail
+explicitly. Signed-zero reconstruction is not guaranteed by this approximation.
+The benchmark checks the full production projection against its capture before
+sampling eight output rows for every token/routed assignment, with 16 independent
+CPU F64/affine oracle dots per projection. It separately attributes activation
+reconstruction, decoder rearrangement and integer-merge rounding errors.
+A scalar four-product TF32 control measures accuracy, not tensor-core throughput.
+CUDA-event timings include both component preparations or both products and
+corrections, respectively; allocation, copies and CPU worklists are excluded.
+These sampled dot timings cannot establish the required production-GEMM speedup
+or full-logit quality gates. Primitive diagnostic controls remain test-only.
+Only the explicit `residual-int8-research` profile loads the shared conversion
+and matrix kernels; existing profiles do not include them. See the
+[primitive results](results/cuda-runtime-m8-residual-primitives/summary.json)
+and [research checkpoint](results/cuda-runtime-m8-residual-primitives/checkpoint.json).
+
+`benchmark_residual_model_matrices`, with the same environment, evaluates a
+research 32-row/32-assignment DP4A tile against the production dense and expert
+kernels. It stages packed integer weights and both activation components in
+shared memory, retains Q4_K minima and Q6_K signed corrections, and writes the
+original token/assignment-major output layout. Weight decoding, activation
+gather and output scatter occur inside the measured kernel; no separate layout
+conversion is omitted. All output rows are compared, not sampled; NaN-initialized
+interiors detect unwritten outputs and surrounding guards detect overruns.
+Preparation remains shared once per input stage. Aggregate comparisons count
+each preparation once, and the same expert-grouping cost on both paths.
+Repeated isolated projection timings are not end-to-end inference measurements.
+The benchmark does not establish full-logit/exact-ID acceptance.
+The separately opt-in research integration is evaluated by the ignored
+`cuda::model_quality::residual_full_model_quality` test. Its `M8_QUALITY_MODEL`,
+`M8_QUALITY_CASES`, `M8_QUALITY_OUTPUT` and `M8_QUALITY_MODE` select the model,
+bounded case map, new output directory and profile. `M8_QUALITY_TEACHER` optionally
+supplies the baseline's saved teacher schedule. It writes complete F32 vocabulary
+vectors, compares greedy generation separately through the decode graph, and
+checks workspace reuse, exact context capacity, invalid admission and sticky
+quantization failure/reset. This is diagnostic work, not inference timing.
+A subsequent test-only three-component FMA-residual quantizer reduces worst
+component-reconstruction error to **1.3514e-8** across3,670,016 first-layer captured
+values. All bytes/scales/sums match an independent CPU oracle;68 ordinary tests
+and three scoped sanitizers pass. Native integer tensor-core instruction mappings
+also match8,192 CPU integer outputs. These are
+[primitive results](results/cuda-runtime-m8-precise3-primitives/checkpoint.json),
+not final-logit or end-to-end admission. Full three-component IMMA matrices are
+evaluated separately in the [MMA corpus](results/cuda-runtime-m8-mma3-matrices-v3/summary.json).
+All84 projections win, with **2.5715x aggregate speedup including conversion and
+grouping**. This passes the matrix gate, not the full-model gate.
+The explicit `--cuda-matmul residual-mma3-research` mode now connects that frozen
+kernel to prefill batches of at least32 tokens (initially256); shorter or unsupported
+projections, including decode projections, retain the accepted F32-tiled path. It requires compute
+capability8.0 and adds a separately accounted, reusable11.25MiB workspace at
+batch512 on the MoE model, without allocating the rejected two-component
+workspace. The [full-model gate](results/cuda-runtime-m8-mma3-model/quality-summary.json)
+passes all594 full-vocabulary comparisons across18 cases, including four
+predeclared broader heldouts: worst error0.001194, minimum cosine0.9999999989,
+exact teacher-forced argmax and32-token generated IDs. Capacity/error/reset,
+workspace reuse,68 ordinary tests, strict Clippy/fmt and three scoped real-model
+sanitizers pass.
+The [public ABBA](results/cuda-runtime-m8-mma3-acceptance/performance-summary.json)
+reduces256-token prefill from272.25ms to115.15ms (**2.36x**) and512-token prefill
+from498.34ms to200.94ms (**2.48x**). Targeted complete requests improve1.83x/2.48x;
+decode and46-token prefill remain effectively unchanged. All measured IDs match
+the accepted runtime, with no phase regression above5%. This is scoped opt-in
+validation, not a production/default promotion.
+The subsequent [attention improvement](results/cuda-runtime-m8-attention-normalized/performance-summary.json)
+normalizes each shared score once instead of repeating its division for every
+output dimension, only in the MMA3 profile. All594 vocabulary vectors and all
+18 generated sequences remain bit-exact to admitted MMA3; four F32/F32-tiled
+graph/non-graph PTX comparisons are byte-identical. No workspace is added.
+ABBA improves512-token prefill another2.6% to195.55ms and256-token prefill to113.23ms.
+Decode rises from170.45 to176.27token/s on the1/32 case,153.26 to168.75 after46
+prompt tokens, and93.93 to132.84 after256. The latter complete requests improve14.3%.
+See the [completed admission](results/cuda-runtime-m8-attention-normalized/public-checkpoint.json)
+and [latest comparison](results/cuda-runtime-m8-attention-normalized/comparison.json):
+llama.cpp still leads by4.31x/5.99x prefill and approximately1.96x short decode.
+The [fresh head-to-head control](results/cuda-runtime-m8-head-to-head/comparison.json)
+still shows llama.cpp ahead; matrix improvements do not establish otherwise.
+The [new post-MMA comparison](results/cuda-runtime-m8-mma3-acceptance/comparison.json)
+narrows the prefill gap to4.43x/6.14x at256/512 tokens versus llama.cpp F32 KV;
+short decode is170.42 versus344.42token/s. The engines still differ in generated
+IDs for the one-token/32-generated case, and llama controls are not ABBA.
+
+The [small-prefix extension](results/cuda-runtime-m8-mma3-small-acceptance/checkpoint.json)
+lowers only MMA3 eligibility to32 tokens; the rejected two-component mode stays
+at256 and defaults remain unchanged. Actual32/46/128-token matrices pass the
+1.5x conversion/grouping-inclusive gate in both development and frozen-binary
+heldout runs. The baseline uses its real small-prefix dense kernel and tile8
+expert grouping, not the larger-prefix kernels or candidate tile32 grouping.
+All [990 vocabulary comparisons](results/cuda-runtime-m8-mma3-small-model/quality-summary.json)
+across30 cases and all30 generated32-token sequences pass unchanged quality
+gates. The18 prior cases, including four broader prompts, are retained;12 new
+boundary cases reuse existing prompts rather than claiming new unseen content.
+All528 unaffected prior snapshots and132 below-threshold fallback comparisons
+are bit-exact. Actual batch capacities31/32/46/128/255 pass memory, full-context,
+error/reset and exact-ID checks; three bounded sanitizers test the newly allocated
+batch32 workspace. At batch32 the accounted increase is737,280 quantization bytes
+plus12,096 group bytes; batch512 adds nothing over admitted MMA3.
+[Public ABBA](results/cuda-runtime-m8-mma3-small-acceptance/performance-summary.json)
+cuts46-token prefill128.87ms ->63.21ms (**2.04x**) and improves its complete
+request **1.63x**, exceeding the predeclared10% gate in both orders. All measured
+IDs match; no phase regresses more than5%. The256/512-token prefills remain
+113.25/195.78ms and short decode176.30token/s. The
+[fresh comparison](results/cuda-runtime-m8-mma3-small-acceptance/comparison.json)
+still favors llama.cpp:4.76x/4.33x/5.99x prefill at46/256/512 tokens and roughly
+1.95x short decode. These are scoped research results, not production/default
+promotion or cross-engine numerical equivalence.
+
+The subsequent [projection pipeline study](results/cuda-runtime-m8-mma3-projection-profile/study-summary.json)
+is **not admitted**. A test-only double-buffered `cp.async` kernel preserves all
+three activation components and the exact floating-point accumulation order.
+The cached-index revision improves complete matrix-panel costs1.439x/1.378x/
+1.255x/1.054x at32/46/128/512 tokens, including preparation and grouping.
+All28 projections /25,733,120 outputs per revision match frozen MMA3 bits;
+24 synthetic tail/routing/layout fixtures,68 ordinary tests, strict Clippy/fmt
+and three scoped sanitizers pass. But all three revisions fail the predeclared
+10% improvement at every panel length; the final occupancy-bound revision also
+fails the individual-projection5% regression bound. No threshold is narrowed
+after failure, and no heldout/full-model/public admission is claimed.
+The inference executable remains byte-identical to accepted small-prefix MMA3.
+
+Hardware-counter profiling is blocked by `ERR_NVGPUCTRPERM`, after a retained-ABI
+replay resolved an older Nsight/CUDA13 injection mismatch. No GPU permissions,
+clocks or power configuration were changed. Driver resource queries show cached
+indices raise registers66 ->76 and theoretical resident blocks7 ->6; forcing7
+blocks introduces16 local bytes/thread and does not rescue the speed gate.
+These are static resources, not measured warp stalls or achieved occupancy.
+The validated cached-index version remains research-only; larger-prefix
+projection cost still requires a materially different improvement.
+
+The [block-affine arithmetic screen](results/cuda-runtime-m8-mma3-block-affine-development/summary.json)
+is also **rejected**, with no inference integration. It retains three activation
+components but shares their scales across256 values, folds Q4/Q6 subgroup
+coefficients into two exact signed-byte planes, and applies floating-point
+corrections once per GGUF block. Complete development-panel speedups versus
+admitted MMA3 are only0.879x/0.875x/0.866x/0.850x at32/46/128/512 tokens:
+all fail the predeclared1.5x gate, with an individual-projection regression too.
+All28 actual matrices /25,733,120 values pass the matrix accuracy screen
+(maximum absolute error0.00009919, minimum cosine0.9999999999992476); this is
+not full-vocabulary or full-model quality admission. Independent CPU oracles,
+24 synthetic matrix fixtures,71 ordinary tests, strict Clippy/fmt and three
+sanitizers covering both the quantizer and matrices pass. The accepted executable
+remains byte-identical.
+
+**Model provenance limitation:** the current local GGUF's whole-file SHA256
+differs from both the historical corpus pin and the download lock. All21 packed
+projection tensors across layers0/37/47 match the historical corpus exactly.
+The [explicit user-approved amendment](results/cuda-runtime-m8-mma3-block-affine-development/provenance-amendment.json)
+permits this matrix-only screen with unchanged tensor, capture and admitted
+output hash checks; it does not establish metadata-only differences or
+whole-model equivalence. No model files or historical results were modified, and
+no heldout/full-model/public run was used to excuse the block-affine rejection.
+The current file (`398bf479...6aa86`) was subsequently approved for fresh
+same-file comparisons only.
+
+[Parallel expert grouping](results/cuda-runtime-m8-parallel-grouping/paired/paired.json)
+is available with `--features cuda-parallel-grouping-research` and
+`--cuda-matmul residual-mma3-research`. With 512 extra bytes of workspace on
+Qwen3, it matches all 990 full-vocabulary snapshots and 30 independent
+generations in the fresh quality run. It speeds up 512-token prefill by
+2.7-3.0% across both ABBA orders, below the 10% package gate. The default
+grouping path is unchanged. The final feature-gated build also matched the
+measured candidate's 46-token smoke-test logits exactly.
+
+The optional `cuda-packed-reduction-research` feature reduces packed F32
+matvec synchronization in the same MMA3 profile without reordering additions.
+In the [short-context decode ABBA](results/cuda-runtime-m8-packed-decode-trace/decode-abba-summary.json)
+it improves throughput from about 176 to 210 tokens/s with no added reservation.
+All 990 full-vocabulary snapshots and 30 independent generations match the
+fresh Rust baseline. The accepted executable remains unchanged.
+
+`cuda-packed-down-research` is an additional, unadmitted opt-in experiment for
+width-768 Q4_K/Q6_K expert down projections in single-token MMA3 execution. It
+maps one warp to each output row while preserving the original packed reduction
+tree. Other shapes and default builds retain their existing dispatch. Replay
+results are diagnostic, not full-model admission or llama.cpp parity.
+
+`cuda-packed-gate-up-research` is a separate opt-in experiment for width-2048
+Q4_K/Q6_K expert gate and up projections in single-token MMA3 execution. It
+preserves each packed reduction tree and writes the SwiGLU activation directly.
+Other shapes and default builds retain separate launches.
+
+`cuda-mma3-wide-rows-research` is an opt-in 64-row MMA3 tile for grouped
+expert projections at exactly 512 prefill tokens. It shares activation staging
+across more output rows without changing the K accumulation order. Dense
+projections, smaller chunks, and default builds retain their existing dispatch.
+The separate `cuda-mma3-dense-wide-rows-research` feature also enables the
+tile for eligible dense MMA3 projections at 512 tokens only.
+
+`cuda-attention-query-pair-research` pairs adjacent causal queries for
+512-token MMA3 prefill with 128-wide heads and bounded fused attention.
+Each query keeps its original score and value reduction order. Other attention
+shapes, including single-token decode, retain their prior dispatch.
+
+Two additional MMA3 opt-in features preserve the original reduction order:
+`cuda-block-reduction-research` for shared 256-thread sums and
+`cuda-attention-reuse-research` for fused attention query reuse and softmax
+maximum reduction. With both enabled alongside parallel grouping and packed
+matvec reduction, all 990 full-vocabulary snapshots and 30 independent
+generations match the fresh Rust baseline. Neither feature changes the
+default dispatch.
+
+See the [full-matrix results](results/cuda-runtime-m8-residual-matrices/summary.json)
+and [checkpoint](results/cuda-runtime-m8-residual-matrices/checkpoint.json).
+
 Choose positions present in the prompt. Captures contain selected projection
 inputs/outputs and routing records, with a default 64 MiB retained-record budget
 (`--max-bytes`). JSON encoding and transient host staging are not included in that
@@ -286,7 +628,9 @@ M8_ROUTING_FIXTURE=capture.jsonl cargo test --release --locked --features cuda \
 ```
 
 Replay validates expert IDs, counts, and assignment ordering before initializing
-CUDA. Its matrix operands are deterministic fixtures: captured routing is real,
+CUDA. Input files are limited to 64 MiB and 128 routing records; use selected
+layers or a routing-only subset of larger combined projection dumps.
+Its matrix operands are deterministic fixtures: captured routing is real,
 but replay timings are not full-model performance measurements.
 
 The subsequent [matched-precision MoE investigation](benchmarks/moe-numerical-fix.md)

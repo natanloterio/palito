@@ -19,6 +19,8 @@ use std::{
 #[derive(Clone, Debug)]
 pub struct CaptureOptions {
     pub layers: Vec<usize>,
+    /// Empty selects all projection stages. Routing is always retained.
+    pub stages: Vec<String>,
     /// Global, zero-based prompt positions, not positions within an evaluate call.
     pub positions: Vec<usize>,
     pub max_bytes: usize,
@@ -82,6 +84,7 @@ impl Capture {
     fn new(mut options: CaptureOptions, layers: usize, context: usize) -> Result<Self> {
         options.layers.sort_unstable();
         options.positions.sort_unstable();
+        options.stages.sort_unstable();
         if options.max_bytes == 0
             || options.layers.is_empty()
             || options.positions.is_empty()
@@ -89,10 +92,35 @@ impl Capture {
             || options.positions.last().is_some_and(|&n| n >= context)
             || options.layers.windows(2).any(|p| p[0] == p[1])
             || options.positions.windows(2).any(|p| p[0] == p[1])
+            || options.stages.windows(2).any(|p| p[0] == p[1])
+            || options.stages.iter().any(|stage| {
+                !matches!(
+                    stage.as_str(),
+                    "attn_norm"
+                        | "Qproj"
+                        | "Kproj"
+                        | "Vproj"
+                        | "Qcur"
+                        | "Kcur"
+                        | "Vcur"
+                        | "attn_attended"
+                        | "attn_output"
+                        | "ffn_inp"
+                        | "ffn_norm"
+                        | "ffn_moe_logits"
+                        | "ffn_moe_weights_norm"
+                        | "ffn_gate"
+                        | "ffn_up"
+                        | "ffn_down_inp"
+                        | "ffn_down"
+                        | "l_out"
+                        | "ffn_moe_topk"
+                )
+            })
         {
             return Err(invalid("invalid capture layers, positions, or byte budget"));
         }
-        let bytes = product(
+        let mut bytes = product(
             options
                 .layers
                 .capacity()
@@ -100,6 +128,14 @@ impl Capture {
                 .ok_or_else(|| invalid("capture selection size overflow"))?,
             size_of::<usize>(),
         )?;
+        charge(
+            &mut bytes,
+            options.max_bytes,
+            product(options.stages.capacity(), size_of::<String>())?,
+        )?;
+        for stage in &options.stages {
+            charge(&mut bytes, options.max_bytes, stage.capacity())?;
+        }
         if bytes > options.max_bytes {
             return Err(invalid("capture selections exceed byte budget"));
         }
@@ -121,6 +157,15 @@ impl Capture {
 
     fn selected(&self, layer: usize) -> bool {
         self.options.layers.binary_search(&layer).is_ok()
+    }
+
+    fn selected_stage(&self, stage: &str) -> bool {
+        self.options.stages.is_empty()
+            || self
+                .options
+                .stages
+                .binary_search_by(|name| name.as_str().cmp(stage))
+                .is_ok()
     }
 
     fn reserve_record(&mut self, payload: usize) -> Result<()> {
@@ -145,7 +190,7 @@ impl Capture {
         source: &CudaSlice<f32>,
         width: usize,
     ) -> Result<()> {
-        if !self.selected(layer) {
+        if !self.selected(layer) || !self.selected_stage(stage) {
             return Ok(());
         }
         let end = position
@@ -233,6 +278,9 @@ impl Capture {
             assignment_ids,
             logits,
         });
+        if !self.selected_stage("ffn_moe_topk") {
+            return Ok(());
+        }
         for i in 0..self.options.positions.len() {
             let selected = self.options.positions[i];
             if selected >= position && selected - position < tokens {
@@ -331,6 +379,7 @@ impl CudaBackend {
             &serde_json::json!({
                 "kind": "metadata", "version": 1, "matmul": self.matmul,
                 "layers": capture.options.layers, "positions": capture.options.positions,
+                "stages": capture.options.stages,
                 "payload_bytes": capture.bytes, "max_bytes": capture.options.max_bytes,
                 "layout": "token-major; expert projections routing-slot-major within token",
             }),
@@ -354,6 +403,7 @@ mod tests {
     fn options() -> CaptureOptions {
         CaptureOptions {
             layers: vec![0],
+            stages: vec![],
             positions: vec![0],
             max_bytes: 4096,
         }
@@ -379,6 +429,7 @@ mod tests {
                 Capture::new(
                     CaptureOptions {
                         layers,
+                        stages: vec![],
                         positions,
                         max_bytes: budget,
                     },
@@ -388,6 +439,25 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn stage_filters_are_explicit_validated_and_budgeted() {
+        let all = Capture::new(options(), 2, 128).unwrap();
+        assert!(all.selected_stage("ffn_gate"));
+        let mut selected = options();
+        selected.stages = vec!["Qproj".into()];
+        let filtered = Capture::new(selected.clone(), 2, 128).unwrap();
+        assert!(filtered.selected_stage("Qproj"));
+        assert!(!filtered.selected_stage("ffn_gate"));
+        assert!(filtered.bytes > all.bytes);
+        selected.max_bytes = all.bytes;
+        assert!(Capture::new(selected.clone(), 2, 128).is_err());
+        selected.max_bytes = 4096;
+        selected.stages = vec!["unknown".into()];
+        assert!(Capture::new(selected.clone(), 2, 128).is_err());
+        selected.stages = vec!["Qproj".into(), "Qproj".into()];
+        assert!(Capture::new(selected, 2, 128).is_err());
     }
 
     #[test]
@@ -464,6 +534,7 @@ mod tests {
         backend.reset()?;
         backend.enable_capture(CaptureOptions {
             layers: vec![0],
+            stages: vec![],
             positions: vec![0, ids.len() - 1],
             max_bytes: 64 * 1024 * 1024,
         })?;
@@ -476,12 +547,29 @@ mod tests {
         backend.reset()?;
         backend.enable_capture(CaptureOptions {
             layers: vec![0],
+            stages: vec!["Qproj".into()],
             positions: vec![0],
             max_bytes: 64 * 1024 * 1024,
         })?;
         backend.evaluate(&ids, 0)?;
         assert!(backend.save_capture(&path).is_err());
         assert_eq!(std::fs::read_to_string(&path)?, contents);
+        assert_eq!(backend.logits()?, expected);
+        let filtered_path = path.with_extension("filtered.jsonl");
+        backend.save_capture(&filtered_path)?;
+        let filtered: Vec<serde_json::Value> = std::fs::read_to_string(&filtered_path)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(filtered[0]["stages"], serde_json::json!(["Qproj"]));
+        assert!(filtered.iter().any(|r| r["stage"] == "Qproj"));
+        assert!(
+            filtered
+                .iter()
+                .filter(|r| r["kind"] == "projection")
+                .all(|r| r["stage"] == "Qproj")
+        );
+        std::fs::remove_file(filtered_path)?;
         let rows: Vec<serde_json::Value> = contents
             .lines()
             .map(serde_json::from_str)
@@ -498,6 +586,7 @@ mod tests {
         backend.reset()?;
         backend.enable_capture(CaptureOptions {
             layers: vec![0],
+            stages: vec![],
             positions: vec![0],
             max_bytes: 2 * size_of::<usize>(),
         })?;

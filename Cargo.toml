@@ -11,6 +11,15 @@ license = "MIT"
 default = []
 ktransformers = ["dep:reqwest"]
 cuda = ["dep:cudarc", "dep:libloading", "dep:sha2"]
+cuda-parallel-grouping-research = ["cuda"]
+cuda-packed-reduction-research = ["cuda"]
+cuda-packed-down-research = ["cuda-packed-reduction-research"]
+cuda-packed-gate-up-research = ["cuda-packed-reduction-research"]
+cuda-mma3-wide-rows-research = ["cuda"]
+cuda-mma3-dense-wide-rows-research = ["cuda-mma3-wide-rows-research"]
+cuda-block-reduction-research = ["cuda"]
+cuda-attention-reuse-research = ["cuda"]
+cuda-attention-query-pair-research = ["cuda-attention-reuse-research"]
 
 [[bin]]
 name = "local-inference"

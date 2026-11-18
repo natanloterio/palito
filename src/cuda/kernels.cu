@@ -1,8 +1,16 @@
 typedef unsigned char u8;
 typedef unsigned long long u64;
 
-__device__ float half_value(const u8 *p) {
-    unsigned int h = (unsigned int)p[0] | ((unsigned int)p[1] << 8);
+__device__ float half_value_bits(unsigned int h) {
+#ifdef CUDA_NATIVE_HALF
+    // Preserve legacy reserved-exponent handling; every finite half is exact in F32.
+    if ((h & 0x7c00) != 0x7c00) {
+        unsigned short packed = (unsigned short)h;
+        float value;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(value) : "h"(packed));
+        return value;
+    }
+#endif
     unsigned int sign = (h & 0x8000) << 16;
     unsigned int exponent = (h >> 10) & 31;
     unsigned int fraction = h & 1023;
@@ -11,6 +19,10 @@ __device__ float half_value(const u8 *p) {
         return (sign != 0) ? -value : value;
     }
     return __uint_as_float(sign | ((exponent + 112) << 23) | (fraction << 13));
+}
+
+__device__ float half_value(const u8 *p) {
+    return half_value_bits((unsigned int)p[0] | ((unsigned int)p[1] << 8));
 }
 
 __device__ __forceinline__ float weight(const u8 *data, int kind, u64 index) {
@@ -83,11 +95,37 @@ __device__ __forceinline__ float warp_weight(const u8 *data, u64 index) {
     return d * (float)scale * (float)((low | (high << 4)) - 32);
 }
 
+#if defined(CUDA_PACKED_REDUCTION_RESEARCH) || defined(CUDA_BLOCK_REDUCTION_RESEARCH) || defined(CUDA_M8_PROTOTYPES)
+__device__ __forceinline__ float reduce_first_warp_256(const float *partial, int lane, float value) {
+    // Keep the 128/64/32 addition tree before reducing the last warp.
+    float a = value + partial[lane + 128];
+    float b = partial[lane + 64] + partial[lane + 192];
+    float c = partial[lane + 32] + partial[lane + 160];
+    float d = partial[lane + 96] + partial[lane + 224];
+    float sum = (a + b) + (c + d);
+    #pragma unroll
+    for (int stride = 16; stride > 0; stride /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, stride);
+    return sum;
+}
+#endif
+
 __device__ float sum_block(float value) {
     __shared__ float partial[256];
     int lane = threadIdx.x;
     partial[lane] = value;
     __syncthreads();
+#ifdef CUDA_BLOCK_REDUCTION_RESEARCH
+    if (blockDim.x == 256) {
+        __shared__ float result;
+        if (lane < 32) {
+            float sum = reduce_first_warp_256(partial, lane, value);
+            if (lane == 0) result = sum;
+        }
+        __syncthreads();
+        return result;
+    }
+#endif
     for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
         if (lane < stride) partial[lane] += partial[lane + stride];
         __syncthreads();
@@ -155,16 +193,27 @@ extern "C" __global__ void matvec(const u8 *w, int kind, const float *x, float *
     if (threadIdx.x == 0) y[(u64)selected * rows + row] = sum;
 }
 
-#ifdef CUDA_M8_PROTOTYPES
+#if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_PACKED_DECODE)
+#ifdef CUDA_PACKED_REDUCTION_RESEARCH
+__device__ __forceinline__ float packed_sum_block(float value) {
+    __shared__ float partial[256];
+    int lane = threadIdx.x;
+    partial[lane] = value;
+    __syncthreads();
+    if (lane >= 32) return 0.0f;
+    return reduce_first_warp_256(partial, lane, value);
+}
+#endif
+
 // One warp owns a complete 256-value block, with eight independent K chains.
 // Q4_K blocks are 16-byte aligned; Q6_K's 210-byte stride permits only u16
 // loads. Metadata stays local to the lane, without warp-wide broadcasts.
 template<int Kind>
-__device__ __forceinline__ float packed_matrix_row(const u8 *w, const float *x,
-                                                   u64 offset, int width) {
+__device__ __forceinline__ float packed_matrix_lane(const u8 *w, const float *x,
+                                                    u64 offset, int width, int tid) {
     float parts[8] = {};
-    int lane = threadIdx.x & 31;
-    for (int first = (threadIdx.x / 32) * 256; first < width; first += 2048) {
+    int lane = tid & 31;
+    for (int first = (tid / 32) * 256; first < width; first += 2048) {
         const u8 *p = w + ((offset + first) / 256) * (Kind == 12 ? 144 : 210);
         float d = half_value(p + (Kind == 12 ? 0 : 208));
         if (Kind == 12) {
@@ -213,7 +262,18 @@ __device__ __forceinline__ float packed_matrix_row(const u8 *w, const float *x,
     parts[3] += parts[7];
     parts[0] += parts[2];
     parts[1] += parts[3];
-    return sum_block(parts[0] + parts[1]);
+    return parts[0] + parts[1];
+}
+
+template<int Kind>
+__device__ __forceinline__ float packed_matrix_row(const u8 *w, const float *x,
+                                                   u64 offset, int width) {
+    float partial = packed_matrix_lane<Kind>(w, x, offset, width, threadIdx.x);
+#ifdef CUDA_PACKED_REDUCTION_RESEARCH
+    return packed_sum_block(partial);
+#else
+    return sum_block(partial);
+#endif
 }
 
 // Experimental drop-in launch contract: grid=(rows, selections, 1),
@@ -245,6 +305,111 @@ extern "C" __global__ void matvec_packed_f32(const u8 *w, int kind, const float 
     }
     if (threadIdx.x == 0) y[(u64)selected * rows + row] = sum;
 }
+
+#if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_PACKED_GATE_UP_RESEARCH)
+extern "C" __global__ void matvec_packed_gate_up(const u8 *gate, int gate_kind,
+    const u8 *up, int up_kind, const float *x, float *y, int rows, const int *ids) {
+    __shared__ float gate_partial[256], up_partial[256];
+    int tid = threadIdx.x, row = blockIdx.x, selected = blockIdx.y;
+    if (row >= rows) return;
+    u64 offset = ((u64)ids[selected] * rows + row) * 2048;
+    float g = gate_kind == 12 ? packed_matrix_lane<12>(gate, x, offset, 2048, tid)
+                              : packed_matrix_lane<14>(gate, x, offset, 2048, tid);
+    float u = up_kind == 12 ? packed_matrix_lane<12>(up, x, offset, 2048, tid)
+                            : packed_matrix_lane<14>(up, x, offset, 2048, tid);
+    gate_partial[tid] = g;
+    up_partial[tid] = u;
+    __syncthreads();
+    if (tid < 32) {
+        g = reduce_first_warp_256(gate_partial, tid, g);
+        u = reduce_first_warp_256(up_partial, tid, u);
+        if (tid == 0) y[(u64)selected * rows + row] = g / (1.0f + expf(-g)) * u;
+    }
+}
+#endif
+
+#ifdef CUDA_M8_PROTOTYPES
+template<int Kind>
+__device__ __forceinline__ void packed_k_pair(const u8 *w, const float *x, float *y, int width) {
+    __shared__ float partial[128];
+    int tid = threadIdx.x, row = blockIdx.x;
+    u64 offset = (u64)row * width;
+    float pair = packed_matrix_lane<Kind>(w, x, offset, width, tid) +
+                 packed_matrix_lane<Kind>(w, x, offset, width, tid + 128);
+    partial[tid] = pair;
+    __syncthreads();
+    if (tid < 32) {
+        float sum = (pair + partial[tid + 64]) +
+                    (partial[tid + 32] + partial[tid + 96]);
+        #pragma unroll
+        for (int stride = 16; stride > 0; stride /= 2)
+            sum += __shfl_down_sync(0xffffffff, sum, stride);
+        if (tid == 0) y[row] = sum;
+    }
+}
+
+extern "C" __global__ void matvec_packed_k_pair(
+    const u8 *w, int kind, const float *x, float *y, int width, int rows,
+    const int *ids, int moe, int batched) {
+    if (blockIdx.x >= rows || moe || batched || width % 256 != 0) return;
+    if (kind == 12) packed_k_pair<12>(w, x, y, width);
+    if (kind == 14) packed_k_pair<14>(w, x, y, width);
+}
+
+extern "C" __global__ void matvec_packed_down_two_row(
+    const u8 *w, int kind, const float *x, float *y, int rows, const int *ids) {
+    __shared__ float input[768], partial[2][96];
+    int tid = threadIdx.x, selected = blockIdx.y;
+    #pragma unroll
+    for (int k = tid; k < 768; k += 256) input[k] = x[selected * 768 + k];
+    __syncthreads();
+    int local_row = tid / 128, task = tid % 128;
+    int row = blockIdx.x * 2 + local_row;
+    if (row < rows && task < 96) {
+        u64 offset = ((u64)ids[selected] * rows + row) * 768;
+        partial[local_row][task] = kind == 12
+            ? packed_matrix_lane<12>(w, input, offset, 768, task)
+            : packed_matrix_lane<14>(w, input, offset, 768, task);
+    }
+    __syncthreads();
+    if (row < rows && task < 32) {
+        // Logical warps 3..7 have no input blocks, but keep their zero additions.
+        float a = __fadd_rn(partial[local_row][task], 0.0f);
+        float b = __fadd_rn(partial[local_row][task + 64], 0.0f);
+        float c = __fadd_rn(partial[local_row][task + 32], 0.0f);
+        float sum = (a + b) + __fadd_rn(c, 0.0f);
+        #pragma unroll
+        for (int stride = 16; stride > 0; stride /= 2)
+            sum += __shfl_down_sync(0xffffffff, sum, stride);
+        if (task == 0) y[(u64)selected * rows + row] = sum;
+    }
+}
+#endif
+#if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_PACKED_DOWN_RESEARCH)
+template<int Kind>
+__device__ __forceinline__ float packed_down_warp_row(const u8 *w, const float *x,
+                                                      u64 offset, int lane) {
+    float a = __fadd_rn(packed_matrix_lane<Kind>(w, x, offset, 768, lane), 0.0f);
+    float b = __fadd_rn(packed_matrix_lane<Kind>(w, x, offset, 768, lane + 64), 0.0f);
+    float c = __fadd_rn(packed_matrix_lane<Kind>(w, x, offset, 768, lane + 32), 0.0f);
+    return (a + b) + __fadd_rn(c, 0.0f);
+}
+
+extern "C" __global__ void matvec_packed_down_warp(
+    const u8 *w, int kind, const float *x, float *y, int rows, const int *ids) {
+    int row = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (row >= rows) return;
+    int selected = blockIdx.y;
+    u64 offset = ((u64)ids[selected] * rows + row) * 768;
+    const float *input = x + selected * 768;
+    float sum = kind == 12 ? packed_down_warp_row<12>(w, input, offset, lane)
+                           : packed_down_warp_row<14>(w, input, offset, lane);
+    #pragma unroll
+    for (int stride = 16; stride > 0; stride /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, stride);
+    if (lane == 0) y[(u64)selected * rows + row] = sum;
+}
+#endif
 #endif
 
 extern "C" __global__ void normalize(const float *x, const u8 *w, float *y, int n, float epsilon) {
@@ -255,6 +420,32 @@ extern "C" __global__ void normalize(const float *x, const u8 *w, float *y, int 
     float inverse = 1.0f / sqrtf(sum_block(sum) / (float)n + epsilon);
     for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = x[i] * inverse * ((const float *)w)[i];
 }
+
+#if defined(CUDA_M8_PROTOTYPES) && defined(CUDA_BLOCK_REDUCTION_RESEARCH)
+extern "C" __global__ void normalize_retained2048(const float *x, const u8 *w, float *y, float epsilon) {
+    __shared__ float partial[256], inverse;
+    int lane = threadIdx.x;
+    float retained[8], sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 8; k++) {
+        float value = x[lane + k * 256];
+        retained[k] = value;
+        sum += value * value;
+    }
+    partial[lane] = sum;
+    __syncthreads();
+    if (lane < 32) {
+        float total = reduce_first_warp_256(partial, lane, sum);
+        if (lane == 0) inverse = 1.0f / sqrtf(total / 2048.0f + epsilon);
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int k = 0; k < 8; k++) {
+        int i = lane + k * 256;
+        y[i] = retained[k] * inverse * ((const float *)w)[i];
+    }
+}
+#endif
 
 extern "C" __global__ void head_norm(float *x, const u8 *w, int dim, float epsilon) {
     x += (u64)blockIdx.x * dim;

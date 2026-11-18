@@ -195,19 +195,19 @@ fn benchmark_grouped_modes(
 // Routing records use token-major ids[token * used + slot]. Captured activations
 // and weights are not replayed here: projection operands remain packed_fixture.
 #[derive(Debug, Deserialize)]
-struct RoutingFixture {
+pub(super) struct RoutingFixture {
     #[serde(default)]
     name: String,
     #[serde(default)]
     version: Option<u32>,
     #[serde(default)]
-    layer: Option<usize>,
+    pub(super) layer: Option<usize>,
     #[serde(default)]
-    position: Option<usize>,
-    experts: usize,
-    used: usize,
-    tokens: usize,
-    ids: Vec<i32>,
+    pub(super) position: Option<usize>,
+    pub(super) experts: usize,
+    pub(super) used: usize,
+    pub(super) tokens: usize,
+    pub(super) ids: Vec<i32>,
     #[serde(default)]
     counts: Option<Vec<usize>>,
     #[serde(default)]
@@ -220,7 +220,7 @@ const MAX_ROUTING_EXPERTS: usize = 4096;
 const MAX_ROUTING_ASSIGNMENTS: usize = 65535;
 
 impl RoutingFixture {
-    fn validate(&self) -> Result<Vec<usize>> {
+    pub(super) fn validate(&self) -> Result<Vec<usize>> {
         let assignments = self
             .tokens
             .checked_mul(self.used)
@@ -277,13 +277,13 @@ impl RoutingFixture {
         Ok(counts)
     }
 
-    fn slots(&self, tile: usize) -> usize {
+    pub(super) fn slots(&self, tile: usize) -> usize {
         self.ids
             .len()
             .min(self.ids.len().div_ceil(tile) + self.experts - 1)
     }
 
-    fn descriptors(&self, tile: usize) -> Vec<i32> {
+    pub(super) fn descriptors(&self, tile: usize) -> Vec<i32> {
         let mut result = Vec::new();
         for expert in 0..self.experts {
             let assignments: Vec<_> = self
@@ -410,6 +410,99 @@ fn load_routing(path: &Path) -> Result<Vec<RoutingFixture>> {
         return Err(failure("routing fixture exceeds 64 MiB replay limit"));
     }
     parse_routing(std::str::from_utf8(&bytes).map_err(failure)?)
+}
+
+#[test]
+#[ignore = "serial CUDA; optional M8_ROUTING_FIXTURE for frozen routing performance screen"]
+fn benchmark_parallel_grouping32() -> Result<()> {
+    let harness = Harness::new()?;
+    let fixtures = match std::env::var_os("M8_ROUTING_FIXTURE") {
+        Some(path) => load_routing(Path::new(&path))?,
+        None => synthetic_routing(),
+    };
+    for fixture in fixtures {
+        fixture.validate()?;
+        let expected = fixture.descriptors(32);
+        let ids = harness.stream.clone_htod(&fixture.ids).map_err(failure)?;
+        let (experts, used, tokens, slots, assignments) = (
+            fixture.experts as i32,
+            fixture.used as i32,
+            fixture.tokens as i32,
+            fixture.slots(32) as i32,
+            fixture.ids.len() as i32,
+        );
+        let mut counts = harness
+            .stream
+            .alloc_zeros::<i32>(fixture.experts)
+            .map_err(failure)?;
+        let poison = vec![-777; expected.len() + 16];
+        let mut output = harness.stream.clone_htod(&poison).map_err(failure)?;
+        let mut run = |parallel: bool, output: &mut CudaSlice<i32>| -> Result<()> {
+            let mut view = output.slice_mut(8..8 + expected.len());
+            if parallel {
+                launch!(harness, "group_parallel_count32", (experts as u32, 1, 1);32,
+                    &ids, &mut counts, &assignments);
+                launch!(harness, "group_parallel_emit32", (experts as u32 + 1, 1, 1);32,
+                    &ids, &counts, &mut view, &assignments, &experts, &slots);
+            } else {
+                launch!(
+                    harness,
+                    "group_experts_reg32",
+                    (1, 1, 1),
+                    &ids,
+                    &mut view,
+                    &experts,
+                    &used,
+                    &tokens,
+                    &slots
+                );
+            }
+            Ok(())
+        };
+        for parallel in [false, true] {
+            harness
+                .stream
+                .memcpy_htod(&poison, &mut output)
+                .map_err(failure)?;
+            run(parallel, &mut output)?;
+            let actual = harness.stream.clone_dtoh(&output).map_err(failure)?;
+            assert_eq!(actual[8..8 + expected.len()], expected);
+            assert!(
+                actual[..8]
+                    .iter()
+                    .chain(&actual[8 + expected.len()..])
+                    .all(|&x| x == -777)
+            );
+        }
+        let mut samples = [Vec::new(), Vec::new()];
+        for repetition in 0..10 {
+            for slot in 0..2 {
+                let i = (repetition + slot) % 2;
+                let start = harness
+                    .stream
+                    .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .map_err(failure)?;
+                run(i == 1, &mut output)?;
+                let end = harness
+                    .stream
+                    .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .map_err(failure)?;
+                end.synchronize().map_err(failure)?;
+                if repetition >= 3 {
+                    samples[i].push(start.elapsed_ms(&end).map_err(failure)?);
+                }
+            }
+        }
+        println!(
+            "PARALLEL_GROUP32 {}",
+            json!({
+                "name":fixture.name,"tokens":tokens,"layer":fixture.layer,"experts":experts,
+                "assignments":assignments,"descriptor_words":expected.len(),"exact":true,
+                "scratch_bytes":fixture.experts*4,"serial_ms":samples[0],"parallel_ms":samples[1]
+            })
+        );
+    }
+    Ok(())
 }
 
 fn synthetic_routing() -> Vec<RoutingFixture> {
@@ -634,6 +727,249 @@ fn benchmark_grouped_routing_replay() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "fused expert gate/up/SwiGLU exactness; serial CUDA release"]
+fn fused_grouped_gate_up_matches_separate_bits_and_guards() -> Result<()> {
+    let harness = Harness::new()?;
+    for fixture in synthetic_routing() {
+        replay_gate_up(&harness, &fixture, 256, 35, false)?;
+        replay_gate_up(&harness, &fixture, 257, 256, false)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "driver resource attributes, not measured occupancy; serial CUDA release"]
+fn expert_projection_kernel_resources() -> Result<()> {
+    let harness = Harness::new()?;
+    for (name, threads) in [
+        ("grouped_matmul_reg32_counted", 128),
+        ("grouped_matmul_coalesced_k32", 128),
+        ("grouped_matmul_coalesced_k64", 128),
+        ("grouped_matmul_coalesced_k128", 128),
+        ("grouped_gate_up_reg32x32", 128),
+        ("grouped_gate_up_reg16_counted", 128),
+        ("grouped_gate_up_reg16_k32", 128),
+        ("grouped_matmul_balanced32", 128),
+        ("grouped_matmul_wide64", 256),
+        ("grouped_matmul_balanced64", 128),
+        ("grouped_matmul_balanced128", 256),
+        ("grouped_matmul_unroll2", 128),
+        ("grouped_matmul_unroll4", 128),
+        ("grouped_matmul_unroll8", 128),
+        ("grouped_matmul_unroll16", 128),
+        ("grouped_matmul_unroll32", 128),
+    ] {
+        let function = &harness.functions[name];
+        println!(
+            "EXPERT_RESOURCES {}",
+            json!({
+                "kernel":name,
+                "registers_per_thread":function.num_regs().map_err(failure)?,
+                "static_shared_bytes":function.shared_size_bytes().map_err(failure)?,
+                "local_bytes_per_thread":function.local_size_bytes().map_err(failure)?,
+                "driver_predicted_max_blocks_per_sm":function
+                    .occupancy_max_active_blocks_per_multiprocessor(threads, 0, None)
+                    .map_err(failure)?,
+                "threads":threads,
+                "measured_occupancy":false,
+            })
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires explicit M8_ROUTING_FIXTURE; serial release --nocapture"]
+fn benchmark_fused_grouped_gate_up() -> Result<()> {
+    let path = std::env::var_os("M8_ROUTING_FIXTURE")
+        .ok_or_else(|| failure("set M8_ROUTING_FIXTURE to an explicit local routing fixture"))?;
+    let fixtures = load_routing(Path::new(&path))?;
+    let harness = Harness::new()?;
+    for (index, mut fixture) in fixtures.into_iter().enumerate() {
+        if fixture.name.is_empty() {
+            fixture.name = format!("record_{index}");
+        }
+        replay_gate_up(&harness, &fixture, 2048, 768, true)?;
+    }
+    Ok(())
+}
+
+fn replay_gate_up(
+    harness: &Harness,
+    fixture: &RoutingFixture,
+    width: usize,
+    rows: usize,
+    timed: bool,
+) -> Result<()> {
+    fixture.validate()?;
+    let descriptors = fixture.descriptors(32);
+    let groups = harness.stream.clone_htod(&descriptors).map_err(failure)?;
+    let slots = fixture.slots(32) as u32;
+    let used = fixture.used as i32;
+    let modes = [
+        (
+            "separate_counted",
+            "grouped_matmul_reg32_counted",
+            32u32,
+            false,
+        ),
+        (
+            "separate_coalesced32",
+            "grouped_matmul_coalesced_k32",
+            32,
+            false,
+        ),
+        (
+            "separate_coalesced64",
+            "grouped_matmul_coalesced_k64",
+            32,
+            false,
+        ),
+        ("fused32", "grouped_gate_up_reg32x32", 32, true),
+        ("fused16_counted", "grouped_gate_up_reg16_counted", 16, true),
+        ("fused16_k32", "grouped_gate_up_reg16_k32", 16, true),
+    ];
+    let length = fixture.ids.len() * rows;
+    let count = length as i32;
+    let input = harness
+        .stream
+        .clone_htod(&inputs(width, fixture.tokens))
+        .map_err(failure)?;
+    for kind in [12, 14] {
+        let gate_weights = DeviceTensor::upload(
+            packed_fixture(kind, width, rows, fixture.experts),
+            &harness.stream,
+        )?;
+        let mut up_weights = packed_fixture(kind, width, rows, fixture.experts);
+        if let Storage::Packed { bytes, .. } = &mut up_weights.storage {
+            let size = crate::gguf::layout(kind)?.1;
+            for block in bytes.chunks_exact_mut(size) {
+                block[if kind == 12 { 16 } else { 0 }] ^= 0x5a;
+            }
+        }
+        let up_weights = DeviceTensor::upload(up_weights, &harness.stream)?;
+        let initial = vec![1337.0f32; length + 16];
+        let mut gate = harness.stream.clone_htod(&initial).map_err(failure)?;
+        let mut up = harness.stream.clone_htod(&initial).map_err(failure)?;
+        macro_rules! project {
+            ($mode:expr) => {{
+                let (_, kernel, row_tile, fused) = $mode;
+                let mut g = gate.slice_mut(8..8 + length);
+                let mut u = up.slice_mut(8..8 + length);
+                if fused {
+                    launch!(
+                        harness,
+                        kernel,
+                        ((rows as u32).div_ceil(row_tile), slots, 1); 128,
+                        &gate_weights.bytes,
+                        &up_weights.bytes,
+                        &gate_weights.kind,
+                        &input,
+                        &mut g,
+                        &gate_weights.width,
+                        &gate_weights.rows,
+                        &groups,
+                        &used
+                    );
+                } else {
+                    for (tensor, output) in [(&gate_weights, &mut g), (&up_weights, &mut u)] {
+                        launch!(
+                            harness,
+                            kernel,
+                            ((rows as u32).div_ceil(row_tile), slots, 1); 128,
+                            &tensor.bytes,
+                            &tensor.kind,
+                            &input,
+                            output,
+                            &tensor.width,
+                            &tensor.rows,
+                            &groups,
+                            &used,
+                            &0i32
+                        );
+                    }
+                    launch!(
+                        harness,
+                        "swiglu",
+                        ((length as u32).div_ceil(256), 1, 1),
+                        &mut g,
+                        &mut u,
+                        &count
+                    );
+                }
+            }};
+        }
+        project!(modes[0]);
+        let expected = harness.stream.clone_dtoh(&gate).map_err(failure)?;
+        for &mode in &modes {
+            harness
+                .stream
+                .memcpy_htod(&initial, &mut gate)
+                .map_err(failure)?;
+            project!(mode);
+            let actual = harness.stream.clone_dtoh(&gate).map_err(failure)?;
+            assert!(actual[8..8 + length].iter().all(|value| value.is_finite()));
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "gate/up/SwiGLU changed bits or guards: {} kind={kind} mode={}",
+                fixture.name,
+                mode.0
+            );
+        }
+        assert_eq!(
+            harness.stream.clone_dtoh(&groups).map_err(failure)?,
+            descriptors
+        );
+        println!(
+            "GATE_UP_CHECK {}",
+            json!({"routing":fixture.name,"layer":fixture.layer,"position":fixture.position,
+                "kind":kind,"width":width,"rows":rows,
+                "tokens":fixture.tokens,"experts":fixture.experts,"used":fixture.used,
+                "bitwise_equal":true,"guards_ok":true,"different_gate_up_weights":true})
+        );
+        if !timed {
+            continue;
+        }
+        for _ in 0..3 {
+            for &mode in &modes {
+                project!(mode);
+            }
+        }
+        for repetition in 0..7 {
+            for slot in 0..modes.len() {
+                let mode = modes[(slot + repetition) % modes.len()];
+                let start = harness
+                    .stream
+                    .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .map_err(failure)?;
+                project!(mode);
+                let end = harness
+                    .stream
+                    .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .map_err(failure)?;
+                end.synchronize().map_err(failure)?;
+                println!(
+                    "GATE_UP_BENCH {}",
+                    json!({"routing":fixture.name,"layer":fixture.layer,"position":fixture.position,
+                        "kind":kind,"width":width,"rows":rows,
+                        "tokens":fixture.tokens,"mode":mode.0,"repetition":repetition,
+                        "cuda_event_ms":start.elapsed_ms(&end).map_err(failure)?,
+                        "timing_scope":"gate+up+SwiGLU; resident operands/descriptors; no diagnostic copies"})
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn replay_routing(
     harness: &Harness,
     fixture: &RoutingFixture,
@@ -751,6 +1087,19 @@ fn replay_routing(
         ];
         if matches!(kind, 12 | 14) {
             modes.push(("grouped_matmul_reg32x32", 32, 32, 128));
+            modes.push(("grouped_matmul_reg32_counted", 32, 32, 128));
+            modes.push(("grouped_matmul_coalesced_k32", 32, 32, 128));
+            modes.push(("grouped_matmul_coalesced_k64", 32, 32, 128));
+            modes.push(("grouped_matmul_coalesced_k128", 32, 32, 128));
+            modes.push(("grouped_matmul_balanced32", 32, 32, 128));
+            modes.push(("grouped_matmul_wide64", 64, 32, 256));
+            modes.push(("grouped_matmul_balanced64", 64, 32, 128));
+            modes.push(("grouped_matmul_balanced128", 128, 32, 256));
+            modes.push(("grouped_matmul_unroll2", 32, 32, 128));
+            modes.push(("grouped_matmul_unroll4", 32, 32, 128));
+            modes.push(("grouped_matmul_unroll8", 32, 32, 128));
+            modes.push(("grouped_matmul_unroll16", 32, 32, 128));
+            modes.push(("grouped_matmul_unroll32", 32, 32, 128));
         }
         let host_tensor = (!timed).then(|| packed_fixture(kind, width, rows, fixture.experts));
         let tensor = DeviceTensor::upload(
@@ -867,6 +1216,7 @@ fn replay_routing(
                     unsafe { args.launch(cfg) }.map_err(failure)?;
                 }};
             }
+            let mut ordered = None;
             for &mode in &modes {
                 output = harness
                     .stream
@@ -874,6 +1224,24 @@ fn replay_routing(
                     .map_err(failure)?;
                 project_replay!(mode);
                 let actual = harness.stream.clone_dtoh(&output).map_err(failure)?;
+                if mode.0 == "grouped_matmul_reg32x32" {
+                    ordered = Some(
+                        actual[8..8 + length]
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                    );
+                } else if mode.2 == 32 {
+                    assert_eq!(
+                        actual[8..8 + length]
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        *ordered.as_ref().unwrap(),
+                        "expert tiles changed ordered F32 outputs: {}",
+                        mode.0
+                    );
+                }
                 assert!(
                     actual[..8]
                         .iter()

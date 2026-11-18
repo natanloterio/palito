@@ -14,7 +14,8 @@ from validate_cuda import compare_logits
 
 
 def validate_controls(reports, provenance, candidate_matmul, *, candidate_decode_graph=False,
-                      candidate_batch=None, candidate_chunk=None, allowed_reservation_increase=0):
+                      candidate_batch=None, candidate_chunk=None, allowed_reservation_increase=0,
+                      baseline_matmul="f32", baseline_decode_graph=False):
     if allowed_reservation_increase < 0:
         raise ValueError("reservation allowance must be nonnegative")
     baseline = provenance["a1"]
@@ -26,14 +27,14 @@ def validate_controls(reports, provenance, candidate_matmul, *, candidate_decode
         controls = dict(report["controls"])
         mode = controls.pop("matmul", "f32")
         graph = controls.pop("decode_graph", False)
-        if graph != (candidate_decode_graph if label[0] == "b" else False):
+        if graph != (candidate_decode_graph if label[0] == "b" else baseline_decode_graph):
             raise ValueError(f"{label}: wrong decode graph policy")
         for field, selected in [("batch", candidate_batch), ("chunk", candidate_chunk)]:
             if selected is not None and label[0] == "b":
                 if controls.get(field) != selected:
                     raise ValueError(f"{label}: wrong {field}")
                 controls[field] = expected[field]
-        if mode != (candidate_matmul if label[0] == "b" else "f32"):
+        if mode != (candidate_matmul if label[0] == "b" else baseline_matmul):
             raise ValueError(f"{label}: wrong precision mode")
         if controls != {k: v for k, v in expected.items() if k not in ("matmul", "decode_graph")}:
             raise ValueError(f"{label}: benchmark controls changed")
@@ -47,7 +48,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--candidate", type=Path, required=True)
-    parser.add_argument("--candidate-matmul", choices=["f32", "tf32", "tf32x3", "f32-tiled", "tf32x3-tiled"], default="f32")
+    parser.add_argument("--baseline-matmul", choices=["f32", "tf32", "tf32x3", "f32-tiled", "tf32x3-tiled", "residual-mma3-research"], default="f32")
+    parser.add_argument("--baseline-decode-graph", action="store_true")
+    parser.add_argument("--baseline-batch", type=int, default=128)
+    parser.add_argument("--baseline-chunk", type=int, default=128)
+    parser.add_argument("--candidate-matmul", choices=["f32", "tf32", "tf32x3", "f32-tiled", "tf32x3-tiled", "residual-mma3-research"], default="f32")
     parser.add_argument("--candidate-decode-graph", action="store_true")
     parser.add_argument("--candidate-batch", type=int, default=128)
     parser.add_argument("--candidate-chunk", type=int, default=128)
@@ -65,6 +70,8 @@ def main():
         parser.error("at least one warmup and three repetitions required")
     if not 1 <= args.candidate_chunk <= args.candidate_batch <= 512:
         parser.error("require 1 <= candidate chunk <= candidate batch <= 512")
+    if not 1 <= args.baseline_chunk <= args.baseline_batch <= 512:
+        parser.error("require 1 <= baseline chunk <= baseline batch <= 512")
     root = args.output_dir.resolve()
     root.mkdir(parents=True, exist_ok=False)
     binaries = {}
@@ -88,6 +95,11 @@ def main():
                             "--batch", str(args.candidate_batch), "--chunk", str(args.candidate_chunk)])
             if args.candidate_decode_graph:
                 command.append("--cuda-decode-graph")
+        else:
+            command.extend(["--cuda-matmul", args.baseline_matmul,
+                            "--batch", str(args.baseline_batch), "--chunk", str(args.baseline_chunk)])
+            if args.baseline_decode_graph:
+                command.append("--cuda-decode-graph")
         if label == "a2" and args.llama:
             command.append("--llama")
         write_new(root / "commands.json" if label == "a1" else root / f"{label}-command.json",
@@ -99,7 +111,9 @@ def main():
     validate_controls(reports, provenance, args.candidate_matmul,
                       candidate_decode_graph=args.candidate_decode_graph,
                       candidate_batch=args.candidate_batch, candidate_chunk=args.candidate_chunk,
-                      allowed_reservation_increase=args.allowed_reservation_increase)
+                      allowed_reservation_increase=args.allowed_reservation_increase,
+                      baseline_matmul=args.baseline_matmul,
+                      baseline_decode_graph=args.baseline_decode_graph)
     results = {}
     for name in reports["a1"]["results"]:
         samples = {}
@@ -142,7 +156,7 @@ def main():
                 process = json.loads((root / label / f"{model}-long-logits-process.json").read_text())
                 actual = json.loads(process["stdout"])["logits"]
                 if expected is not None:
-                    if args.candidate_matmul == "f32" and actual != expected:
+                    if args.candidate_matmul == args.baseline_matmul == "f32" and actual != expected:
                         raise ValueError(f"{model}: long-prefix logits changed")
                     long_logits[f"{model}-{label}"] = compare_logits(expected, actual)
                 if expected is None:
@@ -152,6 +166,9 @@ def main():
         "binary_sha256": {label: digest(path) for label, path in binaries.items()},
         "results": results, "commands": commands, "long_logits": long_logits,
         "candidate_matmul": args.candidate_matmul,
+        "baseline_matmul": args.baseline_matmul,
+        "baseline_decode_graph": args.baseline_decode_graph,
+        "baseline_batch": args.baseline_batch, "baseline_chunk": args.baseline_chunk,
         "candidate_decode_graph": args.candidate_decode_graph,
         "candidate_batch": args.candidate_batch, "candidate_chunk": args.candidate_chunk,
         "allowed_reservation_increase": args.allowed_reservation_increase,

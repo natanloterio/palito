@@ -34,21 +34,50 @@ pub enum CudaMatmul {
     Tf32,
     /// Experimental three-product TF32; tested for long MoE, slower on small/dense prompts.
     Tf32x3,
-    /// Experimental staged F32 expert tiles; dense projections stay F32.
+    /// Experimental staged/register F32 experts and packed decode; no activation quantization.
     #[serde(rename = "f32-tiled")]
     F32Tiled,
     /// Experimental staged three-product TF32 experts; failed strict MoE quality gates.
     #[serde(rename = "tf32x3-tiled")]
     Tf32x3Tiled,
+    /// Research-only residual INT8 prefill; full-model quality is not admitted.
+    #[serde(rename = "residual-int8-research")]
+    ResidualInt8Research,
+    /// Research-only three-component integer MMA prefill; no production promotion.
+    #[serde(rename = "residual-mma3-research")]
+    ResidualMma3Research,
 }
 
 impl CudaMatmul {
+    fn f32_tiled(self) -> bool {
+        matches!(
+            self,
+            Self::F32Tiled | Self::ResidualInt8Research | Self::ResidualMma3Research
+        )
+    }
+
+    fn residual_components(self) -> usize {
+        match self {
+            Self::ResidualInt8Research => 2,
+            Self::ResidualMma3Research => 3,
+            _ => 0,
+        }
+    }
+
+    fn residual_min_tokens(self) -> usize {
+        if self == Self::ResidualMma3Research {
+            32
+        } else {
+            256
+        }
+    }
+
     fn tensor_cores(self) -> bool {
         matches!(self, Self::Tf32 | Self::Tf32x3 | Self::Tf32x3Tiled)
     }
 
     fn group_tile(self) -> usize {
-        if matches!(self, Self::F32Tiled | Self::Tf32x3Tiled) {
+        if self.f32_tiled() || self == Self::Tf32x3Tiled {
             8
         } else {
             4
@@ -179,6 +208,51 @@ struct Workspace {
     logits: CudaSlice<f32>,
     tokens: Option<CudaSlice<i32>>,
     groups: Option<CudaSlice<i32>>,
+    group_counts: Option<CudaSlice<i32>>,
+    residual_int8: Option<ResidualWorkspace>,
+    residual_mma3: Option<PreciseWorkspace>,
+}
+
+struct ResidualWorkspace {
+    q0: CudaSlice<i8>,
+    q1: CudaSlice<i8>,
+    scales: CudaSlice<f32>,
+    sums: CudaSlice<i32>,
+}
+
+struct PreciseWorkspace {
+    values: CudaSlice<i8>,
+    scales: CudaSlice<f32>,
+    sums: CudaSlice<i32>,
+}
+
+fn residual_workspace_elements(spec: &Spec, matmul: CudaMatmul) -> Result<usize> {
+    if matmul.residual_components() == 0 || prefill_capacity(spec) < matmul.residual_min_tokens() {
+        return Ok(0);
+    }
+    let sizes = workspace_sizes(spec)?;
+    let largest = sizes[0].max(sizes[2]).max(sizes[7]);
+    largest
+        .checked_add(31)
+        .map(|n| n / 32 * 32)
+        .filter(|&n| {
+            n <= i32::MAX as usize
+                / if matmul == CudaMatmul::ResidualMma3Research {
+                    3
+                } else {
+                    1
+                }
+        })
+        .ok_or_else(|| invalid("residual INT8 workspace exceeds CUDA indexing"))
+}
+
+fn residual_workspace_bytes(spec: &Spec, matmul: CudaMatmul) -> Result<u64> {
+    let count = residual_workspace_elements(spec, matmul)? as u64;
+    let components = matmul.residual_components() as u64;
+    count
+        .checked_mul(components)
+        .and_then(|n| n.checked_add(count / 32 * components * 8))
+        .ok_or_else(|| invalid("residual INT8 workspace byte overflow"))
 }
 
 fn prefill_capacity(spec: &Spec) -> usize {
@@ -204,14 +278,39 @@ fn group_elements_with(spec: &Spec, tile: usize) -> Result<usize> {
         return Ok(0);
     }
     let assignments = routing_elements(spec)?;
-    // At most three padding slots per nonempty expert; no expert is selected
-    // twice by a token. Five integers describe an expert and four assignments.
+    // At most tile-1 padding slots per nonempty expert; a descriptor holds
+    // one expert ID followed by tile original assignment IDs.
     assignments
         .div_ceil(tile)
         .checked_add(spec.experts - 1)
         .map(|n| n.min(assignments))
         .and_then(|n| n.checked_mul(tile + 1))
         .ok_or_else(|| invalid("group workspace overflow"))
+}
+
+fn register_group_shape(spec: &Spec, matmul: CudaMatmul, tokens: usize) -> bool {
+    matmul.f32_tiled()
+        && tokens >= 256
+        && spec.width == 2048
+        && spec.hidden == 768
+        && spec.experts == 128
+        && spec.used == 8
+}
+
+fn group_workspace_elements(spec: &Spec, matmul: CudaMatmul) -> Result<usize> {
+    let base = if matmul.group_tile() == 4 {
+        group_elements(spec)?
+    } else {
+        group_elements_with(spec, matmul.group_tile())?
+    };
+    if register_group_shape(spec, matmul, prefill_capacity(spec))
+        || (matmul.residual_components() > 0
+            && prefill_capacity(spec) >= matmul.residual_min_tokens())
+    {
+        Ok(base.max(group_elements_with(spec, 32)?))
+    } else {
+        Ok(base)
+    }
 }
 
 fn workspace_sizes(spec: &Spec) -> Result<[usize; 12]> {
@@ -248,6 +347,17 @@ fn workspace_sizes(spec: &Spec) -> Result<[usize; 12]> {
     Ok(sizes)
 }
 
+fn parallel_group_count_elements(spec: &Spec, matmul: CudaMatmul) -> usize {
+    if cfg!(feature = "cuda-parallel-grouping-research")
+        && matmul == CudaMatmul::ResidualMma3Research
+        && prefill_capacity(spec) >= matmul.residual_min_tokens()
+    {
+        spec.experts
+    } else {
+        0
+    }
+}
+
 impl Workspace {
     fn new(spec: &Spec, stream: &Arc<CudaStream>, matmul: CudaMatmul) -> Result<Self> {
         let [w, _, qw, kw, _, _, _, gates, _, down, scores, router] = workspace_sizes(spec)?;
@@ -282,26 +392,58 @@ impl Workspace {
             } else {
                 None
             },
-            groups: if group_elements_with(spec, matmul.group_tile())? > 0 {
+            groups: if group_workspace_elements(spec, matmul)? > 0 {
                 Some(
                     stream
-                        .alloc_zeros(group_elements_with(spec, matmul.group_tile())?)
+                        .alloc_zeros(group_workspace_elements(spec, matmul)?)
                         .map_err(failure)?,
                 )
             } else {
                 None
+            },
+            group_counts: match parallel_group_count_elements(spec, matmul) {
+                0 => None,
+                n => Some(stream.alloc_zeros(n).map_err(failure)?),
+            },
+            residual_int8: {
+                let count = residual_workspace_elements(spec, matmul)?;
+                if count == 0 || matmul != CudaMatmul::ResidualInt8Research {
+                    None
+                } else {
+                    Some(ResidualWorkspace {
+                        q0: stream.alloc_zeros(count).map_err(failure)?,
+                        q1: stream.alloc_zeros(count).map_err(failure)?,
+                        scales: alloc(count / 32 * 2)?,
+                        sums: stream.alloc_zeros(count / 32 * 2).map_err(failure)?,
+                    })
+                }
+            },
+            residual_mma3: {
+                let count = residual_workspace_elements(spec, matmul)?;
+                if count == 0 || matmul != CudaMatmul::ResidualMma3Research {
+                    None
+                } else {
+                    Some(PreciseWorkspace {
+                        values: stream.alloc_zeros(count * 3).map_err(failure)?,
+                        scales: alloc(count / 32 * 3)?,
+                        sums: stream.alloc_zeros(count / 32 * 3).map_err(failure)?,
+                    })
+                }
             },
         })
     }
 }
 
 macro_rules! launch {
-    ($backend:ident, $name:expr, $grid:expr, $($arg:expr),+ $(,)?) => {{
-        let cfg = LaunchConfig { grid_dim: $grid, block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+    ($backend:ident, $name:expr, $grid:expr; $threads:expr, $($arg:expr),+ $(,)?) => {{
+        let cfg = LaunchConfig { grid_dim: $grid, block_dim: ($threads, 1, 1), shared_mem_bytes: 0 };
         let mut args = $backend.stream.launch_builder(&$backend.functions[$name]);
         $(args.arg($arg);)+
-        // Kernel signatures, validated tensor shapes, and fixed 256-thread reductions agree.
+        // Kernel signatures, validated shapes, and per-kernel thread counts agree.
         unsafe { args.launch(cfg) }.map_err(failure)?;
+    }};
+    ($backend:ident, $name:expr, $grid:expr, $($arg:expr),+ $(,)?) => {{
+        launch!($backend, $name, $grid; 256, $($arg),+)
     }};
 }
 
@@ -326,9 +468,17 @@ mod decode;
 #[cfg(test)]
 mod grouped_bench;
 #[cfg(test)]
+mod model_quality;
+#[cfg(test)]
+mod model_replay;
+#[cfg(test)]
 mod packed_decode;
 #[cfg(test)]
 mod prefill;
+#[cfg(test)]
+mod residual;
+#[cfg(test)]
+mod residual_precise;
 
 pub struct CudaBackend {
     // Destroy captured references before their buffers and modules.
@@ -378,6 +528,18 @@ impl CudaBackend {
                 "TF32 tensor-core mode requires compute capability >=8.0",
             ));
         }
+        if options.matmul == CudaMatmul::ResidualInt8Research
+            && (major < 6 || (major == 6 && minor < 1))
+        {
+            return Err(invalid(
+                "residual INT8 research requires compute capability >=6.1",
+            ));
+        }
+        if options.matmul == CudaMatmul::ResidualMma3Research && major < 8 {
+            return Err(invalid(
+                "residual MMA3 research requires compute capability >=8.0",
+            ));
+        }
         let base_source = concat!(
             include_str!("cuda/kernels.cu"),
             "\n",
@@ -385,6 +547,37 @@ impl CudaBackend {
             "\n",
             include_str!("cuda/attention.cu")
         );
+        #[cfg(feature = "cuda-packed-reduction-research")]
+        let packed_reduction_source;
+        #[cfg(feature = "cuda-packed-reduction-research")]
+        let base_source = if options.matmul == CudaMatmul::ResidualMma3Research {
+            let prefix = if cfg!(feature = "cuda-packed-down-research") {
+                "#define CUDA_PACKED_DOWN_RESEARCH 1\n"
+            } else {
+                ""
+            };
+            let gate_up = if cfg!(feature = "cuda-packed-gate-up-research") {
+                "#define CUDA_PACKED_GATE_UP_RESEARCH 1\n"
+            } else {
+                ""
+            };
+            packed_reduction_source = format!(
+                "{prefix}{gate_up}#define CUDA_PACKED_REDUCTION_RESEARCH 1\n{base_source}"
+            );
+            &packed_reduction_source
+        } else {
+            base_source
+        };
+        #[cfg(feature = "cuda-block-reduction-research")]
+        let block_reduction_source;
+        #[cfg(feature = "cuda-block-reduction-research")]
+        let base_source = if options.matmul == CudaMatmul::ResidualMma3Research {
+            block_reduction_source =
+                format!("#define CUDA_BLOCK_REDUCTION_RESEARCH 1\n{base_source}");
+            &block_reduction_source
+        } else {
+            base_source
+        };
         let base_source = if options.decode_graph {
             format!("{base_source}\n{}", include_str!("cuda/decode.cu"))
         } else {
@@ -394,6 +587,57 @@ impl CudaBackend {
             format!("{base_source}\n{}", include_str!("cuda/tensorcore.cu"))
         } else {
             base_source
+        };
+        let source = match options.matmul {
+            CudaMatmul::ResidualInt8Research => format!(
+                "{source}\n{}\n{}",
+                include_str!("cuda/residual.cu"),
+                include_str!("cuda/residual_tile.cu")
+            ),
+            CudaMatmul::ResidualMma3Research => format!(
+                "{source}\n{}\n{}\n{}",
+                include_str!("cuda/residual.cu"),
+                include_str!("cuda/residual_precise.cu"),
+                include_str!("cuda/residual_mma.cu")
+            ),
+            _ => source,
+        };
+        let source = if cfg!(feature = "cuda-parallel-grouping-research")
+            && options.matmul == CudaMatmul::ResidualMma3Research
+        {
+            format!("{source}\n{}", include_str!("cuda/grouping_parallel.cu"))
+        } else {
+            source
+        };
+        let source = if options.matmul.f32_tiled() {
+            format!(
+                "#define CUDA_PACKED_DECODE 1\n#define CUDA_REGISTER_PREFILL 1\n#define CUDA_NATIVE_HALF 1\n{source}"
+            )
+        } else {
+            source
+        };
+        let source = if options.matmul == CudaMatmul::ResidualMma3Research {
+            format!("#define CUDA_NORMALIZED_ATTENTION 1\n{source}")
+        } else {
+            source
+        };
+        let source = if cfg!(feature = "cuda-mma3-wide-rows-research")
+            && options.matmul == CudaMatmul::ResidualMma3Research
+        {
+            format!("#define CUDA_MMA3_WIDE_ROWS_RESEARCH 1\n{source}")
+        } else {
+            source
+        };
+        #[cfg(feature = "cuda-attention-reuse-research")]
+        let source = if options.matmul == CudaMatmul::ResidualMma3Research {
+            let pair = if cfg!(feature = "cuda-attention-query-pair-research") {
+                "#define CUDA_ATTENTION_QUERY_PAIR_RESEARCH 1\n"
+            } else {
+                ""
+            };
+            format!("{pair}#define CUDA_ATTENTION_REUSE_RESEARCH 1\n{source}")
+        } else {
+            source
         };
         let ptx = cache::compile(
             options.kernel_cache_dir.as_deref(),
@@ -430,7 +674,55 @@ impl CudaBackend {
             "group_experts_tiled",
             "grouped_matmul_tiled",
         ] {
-            functions.insert(name, module.load_function(name).map_err(failure)?);
+            let entry = if name == "matvec" && options.matmul.f32_tiled() {
+                "matvec_packed_f32"
+            } else {
+                name
+            };
+            functions.insert(name, module.load_function(entry).map_err(failure)?);
+        }
+        if options.matmul.f32_tiled() {
+            for name in [
+                "group_experts_reg32",
+                "grouped_matmul_reg32x32",
+                "grouped_matmul_reg32_counted",
+                "grouped_matmul_coalesced_k32",
+                "grouped_matmul_unroll8",
+                "prefill_matmul_ref2x16",
+            ] {
+                functions.insert(name, module.load_function(name).map_err(failure)?);
+            }
+            if options.matmul == CudaMatmul::ResidualInt8Research {
+                for name in ["residual_quantize32", "residual_matmul32"] {
+                    functions.insert(name, module.load_function(name).map_err(failure)?);
+                }
+            }
+            if options.matmul == CudaMatmul::ResidualMma3Research {
+                if cfg!(feature = "cuda-attention-query-pair-research") {
+                    let name = "attention_fused_query_pair";
+                    functions.insert(name, module.load_function(name).map_err(failure)?);
+                }
+                if cfg!(feature = "cuda-mma3-wide-rows-research") {
+                    let name = "residual_matmul_mma3_rows64";
+                    functions.insert(name, module.load_function(name).map_err(failure)?);
+                }
+                if cfg!(feature = "cuda-packed-down-research") {
+                    let name = "matvec_packed_down_warp";
+                    functions.insert(name, module.load_function(name).map_err(failure)?);
+                }
+                if cfg!(feature = "cuda-packed-gate-up-research") {
+                    let name = "matvec_packed_gate_up";
+                    functions.insert(name, module.load_function(name).map_err(failure)?);
+                }
+                for name in ["residual_quantize32_precise3", "residual_matmul_mma3"] {
+                    functions.insert(name, module.load_function(name).map_err(failure)?);
+                }
+                if cfg!(feature = "cuda-parallel-grouping-research") {
+                    for name in ["group_parallel_count32", "group_parallel_emit32"] {
+                        functions.insert(name, module.load_function(name).map_err(failure)?);
+                    }
+                }
+            }
         }
         if options.matmul.tensor_cores() {
             for name in [
@@ -480,15 +772,12 @@ impl CudaBackend {
             .and_then(|n| n.checked_mul(8))
             .ok_or_else(|| invalid("KV byte overflow"))?;
         let routing = routing_elements(s)? as u64;
-        let groups = if options.matmul.group_tile() == 4 {
-            group_elements(s)?
-        } else {
-            group_elements_with(s, options.matmul.group_tile())?
-        } as u64;
+        let groups = group_workspace_elements(s, options.matmul)? as u64;
         let workspace_bytes = workspace_sizes(s)?
             .into_iter()
             .try_fold(0u64, |sum, n| sum.checked_add(n as u64))
             .and_then(|n| n.checked_add(routing * 2 + groups + 1))
+            .and_then(|n| n.checked_add(parallel_group_count_elements(s, options.matmul) as u64))
             .and_then(|n| {
                 n.checked_add(if prefill_capacity(s) > 1 {
                     prefill_capacity(s) as u64
@@ -497,6 +786,9 @@ impl CudaBackend {
                 })
             })
             .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| invalid("workspace byte overflow"))?;
+        let workspace_bytes = workspace_bytes
+            .checked_add(residual_workspace_bytes(s, options.matmul)?)
             .ok_or_else(|| invalid("workspace byte overflow"))?;
         let logits_bytes = u64::from(s.info.vocab_tokens) * 4;
         let reservation = weight_bytes
@@ -795,46 +1087,89 @@ impl CudaBackend {
                 );
             }
             let moe = i32::from(l.router.is_some());
-            for (t, out) in [(&l.gate, &mut self.work.gate), (&l.up, &mut self.work.up)] {
+            if cfg!(feature = "cuda-packed-gate-up-research")
+                && self.matmul == CudaMatmul::ResidualMma3Research
+                && moe != 0
+                && l.gate.width == 2048
+                && l.up.width == 2048
+                && l.gate.rows == l.up.rows
+                && matches!(l.gate.kind, 12 | 14)
+                && matches!(l.up.kind, 12 | 14)
+            {
+                launch!(
+                    self,
+                    "matvec_packed_gate_up",
+                    (l.gate.rows as u32, used as u32, 1),
+                    &l.gate.bytes,
+                    &l.gate.kind,
+                    &l.up.bytes,
+                    &l.up.kind,
+                    &self.work.normalized,
+                    &mut self.work.gate,
+                    &l.gate.rows,
+                    &self.work.ids
+                );
+            } else {
+                for (t, out) in [(&l.gate, &mut self.work.gate), (&l.up, &mut self.work.up)] {
+                    launch!(
+                        self,
+                        "matvec",
+                        (t.rows as u32, used as u32, 1),
+                        &t.bytes,
+                        &t.kind,
+                        &self.work.normalized,
+                        out,
+                        &t.width,
+                        &t.rows,
+                        &self.work.ids,
+                        &moe,
+                        &0i32
+                    );
+                }
+                let activated = (s.hidden * s.used) as i32;
+                launch!(
+                    self,
+                    "swiglu",
+                    vector(activated),
+                    &mut self.work.gate,
+                    &self.work.up,
+                    &activated
+                );
+            }
+            let t = &l.down;
+            if cfg!(feature = "cuda-packed-down-research")
+                && self.matmul == CudaMatmul::ResidualMma3Research
+                && moe != 0
+                && t.width == 768
+                && matches!(t.kind, 12 | 14)
+            {
+                launch!(
+                    self,
+                    "matvec_packed_down_warp",
+                    ((t.rows as u32).div_ceil(8), used as u32, 1),
+                    &t.bytes,
+                    &t.kind,
+                    &self.work.gate,
+                    &mut self.work.down,
+                    &t.rows,
+                    &self.work.ids
+                );
+            } else {
                 launch!(
                     self,
                     "matvec",
                     (t.rows as u32, used as u32, 1),
                     &t.bytes,
                     &t.kind,
-                    &self.work.normalized,
-                    out,
+                    &self.work.gate,
+                    &mut self.work.down,
                     &t.width,
                     &t.rows,
                     &self.work.ids,
                     &moe,
-                    &0i32
+                    &1i32
                 );
             }
-            let activated = (s.hidden * s.used) as i32;
-            launch!(
-                self,
-                "swiglu",
-                vector(activated),
-                &mut self.work.gate,
-                &self.work.up,
-                &activated
-            );
-            let t = &l.down;
-            launch!(
-                self,
-                "matvec",
-                (t.rows as u32, used as u32, 1),
-                &t.bytes,
-                &t.kind,
-                &self.work.gate,
-                &mut self.work.down,
-                &t.width,
-                &t.rows,
-                &self.work.ids,
-                &moe,
-                &1i32
-            );
             launch!(
                 self,
                 "combine",
@@ -908,7 +1243,7 @@ impl CudaBackend {
         self.stream.synchronize().map_err(failure)?;
         if status[0] != 0 || self.logits.iter().any(|x| !x.is_finite()) {
             return Err(failure(
-                "nonfinite router scores or logits; request poisoned",
+                "nonfinite router scores, logits or residual INT8 arithmetic; request poisoned",
             ));
         }
         Ok(())
@@ -1074,6 +1409,146 @@ mod tests {
             accelerated: false,
             block_elements: block,
         }
+    }
+
+    #[test]
+    fn register_group_workspace_covers_large_and_fallback_chunks() {
+        let mut spec = Spec {
+            info: ModelInfo {
+                backend: "test".into(),
+                revision: "test".into(),
+                architecture: "qwen3moe".into(),
+                tensor_types: vec![],
+                weight_bytes: 0,
+                parameters: 0,
+                context_tokens: 1024,
+                batch_tokens: 512,
+                vocab_tokens: 3,
+                capabilities: crate::backend::Capabilities {
+                    token_step: true,
+                    chunked_prefill: true,
+                },
+            },
+            width: 2048,
+            heads: 32,
+            kv_heads: 4,
+            dim: 128,
+            hidden: 768,
+            experts: 128,
+            used: 8,
+            epsilon: 1e-6,
+            rope_base: 1_000_000.0,
+            neox: true,
+            eog: vec![],
+            tokenizer: Err(invalid("tokenizer unused by workspace sizing")),
+        };
+        for capacity in [1, 2, 31, 32, 33, 46, 127, 128, 255, 256, 257, 511, 512] {
+            spec.info.batch_tokens = capacity;
+            let count =
+                residual_workspace_elements(&spec, CudaMatmul::ResidualInt8Research).unwrap();
+            assert_eq!(
+                count,
+                if capacity < 256 {
+                    0
+                } else {
+                    capacity as usize * 768 * 8
+                }
+            );
+            assert_eq!(
+                residual_workspace_bytes(&spec, CudaMatmul::ResidualInt8Research).unwrap(),
+                count as u64 * 2 + count as u64 / 32 * 16
+            );
+            let precise_count = if capacity < 32 {
+                0
+            } else {
+                capacity as usize * 768 * 8
+            };
+            assert_eq!(
+                residual_workspace_elements(&spec, CudaMatmul::ResidualMma3Research).unwrap(),
+                precise_count
+            );
+            assert_eq!(
+                residual_workspace_bytes(&spec, CudaMatmul::ResidualMma3Research).unwrap(),
+                precise_count as u64 * 3 + precise_count as u64 / 32 * 24
+            );
+            assert_eq!(
+                residual_workspace_elements(&spec, CudaMatmul::F32Tiled).unwrap(),
+                0
+            );
+            assert_eq!(
+                group_workspace_elements(&spec, CudaMatmul::ResidualInt8Research).unwrap(),
+                group_workspace_elements(&spec, CudaMatmul::F32Tiled).unwrap()
+            );
+            let reserved = group_workspace_elements(&spec, CudaMatmul::F32Tiled).unwrap();
+            let precise_reserved =
+                group_workspace_elements(&spec, CudaMatmul::ResidualMma3Research).unwrap();
+            assert_eq!(
+                precise_reserved,
+                if capacity >= 32 {
+                    reserved.max(group_elements_with(&spec, 32).unwrap())
+                } else {
+                    reserved
+                }
+            );
+            let legacy = group_elements_with(&spec, 8).unwrap();
+            if capacity < 256 {
+                assert_eq!(reserved, legacy);
+            }
+            if capacity == 512 {
+                assert_eq!((reserved - legacy) * size_of::<i32>(), 10_656);
+            }
+            for chunk in 1..=capacity {
+                spec.info.batch_tokens = chunk;
+                let tile = if register_group_shape(&spec, CudaMatmul::F32Tiled, chunk as usize) {
+                    32
+                } else {
+                    8
+                };
+                assert!(group_elements_with(&spec, tile).unwrap() <= reserved);
+                assert!(group_elements_with(&spec, 8).unwrap() <= reserved);
+                assert!(group_elements_with(&spec, 8).unwrap() <= precise_reserved);
+                if chunk >= 32 {
+                    assert!(group_elements_with(&spec, 32).unwrap() <= precise_reserved);
+                }
+            }
+        }
+        spec.experts = 64;
+        assert_eq!(
+            group_workspace_elements(&spec, CudaMatmul::F32Tiled).unwrap(),
+            group_elements_with(&spec, 8).unwrap()
+        );
+        assert_eq!(
+            group_workspace_elements(&spec, CudaMatmul::F32).unwrap(),
+            group_elements(&spec).unwrap()
+        );
+        assert!(
+            group_workspace_elements(&spec, CudaMatmul::ResidualInt8Research).unwrap()
+                >= group_elements_with(&spec, 32).unwrap()
+        );
+        assert!(
+            group_workspace_elements(&spec, CudaMatmul::ResidualMma3Research).unwrap()
+                >= group_elements_with(&spec, 32).unwrap()
+        );
+        spec.used = 1;
+        assert_eq!(
+            residual_workspace_elements(&spec, CudaMatmul::ResidualInt8Research).unwrap(),
+            4096 * 512
+        );
+        spec.hidden = 8192;
+        assert_eq!(
+            residual_workspace_elements(&spec, CudaMatmul::ResidualInt8Research).unwrap(),
+            8192 * 512
+        );
+        assert_eq!(
+            residual_workspace_elements(&spec, CudaMatmul::ResidualMma3Research).unwrap(),
+            8192 * 512
+        );
+        spec.hidden = 1_400_000;
+        assert!(residual_workspace_elements(&spec, CudaMatmul::ResidualInt8Research).is_ok());
+        assert!(residual_workspace_elements(&spec, CudaMatmul::ResidualMma3Research).is_err());
+        spec.hidden = usize::MAX;
+        assert!(residual_workspace_elements(&spec, CudaMatmul::ResidualInt8Research).is_err());
+        assert!(residual_workspace_elements(&spec, CudaMatmul::ResidualMma3Research).is_err());
     }
 
     #[test]

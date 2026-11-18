@@ -1,0 +1,74 @@
+flowchart LR
+    CALLER["CLI user or automation"]
+    LIB_CALLER["Rust embedding application"]
+    MODEL[("Local GGUF v3 file")]
+    KCACHE[("Optional private PTX cache")]
+
+    subgraph RUNTIME["Rust runtime process - one local sequence per backend"]
+        CLI["CLI - input selection, backend construction, JSON output"]
+        TOKENIZER["Tokenizer - embedded-vocabulary BPE and complete-sequence decoding"]
+        LOADER["GGUF reader and model validation - owned tensors and metadata"]
+        EXEC["Executor - admission, reset, chunking, greedy generation"]
+        BAPI["Backend - single-owner token-step interface"]
+
+        subgraph CPU_BOUNDARY["Default CPU backend"]
+            CPU["CpuBackend - dense llama, prefix reuse, draft transactions"]
+            CKERN["Rust kernels - Rayon row parallelism, portable or AVX2"]
+            CPSTATE[("Owned host weights, F32 KV, workspace, logits, history")]
+        end
+
+        subgraph CUDA_HOST["Optional cuda feature - host control"]
+            CUDA["CudaBackend - dense or Qwen3-MoE, precision policy and graph control"]
+            CUDAAPI["FFI - cudarc driver/NVRTC, dynamic CUDA libraries"]
+            REF["ReferenceBackend - packed CPU correctness oracle"]
+        end
+
+        subgraph REMOTE_CLIENT["Optional ktransformers feature"]
+            KT["KTransformersBackend - separate RequestBackend, blocking HTTP"]
+        end
+    end
+
+    subgraph DEVICE["Selected NVIDIA device - not shared with CPU backend state"]
+        GPUK["Own CUDA kernels - attention, projections, routing, sampling"]
+        RESIDUAL["Opt-in residual prefill - two-component DP4A or three-component MMA"]
+        GPUSTATE[("Packed weights, F32 KV/workspace/logits, optional graph and INT8 operands")]
+    end
+
+    KT_SERVICE["Separate loopback SGLang/KT service - owns scheduling, experts and KV"]
+    subgraph OFFLINE["Explicit research and validation processes - not inference dependencies"]
+        HARNESS["Python harnesses - provision, compare, validate, profile"]
+        REFERENCE["External C++ reference/oracles - C ABI bridge or patched GGML"]
+        REPORTS[("Reports, provenance, traces and captures")]
+    end
+
+    CALLER -->|"CALL commands and explicit options"| CLI
+    LIB_CALLER -->|"CALL library API"| EXEC
+    CLI -->|"CALL generate or repeated bench samples"| EXEC
+    CLI -->|"CALL tokenize or detokenize only"| TOKENIZER
+    CLI -->|"CALL construct selected local backend"| BAPI
+    EXEC -->|"CALL reset, evaluate, sample and prefix hooks"| BAPI
+    BAPI -->|"CALL selected default implementation"| CPU
+    BAPI -->|"CALL selected cuda implementation"| CUDA
+    BAPI -->|"CALL selected reference implementation"| REF
+    MODEL ==>|"DATA file bytes"| LOADER
+    LOADER ==>|"DATA embedded vocabulary and merges"| TOKENIZER
+    CPU -.->|"DEP GGUF validation"| LOADER
+    CUDA -.->|"DEP transformer layout and GGUF validation"| LOADER
+    REF -.->|"DEP transformer layout and GGUF validation"| LOADER
+    BAPI -->|"CALL backend-owned text processing"| TOKENIZER
+    CPU -->|"CALL forward products and norms"| CKERN
+    CPU <-->|"STATE exclusive mutation and reads"| CPSTATE
+    REF -->|"CALL shared CPU numerical primitives"| CKERN
+    CUDA -->|"CALL compile, launch and synchronize"| CUDAAPI
+    CUDAAPI <-->|"DATA optional compilation persistence"| KCACHE
+    CUDAAPI -->|"CALL device kernels across FFI/device boundary"| GPUK
+    CUDAAPI -->|"CALL eligible research-profile projections"| RESIDUAL
+    GPUK ==>|"DATA F32 projection inputs for optional preparation"| RESIDUAL
+    CUDA ==>|"DATA initial upload, IDs in, logits or sampled IDs out"| GPUSTATE
+    GPUK <-->|"STATE device reads and writes"| GPUSTATE
+    RESIDUAL <-->|"STATE reuse component bytes, scales and sums"| GPUSTATE
+    CLI -->|"CALL remote command, bypasses Executor"| KT
+    KT -->|"CALL GET identity; POST non-streaming generation"| KT_SERVICE
+    HARNESS -->|"CALL explicit child process"| CLI
+    HARNESS -->|"CALL external reference process"| REFERENCE
+    HARNESS ==>|"DATA timings, comparisons and hashes"| REPORTS

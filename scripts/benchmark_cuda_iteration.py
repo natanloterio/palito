@@ -89,7 +89,7 @@ def main():
     parser.add_argument("--llama", action="store_true", help="Run pinned all-GPU llama.cpp F32 and F16 KV controls")
     parser.add_argument("--repetitions", type=int, default=7)
     parser.add_argument("--warmups", type=int, default=1)
-    parser.add_argument("--cuda-matmul", choices=["f32", "tf32", "tf32x3", "f32-tiled", "tf32x3-tiled"], default="f32")
+    parser.add_argument("--cuda-matmul", choices=["f32", "tf32", "tf32x3", "f32-tiled", "tf32x3-tiled", "residual-mma3-research"], default="f32")
     parser.add_argument("--cuda-decode-graph", action="store_true")
     parser.add_argument("--batch", type=int, default=128)
     parser.add_argument("--chunk", type=int, default=128)

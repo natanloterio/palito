@@ -2,7 +2,7 @@
 use local_inference::{
     Config, Executor, GenerationMode,
     backend::Backend,
-    cuda::{CudaBackend, CudaOptions, reference::ReferenceBackend},
+    cuda::{CudaBackend, CudaMatmul, CudaOptions, reference::ReferenceBackend},
 };
 use std::{fs, path::PathBuf};
 
@@ -215,7 +215,12 @@ fn config() -> Config {
 #[test]
 #[ignore = "requires CUDA 13 and an idle GPU; run serially in release mode"]
 fn captured_decode_matches_full_logits_token_only_generation_and_context_reset() {
-    for dense in [false, true] {
+    for (dense, matmul) in [
+        (false, CudaMatmul::F32),
+        (true, CudaMatmul::F32),
+        (false, CudaMatmul::F32Tiled),
+        (true, CudaMatmul::F32Tiled),
+    ] {
         let fixture = Fixture::from_bytes(
             if dense { "graph-dense" } else { "graph-moe" },
             &tiny_weights_shape(if dense { 1 } else { 2 }, false, dense, 2, 32),
@@ -226,11 +231,20 @@ fn captured_decode_matches_full_logits_token_only_generation_and_context_reset()
             prefill_chunk: 7,
             threads: 2,
         };
-        let mut baseline = CudaBackend::open(&fixture.0, &config, CudaOptions::default()).unwrap();
+        let mut baseline = CudaBackend::open(
+            &fixture.0,
+            &config,
+            CudaOptions {
+                matmul,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let mut captured = CudaBackend::open(
             &fixture.0,
             &config,
             CudaOptions {
+                matmul,
                 decode_graph: true,
                 ..Default::default()
             },

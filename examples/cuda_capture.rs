@@ -21,6 +21,9 @@ struct Args {
     /// Comma-separated zero-based layer indices.
     #[arg(long, value_delimiter = ',', required = true)]
     layers: Vec<usize>,
+    /// Projection stages to retain; omit to retain all. Routing is always saved.
+    #[arg(long, value_delimiter = ',')]
+    stages: Vec<String>,
     /// Comma-separated global zero-based prompt positions.
     #[arg(long, value_delimiter = ',', required = true)]
     positions: Vec<usize>,
@@ -106,6 +109,7 @@ fn main() -> Result<()> {
         backend.reset()?;
         backend.enable_capture(CaptureOptions {
             layers: args.layers.clone(),
+            stages: args.stages.clone(),
             positions: args.positions.clone(),
             max_bytes: args.max_bytes,
         })?;

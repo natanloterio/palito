@@ -510,6 +510,10 @@ extern "C" __global__ void prefill_matmul_ref2x16(const u8 *w, int kind, const f
     __shared__ float partial[2][16][128];
     if (kind == 12) projection_reference_legacy<12, 2, 16>(w, x, y, width, rows, tokens, partial);
     if (kind == 14) projection_reference_legacy<14, 2, 16>(w, x, y, width, rows, tokens, partial);
+#ifdef CUDA_M8_PROTOTYPES
+    if (kind == 8) projection_reference_legacy<8, 2, 16>(w, x, y, width, rows, tokens, partial);
+    if (kind == 13) projection_reference_legacy<13, 2, 16>(w, x, y, width, rows, tokens, partial);
+#endif
 }
 #ifdef CUDA_M8_PROTOTYPES
 extern "C" __global__ void prefill_matmul_refinterleave2x16(const u8 *w, int kind, const float *x,

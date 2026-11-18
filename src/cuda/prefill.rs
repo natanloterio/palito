@@ -1641,6 +1641,101 @@ fn benchmark_reference_order_prefill() -> Result<()> {
     )
 }
 
+#[test]
+#[ignore = "requires QWEN35_GGUF; serial CUDA release --nocapture"]
+fn benchmark_qwen35_reference_prefill() -> Result<()> {
+    let path = std::env::var_os("QWEN35_GGUF").expect("set the GGUF fixture path");
+    let gguf = crate::gguf::Gguf::open(std::path::Path::new(&path), false)?;
+    let harness = Harness::new()?;
+    let modes = [
+        Mode::Tiled,
+        Mode::Reference2x16,
+        Mode::ReferenceInterleaved8,
+        Mode::ReferenceInterleaved16,
+        Mode::Reference4x16,
+        Mode::ReferencePacked2x16,
+    ];
+    let mut shapes = std::collections::BTreeMap::new();
+    for (name, tensor) in gguf.tensors {
+        if let (
+            true,
+            &[width, rows],
+            Storage::Packed {
+                kind: kind @ (8 | 12 | 13 | 14),
+                ..
+            },
+        ) = (
+            name.starts_with("blk."),
+            tensor.dims.as_slice(),
+            &tensor.storage,
+        ) {
+            let entry = shapes
+                .entry((*kind, width, rows))
+                .or_insert_with(|| (name.clone(), None));
+            if entry.1.is_none() || name < entry.0 {
+                *entry = (name, Some(tensor));
+            }
+        }
+    }
+    assert!(!shapes.is_empty(), "no packed Qwen3.5 projection matrices");
+    for ((kind, width, rows), (name, tensor)) in shapes {
+        let modes = if matches!(kind, 12 | 14) {
+            &modes[..]
+        } else {
+            &modes[..2]
+        };
+        let t = DeviceTensor::upload(tensor.expect("selected weight tensor"), &harness.stream)?;
+        for tokens in [16, 128, 512] {
+            let x = harness
+                .stream
+                .clone_htod(&inputs(width, tokens))
+                .map_err(failure)?;
+            let mut output = harness
+                .stream
+                .alloc_zeros::<f32>(rows * tokens + 16)
+                .map_err(failure)?;
+            harness.project(Mode::Tiled, &t, &x, &mut output, tokens)?;
+            let expected = harness.stream.clone_dtoh(&output).map_err(failure)?;
+            harness.check_modes(&t, &x, &expected[8..8 + rows * tokens], tokens, modes, true)?;
+            let mut samples = [
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ];
+            let timing = Some(sys::CUevent_flags::CU_EVENT_DEFAULT);
+            for repetition in 0..8 {
+                for slot in 0..modes.len() {
+                    let i = (slot + repetition) % modes.len();
+                    let start = harness.stream.record_event(timing).map_err(failure)?;
+                    for _ in 0..8 {
+                        harness.project(modes[i], &t, &x, &mut output, tokens)?;
+                    }
+                    let end = harness.stream.record_event(timing).map_err(failure)?;
+                    end.synchronize().map_err(failure)?;
+                    if repetition > 0 {
+                        samples[i].push(start.elapsed_ms(&end).map_err(failure)? / 8.0);
+                    }
+                }
+            }
+            for (mode, values) in modes.iter().zip(&mut samples) {
+                values.sort_by(f32::total_cmp);
+                println!(
+                    "QWEN35_PROJECTION {}",
+                    json!({
+                        "tensor":name, "kind":kind, "width":width, "rows":rows, "tokens":tokens,
+                        "mode":format!("{mode:?}"), "median_ms":values[values.len()/2],
+                        "samples_ms":values,
+                    })
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn benchmark_prefill_shapes(
     modes: &[Mode],
     token_counts: &[usize],

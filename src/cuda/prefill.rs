@@ -116,6 +116,10 @@ impl Harness {
         Self::compile(true, true, false, true)
     }
 
+    pub(super) fn with_admitted_decode() -> Result<Self> {
+        Self::compile(true, true, true, true)
+    }
+
     fn compile(
         normalize: bool,
         reuse: bool,
@@ -219,6 +223,9 @@ impl Harness {
             "residual_matmul_mma3_sync_k64",
             "residual_matmul_mma3_mixed",
             "residual_matmul_mma3_same_expert",
+            "residual_matmul_mma3_same_expert_warp8",
+            "residual_matmul_mma3_splitk",
+            "residual_splitk_reduce",
             "residual_matmul_mma1",
             "residual_matmul_mma3_skip_empty",
             "residual_matmul_mma3_cached_scales",
@@ -229,6 +236,7 @@ impl Harness {
             "residual_matmul_mma3_cols16",
             "residual_matmul_mma3_wide16",
             "residual_matmul_mma3_pipeline",
+            "residual_matmul_mma3_true_pipeline",
             "residual_quantize256_precise3",
             "residual_matmul_mma3_block",
             "residual_int8_dot",
@@ -285,6 +293,16 @@ impl Harness {
             "grouped_gate_up_reg16_k32",
             "swiglu",
             "normalize",
+            "head_norm",
+            "rotary",
+            "cache_kv",
+            "router",
+            "residual",
+            "matvec_packed_qkv",
+            "router_warp128",
+            "qkv_head_norm_rope_cache",
+            "qkv_head_norm_rope_cache_decode",
+            "residual_normalize",
         ]
         .into_iter()
         .chain(block_reduction.then_some("normalize_retained2048"))

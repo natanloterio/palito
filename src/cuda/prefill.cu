@@ -60,10 +60,18 @@ extern "C" __global__ void prefill_matmul(const u8 *w, int kind, const float *x,
     switch (kind) {
         case 0: prompt_tile_workspace<0>(w, x, y, width, rows, tokens, partial); break;
         case 1: prompt_tile_workspace<1>(w, x, y, width, rows, tokens, partial); break;
+        case 2: prompt_tile_workspace<2>(w, x, y, width, rows, tokens, partial); break;
+        case 3: prompt_tile_workspace<3>(w, x, y, width, rows, tokens, partial); break;
         case 6: prompt_tile_workspace<6>(w, x, y, width, rows, tokens, partial); break;
+        case 7: prompt_tile_workspace<7>(w, x, y, width, rows, tokens, partial); break;
         case 8: prompt_tile_workspace<8>(w, x, y, width, rows, tokens, partial); break;
+        case 10: prompt_tile_workspace<10>(w, x, y, width, rows, tokens, partial); break;
+        case 11: prompt_tile_workspace<11>(w, x, y, width, rows, tokens, partial); break;
         case 12: prompt_tile_workspace<12>(w, x, y, width, rows, tokens, partial); break;
+        case 13: prompt_tile_workspace<13>(w, x, y, width, rows, tokens, partial); break;
         case 14: prompt_tile_workspace<14>(w, x, y, width, rows, tokens, partial); break;
+        case 20: prompt_tile_workspace<20>(w, x, y, width, rows, tokens, partial); break;
+        case 30: prompt_tile_workspace<30>(w, x, y, width, rows, tokens, partial); break;
     }
 }
 

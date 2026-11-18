@@ -1,0 +1,13 @@
+diff --git a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
+index c54ed3f07..b01584dd2 100644
+--- a/ggml/src/ggml-cpu/vec.h
++++ b/ggml/src/ggml-cpu/vec.h
+@@ -43,8 +43,6 @@ inline static ggml_float ggml_sve_sum_f32x2(svfloat32_t sum_lo, svfloat32_t sum_
+ }
+ #endif
+ 
+-#define GGML_GELU_FP16
+-
+ #define GGML_SOFT_MAX_UNROLL 4
+ #define GGML_VEC_DOT_UNROLL  2
+ #define GGML_VEC_MAD_UNROLL  32

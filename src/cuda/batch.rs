@@ -20,6 +20,24 @@ fn residual_projection(matmul: CudaMatmul, tensor: &DeviceTensor, tokens: i32) -
         && tensor.width % 256 == 0
 }
 
+fn dense_mma3_splits(width: i32, rows: i32, tokens: i32, scratch_floats: usize) -> u32 {
+    if width <= 0 || rows <= 0 || tokens <= 0 {
+        return 1;
+    }
+    let base_ctas = (rows as u32).div_ceil(32) * (tokens as u32).div_ceil(32);
+    let mut splits = 1u32;
+    while (width as u32) % (splits * 2 * 128) == 0
+        && base_ctas * (splits * 2) <= 1024
+        && (splits as usize * 2)
+            .saturating_mul(tokens as usize)
+            .saturating_mul(rows as usize)
+            <= scratch_floats
+    {
+        splits *= 2;
+    }
+    splits
+}
+
 macro_rules! prepare_residual {
     ($backend:ident,$input:expr,$count:expr) => {{
         let count: i32 = $count;
@@ -63,12 +81,13 @@ macro_rules! prepare_residual {
 }
 
 macro_rules! project_residual {
-    ($backend:ident,$tensor:expr,$input:expr,$output:expr,$tokens:expr,$grouped:expr,$major:expr,$used:expr,$slots:expr) => {{
+    ($backend:ident,$tensor:expr,$input:expr,$output:expr,$tokens:expr,$grouped:expr,$major:expr,$used:expr,$slots:expr,$scratch:expr) => {{
         let tensor = $tensor;
         let tokens:i32 = $tokens;
         let grouped = i32::from($grouped);
         let major:i32 = $major;
         let used:i32 = $used;
+        let mut scratch: Option<&mut CudaSlice<f32>> = $scratch;
         let groups = $backend.work.groups.as_ref().unwrap_or(&$backend.work.ids);
         let grid = ((tensor.rows as u32).div_ceil(32),
             if grouped!=0 {$slots}
@@ -84,18 +103,42 @@ macro_rules! project_residual {
         } else if $backend.matmul == CudaMatmul::ResidualMma3Research {
             let work = $backend.work.residual_mma3.as_ref()
                 .ok_or_else(||failure("residual MMA3 workspace missing"))?;
-            let (kernel, grid, threads) = if cfg!(feature = "cuda-mma3-wide-rows-research")
-                && tokens == 512
-                && (grouped != 0 || cfg!(feature = "cuda-mma3-dense-wide-rows-research"))
-            {
-                ("residual_matmul_mma3_rows64", ((tensor.rows as u32).div_ceil(64), grid.1, 1), 256)
+            let splits = if cfg!(feature = "cuda-mma3-splitk-research") && grouped == 0 {
+                dense_mma3_splits(
+                    tensor.width,
+                    tensor.rows,
+                    tokens,
+                    scratch.as_ref().map_or(0, |buf| buf.len()),
+                )
             } else {
-                ("residual_matmul_mma3", grid, 128)
+                1
             };
-            launch!($backend,kernel,grid;threads,
-                &tensor.bytes,&tensor.kind,&work.values,&work.scales,&work.sums,
-                $output,&tensor.width,&tensor.rows,&tokens,groups,&used,&grouped,&major,
-                &mut $backend.work.status);
+            if splits > 1 {
+                let partials = scratch.as_deref_mut()
+                    .ok_or_else(||failure("residual MMA3 split-k scratch missing"))?;
+                let splits_i32 = splits as i32;
+                let count = (tokens as usize) * (tensor.rows as usize);
+                let count_i32 = count as i32;
+                launch!($backend,"residual_matmul_mma3_splitk",(grid.0, grid.1, splits);128,
+                    &tensor.bytes,&tensor.kind,&work.values,&work.scales,&work.sums,
+                    &mut *partials,&tensor.width,&tensor.rows,&tokens,&splits_i32,
+                    &mut $backend.work.status);
+                launch!($backend,"residual_splitk_reduce",((count as u32).div_ceil(256), 1, 1);256,
+                    &*partials,$output,&count_i32,&splits_i32,&mut $backend.work.status);
+            } else {
+                let (kernel, grid, threads) = if cfg!(feature = "cuda-mma3-wide-rows-research")
+                    && tokens == 512
+                    && (grouped != 0 || cfg!(feature = "cuda-mma3-dense-wide-rows-research"))
+                {
+                    ("residual_matmul_mma3_rows64", ((tensor.rows as u32).div_ceil(64), grid.1, 1), 256)
+                } else {
+                    ("residual_matmul_mma3", grid, 128)
+                };
+                launch!($backend,kernel,grid;threads,
+                    &tensor.bytes,&tensor.kind,&work.values,&work.scales,&work.sums,
+                    $output,&tensor.width,&tensor.rows,&tokens,groups,&used,&grouped,&major,
+                    &mut $backend.work.status);
+            }
         } else {
             let work = $backend.work.residual_int8.as_ref()
                 .ok_or_else(||failure("residual INT8 workspace missing"))?;
@@ -190,15 +233,61 @@ impl CudaBackend {
             &mut self.work.x,
             &w
         );
+        let embedding_norm = self.weights.embedding_norm.as_ref();
+        if let Some([weight, bias]) = embedding_norm {
+            transformer_norm!(
+                self,
+                &self.work.x,
+                Some(weight),
+                Some(bias),
+                n,
+                w,
+                s.epsilon
+            );
+            std::mem::swap(&mut self.work.x, &mut self.work.normalized);
+        }
+        let position_embedding = self.weights.position_embedding.as_ref();
+        if let Some(t) = position_embedding {
+            launch!(
+                self,
+                "add_position_embedding",
+                ((w as u32).div_ceil(256), n as u32, 1),
+                &mut self.work.x,
+                &t.bytes,
+                &t.kind,
+                &w,
+                &pos
+            );
+        }
+        let gemma = self.weights.gemma.as_ref();
+        if gemma.is_some() {
+            let scale = (w as f32).sqrt();
+            launch!(
+                self,
+                "gemma_embedding_scale",
+                vector(total_width),
+                &mut self.work.x,
+                &total_width,
+                &scale
+            );
+        }
         for (index, l) in self.weights.layers.iter().enumerate() {
+            let gate = l.gate.as_ref();
+            let affine = l.affine.as_ref();
+            let gemma_attention = gemma.map(|g| g.attention(s, index));
+            let rope_base = gemma_attention.map_or(s.rope_base, |(_, base, _)| base);
             let integer_groups = s.experts > 0
-                && [&l.gate, &l.up, &l.down]
-                    .iter()
-                    .all(|t| residual_projection(matmul, t, n));
+                && gate.is_some_and(|gate| {
+                    [gate, &l.up, &l.down]
+                        .iter()
+                        .all(|t| residual_projection(matmul, t, n))
+                });
             let register_groups = register_group_shape(s, matmul, tokens.len())
-                && [&l.gate, &l.up, &l.down]
-                    .iter()
-                    .all(|t| matches!(t.kind, 12 | 14));
+                && gate.is_some_and(|gate| {
+                    [gate, &l.up, &l.down]
+                        .iter()
+                        .all(|t| matches!(t.kind, 12 | 14))
+                });
             let (grouped_projection, group_row_tile, group_tile, group_threads) =
                 if register_groups || integer_groups {
                     ("grouped_matmul_unroll8", 32, 32, 128)
@@ -210,16 +299,26 @@ impl CudaBackend {
             } else {
                 0
             };
-            launch!(
-                self,
-                "normalize",
-                (n as u32, 1, 1),
-                &self.work.x,
-                &l.norm.bytes,
-                &mut self.work.normalized,
-                &w,
-                &s.epsilon
-            );
+            let olmo2 = s.info.architecture == "olmo2";
+            let olmoe = s.info.architecture == "olmoe";
+            if olmo2 {
+                self.stream
+                    .memcpy_dtod(
+                        &self.work.x.slice(..total_width as usize),
+                        &mut self.work.normalized.slice_mut(..total_width as usize),
+                    )
+                    .map_err(failure)?;
+            } else {
+                transformer_norm!(
+                    self,
+                    &self.work.x,
+                    l.norm.as_ref(),
+                    affine.map(|b| &b.norm),
+                    n,
+                    w,
+                    s.epsilon
+                );
+            }
             capture_projection!(
                 self,
                 index,
@@ -235,11 +334,14 @@ impl CudaBackend {
             {
                 prepare_residual!(self, &self.work.normalized, n * w);
             }
-            for (tensor, output, stage) in [
+            for (component, (tensor, output, stage)) in [
                 (&l.q, &mut self.work.q, "Qproj"),
                 (&l.k, &mut self.work.k, "Kproj"),
                 (&l.v, &mut self.work.v, "Vproj"),
-            ] {
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 let (projection, row_tile, token_tile) = dense_projection(tensor);
                 if residual_projection(matmul, tensor, n) {
                     project_residual!(
@@ -251,7 +353,8 @@ impl CudaBackend {
                         false,
                         0i32,
                         used,
-                        group_slots
+                        group_slots,
+                        Some(&mut self.work.down)
                     );
                 } else {
                     launch!(
@@ -271,6 +374,17 @@ impl CudaBackend {
                         &n
                     );
                 }
+                if let Some(biases) = &l.qkv_bias {
+                    let bias = &biases[component];
+                    launch!(
+                        self,
+                        "add_row_bias",
+                        ((bias.width as u32).div_ceil(256), n as u32, 1),
+                        &mut *output,
+                        &bias.bytes,
+                        &bias.width
+                    );
+                }
                 if let Some(capture) = &mut self.diagnostic {
                     capture.projection(
                         &self.stream,
@@ -286,27 +400,33 @@ impl CudaBackend {
                 (&l.k_norm, &mut self.work.k, kw),
             ] {
                 if let Some(norm) = norm {
+                    let norm_width = if olmo2 || olmoe { size } else { dim };
                     launch!(
                         self,
                         "head_norm",
-                        ((size / dim * n) as u32, 1, 1),
+                        ((size / norm_width * n) as u32, 1, 1),
                         &mut *values,
                         &norm.bytes,
-                        &dim,
+                        &norm_width,
                         &s.epsilon
                     );
                 }
-                launch!(
-                    self,
-                    "rotary",
-                    (((size / 2) as u32).div_ceil(256), n as u32, 1),
-                    values,
-                    &size,
-                    &dim,
-                    &pos,
-                    &s.rope_base,
-                    &neox
-                );
+                if position_embedding.is_some() || embedding_norm.is_some() {
+                    continue;
+                }
+                let grid = (((size / 2) as u32).div_ceil(256), n as u32, 1);
+                if s.rotary_dim != s.dim {
+                    let rotary_dim = s.rotary_dim as i32;
+                    launch!(self, "rotary_partial_neox", grid;
+                        256, values, &size, &dim, &pos, &rope_base, &rotary_dim);
+                } else if let Some(factors) = &self.weights.rope_factors {
+                    launch!(self, "rotary_factored", grid;
+                        256, values, &size, &dim, &pos, &rope_base, &neox, &factors.bytes, &s.rope_attn_factor);
+                } else {
+                    launch!(
+                        self, "rotary", grid, values, &size, &dim, &pos, &rope_base, &neox
+                    );
+                }
             }
             capture_projection!(
                 self,
@@ -347,11 +467,30 @@ impl CudaBackend {
                 &pos
             );
             // Future KV rows are already written; each query can only see its prefix.
-            if cfg!(feature = "cuda-attention-query-pair-research")
+            if embedding_norm.is_some() {
+                alibi_attention!(self, index, heads, kv_heads, dim, context, count, n);
+            } else if let Some((window, _, scale)) = gemma_attention {
+                gemma_attention!(
+                    self,
+                    index,
+                    heads,
+                    kv_heads,
+                    dim,
+                    context,
+                    count,
+                    n,
+                    window,
+                    scale,
+                    gemma.unwrap().attention_softcap
+                );
+            } else if cfg!(feature = "cuda-attention-query-pair-research")
                 && self.matmul == CudaMatmul::ResidualMma3Research
                 && fused_attention_supported(s)
                 && dim == 128
-                && n == 512
+                && (n == 512
+                    || (cfg!(feature = "cuda-attention-query-pair-even-research")
+                        && n >= 32
+                        && n % 2 == 0))
             {
                 launch!(
                     self,
@@ -429,7 +568,8 @@ impl CudaBackend {
                     false,
                     0i32,
                     used,
-                    group_slots
+                    group_slots,
+                    Some(&mut self.work.down)
                 );
             } else {
                 launch!(
@@ -458,14 +598,28 @@ impl CudaBackend {
                 &self.work.projected,
                 t.rows as usize
             );
-            launch!(
-                self,
-                "residual",
-                vector(total_width),
-                &mut self.work.x,
-                &self.work.projected,
-                &total_width
-            );
+            if let Some(b) = affine {
+                launch!(
+                    self,
+                    "add_row_bias",
+                    ((w as u32).div_ceil(256), n as u32, 1),
+                    &mut self.work.projected,
+                    &b.attention.bytes,
+                    &w
+                );
+            }
+            if let Some([post_attn, _]) = &l.post_norms {
+                gemma_post_norm!(self, projected, post_attn, n, w, s.epsilon);
+            } else if !s.parallel_residual {
+                launch!(
+                    self,
+                    "residual",
+                    vector(total_width),
+                    &mut self.work.x,
+                    &self.work.projected,
+                    &total_width
+                );
+            }
             capture_projection!(
                 self,
                 index,
@@ -475,16 +629,24 @@ impl CudaBackend {
                 &self.work.x,
                 s.width
             );
-            launch!(
-                self,
-                "normalize",
-                (n as u32, 1, 1),
-                &self.work.x,
-                &l.ffn_norm.bytes,
-                &mut self.work.normalized,
-                &w,
-                &s.epsilon
-            );
+            if olmo2 {
+                self.stream
+                    .memcpy_dtod(
+                        &self.work.x.slice(..total_width as usize),
+                        &mut self.work.normalized.slice_mut(..total_width as usize),
+                    )
+                    .map_err(failure)?;
+            } else {
+                transformer_norm!(
+                    self,
+                    &self.work.x,
+                    l.ffn_norm.as_ref(),
+                    affine.map(|b| &b.ffn_norm),
+                    n,
+                    w,
+                    s.epsilon
+                );
+            }
             capture_projection!(
                 self,
                 index,
@@ -494,6 +656,20 @@ impl CudaBackend {
                 &self.work.normalized,
                 s.width
             );
+            if let Some(b) = affine {
+                affine_ffn!(self, l, b, n, w, s.parallel_residual);
+                capture_projection!(
+                    self,
+                    index,
+                    position,
+                    tokens.len(),
+                    "l_out",
+                    &self.work.x,
+                    s.width
+                );
+                continue;
+            }
+            let gate = gate.expect("gated CUDA layer");
             if let Some(t) = &l.router {
                 launch!(
                     self,
@@ -516,17 +692,38 @@ impl CudaBackend {
                     &self.work.router,
                     s.experts
                 );
-                launch!(
-                    self,
-                    "router",
-                    (n as u32, 1, 1),
-                    &self.work.router,
-                    &experts,
-                    &used,
-                    &mut self.work.ids,
-                    &mut self.work.probabilities,
-                    &mut self.work.status
-                );
+                if cfg!(feature = "cuda-decode-fusion-research")
+                    && matmul == CudaMatmul::ResidualMma3Research
+                    && experts == 128
+                    && used <= 32
+                {
+                    launch!(
+                        self,
+                        "router_warp128",
+                        (n as u32, 1, 1); 32,
+                        &self.work.router,
+                        &used,
+                        &mut self.work.ids,
+                        &mut self.work.probabilities,
+                        &mut self.work.status
+                    );
+                } else {
+                    launch!(
+                        self,
+                        if olmoe {
+                            "router_full_softmax"
+                        } else {
+                            "router"
+                        },
+                        (n as u32, 1, 1),
+                        &self.work.router,
+                        &experts,
+                        &used,
+                        &mut self.work.ids,
+                        &mut self.work.probabilities,
+                        &mut self.work.status
+                    );
+                }
                 capture_projection!(
                     self,
                     index,
@@ -586,13 +783,13 @@ impl CudaBackend {
             }
             if integer_groups
                 || (s.experts == 0
-                    && [&l.gate, &l.up]
+                    && [gate, &l.up]
                         .iter()
                         .any(|t| residual_projection(matmul, t, n)))
             {
                 prepare_residual!(self, &self.work.normalized, n * w);
             }
-            for (t, out) in [(&l.gate, &mut self.work.gate), (&l.up, &mut self.work.up)] {
+            for (t, out) in [(gate, &mut self.work.gate), (&l.up, &mut self.work.up)] {
                 if integer_groups || (s.experts == 0 && residual_projection(matmul, t, n)) {
                     project_residual!(
                         self,
@@ -603,7 +800,12 @@ impl CudaBackend {
                         integer_groups,
                         0i32,
                         used,
-                        group_slots
+                        group_slots,
+                        if integer_groups {
+                            None
+                        } else {
+                            Some(&mut self.work.down)
+                        }
                     );
                 } else if let Some(groups) = &self.work.groups {
                     launch!(
@@ -660,7 +862,11 @@ impl CudaBackend {
             );
             launch!(
                 self,
-                "swiglu",
+                if gemma.is_some() {
+                    "gemma_geglu"
+                } else {
+                    "swiglu"
+                },
                 vector(activated),
                 &mut self.work.gate,
                 &self.work.up,
@@ -691,7 +897,12 @@ impl CudaBackend {
                     integer_groups,
                     1i32,
                     used,
-                    group_slots
+                    group_slots,
+                    if integer_groups {
+                        None
+                    } else {
+                        Some(&mut self.work.projected)
+                    }
                 );
             } else if let Some(groups) = &self.work.groups {
                 launch!(
@@ -737,16 +948,20 @@ impl CudaBackend {
                 &self.work.down,
                 s.width * s.used
             );
-            launch!(
-                self,
-                "combine_batch",
-                ((w as u32).div_ceil(256), n as u32, 1),
-                &mut self.work.x,
-                &self.work.down,
-                &self.work.probabilities,
-                &w,
-                &used
-            );
+            if let Some([_, post_ffn]) = &l.post_norms {
+                gemma_post_norm!(self, down, post_ffn, n, w, s.epsilon);
+            } else {
+                launch!(
+                    self,
+                    "combine_batch",
+                    ((w as u32).div_ceil(256), n as u32, 1),
+                    &mut self.work.x,
+                    &self.work.down,
+                    &self.work.probabilities,
+                    &w,
+                    &used
+                );
+            }
             capture_projection!(
                 self,
                 index,

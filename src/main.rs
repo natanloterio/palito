@@ -259,11 +259,11 @@ impl ModelArgs {
             }
             match self.backend {
                 LocalBackend::Cuda => {
-                    return Ok(Box::new(local_inference::cuda::CudaBackend::open(
+                    return local_inference::cuda::open_backend(
                         &self.model,
                         &self.config(),
                         self.cuda_options(),
-                    )?));
+                    );
                 }
                 LocalBackend::Reference => {
                     return Ok(Box::new(

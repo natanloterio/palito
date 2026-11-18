@@ -397,6 +397,8 @@ enum Replay {
     MixedExpert,
     WideExpertPanel,
     SameExpertPanel,
+    SameExpertWarp8Panel,
+    TruePipelinePanel,
     PackedDown,
     PackedGateUp,
     PackedKPair,
@@ -404,6 +406,7 @@ enum Replay {
     DenseWideRows,
     DenseRegisters,
     DensePlanar,
+    DenseSplitK,
 }
 
 #[test]
@@ -422,7 +425,10 @@ fn benchmark_mma3_compact8() -> Result<()> {
 #[ignore = "frozen mixed expert schedule validation; serial CUDA"]
 fn mixed_expert_schedule_matches_cpu() -> Result<()> {
     let path = PathBuf::from(std::env::var("M8_REPLAY_CAPTURE").map_err(failure)?);
-    let layer = std::env::var("M8_REPLAY_LAYER").map_err(failure)?.parse().map_err(failure)?;
+    let layer = std::env::var("M8_REPLAY_LAYER")
+        .map_err(failure)?
+        .parse()
+        .map_err(failure)?;
     let pin = match layer {
         0 => "fa590dfeea71a36cda673eb6f3e5044d43abea1e64b750fd92ac08d2fdbf5dbe",
         47 => "dd961ab91ccfcc44f1f40fd75d6d798c1bf0605d05e82234d22edd4c5abaaadb",
@@ -453,14 +459,22 @@ fn mixed_expert_schedule_matches_cpu() -> Result<()> {
     expected.resize(slots * 2, -1);
     let h = Harness::new()?;
     let groups = h.stream.clone_htod(&descriptors).map_err(failure)?;
-    let mut guarded = h.stream.clone_htod(&vec![-777i32; slots * 2 + 16]).map_err(failure)?;
+    let mut guarded = h
+        .stream
+        .clone_htod(&vec![-777i32; slots * 2 + 16])
+        .map_err(failure)?;
     let mut schedule = guarded.slice_mut(8..8 + slots * 2);
     let slots_arg = slots as i32;
     launch!(h, "group_parallel_mixed_schedule", (1, 1, 1);32,
         &groups, &slots_arg, &mut schedule);
     let actual = h.stream.clone_dtoh(&guarded).map_err(failure)?;
     assert_eq!(&actual[8..8 + slots * 2], &expected);
-    assert!(actual[..8].iter().chain(&actual[8 + slots * 2..]).all(|&x| x == -777));
+    assert!(
+        actual[..8]
+            .iter()
+            .chain(&actual[8 + slots * 2..])
+            .all(|&x| x == -777)
+    );
     println!("MIXED_EXPERT_SCHEDULE layer={layer} live_ctas={live} exact=true");
     Ok(())
 }
@@ -491,14 +505,22 @@ fn same_expert_schedule_matches_cpu() -> Result<()> {
     expected.resize(slots * 2, -1);
     let h = Harness::new()?;
     let groups = h.stream.clone_htod(&descriptors).map_err(failure)?;
-    let mut guarded = h.stream.clone_htod(&vec![-777i32; slots * 2 + 16]).map_err(failure)?;
+    let mut guarded = h
+        .stream
+        .clone_htod(&vec![-777i32; slots * 2 + 16])
+        .map_err(failure)?;
     let mut schedule = guarded.slice_mut(8..8 + slots * 2);
     let slots_arg = slots as i32;
     launch!(h, "group_parallel_same_expert_schedule", (1, 1, 1);32,
         &groups, &slots_arg, &mut schedule);
     let actual = h.stream.clone_dtoh(&guarded).map_err(failure)?;
     assert_eq!(&actual[8..8 + slots * 2], &expected);
-    assert!(actual[..8].iter().chain(&actual[8 + slots * 2..]).all(|&x| x == -777));
+    assert!(
+        actual[..8]
+            .iter()
+            .chain(&actual[8 + slots * 2..])
+            .all(|&x| x == -777)
+    );
     println!("SAME_EXPERT_SCHEDULE live_ctas={live} pairs={pairs} exact=true");
     Ok(())
 }
@@ -528,22 +550,42 @@ fn benchmark_mma3_same_expert_panel() -> Result<()> {
 }
 
 #[test]
+#[ignore = "frozen 256-token eight-warp same-expert panel; serial CUDA"]
+fn benchmark_mma3_same_expert_warp8_panel() -> Result<()> {
+    run_model_projection_replay(Replay::SameExpertWarp8Panel)
+}
+
+#[test]
+#[ignore = "frozen weight-pipelined expert MMA3 panel; serial CUDA"]
+fn benchmark_mma3_true_pipeline_panel() -> Result<()> {
+    run_model_projection_replay(Replay::TruePipelinePanel)
+}
+
+#[test]
 #[ignore = "query driver resource attributes from one CUDA module"]
 fn mixed_expert_kernel_resources() -> Result<()> {
     let h = Harness::new()?;
     for (name, threads) in [
         ("residual_matmul_mma3", 128),
+        ("residual_matmul_mma3_rows64", 256),
         ("residual_matmul_mma3_compact8", 64),
         ("residual_matmul_mma3_mixed", 128),
         ("residual_matmul_mma3_same_expert", 128),
+        ("residual_matmul_mma3_same_expert_warp8", 256),
+        ("residual_matmul_mma3_splitk", 128),
+        ("residual_matmul_mma3_pipeline", 128),
+        ("residual_matmul_mma3_true_pipeline", 128),
     ] {
         let f = &h.functions[name];
-        println!("EXPERT_KERNEL_RESOURCES {}", json!({
-            "kernel":name,"threads":threads,"registers":f.num_regs().map_err(failure)?,
-            "shared_bytes":f.shared_size_bytes().map_err(failure)?,
-            "local_bytes":f.local_size_bytes().map_err(failure)?,
-            "predicted_blocks_per_sm":f.occupancy_max_active_blocks_per_multiprocessor(threads, 0, None).map_err(failure)?
-        }));
+        println!(
+            "EXPERT_KERNEL_RESOURCES {}",
+            json!({
+                "kernel":name,"threads":threads,"registers":f.num_regs().map_err(failure)?,
+                "shared_bytes":f.shared_size_bytes().map_err(failure)?,
+                "local_bytes":f.local_size_bytes().map_err(failure)?,
+                "predicted_blocks_per_sm":f.occupancy_max_active_blocks_per_multiprocessor(threads, 0, None).map_err(failure)?
+            })
+        );
     }
     Ok(())
 }
@@ -591,10 +633,511 @@ fn benchmark_mma3_dense_planar() -> Result<()> {
 }
 
 #[test]
+#[ignore = "frozen dense Split-K MMA3 projection replay; serial CUDA"]
+fn benchmark_mma3_dense_splitk() -> Result<()> {
+    run_model_projection_replay(Replay::DenseSplitK)
+}
+
+#[test]
+#[ignore = "frozen decode-shaped fusion component screens; serial CUDA"]
+fn benchmark_decode_fusion_components() -> Result<()> {
+    use super::residual::{matrix_output, read_matrix_output};
+    let path = PathBuf::from(std::env::var("M8_REPLAY_CAPTURE").map_err(failure)?);
+    let layer: usize = std::env::var("M8_REPLAY_LAYER")
+        .map_err(failure)?
+        .parse()
+        .map_err(failure)?;
+    let pin = match layer {
+        0 => "fa590dfeea71a36cda673eb6f3e5044d43abea1e64b750fd92ac08d2fdbf5dbe",
+        47 => "dd961ab91ccfcc44f1f40fd75d6d798c1bf0605d05e82234d22edd4c5abaaadb",
+        _ => return Err(invalid("unexpected decode fusion replay layer")),
+    };
+    let model_path = PathBuf::from(std::env::var("M8_REPLAY_MODEL").map_err(failure)?);
+    if file_hash(&path)? != pin
+        || file_hash(&model_path)?
+            != "398bf479282bf374f996f55b0f742c4b45b798e51bf45ca9b7dda0e400d6aa86"
+    {
+        return Err(invalid("decode fusion replay pin mismatch"));
+    }
+    let operands = Operands::load(&path, layer)?;
+    let routing = operands.routing.as_ref().unwrap();
+    let attn_norm = operands.matrix("attn_norm", 2048, 46)?;
+    let q_proj = operands.matrix("Qproj", 4096, 46)?;
+    let k_proj = operands.matrix("Kproj", 512, 46)?;
+    let v_proj = operands.matrix("Vproj", 512, 46)?;
+    let attn_out = operands.matrix("attn_output", 2048, 46)?;
+    let ffn_inp = operands.matrix("ffn_inp", 2048, 46)?;
+    let ffn_norm = operands.matrix("ffn_norm", 2048, 46)?;
+    let mut model = crate::gguf::Gguf::open(&model_path, false)?;
+    let epsilon = model.float("qwen3moe.attention.layer_norm_rms_epsilon")?;
+    let rope_base = model.float("qwen3moe.rope.freq_base")?;
+    let t_q = model.tensor(&format!("blk.{layer}.attn_q.weight"), &[2048, 4096])?;
+    let t_k = model.tensor(&format!("blk.{layer}.attn_k.weight"), &[2048, 512])?;
+    let t_v = model.tensor(&format!("blk.{layer}.attn_v.weight"), &[2048, 512])?;
+    let t_qn = model.tensor(&format!("blk.{layer}.attn_q_norm.weight"), &[128])?;
+    let t_kn = model.tensor(&format!("blk.{layer}.attn_k_norm.weight"), &[128])?;
+    let t_fn = model.tensor(&format!("blk.{layer}.ffn_norm.weight"), &[2048])?;
+    let t_rt = model.tensor(&format!("blk.{layer}.ffn_gate_inp.weight"), &[2048, 128])?;
+    drop(model);
+    let h = Harness::with_admitted_decode()?;
+    let wq = DeviceTensor::upload(t_q, &h.stream)?;
+    let wk = DeviceTensor::upload(t_k, &h.stream)?;
+    let wv = DeviceTensor::upload(t_v, &h.stream)?;
+    let wqn = DeviceTensor::upload(t_qn, &h.stream)?;
+    let wkn = DeviceTensor::upload(t_kn, &h.stream)?;
+    let wfn = DeviceTensor::upload(t_fn, &h.stream)?;
+    let wrt = DeviceTensor::upload(t_rt, &h.stream)?;
+    let dummy_ids = h.stream.clone_htod(&[0i32; 8]).map_err(failure)?;
+    for position in [0usize, 45usize] {
+        // 1. QKV packed matvec fusion screen
+        {
+            let x = h
+                .stream
+                .clone_htod(&attn_norm[position * 2048..(position + 1) * 2048])
+                .map_err(failure)?;
+            let mut q_buf = [matrix_output(&h, 4096)?, matrix_output(&h, 4096)?];
+            let mut k_buf = [matrix_output(&h, 512)?, matrix_output(&h, 512)?];
+            let mut v_buf = [matrix_output(&h, 512)?, matrix_output(&h, 512)?];
+            let mut samples = [Vec::new(), Vec::new()];
+            for rep in 0..10 {
+                for slot in 0..2 {
+                    let arm = (rep + slot) % 2;
+                    let mut yq = q_buf[arm].slice_mut(8..4104);
+                    let mut yk = k_buf[arm].slice_mut(8..520);
+                    let mut yv = v_buf[arm].slice_mut(8..520);
+                    let start = h
+                        .stream
+                        .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                        .map_err(failure)?;
+                    if arm == 0 {
+                        launch!(
+                            h,
+                            "matvec_packed_f32",
+                            (4096, 1, 1),
+                            &wq.bytes,
+                            &wq.kind,
+                            &x,
+                            &mut yq,
+                            &wq.width,
+                            &wq.rows,
+                            &dummy_ids,
+                            &0i32,
+                            &0i32
+                        );
+                        launch!(
+                            h,
+                            "matvec_packed_f32",
+                            (512, 1, 1),
+                            &wk.bytes,
+                            &wk.kind,
+                            &x,
+                            &mut yk,
+                            &wk.width,
+                            &wk.rows,
+                            &dummy_ids,
+                            &0i32,
+                            &0i32
+                        );
+                        launch!(
+                            h,
+                            "matvec_packed_f32",
+                            (512, 1, 1),
+                            &wv.bytes,
+                            &wv.kind,
+                            &x,
+                            &mut yv,
+                            &wv.width,
+                            &wv.rows,
+                            &dummy_ids,
+                            &0i32,
+                            &0i32
+                        );
+                    } else {
+                        let total_rows = (wq.rows + wk.rows + wv.rows) as u32;
+                        launch!(
+                            h,
+                            "matvec_packed_qkv",
+                            (total_rows, 1, 1),
+                            &wq.bytes,
+                            &wq.kind,
+                            &wq.rows,
+                            &mut yq,
+                            &wk.bytes,
+                            &wk.kind,
+                            &wk.rows,
+                            &mut yk,
+                            &wv.bytes,
+                            &wv.kind,
+                            &wv.rows,
+                            &mut yv,
+                            &x,
+                            &2048i32
+                        );
+                    }
+                    let end = h
+                        .stream
+                        .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                        .map_err(failure)?;
+                    end.synchronize().map_err(failure)?;
+                    if rep >= 3 {
+                        samples[arm].push(start.elapsed_ms(&end).map_err(failure)?);
+                    }
+                }
+            }
+            let flag = h.stream.alloc_zeros::<i32>(1).map_err(failure)?;
+            for [b0, b1] in [&q_buf, &k_buf, &v_buf] {
+                let r0 = read_matrix_output(&h, &flag, b0)?;
+                let r1 = read_matrix_output(&h, &flag, b1)?;
+                assert!(
+                    r0.iter()
+                        .zip(&r1)
+                        .all(|(&a, &b)| a.is_finite() && a.to_bits() == b.to_bits())
+                );
+            }
+            println!(
+                "DECODE_QKV_MATVEC_SCREEN {}",
+                json!({"layer":layer, "position":position, "exact":true, "baseline_ms":samples[0], "fused_ms":samples[1]})
+            );
+        }
+        // 2. QKV head_norm + rotary + cache_kv fusion screen
+        {
+            let q_in = &q_proj[position * 4096..(position + 1) * 4096];
+            let k_in = &k_proj[position * 512..(position + 1) * 512];
+            let v_in = &v_proj[position * 512..(position + 1) * 512];
+            let v_dev = h.stream.clone_htod(v_in).map_err(failure)?;
+            let mut q_init = vec![1337.0f32; 4096 + 16];
+            q_init[8..4104].copy_from_slice(q_in);
+            let mut k_init = vec![1337.0f32; 512 + 16];
+            k_init[8..520].copy_from_slice(k_in);
+            let mut q_buf = [
+                h.stream.clone_htod(&q_init).map_err(failure)?,
+                h.stream.clone_htod(&q_init).map_err(failure)?,
+            ];
+            let mut k_buf = [
+                h.stream.clone_htod(&k_init).map_err(failure)?,
+                h.stream.clone_htod(&k_init).map_err(failure)?,
+            ];
+            let kv_total = 46 * 512;
+            let mut keys_buf = [matrix_output(&h, kv_total)?, matrix_output(&h, kv_total)?];
+            let mut vals_buf = [matrix_output(&h, kv_total)?, matrix_output(&h, kv_total)?];
+            let pos_i32 = position as i32;
+            let mut samples = [Vec::new(), Vec::new()];
+            for rep in 0..10 {
+                for slot in 0..2 {
+                    let arm = (rep + slot) % 2;
+                    h.stream
+                        .memcpy_htod(&q_init, &mut q_buf[arm])
+                        .map_err(failure)?;
+                    h.stream
+                        .memcpy_htod(&k_init, &mut k_buf[arm])
+                        .map_err(failure)?;
+                    let mut yq = q_buf[arm].slice_mut(8..4104);
+                    let mut yk = k_buf[arm].slice_mut(8..520);
+                    let mut keys = keys_buf[arm].slice_mut(8..8 + kv_total);
+                    let mut vals = vals_buf[arm].slice_mut(8..8 + kv_total);
+                    let start = h
+                        .stream
+                        .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                        .map_err(failure)?;
+                    if arm == 0 {
+                        launch!(
+                            h,
+                            "head_norm",
+                            (32, 1, 1),
+                            &mut yq,
+                            &wqn.bytes,
+                            &128i32,
+                            &epsilon
+                        );
+                        launch!(
+                            h,
+                            "rotary",
+                            (8, 1, 1),
+                            &mut yq,
+                            &4096i32,
+                            &128i32,
+                            &pos_i32,
+                            &rope_base,
+                            &1i32
+                        );
+                        launch!(
+                            h,
+                            "head_norm",
+                            (4, 1, 1),
+                            &mut yk,
+                            &wkn.bytes,
+                            &128i32,
+                            &epsilon
+                        );
+                        launch!(
+                            h,
+                            "rotary",
+                            (1, 1, 1),
+                            &mut yk,
+                            &512i32,
+                            &128i32,
+                            &pos_i32,
+                            &rope_base,
+                            &1i32
+                        );
+                        let yk_ro = yk.as_view();
+                        launch!(
+                            h,
+                            "cache_kv",
+                            (2, 1, 1),
+                            &yk_ro,
+                            &v_dev,
+                            &mut keys,
+                            &mut vals,
+                            &512i32,
+                            &pos_i32
+                        );
+                    } else {
+                        launch!(
+                            h,
+                            "qkv_head_norm_rope_cache",
+                            (36, 1, 1),
+                            &mut yq,
+                            &wqn.bytes,
+                            &32i32,
+                            &mut yk,
+                            &wkn.bytes,
+                            &v_dev,
+                            &mut keys,
+                            &mut vals,
+                            &4i32,
+                            &epsilon,
+                            &pos_i32,
+                            &rope_base,
+                            &1i32
+                        );
+                    }
+                    let end = h
+                        .stream
+                        .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                        .map_err(failure)?;
+                    end.synchronize().map_err(failure)?;
+                    if rep >= 3 {
+                        samples[arm].push(start.elapsed_ms(&end).map_err(failure)?);
+                    }
+                }
+            }
+            let flag = h.stream.alloc_zeros::<i32>(1).map_err(failure)?;
+            let rq0 = read_matrix_output(&h, &flag, &q_buf[0])?;
+            let rq1 = read_matrix_output(&h, &flag, &q_buf[1])?;
+            let rk0 = read_matrix_output(&h, &flag, &k_buf[0])?;
+            let rk1 = read_matrix_output(&h, &flag, &k_buf[1])?;
+            assert!(
+                rq0.iter()
+                    .zip(&rq1)
+                    .all(|(&a, &b)| a.is_finite() && a.to_bits() == b.to_bits())
+            );
+            assert!(
+                rk0.iter()
+                    .zip(&rk1)
+                    .all(|(&a, &b)| a.is_finite() && a.to_bits() == b.to_bits())
+            );
+            for [b0, b1] in [&keys_buf, &vals_buf] {
+                let d0 = h.stream.clone_dtoh(b0).map_err(failure)?;
+                let d1 = h.stream.clone_dtoh(b1).map_err(failure)?;
+                assert!(
+                    d0[..8]
+                        .iter()
+                        .chain(&d0[8 + kv_total..])
+                        .all(|&v| v == 1337.0)
+                );
+                assert!(
+                    d1[..8]
+                        .iter()
+                        .chain(&d1[8 + kv_total..])
+                        .all(|&v| v == 1337.0)
+                );
+                let s0 = &d0[8 + position * 512..8 + (position + 1) * 512];
+                let s1 = &d1[8 + position * 512..8 + (position + 1) * 512];
+                assert!(
+                    s0.iter()
+                        .zip(s1)
+                        .all(|(&a, &b)| a.is_finite() && a.to_bits() == b.to_bits())
+                );
+            }
+            println!(
+                "DECODE_QKV_POST_SCREEN {}",
+                json!({"layer":layer, "position":position, "exact":true, "baseline_ms":samples[0], "fused_ms":samples[1]})
+            );
+        }
+        // 3. residual + normalize fusion screen
+        {
+            let proj = &attn_out[position * 2048..(position + 1) * 2048];
+            let finp = &ffn_inp[position * 2048..(position + 1) * 2048];
+            let x_before: Vec<f32> = finp.iter().zip(proj).map(|(&f, &p)| f - p).collect();
+            let proj_dev = h.stream.clone_htod(proj).map_err(failure)?;
+            let mut x_init = vec![1337.0f32; 2048 + 16];
+            x_init[8..2056].copy_from_slice(&x_before);
+            let mut x_buf = [
+                h.stream.clone_htod(&x_init).map_err(failure)?,
+                h.stream.clone_htod(&x_init).map_err(failure)?,
+            ];
+            let mut norm_buf = [matrix_output(&h, 2048)?, matrix_output(&h, 2048)?];
+            let mut samples = [Vec::new(), Vec::new()];
+            for rep in 0..10 {
+                for slot in 0..2 {
+                    let arm = (rep + slot) % 2;
+                    h.stream
+                        .memcpy_htod(&x_init, &mut x_buf[arm])
+                        .map_err(failure)?;
+                    let mut x = x_buf[arm].slice_mut(8..2056);
+                    let mut y = norm_buf[arm].slice_mut(8..2056);
+                    let start = h
+                        .stream
+                        .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                        .map_err(failure)?;
+                    if arm == 0 {
+                        launch!(h, "residual", (8, 1, 1), &mut x, &proj_dev, &2048i32);
+                        let x_ro = x.as_view();
+                        launch!(
+                            h,
+                            "normalize",
+                            (1, 1, 1),
+                            &x_ro,
+                            &wfn.bytes,
+                            &mut y,
+                            &2048i32,
+                            &epsilon
+                        );
+                    } else {
+                        launch!(
+                            h,
+                            "residual_normalize",
+                            (1, 1, 1),
+                            &mut x,
+                            &proj_dev,
+                            &wfn.bytes,
+                            &mut y,
+                            &2048i32,
+                            &epsilon
+                        );
+                    }
+                    let end = h
+                        .stream
+                        .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                        .map_err(failure)?;
+                    end.synchronize().map_err(failure)?;
+                    if rep >= 3 {
+                        samples[arm].push(start.elapsed_ms(&end).map_err(failure)?);
+                    }
+                }
+            }
+            let flag = h.stream.alloc_zeros::<i32>(1).map_err(failure)?;
+            let rx0 = read_matrix_output(&h, &flag, &x_buf[0])?;
+            let rx1 = read_matrix_output(&h, &flag, &x_buf[1])?;
+            let rn0 = read_matrix_output(&h, &flag, &norm_buf[0])?;
+            let rn1 = read_matrix_output(&h, &flag, &norm_buf[1])?;
+            assert!(
+                rx0.iter()
+                    .zip(&rx1)
+                    .all(|(&a, &b)| a.is_finite() && a.to_bits() == b.to_bits())
+            );
+            assert!(
+                rn0.iter()
+                    .zip(&rn1)
+                    .all(|(&a, &b)| a.is_finite() && a.to_bits() == b.to_bits())
+            );
+            println!(
+                "DECODE_RESIDUAL_NORM_SCREEN {}",
+                json!({"layer":layer, "position":position, "exact":true, "baseline_ms":samples[0], "fused_ms":samples[1]})
+            );
+        }
+        // 4. router_warp128 screen (from actual GGUF router weights * captured ffn_norm)
+        {
+            let norm_in = h
+                .stream
+                .clone_htod(&ffn_norm[position * 2048..(position + 1) * 2048])
+                .map_err(failure)?;
+            let mut scores = h.stream.alloc_zeros::<f32>(128).map_err(failure)?;
+            launch!(
+                h,
+                "matvec_packed_f32",
+                (128, 1, 1),
+                &wrt.bytes,
+                &wrt.kind,
+                &norm_in,
+                &mut scores,
+                &2048i32,
+                &128i32,
+                &dummy_ids,
+                &0i32,
+                &0i32
+            );
+            let mut ids_buf = [
+                h.stream
+                    .clone_htod(&vec![-777i32; 8 + 16])
+                    .map_err(failure)?,
+                h.stream
+                    .clone_htod(&vec![-777i32; 8 + 16])
+                    .map_err(failure)?,
+            ];
+            let mut w_buf = [matrix_output(&h, 8)?, matrix_output(&h, 8)?];
+            let mut st_buf = [
+                h.stream.alloc_zeros::<i32>(1).map_err(failure)?,
+                h.stream.alloc_zeros::<i32>(1).map_err(failure)?,
+            ];
+            let mut samples = [Vec::new(), Vec::new()];
+            for rep in 0..10 {
+                for slot in 0..2 {
+                    let arm = (rep + slot) % 2;
+                    let mut ids = ids_buf[arm].slice_mut(8..16);
+                    let mut w = w_buf[arm].slice_mut(8..16);
+                    let start = h
+                        .stream
+                        .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                        .map_err(failure)?;
+                    if arm == 0 {
+                        launch!(h, "router", (1, 1, 1);256,
+                            &scores, &128i32, &8i32, &mut ids, &mut w, &mut st_buf[arm]);
+                    } else {
+                        launch!(h, "router_warp128", (1, 1, 1);32,
+                            &scores, &8i32, &mut ids, &mut w, &mut st_buf[arm]);
+                    }
+                    let end = h
+                        .stream
+                        .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                        .map_err(failure)?;
+                    end.synchronize().map_err(failure)?;
+                    if rep >= 3 {
+                        samples[arm].push(start.elapsed_ms(&end).map_err(failure)?);
+                    }
+                }
+            }
+            let ids0 = h.stream.clone_dtoh(&ids_buf[0]).map_err(failure)?;
+            let ids1 = h.stream.clone_dtoh(&ids_buf[1]).map_err(failure)?;
+            assert!(ids0[..8].iter().chain(&ids0[16..]).all(|&v| v == -777));
+            assert!(ids1[..8].iter().chain(&ids1[16..]).all(|&v| v == -777));
+            assert_eq!(&ids0[8..16], &ids1[8..16]);
+            assert_eq!(&ids0[8..16], &routing.ids[position * 8..(position + 1) * 8]);
+            let rw0 = read_matrix_output(&h, &st_buf[0], &w_buf[0])?;
+            let rw1 = read_matrix_output(&h, &st_buf[1], &w_buf[1])?;
+            assert!(
+                rw0.iter()
+                    .zip(&rw1)
+                    .all(|(&a, &b)| a.is_finite() && a.to_bits() == b.to_bits())
+            );
+            println!(
+                "DECODE_ROUTER_WARP_SCREEN {}",
+                json!({"layer":layer, "position":position, "exact":true, "baseline_ms":samples[0], "warp_ms":samples[1]})
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "frozen decode-shaped FFN normalization replay; serial CUDA"]
 fn benchmark_retained_normalize() -> Result<()> {
     let path = PathBuf::from(std::env::var("M8_REPLAY_CAPTURE").map_err(failure)?);
-    let layer: usize = std::env::var("M8_REPLAY_LAYER").map_err(failure)?.parse().map_err(failure)?;
+    let layer: usize = std::env::var("M8_REPLAY_LAYER")
+        .map_err(failure)?
+        .parse()
+        .map_err(failure)?;
     let pin = match layer {
         0 => "fa590dfeea71a36cda673eb6f3e5044d43abea1e64b750fd92ac08d2fdbf5dbe",
         47 => "dd961ab91ccfcc44f1f40fd75d6d798c1bf0605d05e82234d22edd4c5abaaadb",
@@ -602,7 +1145,8 @@ fn benchmark_retained_normalize() -> Result<()> {
     };
     let model_path = PathBuf::from(std::env::var("M8_REPLAY_MODEL").map_err(failure)?);
     if file_hash(&path)? != pin
-        || file_hash(&model_path)? != "398bf479282bf374f996f55b0f742c4b45b798e51bf45ca9b7dda0e400d6aa86"
+        || file_hash(&model_path)?
+            != "398bf479282bf374f996f55b0f742c4b45b798e51bf45ca9b7dda0e400d6aa86"
     {
         return Err(invalid("normalization replay pin mismatch"));
     }
@@ -618,7 +1162,10 @@ fn benchmark_retained_normalize() -> Result<()> {
     let width = 2048i32;
     for position in [0, 45] {
         let range = position * 2048..(position + 1) * 2048;
-        let x = h.stream.clone_htod(&inputs[range.clone()]).map_err(failure)?;
+        let x = h
+            .stream
+            .clone_htod(&inputs[range.clone()])
+            .map_err(failure)?;
         let mut outputs = [
             super::residual::matrix_output(&h, 2048)?,
             super::residual::matrix_output(&h, 2048)?,
@@ -628,13 +1175,36 @@ fn benchmark_retained_normalize() -> Result<()> {
             for slot in 0..2 {
                 let arm = (repetition + slot) % 2;
                 let mut y = outputs[arm].slice_mut(8..2056);
-                let start = h.stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(failure)?;
+                let start = h
+                    .stream
+                    .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .map_err(failure)?;
                 if arm == 0 {
-                    launch!(h, "normalize", (1, 1, 1), &x, &weights.bytes, &mut y, &width, &epsilon);
+                    launch!(
+                        h,
+                        "normalize",
+                        (1, 1, 1),
+                        &x,
+                        &weights.bytes,
+                        &mut y,
+                        &width,
+                        &epsilon
+                    );
                 } else {
-                    launch!(h, "normalize_retained2048", (1, 1, 1), &x, &weights.bytes, &mut y, &epsilon);
+                    launch!(
+                        h,
+                        "normalize_retained2048",
+                        (1, 1, 1),
+                        &x,
+                        &weights.bytes,
+                        &mut y,
+                        &epsilon
+                    );
                 }
-                let end = h.stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(failure)?;
+                let end = h
+                    .stream
+                    .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .map_err(failure)?;
                 end.synchronize().map_err(failure)?;
                 if repetition >= 3 {
                     samples[arm].push(start.elapsed_ms(&end).map_err(failure)?);
@@ -644,10 +1214,18 @@ fn benchmark_retained_normalize() -> Result<()> {
         let flag = h.stream.alloc_zeros::<i32>(1).map_err(failure)?;
         let baseline = super::residual::read_matrix_output(&h, &flag, &outputs[0])?;
         let candidate = super::residual::read_matrix_output(&h, &flag, &outputs[1])?;
-        assert!(baseline.iter().zip(&candidate).all(|(&a, &b)| a.is_finite() && a.to_bits() == b.to_bits()));
-        println!("NORMALIZE_SCREEN {}", json!({"capture_sha256":pin, "layer":layer, "position":position,
+        assert!(
+            baseline
+                .iter()
+                .zip(&candidate)
+                .all(|(&a, &b)| a.is_finite() && a.to_bits() == b.to_bits())
+        );
+        println!(
+            "NORMALIZE_SCREEN {}",
+            json!({"capture_sha256":pin, "layer":layer, "position":position,
             "output_sha256":float_hash(&baseline), "captured_sha256":float_hash(&captured[range]), "exact":true,
-            "baseline_ms":samples[0], "retained_ms":samples[1], "repetitions":7, "warmups":3}));
+            "baseline_ms":samples[0], "retained_ms":samples[1], "repetitions":7, "warmups":3})
+        );
     }
     Ok(())
 }
@@ -670,21 +1248,27 @@ fn benchmark_temporal_attention_pair() -> Result<()> {
         return Err(invalid("temporal attention capture pin mismatch"));
     }
     let operands = Operands::load(&path, layer)?;
-    let tokens = 512;
+    let tokens: usize = match std::env::var("M8_REPLAY_ATTENTION_TOKENS") {
+        Ok(value) => value.parse().map_err(failure)?,
+        Err(_) => 512,
+    };
+    if !matches!(tokens, 46 | 256 | 512) {
+        return Err(invalid("unexpected temporal attention token length"));
+    }
     let harness = Harness::with_admitted_attention()?;
     let q = harness
         .stream
-        .clone_htod(&operands.matrix("Qcur", 4096, tokens)?)
+        .clone_htod(&operands.matrix("Qcur", 4096, 512)?[..tokens * 4096])
         .map_err(failure)?;
     let k = harness
         .stream
-        .clone_htod(&operands.matrix("Kcur", 512, tokens)?)
+        .clone_htod(&operands.matrix("Kcur", 512, 512)?[..tokens * 512])
         .map_err(failure)?;
     let v = harness
         .stream
-        .clone_htod(&operands.matrix("Vcur", 512, tokens)?)
+        .clone_htod(&operands.matrix("Vcur", 512, 512)?[..tokens * 512])
         .map_err(failure)?;
-    let expected = operands.matrix("attn_attended", 4096, tokens)?;
+    let expected = operands.matrix("attn_attended", 4096, 512)?[..tokens * 4096].to_vec();
     let mut outputs = [
         matrix_output(&harness, expected.len())?,
         matrix_output(&harness, expected.len())?,
@@ -695,7 +1279,7 @@ fn benchmark_temporal_attention_pair() -> Result<()> {
             launch!(
                 harness,
                 "attention_fused",
-                (32, 512, 1),
+                (32, tokens as u32, 1),
                 &q,
                 &k,
                 &v,
@@ -709,7 +1293,7 @@ fn benchmark_temporal_attention_pair() -> Result<()> {
             launch!(
                 harness,
                 "attention_fused_query_pair",
-                (32, 256, 1),
+                (32, (tokens / 2) as u32, 1),
                 &q,
                 &k,
                 &v,
@@ -750,7 +1334,7 @@ fn benchmark_temporal_attention_pair() -> Result<()> {
     }
     println!(
         "TEMPORAL_ATTENTION {}",
-        json!({"layer":layer,"capture_sha256":pin,"output_sha256":float_hash(&expected),
+        json!({"layer":layer,"tokens":tokens,"capture_sha256":pin,"output_sha256":float_hash(&expected),
         "baseline_ms":samples[0],"pair_ms":samples[1],"all_outputs_exact":true,"warmups":3,"runs":7})
     );
     Ok(())
@@ -824,7 +1408,10 @@ fn run_model_projection_replay(mode: Replay) -> Result<()> {
         tensors.push(tensor);
     }
     drop(model);
-    let harness = if matches!(mode, Replay::PackedDown | Replay::PackedGateUp | Replay::PackedKPair) {
+    let harness = if matches!(
+        mode,
+        Replay::PackedDown | Replay::PackedGateUp | Replay::PackedKPair
+    ) {
         Harness::with_packed_reduction()?
     } else {
         Harness::new()?
@@ -848,8 +1435,14 @@ fn run_model_projection_replay(mode: Replay) -> Result<()> {
             let tensor = DeviceTensor::upload(tensor, &harness.stream)?;
             let input = operands.matrix(stage, width, tokens)?;
             for position in [0, tokens - 1] {
-                super::packed_decode::benchmark_k_pair(&harness, &tensor,
-                    &input[position * width..(position + 1) * width], name, position, &capture_hash)?;
+                super::packed_decode::benchmark_k_pair(
+                    &harness,
+                    &tensor,
+                    &input[position * width..(position + 1) * width],
+                    name,
+                    position,
+                    &capture_hash,
+                )?;
             }
         }
         return Ok(());
@@ -870,9 +1463,15 @@ fn run_model_projection_replay(mode: Replay) -> Result<()> {
         let up = DeviceTensor::upload(experts.next().unwrap(), &harness.stream)?;
         let input = operands.matrix("ffn_norm", 2048, tokens)?;
         for position in [0, tokens - 1] {
-            super::packed_decode::benchmark_gate_up(&harness, &gate, &up,
+            super::packed_decode::benchmark_gate_up(
+                &harness,
+                &gate,
+                &up,
                 &input[position * 2048..(position + 1) * 2048],
-                &routing.ids[position * 8..(position + 1) * 8], position, &capture_hash)?;
+                &routing.ids[position * 8..(position + 1) * 8],
+                position,
+                &capture_hash,
+            )?;
         }
         return Ok(());
     }
@@ -901,20 +1500,39 @@ fn run_model_projection_replay(mode: Replay) -> Result<()> {
         }
         return Ok(());
     }
-    if matches!(mode, Replay::GateUp | Replay::Compact8 | Replay::SyncK64 | Replay::MixedExpert | Replay::WideExpertPanel | Replay::SameExpertPanel) {
+    if matches!(
+        mode,
+        Replay::GateUp
+            | Replay::Compact8
+            | Replay::SyncK64
+            | Replay::MixedExpert
+            | Replay::WideExpertPanel
+            | Replay::SameExpertPanel
+            | Replay::SameExpertWarp8Panel
+            | Replay::TruePipelinePanel
+    ) {
+        use super::residual_precise::PanelScreen;
+        let screen = match mode {
+            Replay::GateUp => PanelScreen::GateUp,
+            Replay::Compact8 => PanelScreen::Compact8,
+            Replay::SyncK64 => PanelScreen::SyncK64,
+            Replay::MixedExpert => PanelScreen::MixedExpert,
+            Replay::WideExpertPanel => PanelScreen::WideExpert,
+            Replay::SameExpertPanel => PanelScreen::SameExpert,
+            Replay::SameExpertWarp8Panel => PanelScreen::SameExpertWarp8,
+            Replay::TruePipelinePanel => PanelScreen::TruePipeline,
+            _ => unreachable!(),
+        };
         return super::residual_precise::benchmark_gate_up(
             &harness,
             tensors.split_off(4),
             routing,
-            &operands.matrix("ffn_norm", 2048, tokens)?,
-            &operands.matrix("ffn_down_inp", 8 * 768, tokens)?,
-            &capture_hash,
-            &model_hash,
-            matches!(mode, Replay::Compact8),
-            matches!(mode, Replay::SyncK64),
-            matches!(mode, Replay::MixedExpert),
-            matches!(mode, Replay::WideExpertPanel),
-            matches!(mode, Replay::SameExpertPanel),
+            (
+                &operands.matrix("ffn_norm", 2048, tokens)?,
+                &operands.matrix("ffn_down_inp", 8 * 768, tokens)?,
+            ),
+            (&capture_hash, &model_hash),
+            screen,
         );
     }
     let ids = harness.stream.clone_htod(&routing.ids).map_err(failure)?;
@@ -1032,7 +1650,18 @@ fn run_model_projection_replay(mode: Replay) -> Result<()> {
             Replay::WideRows | Replay::DenseWideRows => "WIDE_ROWS_PROVENANCE",
             Replay::DenseRegisters => "REGISTERS_PROVENANCE",
             Replay::DensePlanar => "PLANAR_PROVENANCE",
-            Replay::GateUp | Replay::Compact8 | Replay::SyncK64 | Replay::MixedExpert | Replay::WideExpertPanel | Replay::SameExpertPanel | Replay::PackedDown | Replay::PackedGateUp | Replay::PackedKPair => unreachable!(),
+            Replay::DenseSplitK => "SPLITK_PROVENANCE",
+            Replay::GateUp
+            | Replay::Compact8
+            | Replay::SyncK64
+            | Replay::MixedExpert
+            | Replay::WideExpertPanel
+            | Replay::SameExpertPanel
+            | Replay::SameExpertWarp8Panel
+            | Replay::TruePipelinePanel
+            | Replay::PackedDown
+            | Replay::PackedGateUp
+            | Replay::PackedKPair => unreachable!(),
         },
         json!({
             "version":1, "model":model_path, "model_sha256":model_hash,
@@ -1062,6 +1691,7 @@ fn run_model_projection_replay(mode: Replay) -> Result<()> {
         Replay::CachedScales => super::residual_precise::Experiment::new_cached_scales(&harness),
         Replay::DenseRegisters => super::residual_precise::Experiment::new_registers(&harness),
         Replay::DensePlanar => super::residual_precise::Experiment::new_planar(&harness),
+        Replay::DenseSplitK => super::residual_precise::Experiment::new_splitk(&harness),
         Replay::WideRows | Replay::DenseWideRows => {
             super::residual_precise::Experiment::new_wide_rows(&harness)
         }
@@ -1074,7 +1704,10 @@ fn run_model_projection_replay(mode: Replay) -> Result<()> {
         plans.into_iter().zip(tensors)
     {
         if (matches!(mode, Replay::NarrowExpert | Replay::WideRows) && !grouped)
-            || (matches!(mode, Replay::DenseWideRows | Replay::DenseRegisters) && grouped)
+            || (matches!(
+                mode,
+                Replay::DenseWideRows | Replay::DenseRegisters | Replay::DenseSplitK
+            ) && grouped)
             || (matches!(mode, Replay::DensePlanar)
                 && (grouped || !matches!(&tensor.storage, Storage::Packed { kind: 12, .. })))
         {
@@ -1117,6 +1750,7 @@ fn run_model_projection_replay(mode: Replay) -> Result<()> {
                     | Replay::DenseWideRows
                     | Replay::DenseRegisters
                     | Replay::DensePlanar
+                    | Replay::DenseSplitK
             ) {
                 precise.probe(probe)?;
             } else {

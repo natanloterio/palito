@@ -180,10 +180,24 @@ fn rope(vector: &mut [f32], head_dim: usize, position: usize, base: f32) {
 }
 
 pub(crate) fn rotary(vector: &mut [f32], head_dim: usize, position: usize, base: f32, neox: bool) {
+    rotary_with_factors(vector, head_dim, position, base, neox, None, 1.0);
+}
+
+pub(crate) fn rotary_with_factors(
+    vector: &mut [f32],
+    head_dim: usize,
+    position: usize,
+    base: f32,
+    neox: bool,
+    factors: Option<&[f32]>,
+    magnitude: f32,
+) {
     for head in vector.chunks_exact_mut(head_dim) {
         for pair in 0..head_dim / 2 {
             let angle = position as f32 * base.powf(-((2 * pair) as f32) / head_dim as f32);
+            let angle = factors.map_or(angle, |factors| angle / factors[pair]);
             let (sin, cos) = angle.sin_cos();
+            let (sin, cos) = (sin * magnitude, cos * magnitude);
             let (a, b) = if neox {
                 (pair, pair + head_dim / 2)
             } else {
@@ -208,9 +222,54 @@ pub(crate) fn attend(
     output: &mut [f32],
     scores: &mut [f32],
 ) {
+    attend_with_divisor(
+        query,
+        keys,
+        values,
+        heads,
+        kv_heads,
+        head_dim,
+        count,
+        (head_dim as f32).sqrt(),
+        0.0,
+        0.0,
+        output,
+        scores,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attend_with_divisor(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    count: usize,
+    divisor: f32,
+    softcap: f32,
+    alibi_max: f32,
+    output: &mut [f32],
+    scores: &mut [f32],
+) {
     output.fill(0.0);
     let kv_width = kv_heads * head_dim;
     for head in 0..heads {
+        let slope = if alibi_max > 0.0 {
+            let base_heads = 1 << heads.ilog2();
+            if head < base_heads {
+                2.0_f32
+                    .powf(-alibi_max / base_heads as f32)
+                    .powi(head as i32 + 1)
+            } else {
+                2.0_f32
+                    .powf(-alibi_max / (2 * base_heads) as f32)
+                    .powi((2 * (head - base_heads) + 1) as i32)
+            }
+        } else {
+            0.0
+        };
         let kv_head = head / (heads / kv_heads);
         let offset = kv_head * head_dim;
         let q = &query[head * head_dim..(head + 1) * head_dim];
@@ -221,7 +280,17 @@ pub(crate) fn attend(
                 .zip(&keys[time * kv_width + offset..time * kv_width + offset + head_dim])
                 .map(|(q, k)| q * k)
                 .sum::<f32>()
-                / (head_dim as f32).sqrt();
+                / divisor;
+            if softcap > 0.0 {
+                *score = if score.is_finite() {
+                    softcap * (*score * softcap.recip()).tanh()
+                } else {
+                    f32::NAN
+                };
+            }
+            if alibi_max > 0.0 {
+                *score -= slope * (count - 1 - time) as f32;
+            }
         }
         let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         for value in &mut *scores {

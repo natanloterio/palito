@@ -12,8 +12,10 @@ pub(crate) enum Value {
     Integer(u64),
     Float(f32),
     Bool(bool),
+    Bools(Vec<bool>),
     Strings(Vec<String>),
     Integers(Vec<u64>),
+    Floats(Vec<f32>),
 }
 
 pub(crate) struct Tensor {
@@ -26,6 +28,64 @@ pub(crate) struct Tensor {
 pub(crate) enum Storage {
     F32(Vec<f32>),
     Packed { kind: u32, bytes: Vec<u8> },
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl Tensor {
+    pub fn split_vector(mut self, count: usize) -> Result<(Self, Self)> {
+        let [total] = self.dims[..] else {
+            return Err(invalid("vector split requires one dimension"));
+        };
+        if count == 0 || count >= total {
+            return Err(invalid("invalid vector split"));
+        }
+        let Storage::F32(values) = &mut self.storage else {
+            return Err(invalid("vector split requires F32 storage"));
+        };
+        let tail = values.split_off(count);
+        values.shrink_to_fit();
+        self.dims[0] = count;
+        let right = Self {
+            dims: vec![total - count],
+            storage: Storage::F32(tail),
+            accelerated: self.accelerated,
+            block_elements: self.block_elements,
+        };
+        Ok((self, right))
+    }
+
+    /// Partition a matrix along its output dimension without unpacking or requantizing rows.
+    pub fn split_rows(mut self, rows: usize) -> Result<(Self, Self)> {
+        let [_, total] = self.dims[..] else {
+            return Err(invalid("row split requires a matrix"));
+        };
+        if rows == 0 || rows >= total {
+            return Err(invalid("invalid matrix row split"));
+        }
+        let tail = match &mut self.storage {
+            Storage::F32(values) => {
+                let tail = values.split_off(values.len() / total * rows);
+                values.shrink_to_fit();
+                Storage::F32(tail)
+            }
+            Storage::Packed { kind, bytes } => {
+                let tail = bytes.split_off(bytes.len() / total * rows);
+                bytes.shrink_to_fit();
+                Storage::Packed {
+                    kind: *kind,
+                    bytes: tail,
+                }
+            }
+        };
+        let right = Self {
+            dims: vec![self.dims[0], total - rows],
+            storage: tail,
+            accelerated: self.accelerated,
+            block_elements: self.block_elements,
+        };
+        self.dims[1] = rows;
+        Ok((self, right))
+    }
 }
 
 pub(crate) struct Gguf {
@@ -70,7 +130,7 @@ impl<'a> Reader<'a> {
         String::from_utf8(self.take(size)?.to_vec()).map_err(|_| invalid("invalid UTF-8 string"))
     }
 
-    fn value(&mut self, kind: u64, depth: usize) -> Result<Option<Value>> {
+    fn value(&mut self, kind: u64, depth: usize, keep_float_array: bool) -> Result<Option<Value>> {
         if depth > 4 {
             return Err(invalid("metadata nesting exceeds limit"));
         }
@@ -107,8 +167,27 @@ impl<'a> Reader<'a> {
                         (0..count).map(|_| self.integer(4)).collect::<Result<_>>()?,
                     )));
                 }
+                if element == 6 && keep_float_array {
+                    if count > (self.bytes.len() - self.position) / 4 {
+                        return Err(invalid("truncated tokenizer scores"));
+                    }
+                    return Ok(Some(Value::Floats(
+                        (0..count)
+                            .map(|_| self.integer(4).map(|bits| f32::from_bits(bits as u32)))
+                            .collect::<Result<_>>()?,
+                    )));
+                }
+                if element == 7 {
+                    let values = self.take(count)?;
+                    if values.iter().any(|&value| value > 1) {
+                        return Err(invalid("invalid boolean array"));
+                    }
+                    return Ok(Some(Value::Bools(
+                        values.iter().map(|&value| value != 0).collect(),
+                    )));
+                }
                 for _ in 0..count {
-                    self.value(element, depth + 1)?;
+                    self.value(element, depth + 1, false)?;
                 }
                 None
             }
@@ -135,8 +214,10 @@ impl<'a> Reader<'a> {
                 return Err(invalid("duplicate metadata key"));
             }
             let kind = self.integer(4)?;
-            if let Some(value) = self.value(kind, 0)? {
+            if let Some(value) = self.value(kind, 0, key == "tokenizer.ggml.scores")? {
                 metadata.insert(key, value);
+            } else if key == "gemma3.attention.sliding_window_pattern" {
+                return Err(invalid("unsupported Gemma 3 window pattern array"));
             }
         }
         Ok((tensor_count, metadata))
@@ -147,10 +228,18 @@ pub(crate) fn layout(kind: u32) -> Result<(usize, usize, &'static str)> {
     match kind {
         0 => Ok((1, 4, "F32")),
         1 => Ok((1, 2, "F16")),
+        2 => Ok((32, 18, "Q4_0")),
+        3 => Ok((32, 20, "Q4_1")),
         6 => Ok((32, 22, "Q5_0")),
+        7 => Ok((32, 24, "Q5_1")),
         8 => Ok((32, 34, "Q8_0")),
+        10 => Ok((256, 84, "Q2_K")),
+        11 => Ok((256, 110, "Q3_K")),
         12 => Ok((256, 144, "Q4_K")),
+        13 => Ok((256, 176, "Q5_K")),
         14 => Ok((256, 210, "Q6_K")),
+        20 => Ok((32, 18, "IQ4_NL")),
+        30 => Ok((1, 2, "BF16")),
         _ => Err(invalid(format!("unsupported tensor type {kind}"))),
     }
 }
@@ -161,9 +250,27 @@ pub(crate) fn half(bytes: &[u8], offset: usize) -> f32 {
 }
 
 fn finite_packed(kind: u32, bytes: &[u8]) -> bool {
+    if kind == 30 {
+        return bf16(bytes).is_finite();
+    }
     // Integer quants/scales are bounded: finite F16 scales cannot overflow F32 products.
-    half(bytes, if kind == 14 { 208 } else { 0 }).is_finite()
-        && (kind != 12 || half(bytes, 2).is_finite())
+    half(
+        bytes,
+        match kind {
+            10 => 80,
+            11 => 108,
+            14 => 208,
+            _ => 0,
+        },
+    )
+    .is_finite()
+        && (!matches!(kind, 3 | 7 | 12 | 13) || half(bytes, 2).is_finite())
+        && (kind != 10 || half(bytes, 82).is_finite())
+}
+
+#[inline(always)]
+fn bf16(bytes: &[u8]) -> f32 {
+    f32::from_bits(u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16)
 }
 
 #[inline(always)]
@@ -171,6 +278,31 @@ pub(crate) fn decode(kind: u32, bytes: &[u8], output: &mut [f32]) {
     match kind {
         0 => output[0] = f32::from_le_bytes(bytes.try_into().expect("validated F32 block")),
         1 => output[0] = half(bytes, 0),
+        30 => output[0] = bf16(bytes),
+        2 => {
+            let scale = half(bytes, 0);
+            for (i, value) in output.iter_mut().enumerate() {
+                let quant = (bytes[2 + i % 16] >> (4 * (i / 16))) & 15;
+                *value = scale * (i32::from(quant) - 8) as f32;
+            }
+        }
+        3 | 7 => {
+            let scale = half(bytes, 0);
+            let offset = half(bytes, 2);
+            let (high, low_offset) = if kind == 7 {
+                (
+                    u32::from_le_bytes(bytes[4..8].try_into().expect("Q5 high bits")),
+                    8,
+                )
+            } else {
+                (0, 4)
+            };
+            for (i, value) in output.iter_mut().enumerate() {
+                let low = (bytes[low_offset + i % 16] >> (4 * (i / 16))) & 15;
+                let quant = u32::from(low) | (((high >> i) & 1) << 4);
+                *value = scale * quant as f32 + offset;
+            }
+        }
         6 => {
             let scale = half(bytes, 0);
             let high = u32::from_le_bytes(bytes[2..6].try_into().expect("Q5 high bits"));
@@ -186,7 +318,35 @@ pub(crate) fn decode(kind: u32, bytes: &[u8], output: &mut [f32]) {
                 *value = scale * (quant as i8) as f32;
             }
         }
-        12 => {
+        10 => {
+            let scale = half(bytes, 80);
+            let minimum = half(bytes, 82);
+            for (i, value) in output.iter_mut().enumerate() {
+                let group = bytes[i / 16];
+                let shift = 2 * ((i % 128) / 32);
+                let quant = (bytes[16 + (i / 128) * 32 + i % 32] >> shift) & 3;
+                *value = scale * f32::from(group & 15) * f32::from(quant)
+                    - minimum * f32::from(group >> 4);
+            }
+        }
+        11 => {
+            let scale = half(bytes, 108);
+            for (i, value) in output.iter_mut().enumerate() {
+                let group = i / 16;
+                let low_scale = (bytes[96 + group % 8] >> (4 * (group / 8))) & 15;
+                let high_scale = (bytes[104 + group % 4] >> (2 * (group / 4))) & 3;
+                let multiplier = i32::from(low_scale | (high_scale << 4)) - 32;
+                let shift = i / 32;
+                let low = (bytes[32 + (i / 128) * 32 + i % 32] >> (2 * (shift % 4))) & 3;
+                let subtract = if bytes[i % 32] & (1 << shift) == 0 {
+                    4
+                } else {
+                    0
+                };
+                *value = scale * multiplier as f32 * (i32::from(low) - subtract) as f32;
+            }
+        }
+        12 | 13 => {
             let scale = half(bytes, 0);
             let minimum = half(bytes, 2);
             let scales = &bytes[4..16];
@@ -200,7 +360,14 @@ pub(crate) fn decode(kind: u32, bytes: &[u8], output: &mut [f32]) {
                         (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4),
                     )
                 };
-                let quant = (bytes[16 + (i / 64) * 32 + i % 32] >> (4 * (group % 2))) & 15;
+                let low_offset = if kind == 13 { 48 } else { 16 };
+                let low = (bytes[low_offset + (i / 64) * 32 + i % 32] >> (4 * (group % 2))) & 15;
+                let high = if kind == 13 {
+                    ((bytes[16 + i % 32] >> group) & 1) << 4
+                } else {
+                    0
+                };
+                let quant = low | high;
                 *value = scale * f32::from(s) * f32::from(quant) - minimum * f32::from(m);
             }
         }
@@ -216,6 +383,16 @@ pub(crate) fn decode(kind: u32, bytes: &[u8], output: &mut [f32]) {
                 let high = (bytes[128 + half_block * 32 + lane] >> (2 * quarter)) & 3;
                 let quant = i32::from(low | (high << 4)) - 32;
                 *value = scale * (bytes[192 + i / 16] as i8) as f32 * quant as f32;
+            }
+        }
+        20 => {
+            const CODEBOOK: [i8; 16] = [
+                -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+            ];
+            let scale = half(bytes, 0);
+            for (i, value) in output.iter_mut().enumerate() {
+                let code = (bytes[2 + i % 16] >> (4 * (i / 16))) & 15;
+                *value = scale * f32::from(CODEBOOK[usize::from(code)]);
             }
         }
         _ => unreachable!("tensor type checked before decoding"),
@@ -402,13 +579,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn split_packed_matrix_preserves_whole_rows() {
+        let tensor = Tensor {
+            dims: vec![256, 3],
+            storage: Storage::Packed {
+                kind: 12,
+                bytes: [1, 2, 3].into_iter().flat_map(|b| [b; 144]).collect(),
+            },
+            accelerated: true,
+            block_elements: 256,
+        };
+        let (first, tail) = tensor.split_rows(1).unwrap();
+        let (second, third) = tail.split_rows(1).unwrap();
+        for (tensor, byte) in [first, second, third].into_iter().zip([1, 2, 3]) {
+            assert_eq!(tensor.dims, [256, 1]);
+            assert!(tensor.accelerated);
+            assert_eq!(tensor.block_elements, 256);
+            assert!(
+                matches!(tensor.storage, Storage::Packed { kind: 12, bytes } if bytes == [byte; 144])
+            );
+        }
+    }
+
+    #[test]
+    fn q5_k_uses_one_high_bit_per_group_and_lane() {
+        let mut packed = [0; 176];
+        packed[..2].copy_from_slice(&f16::ONE.to_bits().to_le_bytes());
+        packed[2..4].copy_from_slice(&f16::ONE.to_bits().to_le_bytes());
+        packed[4..8].fill(2);
+        packed[8..12].fill(3);
+        packed[12..16].fill(0x32);
+        packed[16..24]
+            .iter_mut()
+            .enumerate()
+            .for_each(|(group, byte)| *byte = 1 << group);
+        packed[48..].fill(0x41);
+        let mut output = [0.0; 256];
+        decode(13, &packed, &mut output);
+        for (group, values) in output.chunks_exact(32).enumerate() {
+            let baseline = if group % 2 == 0 { -1.0 } else { 5.0 };
+            for (lane, &value) in values.iter().enumerate() {
+                assert_eq!(value, baseline + if lane == group { 32.0 } else { 0.0 });
+            }
+        }
+    }
+
+    #[test]
     fn packed_validation_rejects_nonfinite_scales_and_accepts_extreme_finite_products() {
-        for kind in [1, 6, 8, 12, 14] {
+        for kind in [1, 6, 8, 12, 13, 14] {
             let (block, size, _) = layout(kind).unwrap();
             let mut bytes = vec![255; size];
             let offset = if kind == 14 { 208 } else { 0 };
             bytes[offset..offset + 2].copy_from_slice(&f16::MAX.to_bits().to_le_bytes());
-            if kind == 12 {
+            if matches!(kind, 12 | 13) {
                 bytes[2..4].copy_from_slice(&f16::MAX.to_bits().to_le_bytes());
             }
             assert!(finite_packed(kind, &bytes));
@@ -419,7 +642,7 @@ mod tests {
                 bytes[offset..offset + 2].copy_from_slice(&value.to_bits().to_le_bytes());
                 assert!(!finite_packed(kind, &bytes));
             }
-            if kind == 12 {
+            if matches!(kind, 12 | 13) {
                 bytes[..2].copy_from_slice(&f16::MAX.to_bits().to_le_bytes());
                 bytes[2..4].copy_from_slice(&f16::INFINITY.to_bits().to_le_bytes());
                 assert!(!finite_packed(kind, &bytes));
@@ -437,13 +660,129 @@ mod tests {
                 bytes: &bytes,
                 position: 0,
             };
-            assert!(reader.value(9, 0).is_err());
+            assert!(reader.value(9, 0, false).is_err());
         }
         let mut reader = Reader {
             bytes: &[2],
             position: 0,
         };
-        assert!(reader.value(7, 0).is_err());
+        assert!(reader.value(7, 0, false).is_err());
+    }
+
+    #[test]
+    fn bf16_preserves_subnormals_and_rejects_nonfinite_weights() {
+        for bits in [0x8000u16, 0x0001, 0x7f7f] {
+            let block = bits.to_le_bytes();
+            let mut output = [0.0];
+            assert!(finite_packed(30, &block));
+            decode(30, &block, &mut output);
+            assert_eq!(output[0].to_bits(), u32::from(bits) << 16);
+        }
+        for bits in [0x7f80u16, 0xff81] {
+            assert!(!finite_packed(30, &bits.to_le_bytes()));
+        }
+    }
+
+    #[test]
+    fn decodes_q2_k_planes_and_subgroup_minima() {
+        let mut block = [0; 84];
+        block[0] = 0x21;
+        block[2] = 0x43;
+        block[8] = 0x65;
+        block[16] = 0x0b;
+        block[48] = 0x02;
+        block[80..82].copy_from_slice(&f16::from_f32(0.5).to_bits().to_le_bytes());
+        block[82..84].copy_from_slice(&f16::from_f32(0.25).to_bits().to_le_bytes());
+        assert!(finite_packed(10, &block));
+        let mut output = [0.0; 256];
+        decode(10, &block, &mut output);
+        assert_eq!((output[0], output[32], output[128]), (1.0, 2.0, 3.5));
+        block[82..84].copy_from_slice(&f16::INFINITY.to_bits().to_le_bytes());
+        assert!(!finite_packed(10, &block));
+    }
+
+    #[test]
+    fn decodes_q3_k_planes_and_signed_subgroup_scales() {
+        let mut block = [0; 110];
+        block[0] = 0x11;
+        block[32] = 3;
+        block[64] = 2;
+        block[96] = 0x61;
+        block[104] = 0x12;
+        block[108..].copy_from_slice(&f16::from_f32(0.5).to_bits().to_le_bytes());
+        let mut output = [0.0; 256];
+        decode(11, &block, &mut output);
+        assert_eq!(
+            (output[0], output[1], output[128], output[129]),
+            (1.5, -2.0, -10.0, 20.0)
+        );
+        block[108..].copy_from_slice(&f16::INFINITY.to_bits().to_le_bytes());
+        assert!(!finite_packed(11, &block));
+    }
+
+    #[test]
+    fn decodes_iq4_nl_nonuniform_nibbles() {
+        let mut block = [0; 18];
+        block[..2].copy_from_slice(&f16::from_f32(0.5).to_bits().to_le_bytes());
+        block[2] = 0xf0;
+        block[17] = 0x87;
+        let mut output = [0.0; 32];
+        decode(20, &block, &mut output);
+        assert_eq!(
+            (output[0], output[15], output[16], output[31]),
+            (-63.5, -5.0, 56.5, 0.5)
+        );
+    }
+
+    #[test]
+    fn decodes_q4_0_split_nibbles_with_signed_scale() {
+        let mut block = [0; 18];
+        block[..2].copy_from_slice(&f16::from_f32(-0.5).to_bits().to_le_bytes());
+        block[2] = 0xf1;
+        block[17] = 0x28;
+        let mut output = [0.0; 32];
+        decode(2, &block, &mut output);
+        assert_eq!(
+            (output[0], output[15], output[16], output[31]),
+            (3.5, 0.0, -3.5, 3.0)
+        );
+    }
+
+    #[test]
+    fn decodes_q4_1_split_nibbles_with_affine_offset() {
+        let mut block = [0; 20];
+        block[..2].copy_from_slice(&f16::from_f32(0.5).to_bits().to_le_bytes());
+        block[2..4].copy_from_slice(&f16::from_f32(-3.0).to_bits().to_le_bytes());
+        block[4] = 0xf1;
+        block[19] = 0x28;
+        let mut output = [0.0; 32];
+        assert!(finite_packed(3, &block));
+        decode(3, &block, &mut output);
+        assert_eq!(
+            (output[0], output[15], output[16], output[31]),
+            (-2.5, 1.0, 4.5, -2.0)
+        );
+        block[2..4].copy_from_slice(&f16::INFINITY.to_bits().to_le_bytes());
+        assert!(!finite_packed(3, &block));
+    }
+
+    #[test]
+    fn decodes_q5_1_high_bits_with_affine_offset() {
+        let mut block = [0; 24];
+        block[..2].copy_from_slice(&f16::from_f32(0.5).to_bits().to_le_bytes());
+        block[2..4].copy_from_slice(&f16::from_f32(-3.0).to_bits().to_le_bytes());
+        block[4..8].copy_from_slice(&0x8000_0001u32.to_le_bytes());
+        block[8] = 0xf1;
+        block[23] = 0x28;
+        let mut output = [0.0; 32];
+        assert!(finite_packed(7, &block));
+        decode(7, &block, &mut output);
+        assert_eq!(
+            (output[0], output[15], output[16], output[31]),
+            (5.5, 1.0, 4.5, 6.0)
+        );
+        block[2..4].copy_from_slice(&f16::INFINITY.to_bits().to_le_bytes());
+        assert!(!finite_packed(7, &block));
     }
 
     #[test]

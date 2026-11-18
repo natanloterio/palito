@@ -252,6 +252,116 @@ RESIDUAL_MMA_ENTRY(residual_matmul_mma3, 3, false, false, 32)
 RESIDUAL_MMA_ENTRY(residual_matmul_mma3_rows64, 3, false, false, 64)
 #endif
 
+#if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_MMA3_SPLITK_RESEARCH)
+#if __CUDA_ARCH__ >= 800
+template<int Kind>
+__device__ void residual_mma_splitk_tile(const u8 *weights, const signed char *values,
+    const float *scales, const int *sums, float *partials, int width, int rows,
+    int tokens, int splits, int *status, ResidualMmaTile &s) {
+    int slot = blockIdx.y, split = blockIdx.z;
+    int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+    int group = lane / 4, thread = lane % 4;
+    int first_row = blockIdx.x * 32, warp_row = (warp / 2) * 16;
+    int warp_token = (warp % 2) * 16;
+    int input_count = width * tokens;
+    if (tid < 32) {
+        int assignment = slot * 32 + tid;
+        s.destination[tid] = assignment < tokens ? assignment : -1;
+    }
+    __syncthreads();
+    int slice_width = width / splits;
+    int k_start = split * slice_width, k_end = k_start + slice_width;
+    float total[3][2][4] = {};
+    for (int k = k_start; k < k_end; k += 32) {
+        for (int index = tid; index < 32 * 8; index += 128) {
+            int row = index / 8, pack = index % 8;
+            unsigned int packed = 0;
+            if (first_row + row < rows) {
+                const u8 *p = weights + (((u64)(first_row + row) * width + k) / 256)
+                    * (Kind == 12 ? 144 : 210);
+                packed = residual_packed_quant<Kind>(p, k % 256 + pack * 4);
+            }
+            s.weights[0][row][pack] = packed;
+            int source = s.destination[row];
+            u64 offset = (u64)(source < 0 ? 0 : source) * width + k + pack * 4;
+            #pragma unroll
+            for (int component = 0; component < 3; component++)
+                s.values[component][row][pack] = source >= 0 ?
+                    *(const unsigned int *)(values + (u64)component * input_count + offset) : 0;
+        }
+        if (tid < 32) {
+            float a0 = 0.0f, a1 = 0.0f, b = 0.0f;
+            if (first_row + tid < rows) {
+                const u8 *p = weights + (((u64)(first_row + tid) * width + k) / 256)
+                    * (Kind == 12 ? 144 : 210);
+                residual_parameters<Kind>(p, k % 256, a0, a1, b);
+            }
+            s.coefficient[0][tid][0] = a0;
+            s.coefficient[0][tid][1] = a1;
+            s.minimum[0][tid] = b;
+            int source = s.destination[tid];
+            u64 offset = ((u64)(source < 0 ? 0 : source) * width + k) / 32 * 3;
+            #pragma unroll
+            for (int component = 0; component < 3; component++) {
+                s.scales[tid][component] = source >= 0 ? scales[offset + component] : 0.0f;
+                s.sums[tid][component] = source >= 0 ? sums[offset + component] : 0;
+            }
+        }
+        __syncthreads();
+        residual_mma_accumulate<Kind, 0, 3, 32, 1, 2, false, 32>(
+            s, total, warp_row, warp_token, group, thread, true, true);
+        __syncthreads();
+    }
+    u64 split_base = (u64)split * tokens * rows;
+    #pragma unroll
+    for (int tile = 0; tile < 2; tile++) {
+        #pragma unroll
+        for (int item = 0; item < 4; item++) {
+            int row = first_row + warp_row + group + item / 2 * 8;
+            int assignment = s.destination[warp_token + tile * 8 + thread * 2 + item % 2];
+            if (row < rows && assignment >= 0) {
+                float result = (total[0][tile][item] + total[1][tile][item]) + total[2][tile][item];
+                if (!isfinite(result)) atomicOr(status, 4);
+                partials[split_base + (u64)assignment * rows + row] = result;
+            }
+        }
+    }
+}
+#endif
+
+extern "C" __global__ void residual_matmul_mma3_splitk(const u8 *weights, int kind,
+    const signed char *values, const float *scales, const int *sums, float *partials,
+    int width, int rows, int tokens, int splits, int *status) {
+#if __CUDA_ARCH__ >= 800
+    __shared__ ResidualMmaTile tile;
+    if (splits <= 0 || width % (splits * 32) != 0) {
+        if (threadIdx.x == 0) atomicOr(status, 8);
+        return;
+    }
+    if (kind == 12) {
+        residual_mma_splitk_tile<12>(weights, values, scales, sums, partials, width,
+            rows, tokens, splits, status, tile);
+    } else if (kind == 14) {
+        residual_mma_splitk_tile<14>(weights, values, scales, sums, partials, width,
+            rows, tokens, splits, status, tile);
+    } else if (threadIdx.x == 0) atomicOr(status, 8);
+#else
+    if (threadIdx.x == 0) atomicOr(status, 16);
+#endif
+}
+
+extern "C" __global__ void residual_splitk_reduce(const float *partials,
+    float *output, int count, int splits, int *status) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    float sum = partials[i];
+    for (int s = 1; s < splits; s++)
+        sum += partials[(u64)s * count + i];
+    if (!isfinite(sum)) atomicOr(status, 4);
+    output[i] = sum;
+}
+#endif
+
 #ifdef CUDA_M8_PROTOTYPES
 #if __CUDA_ARCH__ >= 800
 union ResidualMixedTiles {
@@ -262,6 +372,11 @@ union ResidualMixedTiles {
 union ResidualSameExpertTiles {
     ResidualMmaTile single;
     ResidualMmaTileComponents<3, 64> pair;
+};
+
+struct ResidualSameExpertWarp8Tile {
+    ResidualMmaTileComponents<3, 64, 1, 32> base;
+    int source[64];
 };
 
 template<int Kind>
@@ -279,6 +394,91 @@ __device__ __forceinline__ void residual_mma_same_expert(const u8 *weights,
         residual_mma_tile<Kind, 3, false, 64, false>(weights, values, scales, sums,
             output, width, rows, tokens, groups, used, 1, assignment_major, status,
             tiles.pair, nullptr, first, second);
+    }
+}
+
+template<int Kind>
+__device__ void residual_mma_same_expert_warp8(const u8 *weights,
+    const signed char *values, const float *scales, const int *sums, float *output,
+    int width, int rows, int tokens, const int *groups, int used, int assignment_major,
+    const int *schedule, int *status, ResidualSameExpertWarp8Tile &s) {
+    int first_slot = schedule[blockIdx.y * 2], second_slot = schedule[blockIdx.y * 2 + 1];
+    if (first_slot < 0) return;
+    int expert = groups[first_slot * 33];
+    if (expert < 0) return;
+    bool paired = second_slot >= 0;
+    int cols = paired ? 64 : 32;
+    int tid = threadIdx.x;
+    int warp = tid / 32, lane = tid % 32;
+    int group = lane / 4, thread = lane % 4;
+    int first_row = blockIdx.x * 32;
+    int warp_row = (warp / 4) * 16;
+    int warp_token = (warp % 4) * (paired ? 16 : 8);
+    int input_count = width * tokens * (assignment_major ? used : 1);
+    if (tid < cols) {
+        int source_slot = tid >= 32 ? second_slot : first_slot;
+        int assignment = groups[source_slot * 33 + tid % 32 + 1];
+        s.base.destination[tid] = assignment;
+        s.source[tid] = !assignment_major && assignment >= 0 ? assignment / used : assignment;
+    }
+    __syncthreads();
+    float total[3][2][4] = {};
+    int row_load = tid / 8, pack_load = tid % 8;
+    for (int k = 0; k < width; k += 32) {
+        unsigned int packed = 0;
+        if (first_row + row_load < rows) {
+            const u8 *p = weights + (((u64)(expert * rows + first_row + row_load) * width + k) / 256)
+                * (Kind == 12 ? 144 : 210);
+            packed = residual_packed_quant<Kind>(p, k % 256 + pack_load * 4);
+        }
+        s.base.weights[0][row_load][pack_load] = packed;
+        #pragma unroll 1
+        for (int col = row_load; col < cols; col += 32) {
+            int source = s.source[col];
+            u64 offset = (u64)(source < 0 ? 0 : source) * width + k + pack_load * 4;
+            #pragma unroll
+            for (int component = 0; component < 3; component++)
+                s.base.values[component][col][pack_load] = source >= 0 ?
+                    *(const unsigned int *)(values + (u64)component * input_count + offset) : 0;
+        }
+        if (tid < 32) {
+            float a0 = 0.0f, a1 = 0.0f, b = 0.0f;
+            if (first_row + tid < rows) {
+                const u8 *p = weights + (((u64)(expert * rows + first_row + tid) * width + k) / 256)
+                    * (Kind == 12 ? 144 : 210);
+                residual_parameters<Kind>(p, k % 256, a0, a1, b);
+            }
+            s.base.coefficient[0][tid][0] = a0;
+            s.base.coefficient[0][tid][1] = a1;
+            s.base.minimum[0][tid] = b;
+        } else if (tid < 32 + cols) {
+            int col = tid - 32;
+            int source = s.source[col];
+            u64 offset = ((u64)(source < 0 ? 0 : source) * width + k) / 32 * 3;
+            #pragma unroll
+            for (int component = 0; component < 3; component++) {
+                s.base.scales[col][component] = source >= 0 ? scales[offset + component] : 0.0f;
+                s.base.sums[col][component] = source >= 0 ? sums[offset + component] : 0;
+            }
+        }
+        __syncthreads();
+        residual_mma_accumulate<Kind, 0, 3, 64, 1, 2, true, 32>(
+            s.base, total, warp_row, warp_token, group, thread, true, paired);
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int tile = 0; tile < 2; tile++) {
+        if (!paired && tile == 1) continue;
+        #pragma unroll
+        for (int item = 0; item < 4; item++) {
+            int row = first_row + warp_row + group + item / 2 * 8;
+            int assignment = s.base.destination[warp_token + tile * 8 + thread * 2 + item % 2];
+            if (row < rows && assignment >= 0) {
+                float result = (total[0][tile][item] + total[1][tile][item]) + total[2][tile][item];
+                if (!isfinite(result)) atomicOr(status, 4);
+                output[(u64)assignment * rows + row] = result;
+            }
+        }
     }
 }
 
@@ -317,6 +517,24 @@ extern "C" __global__ void residual_matmul_mma3_same_expert(const u8 *weights, i
     } else if (kind == 14) {
         residual_mma_same_expert<14>(weights, values, scales, sums, output, width, rows,
             tokens, groups, used, assignment_major, schedule, status, tiles);
+    } else if (threadIdx.x == 0) atomicOr(status, 8);
+#else
+    if (threadIdx.x == 0) atomicOr(status, 16);
+#endif
+}
+
+extern "C" __global__ void residual_matmul_mma3_same_expert_warp8(const u8 *weights, int kind,
+    const signed char *values, const float *scales, const int *sums, float *output,
+    int width, int rows, int tokens, const int *groups, int used, int assignment_major,
+    const int *schedule, int *status) {
+#if __CUDA_ARCH__ >= 800
+    __shared__ ResidualSameExpertWarp8Tile tile;
+    if (kind == 12) {
+        residual_mma_same_expert_warp8<12>(weights, values, scales, sums, output, width, rows,
+            tokens, groups, used, assignment_major, schedule, status, tile);
+    } else if (kind == 14) {
+        residual_mma_same_expert_warp8<14>(weights, values, scales, sums, output, width, rows,
+            tokens, groups, used, assignment_major, schedule, status, tile);
     } else if (threadIdx.x == 0) atomicOr(status, 8);
 #else
     if (threadIdx.x == 0) atomicOr(status, 16);

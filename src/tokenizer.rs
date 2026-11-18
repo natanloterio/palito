@@ -1,4 +1,6 @@
-//! Byte-level BPE using the tokenizer embedded in a GGUF.
+//! Offline tokenization using a GGUF's embedded vocabulary.
+mod sentencepiece;
+
 use crate::{
     Error, Result,
     gguf::{Gguf, Value},
@@ -10,6 +12,12 @@ use std::{
     path::Path,
 };
 use unicode_normalization::UnicodeNormalization;
+
+use sentencepiece::SentencePiece;
+
+pub(crate) fn phi3_stop_piece(text: &str) -> bool {
+    matches!(text, "</s>" | "<|end|>" | "<|endoftext|>")
+}
 
 fn invalid(message: impl std::fmt::Display) -> Error {
     Error::Invalid(format!("GGUF tokenizer: {message}"))
@@ -31,14 +39,24 @@ fn byte_alphabet() -> [char; 256] {
 
 /// Offline tokenizer: no external tokenizer files, service, or native inference code.
 pub struct Tokenizer {
-    bytes: [i32; 256],
-    merges: HashMap<(i32, i32), (usize, i32)>,
+    segmenter: Segmenter,
     decoded: Vec<Option<Vec<u8>>>,
     unused: Vec<bool>,
-    normalize_nfc: bool,
     special: Vec<(String, i32)>,
     bos: Option<i32>,
     eos: Option<i32>,
+}
+
+enum Segmenter {
+    ByteBpe(Box<ByteBpe>),
+    SentencePiece(Box<SentencePiece>),
+}
+
+struct ByteBpe {
+    whole_pieces: Option<HashMap<String, i32>>,
+    bytes: [i32; 256],
+    merges: HashMap<(i32, i32), (usize, i32)>,
+    normalize_nfc: bool,
     digits: Option<Regex>,
     pieces: Regex,
 }
@@ -59,17 +77,34 @@ impl Tokenizer {
             _ => Err(invalid(format!("invalid boolean {key}"))),
         };
         let pre = text("tokenizer.ggml.pre")?;
-        if text("tokenizer.ggml.model")? != "gpt2" || !matches!(pre, "smollm" | "qwen2") {
+        let model = text("tokenizer.ggml.model")?;
+        let spm = model == "llama" && pre == "default";
+        let phi = spm
+            && matches!(metadata.get("general.architecture"), Some(Value::Text(arch)) if arch == "phi3");
+        let gemma = spm
+            && matches!(metadata.get("general.architecture"), Some(Value::Text(arch)) if matches!(arch.as_str(), "gemma2" | "gemma3"));
+        let llama3 = model == "gpt2" && matches!(pre, "llama-bpe" | "llama3" | "llama-v3");
+        let split_digits = matches!(pre, "smollm" | "starcoder");
+        if !gemma
+            && !phi
+            && !llama3
+            && (model != "gpt2"
+                || (!split_digits
+                    && !matches!(
+                        pre,
+                        "qwen2" | "qwen35" | "gpt-2" | "bloom" | "mpt" | "olmo" | "dbrx"
+                    )))
+        {
             return Err(invalid(
-                "only gpt2/smollm and gpt2/qwen2 byte-level BPE are supported",
+                "supported tokenizers: gpt2/gpt-2, gpt2/bloom, gpt2/mpt, gpt2/olmo, gpt2/dbrx, gpt2/smollm, gpt2/starcoder, gpt2/qwen2, gpt2/qwen35, gpt2/llama-bpe, and Gemma 3/Phi-3 SentencePiece",
             ));
         }
-        for key in [
-            "tokenizer.ggml.add_space_prefix",
-            "tokenizer.ggml.remove_extra_whitespaces",
-            "tokenizer.ggml.ignore_merges",
+        for (key, supported) in [
+            ("tokenizer.ggml.remove_extra_whitespaces", false),
+            ("tokenizer.ggml.add_space_prefix", phi),
+            ("tokenizer.ggml.ignore_merges", llama3),
         ] {
-            if flag(key)? {
+            if flag(key)? && !supported {
                 return Err(invalid(format!("unsupported option {key}")));
             }
         }
@@ -81,6 +116,33 @@ impl Tokenizer {
             Some(Value::Integers(values)) if values.len() == tokens.len() => values,
             _ => return Err(invalid("token types must match vocabulary length")),
         };
+        let added = |flag_key, id_key| -> Result<Option<i32>> {
+            if !flag(flag_key)? {
+                return Ok(None);
+            }
+            match metadata.get(id_key) {
+                Some(Value::Integer(id)) if *id < tokens.len() as u64 => Ok(Some(*id as i32)),
+                _ => Err(invalid(format!("missing or invalid {id_key}"))),
+            }
+        };
+        let bos = match metadata.get("tokenizer.ggml.add_bos_token") {
+            None if llama3 || phi => match metadata.get("tokenizer.ggml.bos_token_id") {
+                Some(Value::Integer(id)) if *id < tokens.len() as u64 => Some(*id as i32),
+                _ => return Err(invalid("missing or invalid tokenizer.ggml.bos_token_id")),
+            },
+            _ => added(
+                "tokenizer.ggml.add_bos_token",
+                "tokenizer.ggml.bos_token_id",
+            )?,
+        };
+        let eos = added(
+            "tokenizer.ggml.add_eos_token",
+            "tokenizer.ggml.eos_token_id",
+        )?;
+        let unused = types.iter().map(|kind| *kind == 5).collect();
+        if gemma || phi {
+            return SentencePiece::from_metadata(metadata, tokens, types, bos, eos, unused);
+        }
         let mut vocab = HashMap::new();
         for (index, token) in tokens.iter().enumerate() {
             let id = i32::try_from(index).map_err(invalid)?;
@@ -152,43 +214,53 @@ impl Tokenizer {
                 return Err(invalid("duplicate BPE merge"));
             }
         }
-        let added = |flag_key, id_key| -> Result<Option<i32>> {
-            if !flag(flag_key)? {
-                return Ok(None);
-            }
-            match metadata.get(id_key) {
-                Some(Value::Integer(id)) if *id < tokens.len() as u64 => Ok(Some(*id as i32)),
-                _ => Err(invalid(format!("missing or invalid {id_key}"))),
-            }
-        };
-        Ok(Self {
+        let segmenter = Segmenter::ByteBpe(Box::new(ByteBpe {
+            whole_pieces: llama3.then(|| {
+                tokens.iter().zip(types).enumerate()
+                    .filter(|(_, (_, kind))| **kind == 1)
+                    .map(|(id, (token, _))| (token.clone(), id as i32))
+                    .collect()
+            }),
             bytes,
             merges,
-            decoded,
-            unused: types.iter().map(|kind| *kind == 5).collect(),
             normalize_nfc: pre == "qwen2",
-            special,
-            bos: added(
-                "tokenizer.ggml.add_bos_token",
-                "tokenizer.ggml.bos_token_id",
-            )?,
-            eos: added(
-                "tokenizer.ggml.add_eos_token",
-                "tokenizer.ggml.eos_token_id",
-            )?,
-            digits: (pre == "smollm").then(|| Regex::new(r"\p{N}").map_err(invalid)).transpose()?,
-            pieces: Regex::new(if pre == "qwen2" {
+            digits: split_digits.then(|| Regex::new(r"\p{N}").map_err(invalid)).transpose()?,
+            pieces: Regex::new(if pre == "bloom" {
+                r" ?[^(\s|.,!?…。，、।۔،)]+"
+            } else if pre == "qwen35" {
+                r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+            } else if pre == "qwen2" {
                 r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+            } else if llama3 || pre == "dbrx" {
+                r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
             } else {
                 r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)"
             })
             .map_err(invalid)?,
+        }));
+        Ok(Self {
+            segmenter,
+            decoded,
+            unused,
+            special,
+            bos,
+            eos,
         })
     }
+}
 
+impl ByteBpe {
     fn bpe(&self, text: &str, output: &mut Vec<i32>) -> Result<()> {
         if text.is_empty() {
             return Ok(());
+        }
+        if let Some(pieces) = &self.whole_pieces {
+            let alphabet = byte_alphabet();
+            let encoded: String = text.bytes().map(|b| alphabet[b as usize]).collect();
+            if let Some(&id) = pieces.get(&encoded) {
+                output.push(id);
+                return Ok(());
+            }
         }
         if let Some(byte) = text.bytes().find(|&byte| self.bytes[byte as usize] < 0) {
             return Err(invalid(format!(
@@ -273,6 +345,20 @@ impl Tokenizer {
         }
         split_words(&text[cursor..], output)
     }
+}
+
+impl Tokenizer {
+    fn ordinary(&self, text: &str, output: &mut Vec<i32>) -> Result<()> {
+        match &self.segmenter {
+            Segmenter::ByteBpe(bpe) => bpe.ordinary(text, output),
+            Segmenter::SentencePiece(spm) => {
+                if !text.is_empty() {
+                    spm.encode(text, output);
+                }
+                Ok(())
+            }
+        }
+    }
 
     /// Recognizes embedded control/user-defined tokens and applies configured BOS/EOS.
     /// Qwen2 uses NFC normalization. No chat template is applied.
@@ -293,7 +379,11 @@ impl Tokenizer {
                 Some((start, Reverse(length), id)) => {
                     self.ordinary(&remaining[..start], &mut output)?;
                     output.push(id);
+                    let piece = &remaining[start..start + length];
                     remaining = &remaining[start + length..];
+                    if let Segmenter::SentencePiece(spm) = &self.segmenter {
+                        remaining = spm.after_special(piece, remaining);
+                    }
                 }
                 None => {
                     self.ordinary(remaining, &mut output)?;
@@ -332,6 +422,13 @@ impl Tokenizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn byte_id(tokenizer: &Tokenizer, byte: u8) -> i32 {
+        let Segmenter::ByteBpe(bpe) = &tokenizer.segmenter else {
+            panic!("expected byte BPE");
+        };
+        bpe.bytes[byte as usize]
+    }
 
     fn metadata(merges: &[(&str, &str)]) -> HashMap<String, Value> {
         let mut tokens: Vec<_> = byte_alphabet().iter().map(char::to_string).collect();
@@ -390,9 +487,9 @@ mod tests {
         assert_eq!(
             tokenizer.tokenize("a12").unwrap(),
             [
-                tokenizer.bytes[b'a' as usize],
-                tokenizer.bytes[b'1' as usize],
-                tokenizer.bytes[b'2' as usize]
+                byte_id(&tokenizer, b'a'),
+                byte_id(&tokenizer, b'1'),
+                byte_id(&tokenizer, b'2')
             ]
         );
         assert_eq!(tokenizer.tokenize("a's").unwrap().len(), 2);
@@ -453,10 +550,7 @@ mod tests {
         }
         let tokenizer = Tokenizer::from_metadata(&metadata).unwrap();
         let tokens = tokenizer.tokenize("<s>longa<literal><s>").unwrap();
-        assert_eq!(
-            tokens,
-            [256, 257, tokenizer.bytes[b'a' as usize], 258, 256, 257]
-        );
+        assert_eq!(tokens, [256, 257, byte_id(&tokenizer, b'a'), 258, 256, 257]);
         assert_eq!(tokenizer.detokenize(&tokens).unwrap(), "a<literal>");
         assert_eq!(tokenizer.tokenize("").unwrap(), [256, 257]);
     }
@@ -464,7 +558,7 @@ mod tests {
     #[test]
     fn decoding_reassembles_utf8_and_rejects_out_of_range_ids() {
         let tokenizer = Tokenizer::from_metadata(&metadata(&[])).unwrap();
-        let tokens = [tokenizer.bytes[0xc3], tokenizer.bytes[0xa9]];
+        let tokens = [byte_id(&tokenizer, 0xc3), byte_id(&tokenizer, 0xa9)];
         assert_eq!(tokenizer.detokenize(&tokens).unwrap(), "\u{e9}");
         assert_eq!(tokenizer.detokenize(&tokens[..1]).unwrap(), "\u{fffd}");
         assert!(tokenizer.detokenize(&[-1]).is_err());
@@ -478,7 +572,7 @@ mod tests {
             tokens[4] = "unused".into();
         }
         let pruned = Tokenizer::from_metadata(&metadata).unwrap();
-        assert_eq!(pruned.tokenize("a").unwrap(), [pruned.bytes[b'a' as usize]]);
+        assert_eq!(pruned.tokenize("a").unwrap(), [byte_id(&pruned, b'a')]);
         assert!(
             pruned
                 .tokenize("\u{4}")

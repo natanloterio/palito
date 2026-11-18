@@ -37,7 +37,27 @@ fn tiny_weights_shape(
     layers: u32,
     context: u32,
 ) -> Vec<u8> {
-    let integers = if dense {
+    tiny_weights_arch(
+        if dense { "llama" } else { "qwen3moe" },
+        used,
+        overflow_first_token,
+        layers,
+        context,
+        4,
+    )
+}
+
+fn tiny_weights_arch(
+    arch: &str,
+    used: u32,
+    overflow_first_token: bool,
+    layers: u32,
+    context: u32,
+    value_length: u32,
+) -> Vec<u8> {
+    let dense = arch != "qwen3moe";
+    let qk_norm = arch != "llama";
+    let mut integers = if dense {
         vec![
             ("embedding_length", 4),
             ("attention.head_count", 2),
@@ -45,15 +65,13 @@ fn tiny_weights_shape(
             ("block_count", layers),
             ("feed_forward_length", 4),
             ("context_length", context),
-            ("rope.dimension_count", 2),
+            ("rope.dimension_count", if qk_norm { 4 } else { 2 }),
         ]
     } else {
         vec![
             ("embedding_length", 4),
             ("attention.head_count", 2),
             ("attention.head_count_kv", 1),
-            ("attention.key_length", 4),
-            ("attention.value_length", 4),
             ("block_count", layers),
             ("expert_feed_forward_length", 4),
             ("expert_count", 3),
@@ -61,14 +79,26 @@ fn tiny_weights_shape(
             ("context_length", context),
         ]
     };
+    if qk_norm {
+        integers.extend([
+            ("attention.key_length", 4),
+            ("attention.value_length", value_length),
+        ]);
+    }
+    if arch == "gemma3" {
+        integers.extend([
+            ("attention.sliding_window", 2),
+            ("attention.sliding_window_pattern", 2),
+        ]);
+    }
     let mut tensors: Vec<(String, Vec<u64>)> = vec![
         ("token_embd.weight".to_owned(), vec![4, 4]),
         ("output_norm.weight".to_owned(), vec![4]),
         ("output.weight".to_owned(), vec![4, 4]),
     ];
     for layer in 0..layers {
-        let q = if dense { 4 } else { 8 };
-        let kv = if dense { 2 } else { 4 };
+        let q = if qk_norm { 8 } else { 4 };
+        let kv = if qk_norm { 4 } else { 2 };
         for (name, dims) in [
             ("attn_norm.weight", vec![4]),
             ("attn_q.weight", vec![4, q]),
@@ -78,9 +108,14 @@ fn tiny_weights_shape(
         ] {
             tensors.push((format!("blk.{layer}.{name}"), dims));
         }
-        if !dense {
+        if qk_norm {
             for name in ["attn_q_norm.weight", "attn_k_norm.weight"] {
                 tensors.push((format!("blk.{layer}.{name}"), vec![4]));
+            }
+            if arch == "gemma3" {
+                for name in ["post_attention_norm.weight", "post_ffw_norm.weight"] {
+                    tensors.push((format!("blk.{layer}.{name}"), vec![4]));
+                }
             }
         }
         tensors.push((format!("blk.{layer}.ffn_norm.weight"), vec![4]));
@@ -99,7 +134,6 @@ fn tiny_weights_shape(
             }
         }
     }
-    let arch = if dense { "llama" } else { "qwen3moe" };
     let mut bytes = b"GGUF".to_vec();
     bytes.extend_from_slice(&3u32.to_le_bytes());
     bytes.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
@@ -119,7 +153,12 @@ fn tiny_weights_shape(
     bytes.extend_from_slice(&9u32.to_le_bytes());
     bytes.extend_from_slice(&8u32.to_le_bytes());
     bytes.extend_from_slice(&4u64.to_le_bytes());
-    for token in ["a", "b", "<|endoftext|>", "<|im_end|>"] {
+    let tokens = if arch == "gemma3" {
+        ["a", "b", "<end_of_turn>", "<eos>"]
+    } else {
+        ["a", "b", "<|endoftext|>", "<|im_end|>"]
+    };
+    for token in tokens {
         string(&mut bytes, token);
     }
     string(&mut bytes, "tokenizer.ggml.token_type");
@@ -361,6 +400,94 @@ fn moe_cpu_oracle_preserves_causal_state_across_chunks_and_reset() {
             .generate(&[0, 1, 2, 0, 1], 5, GenerationMode::FixedLength)
             .is_err()
     );
+}
+
+#[test]
+fn dense_qwen3_cpu_handles_wide_queries_and_rejects_mismatched_heads() {
+    let good = Fixture::from_bytes("qwen3", &tiny_weights_arch("qwen3", 0, false, 2, 8, 4));
+    let bad = Fixture::from_bytes(
+        "qwen3-bad-heads",
+        &tiny_weights_arch("qwen3", 0, false, 2, 8, 2),
+    );
+    let mut backend = ReferenceBackend::open(&good.0, &config()).unwrap();
+    assert_eq!(backend.info().architecture, "qwen3");
+    assert!(backend.is_eog(2));
+    assert!(backend.is_eog(3));
+    assert!(!backend.is_eog(0));
+    assert!(ReferenceBackend::open(&bad.0, &config()).is_err());
+    backend.evaluate(&[0, 1, 0], 0).unwrap();
+    let expected = backend.logits().unwrap().to_vec();
+    backend.reset().unwrap();
+    for (position, token) in [0, 1, 0].into_iter().enumerate() {
+        backend.evaluate(&[token], position as u32).unwrap();
+    }
+    assert_eq!(backend.logits().unwrap(), expected);
+}
+
+#[test]
+#[ignore = "requires CUDA 13 NVRTC/driver; run serially in release mode"]
+fn gpu_dense_qwen3_matches_cpu_across_prefill_and_decode() {
+    let fixture = Fixture::from_bytes("qwen3-gpu", &tiny_weights_arch("qwen3", 0, false, 2, 8, 4));
+    let mut gpu = CudaBackend::open(&fixture.0, &config(), CudaOptions::default()).unwrap();
+    let mut reference = ReferenceBackend::open(&fixture.0, &config()).unwrap();
+    for (position, tokens) in [(0, &[0, 1, 0][..]), (3, &[1, 0][..]), (5, &[1][..])] {
+        gpu.evaluate(tokens, position).unwrap();
+        reference.evaluate(tokens, position).unwrap();
+        let expected = reference.logits().unwrap();
+        let actual = gpu.logits().unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (&a, &b) in actual.iter().zip(expected) {
+            assert!((a - b).abs() < 1e-5, "{a} != {b}");
+        }
+        assert_eq!(
+            gpu.sample_greedy().unwrap(),
+            reference.sample_greedy().unwrap()
+        );
+    }
+}
+
+#[test]
+fn gemma3_reference_masks_evicted_tokens_only_in_local_layers() {
+    let local = Fixture::from_bytes(
+        "gemma-local",
+        &tiny_weights_arch("gemma3", 0, false, 1, 8, 4),
+    );
+    let mixed = Fixture::from_bytes(
+        "gemma-mixed",
+        &tiny_weights_arch("gemma3", 0, false, 2, 8, 4),
+    );
+    for (fixture, evicted) in [(&local, true), (&mixed, false)] {
+        let mut backend = ReferenceBackend::open(&fixture.0, &config()).unwrap();
+        assert!(backend.is_eog(2) && backend.is_eog(3));
+        assert!(!backend.is_eog(0));
+        backend.evaluate(&[0, 1, 0], 0).unwrap();
+        let expected = backend.logits().unwrap().to_vec();
+        backend.reset().unwrap();
+        backend.evaluate(&[0, 1], 0).unwrap();
+        backend.evaluate(&[0], 2).unwrap();
+        assert_eq!(backend.logits().unwrap(), expected);
+        backend.reset().unwrap();
+        backend.evaluate(&[1, 1, 0], 0).unwrap();
+        assert_eq!(backend.logits().unwrap() == expected, evicted);
+    }
+}
+
+#[test]
+#[ignore = "requires CUDA 13 NVRTC/driver; run serially in release mode"]
+fn gpu_gemma3_matches_cpu_across_local_window_and_split_prefill() {
+    let fixture = Fixture::from_bytes("gemma-gpu", &tiny_weights_arch("gemma3", 0, false, 2, 8, 4));
+    let mut gpu = CudaBackend::open(&fixture.0, &config(), CudaOptions::default()).unwrap();
+    let mut reference = ReferenceBackend::open(&fixture.0, &config()).unwrap();
+    for (position, tokens) in [(0, &[0, 1, 0][..]), (3, &[1][..]), (4, &[0, 1][..])] {
+        gpu.evaluate(tokens, position).unwrap();
+        reference.evaluate(tokens, position).unwrap();
+        let actual = gpu.logits().unwrap();
+        let expected = reference.logits().unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (&a, &b) in actual.iter().zip(expected) {
+            assert!((a - b).abs() < 1e-5, "position {position}: {a} != {b}");
+        }
+    }
 }
 
 #[test]

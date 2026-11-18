@@ -1,6 +1,5 @@
 //! Independent CUDA kernels over packed GGUF weights. No GGML or native inference engine.
 pub mod diagnostics;
-pub mod reference;
 
 use crate::{
     Config, Error, Result,
@@ -260,7 +259,9 @@ fn prefill_capacity(spec: &Spec) -> usize {
 }
 
 fn fused_attention_supported(spec: &Spec) -> bool {
-    spec.dim <= 256 && spec.info.context_tokens <= 1024
+    spec.dim <= 256
+        && spec.info.context_tokens <= 1024
+        && !matches!(spec.info.architecture.as_str(), "gemma2" | "gemma3")
 }
 
 fn routing_elements(spec: &Spec) -> Result<usize> {
@@ -460,6 +461,209 @@ macro_rules! launch_position {
     }};
 }
 
+macro_rules! alibi_attention {
+    ($backend:ident, $layer:expr, $heads:expr, $kv_heads:expr, $dim:expr, $context:expr,
+     $count:expr, $tokens:expr) => {{
+        let tokens = $tokens;
+        launch!(
+            $backend,
+            "alibi_attention_scores",
+            ($heads as u32, ($count + tokens - 1) as u32, tokens as u32),
+            &$backend.work.q,
+            &$backend.keys[$layer],
+            &mut $backend.work.scores,
+            &$dim,
+            &$heads,
+            &$kv_heads,
+            &$context,
+            &$count,
+            &crate::transformer::BLOOM_ALIBI_MAX
+        );
+        launch!(
+            $backend,
+            "attention_values",
+            ($heads as u32, tokens as u32, 1),
+            &mut $backend.work.scores,
+            &$backend.values[$layer],
+            &mut $backend.work.attended,
+            &$dim,
+            &$heads,
+            &$kv_heads,
+            &$context,
+            &$count
+        );
+    }};
+}
+
+macro_rules! gemma_attention {
+    ($backend:ident, $layer:expr, $heads:expr, $kv_heads:expr, $dim:expr, $context:expr,
+     $count:expr, $tokens:expr, $window:expr, $scale:expr, $softcap:expr) => {{
+        let tokens = $tokens;
+        launch!(
+            $backend,
+            "gemma_attention_scores",
+            ($heads as u32, ($count + tokens - 1) as u32, tokens as u32),
+            &$backend.work.q,
+            &$backend.keys[$layer],
+            &mut $backend.work.scores,
+            &$dim,
+            &$heads,
+            &$kv_heads,
+            &$context,
+            &$count,
+            &$window,
+            &$scale,
+            &$softcap
+        );
+        launch!(
+            $backend,
+            "gemma_attention_values",
+            ($heads as u32, tokens as u32, 1),
+            &mut $backend.work.scores,
+            &$backend.values[$layer],
+            &mut $backend.work.attended,
+            &$dim,
+            &$heads,
+            &$kv_heads,
+            &$context,
+            &$count,
+            &$window
+        );
+    }};
+}
+
+macro_rules! gemma_post_norm {
+    ($backend:ident, $input:ident, $norm:expr, $tokens:expr, $width:expr, $epsilon:expr) => {{
+        let elements = $tokens * $width;
+        launch!(
+            $backend,
+            "normalize",
+            ($tokens as u32, 1, 1),
+            &$backend.work.$input,
+            &$norm.bytes,
+            &mut $backend.work.normalized,
+            &$width,
+            &$epsilon
+        );
+        launch!(
+            $backend,
+            "residual",
+            ((elements as u32).div_ceil(256), 1, 1),
+            &mut $backend.work.x,
+            &$backend.work.normalized,
+            &elements
+        );
+    }};
+}
+
+macro_rules! transformer_norm {
+    ($backend:ident, $input:expr, $weight:expr, $bias:expr, $n:expr, $width:expr, $eps:expr) => {{
+        let grid = ($n as u32, 1, 1);
+        if let (Some(weight), Some(bias)) = ($weight, $bias) {
+            launch!(
+                $backend,
+                "layer_norm_affine",
+                grid,
+                $input,
+                &weight.bytes,
+                &bias.bytes,
+                &mut $backend.work.normalized,
+                &$width,
+                &$eps
+            );
+        } else if let Some(weight) = $weight {
+            launch!(
+                $backend,
+                "normalize",
+                grid,
+                $input,
+                &weight.bytes,
+                &mut $backend.work.normalized,
+                &$width,
+                &$eps
+            );
+        } else {
+            launch!(
+                $backend,
+                "layer_norm_plain",
+                grid,
+                $input,
+                &mut $backend.work.normalized,
+                &$width,
+                &$eps
+            );
+        }
+    }};
+}
+
+macro_rules! affine_ffn {
+    ($backend:ident, $layer:expr, $bias:expr, $n:expr, $width:expr, $parallel:expr) => {{
+        let (layer, bias, n) = ($layer, $bias, $n);
+        let up = &layer.up;
+        let down = &layer.down;
+        let tiles = (n as u32).div_ceil(4);
+        launch!(
+            $backend,
+            "prefill_matmul",
+            (up.rows as u32, tiles, 1),
+            &up.bytes,
+            &up.kind,
+            &$backend.work.normalized,
+            &mut $backend.work.up,
+            &up.width,
+            &up.rows,
+            &n
+        );
+        launch!(
+            $backend,
+            "gelu_row_bias",
+            ((up.rows as u32).div_ceil(256), n as u32, 1),
+            &mut $backend.work.up,
+            &bias.up.bytes,
+            &up.rows
+        );
+        launch!(
+            $backend,
+            "prefill_matmul",
+            (down.rows as u32, tiles, 1),
+            &down.bytes,
+            &down.kind,
+            &$backend.work.up,
+            &mut $backend.work.down,
+            &down.width,
+            &down.rows,
+            &n
+        );
+        launch!(
+            $backend,
+            "add_row_bias",
+            (($width as u32).div_ceil(256), n as u32, 1),
+            &mut $backend.work.down,
+            &bias.down.bytes,
+            &$width
+        );
+        let count = n * $width;
+        launch!(
+            $backend,
+            "residual",
+            ((count as u32).div_ceil(256), 1, 1),
+            &mut $backend.work.x,
+            &$backend.work.down,
+            &count
+        );
+        if $parallel {
+            launch!(
+                $backend,
+                "residual",
+                ((count as u32).div_ceil(256), 1, 1),
+                &mut $backend.work.x,
+                &$backend.work.projected,
+                &count
+            );
+        }
+    }};
+}
+
 #[cfg(test)]
 mod arithmetic;
 mod batch;
@@ -475,6 +679,7 @@ mod model_replay;
 mod packed_decode;
 #[cfg(test)]
 mod prefill;
+pub mod reference;
 #[cfg(test)]
 mod residual;
 #[cfg(test)]
@@ -494,6 +699,20 @@ pub struct CudaBackend {
     memory: MemoryUsage,
     matmul: CudaMatmul,
     diagnostic: Option<diagnostics::Capture>,
+}
+
+/// Open the native CUDA backend for the model's architecture.
+pub fn open_backend(
+    path: &Path,
+    config: &Config,
+    options: CudaOptions,
+) -> Result<Box<dyn Backend>> {
+    let metadata = crate::gguf::Gguf::read_metadata(path)?;
+    if matches!(metadata.get("general.architecture"), Some(crate::gguf::Value::Text(arch)) if arch == "qwen35")
+    {
+        return reference::qwen35::device::open(path, config, options);
+    }
+    Ok(Box::new(CudaBackend::open(path, config, options)?))
 }
 
 impl CudaBackend {
@@ -561,9 +780,8 @@ impl CudaBackend {
             } else {
                 ""
             };
-            packed_reduction_source = format!(
-                "{prefix}{gate_up}#define CUDA_PACKED_REDUCTION_RESEARCH 1\n{base_source}"
-            );
+            packed_reduction_source =
+                format!("{prefix}{gate_up}#define CUDA_PACKED_REDUCTION_RESEARCH 1\n{base_source}");
             &packed_reduction_source
         } else {
             base_source
@@ -628,6 +846,20 @@ impl CudaBackend {
         } else {
             source
         };
+        let source = if cfg!(feature = "cuda-mma3-splitk-research")
+            && options.matmul == CudaMatmul::ResidualMma3Research
+        {
+            format!("#define CUDA_MMA3_SPLITK_RESEARCH 1\n{source}")
+        } else {
+            source
+        };
+        let source = if cfg!(feature = "cuda-decode-fusion-research")
+            && options.matmul == CudaMatmul::ResidualMma3Research
+        {
+            format!("#define CUDA_DECODE_FUSION_RESEARCH 1\n{source}")
+        } else {
+            source
+        };
         #[cfg(feature = "cuda-attention-reuse-research")]
         let source = if options.matmul == CudaMatmul::ResidualMma3Research {
             let pair = if cfg!(feature = "cuda-attention-query-pair-research") {
@@ -655,12 +887,26 @@ impl CudaBackend {
             "check_finite",
             "matvec",
             "normalize",
+            "layer_norm_affine",
+            "layer_norm_plain",
+            "add_position_embedding",
+            "gelu_row_bias",
             "head_norm",
             "rotary",
+            "rotary_partial_neox",
+            "rotary_factored",
+            "add_row_bias",
             "cache_kv",
             "attention_scores",
+            "alibi_attention_scores",
             "attention_values",
+            "gemma_attention_scores",
+            "gemma_attention_values",
+            "gemma_embedding_scale",
+            "gemma_geglu",
+            "gemma_softcap",
             "router",
+            "router_full_softmax",
             "swiglu",
             "residual",
             "combine",
@@ -706,6 +952,11 @@ impl CudaBackend {
                     let name = "residual_matmul_mma3_rows64";
                     functions.insert(name, module.load_function(name).map_err(failure)?);
                 }
+                if cfg!(feature = "cuda-mma3-splitk-research") {
+                    for name in ["residual_matmul_mma3_splitk", "residual_splitk_reduce"] {
+                        functions.insert(name, module.load_function(name).map_err(failure)?);
+                    }
+                }
                 if cfg!(feature = "cuda-packed-down-research") {
                     let name = "matvec_packed_down_warp";
                     functions.insert(name, module.load_function(name).map_err(failure)?);
@@ -713,6 +964,16 @@ impl CudaBackend {
                 if cfg!(feature = "cuda-packed-gate-up-research") {
                     let name = "matvec_packed_gate_up";
                     functions.insert(name, module.load_function(name).map_err(failure)?);
+                }
+                if cfg!(feature = "cuda-decode-fusion-research") {
+                    for name in [
+                        "matvec_packed_qkv",
+                        "router_warp128",
+                        "qkv_head_norm_rope_cache",
+                        "qkv_head_norm_rope_cache_decode",
+                    ] {
+                        functions.insert(name, module.load_function(name).map_err(failure)?);
+                    }
                 }
                 for name in ["residual_quantize32_precise3", "residual_matmul_mma3"] {
                     functions.insert(name, module.load_function(name).map_err(failure)?);
@@ -750,6 +1011,67 @@ impl CudaBackend {
         }
         let weights = Weights::open(path, config)?;
         let s = &weights.spec;
+        if matches!(
+            s.info.architecture.as_str(),
+            "gpt2" | "starcoder2" | "bloom" | "gptneox" | "olmo" | "olmo2" | "olmoe"
+        ) && (options.decode_graph || options.matmul != CudaMatmul::F32)
+        {
+            return Err(invalid(format!(
+                "{} CUDA requires f32 matmul without a decode graph",
+                s.info.architecture
+            )));
+        }
+        if s.info.architecture == "qwen2"
+            && (options.decode_graph || options.matmul != CudaMatmul::F32)
+        {
+            return Err(invalid(
+                "qwen2 CUDA requires f32 matmul without a decode graph",
+            ));
+        }
+        if s.info.tensor_types.iter().any(|kind| kind == "Q5_K")
+            && (s.experts != 0 || options.decode_graph || options.matmul != CudaMatmul::F32)
+        {
+            return Err(invalid(
+                "Q5_K CUDA requires dense f32 matmul without a decode graph",
+            ));
+        }
+        if s.info.tensor_types.iter().any(|kind| {
+            matches!(
+                kind.as_str(),
+                "Q4_0" | "Q4_1" | "Q5_1" | "Q2_K" | "Q3_K" | "IQ4_NL"
+            )
+        }) && (s.experts != 0 || options.decode_graph || options.matmul != CudaMatmul::F32)
+        {
+            return Err(invalid(
+                "Q4_0/Q4_1/Q5_1/Q2_K/Q3_K/IQ4_NL CUDA requires dense f32 matmul without a decode graph",
+            ));
+        }
+        if s.info.tensor_types.iter().any(|kind| kind == "BF16")
+            && (s.experts != 0 || options.decode_graph || options.matmul != CudaMatmul::F32)
+        {
+            return Err(invalid(
+                "BF16 CUDA requires dense f32 matmul without a decode graph",
+            ));
+        }
+        if s.info.architecture == "phi3"
+            && (options.decode_graph || options.matmul != CudaMatmul::F32)
+        {
+            return Err(invalid(
+                "phi3 CUDA requires f32 matmul without a decode graph",
+            ));
+        }
+        if weights.rope_factors.is_some()
+            && (options.decode_graph || options.matmul != CudaMatmul::F32)
+        {
+            return Err(invalid(
+                "factored RoPE CUDA requires f32 matmul without a decode graph",
+            ));
+        }
+        if weights.gemma.is_some() && (options.decode_graph || options.matmul != CudaMatmul::F32) {
+            return Err(invalid(
+                "Gemma CUDA requires f32 matmul without a decode graph",
+            ));
+        }
         if options.decode_graph && !fused_attention_supported(s) {
             return Err(invalid(
                 "decode graph requires head dimension <=256 and context <=1024",
@@ -906,80 +1228,251 @@ impl CudaBackend {
             &token,
             []
         );
-        for (index, l) in self.weights.layers.iter().enumerate() {
+        let embedding_norm = self.weights.embedding_norm.as_ref();
+        if let Some([weight, bias]) = embedding_norm {
+            transformer_norm!(
+                self,
+                &self.work.x,
+                Some(weight),
+                Some(bias),
+                1,
+                w,
+                s.epsilon
+            );
+            std::mem::swap(&mut self.work.x, &mut self.work.normalized);
+        }
+        let position_embedding = self.weights.position_embedding.as_ref();
+        if let Some(t) = position_embedding {
             launch!(
                 self,
-                "normalize",
-                (1, 1, 1),
-                &self.work.x,
-                &l.norm.bytes,
-                &mut self.work.normalized,
+                "add_position_embedding",
+                vector(w),
+                &mut self.work.x,
+                &t.bytes,
+                &t.kind,
                 &w,
-                &s.epsilon
+                &pos
             );
-            for (tensor, output) in [
-                (&l.q, &mut self.work.q),
-                (&l.k, &mut self.work.k),
-                (&l.v, &mut self.work.v),
-            ] {
-                launch!(
+        }
+        let gemma = self.weights.gemma.as_ref();
+        if gemma.is_some() {
+            let scale = (w as f32).sqrt();
+            launch!(
+                self,
+                "gemma_embedding_scale",
+                vector(w),
+                &mut self.work.x,
+                &w,
+                &scale
+            );
+        }
+        for (index, l) in self.weights.layers.iter().enumerate() {
+            let gemma_attention = gemma.map(|g| g.attention(s, index));
+            let rope_base = gemma_attention.map_or(s.rope_base, |(_, base, _)| base);
+            let affine = l.affine.as_ref();
+            let olmo2 = s.info.architecture == "olmo2";
+            let olmoe = s.info.architecture == "olmoe";
+            if olmo2 {
+                self.stream
+                    .memcpy_dtod(
+                        &self.work.x.slice(..s.width),
+                        &mut self.work.normalized.slice_mut(..s.width),
+                    )
+                    .map_err(failure)?;
+            } else {
+                transformer_norm!(
                     self,
-                    "matvec",
-                    (tensor.rows as u32, 1, 1),
-                    &tensor.bytes,
-                    &tensor.kind,
-                    &self.work.normalized,
-                    output,
-                    &tensor.width,
-                    &tensor.rows,
-                    &self.work.ids,
-                    &0i32,
-                    &0i32
+                    &self.work.x,
+                    l.norm.as_ref(),
+                    affine.map(|b| &b.norm),
+                    1,
+                    w,
+                    s.epsilon
                 );
             }
-            for (norm, vector, size) in [
-                (&l.q_norm, &mut self.work.q, qw),
-                (&l.k_norm, &mut self.work.k, kw),
-            ] {
-                if let Some(norm) = norm {
+            if cfg!(feature = "cuda-decode-fusion-research")
+                && self.matmul == CudaMatmul::ResidualMma3Research
+                && l.q.width == l.k.width
+                && l.k.width == l.v.width
+                && l.q.width % 256 == 0
+                && matches!(l.q.kind, 12 | 14)
+                && matches!(l.k.kind, 12 | 14)
+                && matches!(l.v.kind, 12 | 14)
+            {
+                let total_rows = (l.q.rows + l.k.rows + l.v.rows) as u32;
+                launch!(
+                    self,
+                    "matvec_packed_qkv",
+                    (total_rows, 1, 1),
+                    &l.q.bytes,
+                    &l.q.kind,
+                    &l.q.rows,
+                    &mut self.work.q,
+                    &l.k.bytes,
+                    &l.k.kind,
+                    &l.k.rows,
+                    &mut self.work.k,
+                    &l.v.bytes,
+                    &l.v.kind,
+                    &l.v.rows,
+                    &mut self.work.v,
+                    &self.work.normalized,
+                    &l.q.width
+                );
+            } else {
+                for (tensor, output) in [
+                    (&l.q, &mut self.work.q),
+                    (&l.k, &mut self.work.k),
+                    (&l.v, &mut self.work.v),
+                ] {
                     launch!(
                         self,
-                        "head_norm",
-                        ((size / dim) as u32, 1, 1),
-                        &mut *vector,
-                        &norm.bytes,
-                        &dim,
-                        &s.epsilon
+                        "matvec",
+                        (tensor.rows as u32, 1, 1),
+                        &tensor.bytes,
+                        &tensor.kind,
+                        &self.work.normalized,
+                        output,
+                        &tensor.width,
+                        &tensor.rows,
+                        &self.work.ids,
+                        &0i32,
+                        &0i32
                     );
+                }
+            }
+            if let Some(biases) = &l.qkv_bias {
+                for (projection, bias) in [&mut self.work.q, &mut self.work.k, &mut self.work.v]
+                    .into_iter()
+                    .zip(biases)
+                {
+                    launch!(
+                        self,
+                        "add_row_bias",
+                        vector(bias.width),
+                        projection,
+                        &bias.bytes,
+                        &bias.width
+                    );
+                }
+            }
+            if cfg!(feature = "cuda-decode-fusion-research")
+                && self.matmul == CudaMatmul::ResidualMma3Research
+                && dim == 128
+                && qw == heads * 128
+                && kw == kv_heads * 128
+                && l.q_norm.is_some()
+                && l.k_norm.is_some()
+            {
+                let qn = l.q_norm.as_ref().unwrap();
+                let kn = l.k_norm.as_ref().unwrap();
+                launch_position!(
+                    self,
+                    device_state,
+                    "qkv_head_norm_rope_cache",
+                    "qkv_head_norm_rope_cache_decode",
+                    ((heads + kv_heads) as u32, 1, 1),
+                    [
+                        &mut self.work.q,
+                        &qn.bytes,
+                        &heads,
+                        &mut self.work.k,
+                        &kn.bytes,
+                        &self.work.v,
+                        &mut self.keys[index],
+                        &mut self.values[index],
+                        &kv_heads,
+                        &s.epsilon
+                    ],
+                    &pos,
+                    [&s.rope_base, &neox]
+                );
+            } else {
+                for (norm, vector, size) in [
+                    (&l.q_norm, &mut self.work.q, qw),
+                    (&l.k_norm, &mut self.work.k, kw),
+                ] {
+                    if let Some(norm) = norm {
+                        let norm_width = if olmo2 || olmoe { size } else { dim };
+                        launch!(
+                            self,
+                            "head_norm",
+                            ((size / norm_width) as u32, 1, 1),
+                            &mut *vector,
+                            &norm.bytes,
+                            &norm_width,
+                            &s.epsilon
+                        );
+                    }
+                    if position_embedding.is_some() || embedding_norm.is_some() {
+                        continue;
+                    }
+                    let grid = (((size / 2) as u32).div_ceil(256), 1, 1);
+                    if s.rotary_dim != s.dim {
+                        let rotary_dim = s.rotary_dim as i32;
+                        launch!(self, "rotary_partial_neox", grid;
+                            256, vector, &size, &dim, &pos, &rope_base, &rotary_dim);
+                    } else if let Some(factors) = &self.weights.rope_factors {
+                        launch!(
+                            self,
+                            "rotary_factored",
+                            grid,
+                            vector,
+                            &size,
+                            &dim,
+                            &pos,
+                            &rope_base,
+                            &neox,
+                            &factors.bytes,
+                            &s.rope_attn_factor
+                        );
+                    } else {
+                        launch_position!(
+                            self,
+                            device_state,
+                            "rotary",
+                            "rotary_decode",
+                            grid,
+                            [vector, &size, &dim],
+                            &pos,
+                            [&rope_base, &neox]
+                        );
+                    }
                 }
                 launch_position!(
                     self,
                     device_state,
-                    "rotary",
-                    "rotary_decode",
-                    (((size / 2) as u32).div_ceil(256), 1, 1),
-                    [vector, &size, &dim],
+                    "cache_kv",
+                    "cache_kv_decode",
+                    vector(kw),
+                    [
+                        &self.work.k,
+                        &self.work.v,
+                        &mut self.keys[index],
+                        &mut self.values[index],
+                        &kw
+                    ],
                     &pos,
-                    [&s.rope_base, &neox]
+                    []
                 );
             }
-            launch_position!(
-                self,
-                device_state,
-                "cache_kv",
-                "cache_kv_decode",
-                vector(kw),
-                [
-                    &self.work.k,
-                    &self.work.v,
-                    &mut self.keys[index],
-                    &mut self.values[index],
-                    &kw
-                ],
-                &pos,
-                []
-            );
-            if device_state {
+            if embedding_norm.is_some() {
+                alibi_attention!(self, index, heads, kv_heads, dim, context, count, 1);
+            } else if let Some((window, _, scale)) = gemma_attention {
+                gemma_attention!(
+                    self,
+                    index,
+                    heads,
+                    kv_heads,
+                    dim,
+                    context,
+                    count,
+                    1,
+                    window,
+                    scale,
+                    gemma.unwrap().attention_softcap
+                );
+            } else if device_state {
                 let control = &self
                     .decode
                     .as_ref()
@@ -1041,24 +1534,50 @@ impl CudaBackend {
                 &0i32,
                 &0i32
             );
-            launch!(
-                self,
-                "residual",
-                vector(w),
-                &mut self.work.x,
-                &self.work.projected,
-                &w
-            );
-            launch!(
-                self,
-                "normalize",
-                (1, 1, 1),
-                &self.work.x,
-                &l.ffn_norm.bytes,
-                &mut self.work.normalized,
-                &w,
-                &s.epsilon
-            );
+            if let Some(b) = affine {
+                launch!(
+                    self,
+                    "add_row_bias",
+                    vector(w),
+                    &mut self.work.projected,
+                    &b.attention.bytes,
+                    &w
+                );
+            }
+            if let Some([post_attn, _]) = &l.post_norms {
+                gemma_post_norm!(self, projected, post_attn, 1, w, s.epsilon);
+            } else if !s.parallel_residual {
+                launch!(
+                    self,
+                    "residual",
+                    vector(w),
+                    &mut self.work.x,
+                    &self.work.projected,
+                    &w
+                );
+            }
+            if olmo2 {
+                self.stream
+                    .memcpy_dtod(
+                        &self.work.x.slice(..s.width),
+                        &mut self.work.normalized.slice_mut(..s.width),
+                    )
+                    .map_err(failure)?;
+            } else {
+                transformer_norm!(
+                    self,
+                    &self.work.x,
+                    l.ffn_norm.as_ref(),
+                    affine.map(|b| &b.ffn_norm),
+                    1,
+                    w,
+                    s.epsilon
+                );
+            }
+            if let Some(b) = affine {
+                affine_ffn!(self, l, b, 1i32, w, s.parallel_residual);
+                continue;
+            }
             if let Some(t) = &l.router {
                 launch!(
                     self,
@@ -1074,43 +1593,65 @@ impl CudaBackend {
                     &0i32,
                     &0i32
                 );
-                launch!(
-                    self,
-                    "router",
-                    (1, 1, 1),
-                    &self.work.router,
-                    &experts,
-                    &used,
-                    &mut self.work.ids,
-                    &mut self.work.probabilities,
-                    &mut self.work.status
-                );
+                if cfg!(feature = "cuda-decode-fusion-research")
+                    && self.matmul == CudaMatmul::ResidualMma3Research
+                    && experts == 128
+                    && used <= 32
+                {
+                    launch!(
+                        self,
+                        "router_warp128",
+                        (1, 1, 1); 32,
+                        &self.work.router,
+                        &used,
+                        &mut self.work.ids,
+                        &mut self.work.probabilities,
+                        &mut self.work.status
+                    );
+                } else {
+                    launch!(
+                        self,
+                        if olmoe {
+                            "router_full_softmax"
+                        } else {
+                            "router"
+                        },
+                        (1, 1, 1),
+                        &self.work.router,
+                        &experts,
+                        &used,
+                        &mut self.work.ids,
+                        &mut self.work.probabilities,
+                        &mut self.work.status
+                    );
+                }
             }
             let moe = i32::from(l.router.is_some());
+            let gate = l.gate.as_ref().expect("gated CUDA layer");
             if cfg!(feature = "cuda-packed-gate-up-research")
                 && self.matmul == CudaMatmul::ResidualMma3Research
                 && moe != 0
-                && l.gate.width == 2048
+                && gate.width == 2048
                 && l.up.width == 2048
-                && l.gate.rows == l.up.rows
-                && matches!(l.gate.kind, 12 | 14)
+                && gate.rows == l.up.rows
+                && matches!(gate.kind, 12 | 14)
                 && matches!(l.up.kind, 12 | 14)
             {
                 launch!(
                     self,
                     "matvec_packed_gate_up",
-                    (l.gate.rows as u32, used as u32, 1),
-                    &l.gate.bytes,
-                    &l.gate.kind,
+                    (gate.rows as u32, used as u32, 1),
+                    &gate.bytes,
+                    &gate.kind,
                     &l.up.bytes,
                     &l.up.kind,
                     &self.work.normalized,
                     &mut self.work.gate,
-                    &l.gate.rows,
+                    &gate.rows,
                     &self.work.ids
                 );
             } else {
-                for (t, out) in [(&l.gate, &mut self.work.gate), (&l.up, &mut self.work.up)] {
+                for (t, out) in [(gate, &mut self.work.gate), (&l.up, &mut self.work.up)] {
                     launch!(
                         self,
                         "matvec",
@@ -1129,7 +1670,11 @@ impl CudaBackend {
                 let activated = (s.hidden * s.used) as i32;
                 launch!(
                     self,
-                    "swiglu",
+                    if gemma.is_some() {
+                        "gemma_geglu"
+                    } else {
+                        "swiglu"
+                    },
                     vector(activated),
                     &mut self.work.gate,
                     &self.work.up,
@@ -1170,16 +1715,20 @@ impl CudaBackend {
                     &1i32
                 );
             }
-            launch!(
-                self,
-                "combine",
-                vector(w),
-                &mut self.work.x,
-                &self.work.down,
-                &self.work.probabilities,
-                &w,
-                &used
-            );
+            if let Some([_, post_ffn]) = &l.post_norms {
+                gemma_post_norm!(self, down, post_ffn, 1, w, s.epsilon);
+            } else {
+                launch!(
+                    self,
+                    "combine",
+                    vector(w),
+                    &mut self.work.x,
+                    &self.work.down,
+                    &self.work.probabilities,
+                    &w,
+                    &used
+                );
+            }
         }
         if !output_logits {
             // Skipped logits must not hide a failed intermediate token's numerical state.
@@ -1200,15 +1749,14 @@ impl CudaBackend {
         let s = &self.weights.spec;
         let w = s.width as i32;
         let input = self.work.x.slice(offset..offset + s.width);
-        launch!(
+        transformer_norm!(
             self,
-            "normalize",
-            (1, 1, 1),
             &input,
-            &self.weights.output_norm.bytes,
-            &mut self.work.normalized,
-            &w,
-            &s.epsilon
+            self.weights.output_norm.as_ref(),
+            self.weights.output_norm_bias.as_ref(),
+            1,
+            w,
+            s.epsilon
         );
         let t = self
             .weights
@@ -1229,6 +1777,19 @@ impl CudaBackend {
             &0i32,
             &0i32
         );
+        if let Some(gemma) = &self.weights.gemma
+            && gemma.final_softcap > 0.0
+        {
+            launch!(
+                self,
+                "gemma_softcap",
+                ((t.rows as u32).div_ceil(256), 1, 1),
+                &mut self.work.logits,
+                &t.rows,
+                &gemma.final_softcap,
+                &mut self.work.status
+            );
+        }
         Ok(())
     }
 
@@ -1433,11 +1994,14 @@ mod tests {
             heads: 32,
             kv_heads: 4,
             dim: 128,
+            rotary_dim: 128,
+            parallel_residual: false,
             hidden: 768,
             experts: 128,
             used: 8,
             epsilon: 1e-6,
             rope_base: 1_000_000.0,
+            rope_attn_factor: 1.0,
             neox: true,
             eog: vec![],
             tokenizer: Err(invalid("tokenizer unused by workspace sizing")),
@@ -1581,6 +2145,63 @@ mod tests {
         assert!(state.begin(&[0], 2, &info).is_err());
         state.finish(2);
         assert!(state.begin(&[0], 4, &info).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA 13 NVRTC/driver and a free GPU; run serially in release mode"]
+    fn qwen35_cuda_delta_tracks_decayed_state_across_tokens() {
+        const DIM: usize = 128;
+        const HEADS: usize = 16;
+        const INNER: usize = HEADS * DIM;
+        let context = CudaContext::new(0).unwrap();
+        let module = context
+            .load_module(
+                compile_ptx_with_opts(
+                    include_str!("cuda/qwen35_delta.cu"),
+                    CompileOptions {
+                        fmad: Some(false),
+                        arch: Some("compute_75"),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let stream = context.default_stream();
+        let kernel = module.load_function("qwen35_delta_step").unwrap();
+        let mut state = stream.alloc_zeros::<f32>(INNER * DIM).unwrap();
+        let mut output = stream.alloc_zeros::<f32>(INNER).unwrap();
+        let initial_value: Vec<_> = (0..INNER).map(|i| (i % 31) as f32 * 0.125).collect();
+        let mut projection = vec![0.0; 3 * INNER];
+        projection[2 * INNER..].copy_from_slice(&initial_value);
+        for head in 0..HEADS {
+            projection[head * DIM + head] = 1.0;
+            projection[INNER + head * DIM + head] = 1.0;
+        }
+        let projection = stream.clone_htod(&projection).unwrap();
+        let decay = stream.clone_htod(&[0.5f32; HEADS]).unwrap();
+        let beta = stream.clone_htod(&[0.25f32; HEADS]).unwrap();
+        for factor in [0.25, 0.34375, 0.37890625] {
+            let mut args = stream.launch_builder(&kernel);
+            args.arg(&projection)
+                .arg(&decay)
+                .arg(&beta)
+                .arg(&mut state)
+                .arg(&mut output);
+            // A block handles one head; each of its 128 threads owns one state row.
+            unsafe {
+                args.launch(LaunchConfig {
+                    grid_dim: (HEADS as u32, 1, 1),
+                    block_dim: (DIM as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .unwrap();
+            let values = stream.clone_dtoh(&output).unwrap();
+            for (actual, input) in values.iter().zip(&initial_value) {
+                assert!((actual - input * factor / (DIM as f32).sqrt()).abs() < 1e-7);
+            }
+        }
     }
 
     #[test]

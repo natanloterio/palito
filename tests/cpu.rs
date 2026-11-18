@@ -188,7 +188,7 @@ fn rejects_overlapping_tensor_data_and_unsupported_quantization() {
         (
             "unsupported-type",
             kind_offset,
-            2u32.to_le_bytes().to_vec(),
+            u32::MAX.to_le_bytes().to_vec(),
             "unsupported tensor type",
         ),
     ] {

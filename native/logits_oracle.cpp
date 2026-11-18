@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -74,20 +75,46 @@ static void check(bool valid, const char * message) {
     if (!valid) throw std::runtime_error(message);
 }
 
+static void print_ids(const std::vector<llama_token> & ids) {
+    std::printf("{\"token_ids\":[");
+    for (size_t i = 0; i < ids.size(); ++i) std::printf(i ? ",%d" : "%d", ids[i]);
+    std::puts("]}");
+}
+
 int main(int argc, char ** argv) {
     try {
-        check(argc >= 4 && argc <= 6,
-              "usage: logits-oracle MODEL INPUT_IDS_TEXT GPU_LAYERS(-1=all,0=CPU) [NEW_TRACE_JSONL] [--f32-reference]");
+        check(argc >= 4 && argc <= 8,
+              "usage: logits-oracle MODEL INPUT GPU_LAYERS [NEW_TRACE_JSONL] [--f32-reference] [--context=N] [--tokenize | --greedy=N]");
         const char * trace_path = nullptr;
         bool require_f32 = false;
+        bool tokenize = false;
+        int greedy = 0;
+        int context_tokens = 0;
         for (int i = 4; i < argc; ++i) {
             if (std::strcmp(argv[i], "--f32-reference") == 0) {
                 check(!require_f32, "duplicate --f32-reference");
                 require_f32 = true;
+            } else if (std::strcmp(argv[i], "--tokenize") == 0) {
+                check(!tokenize, "duplicate --tokenize");
+                tokenize = true;
+            } else if (std::strncmp(argv[i], "--greedy=", 9) == 0) {
+                check(!greedy, "duplicate --greedy");
+                size_t used = 0;
+                const std::string count(argv[i] + 9);
+                greedy = std::stoi(count, &used);
+                check(greedy > 0 && used == count.size(), "invalid --greedy count");
+            } else if (std::strncmp(argv[i], "--context=", 10) == 0) {
+                check(!context_tokens, "duplicate --context");
+                size_t used = 0;
+                const std::string count(argv[i] + 10);
+                context_tokens = std::stoi(count, &used);
+                check(context_tokens > 0 && used == count.size(), "invalid --context count");
             } else {
                 check(trace_path == nullptr, "multiple trace paths");
                 trace_path = argv[i];
             }
+            check(!tokenize || (!greedy && !trace_path && !context_tokens),
+                  "tokenize does not evaluate the model");
         }
         auto close_trace = [](FILE * file) { std::fclose(file); };
         std::unique_ptr<FILE, decltype(close_trace)> trace_file(
@@ -98,6 +125,7 @@ int main(int argc, char ** argv) {
         llama_backend_init();
         auto mp = llama_model_default_params();
         mp.n_gpu_layers = std::stoi(argv[3]);
+        mp.vocab_only = tokenize;
         const auto cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         check(cpu != nullptr, "CPU backend unavailable");
         const auto marker = reinterpret_cast<const char * (*)()>(ggml_backend_reg_get_proc_address(
@@ -109,8 +137,22 @@ int main(int argc, char ** argv) {
         std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
             llama_model_load_from_file(argv[1], mp), llama_model_free);
         check(model != nullptr, "model load failed");
+        const auto vocab = llama_model_get_vocab(model.get());
+        std::ifstream input(argv[2], std::ios::binary);
+        check(input.is_open(), "cannot open token input");
+        if (tokenize) {
+            const std::string text((std::istreambuf_iterator<char>(input)), {});
+            check(text.size() <= INT32_MAX, "tokenizer input too long");
+            const int count = llama_tokenize(vocab, text.data(), text.size(), nullptr, 0, true, true);
+            check(count <= 0 && count != INT32_MIN, "invalid tokenizer size");
+            std::vector<llama_token> ids(-count);
+            if (count) check(llama_tokenize(vocab, text.data(), text.size(), ids.data(), ids.size(),
+                                           true, true) == -count, "tokenization failed");
+            print_ids(ids);
+            return 0;
+        }
         auto cp = llama_context_default_params();
-        cp.n_ctx = 1024;
+        cp.n_ctx = context_tokens ? context_tokens : 1024;
         cp.n_batch = 128;
         cp.n_ubatch = 128;
         cp.n_seq_max = 1;
@@ -127,16 +169,14 @@ int main(int argc, char ** argv) {
         std::unique_ptr<llama_context, decltype(&llama_free)> context(
             llama_init_from_model(model.get(), cp), llama_free);
         check(context != nullptr, "context allocation failed");
-        std::ifstream input(argv[2]);
-        check(input.is_open(), "cannot open token input");
         std::vector<llama_token> ids;
         int id;
-        const auto vocab = llama_model_get_vocab(model.get());
         while (input >> id) {
             check(id >= 0 && id < llama_vocab_n_tokens(vocab), "invalid token ID");
             ids.push_back(id);
         }
-        check(input.eof() && !ids.empty() && ids.size() <= 1024, "invalid input tokens");
+        check(input.eof() && !ids.empty() && ids.size() <= cp.n_ctx, "invalid input tokens");
+        check(static_cast<size_t>(greedy) <= cp.n_ctx - ids.size(), "greedy exceeds context");
         std::unique_ptr<llama_batch_ext, decltype(&llama_batch_ext_free)> batch(
             llama_batch_ext_init(context.get()), llama_batch_ext_free);
         check(batch != nullptr, "batch allocation failed");
@@ -160,6 +200,26 @@ int main(int argc, char ** argv) {
         const float * logits = llama_get_logits_ith(context.get(), -1);
         check(logits != nullptr, "missing logits");
         const int n = llama_vocab_n_tokens(vocab);
+        if (greedy) {
+            std::vector<llama_token> generated;
+            for (int i = 0; i < greedy; ++i) {
+                for (int j = 0; j < n; ++j) check(std::isfinite(logits[j]), "nonfinite logits");
+                const auto token = static_cast<llama_token>(std::max_element(logits, logits + n) - logits);
+                generated.push_back(token);
+                if (llama_vocab_is_eog(vocab, token) || i + 1 == greedy) break;
+                llama_batch_ext_clear(batch.get());
+                const int index = llama_batch_ext_add_token(batch.get(), 0, token);
+                check(index >= 0, "cannot add greedy token");
+                const llama_pos pos = ids.size() + i;
+                check(llama_batch_ext_set_pos(batch.get(), index, &pos), "cannot set greedy position");
+                check(llama_batch_ext_set_output_logits(batch.get(), index, true), "cannot request greedy logits");
+                check(llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "greedy decode failed");
+                logits = llama_get_logits_ith(context.get(), -1);
+                check(logits != nullptr, "missing greedy logits");
+            }
+            print_ids(generated);
+            return 0;
+        }
         for (int i = 0; i < n; ++i) check(std::isfinite(logits[i]), "nonfinite logits");
         std::printf("{\"arithmetic\":\"%s\",\"logits\":[",
                     f32_reference ? "local-f32-activations-v1" : "backend-default");

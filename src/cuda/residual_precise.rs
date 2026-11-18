@@ -565,30 +565,58 @@ struct Matrix<'a> {
     projection: &'a super::model_replay::Projection<'a>,
     prepared: &'a Prepared,
     planar_weights: Option<&'a CudaSlice<u8>>,
+    splitk_partials: Option<CudaSlice<f32>>,
+    splits: u32,
     flag: CudaSlice<i32>,
     kernel: &'static str,
+}
+
+pub(super) fn dense_mma3_splits(width: i32, rows: i32, tokens: usize) -> u32 {
+    if width <= 0 || rows <= 0 || tokens == 0 {
+        return 1;
+    }
+    let base_ctas = (rows as u32).div_ceil(32) * (tokens as u32).div_ceil(32);
+    let mut splits = 1u32;
+    while (width as u32) % (splits * 2 * 128) == 0 && base_ctas * (splits * 2) <= 1024 {
+        splits *= 2;
+    }
+    splits
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PanelScreen {
+    GateUp,
+    Compact8,
+    SyncK64,
+    MixedExpert,
+    WideExpert,
+    SameExpert,
+    SameExpertWarp8,
+    TruePipeline,
 }
 
 pub(super) fn benchmark_gate_up(
     h: &Harness,
     tensors: Vec<Tensor>,
     routing: &super::grouped_bench::RoutingFixture,
-    input: &[f32],
-    frozen_down_input: &[f32],
-    capture_hash: &str,
-    model_hash: &str,
-    screen_compact: bool,
-    screen_k64: bool,
-    screen_mixed: bool,
-    screen_wide: bool,
-    screen_same_expert: bool,
+    operands: (&[f32], &[f32]),
+    hashes: (&str, &str),
+    screen: PanelScreen,
 ) -> Result<()> {
     use super::{
         model_replay::float_hash,
         residual::{matrix_output, read_matrix_output},
     };
+    let (input, frozen_down_input) = operands;
+    let (capture_hash, model_hash) = hashes;
+    let screen_compact = screen == PanelScreen::Compact8;
+    let screen_k64 = screen == PanelScreen::SyncK64;
+    let screen_mixed = screen == PanelScreen::MixedExpert;
+    let screen_wide = screen == PanelScreen::WideExpert;
+    let screen_same_expert = screen == PanelScreen::SameExpert;
+    let screen_same_expert_warp8 = screen == PanelScreen::SameExpertWarp8;
     let tokens = routing.tokens as i32;
-    let separate_candidate = screen_compact || screen_k64 || screen_mixed || screen_wide || screen_same_expert;
+    let separate_candidate = screen != PanelScreen::GateUp;
     let (down_kind, expected) = match capture_hash {
         "b3fe94936ce6b3ebdcc00469f6cda14f17f48c8dc60deff37ce511336b76fd14" if tokens == 256 => (
             12,
@@ -674,7 +702,10 @@ pub(super) fn benchmark_gate_up(
     ];
     let mut counts = h.stream.alloc_zeros::<i32>(128).map_err(failure)?;
     let schedule_words = 2 * routing.slots(32);
-    let mut schedule_buffer = h.stream.clone_htod(&vec![-777i32; schedule_words + 16]).map_err(failure)?;
+    let mut schedule_buffer = h
+        .stream
+        .clone_htod(&vec![-777i32; schedule_words + 16])
+        .map_err(failure)?;
     let mut status = h.stream.alloc_zeros::<i32>(1).map_err(failure)?;
     let count = frozen_down_input.len();
     let activation_count = count as i32;
@@ -695,6 +726,7 @@ pub(super) fn benchmark_gate_up(
         let compact = candidate && screen_compact;
         let mixed = candidate && screen_mixed;
         let same_expert = candidate && screen_same_expert;
+        let same_expert_warp8 = candidate && screen_same_expert_warp8;
         let merge = candidate && !separate_candidate;
         let layout = usize::from(compact);
         let slots = routing.slots(tiles[layout]) as i32;
@@ -710,8 +742,12 @@ pub(super) fn benchmark_gate_up(
             &ids, &counts, &mut groups, &assignments, &128i32, &slots);
         let groups = groups.as_view();
         let mut schedule = schedule_buffer.slice_mut(8..8 + schedule_words);
-        if mixed || same_expert {
-            let emitter = if mixed { "group_parallel_mixed_schedule" } else { "group_parallel_same_expert_schedule" };
+        if mixed || same_expert || same_expert_warp8 {
+            let emitter = if mixed {
+                "group_parallel_mixed_schedule"
+            } else {
+                "group_parallel_same_expert_schedule"
+            };
             launch!(h, emitter, (1,1,1);32,
                 &groups, &slots, &mut schedule);
         }
@@ -747,6 +783,12 @@ pub(super) fn benchmark_gate_up(
                         &$tensor.bytes, &$tensor.kind, &q, &d, &s, $dst,
                         &$tensor.width, &$tensor.rows, &tokens, &groups, &8i32, &1i32,
                         &$assignment_major, &mut status);
+                } else if same_expert_warp8 {
+                    let schedule = schedule.as_view();
+                    launch!(h, "residual_matmul_mma3_same_expert_warp8", grid;256,
+                        &$tensor.bytes, &$tensor.kind, &q, &d, &s, $dst,
+                        &$tensor.width, &$tensor.rows, &tokens, &groups, &8i32,
+                        &$assignment_major, &schedule, &mut status);
                 } else if mixed || same_expert {
                     let schedule = schedule.as_view();
                     let kernel = if mixed { "residual_matmul_mma3_mixed" } else { "residual_matmul_mma3_same_expert" };
@@ -760,7 +802,9 @@ pub(super) fn benchmark_gate_up(
                         &$tensor.width, &$tensor.rows, &tokens, &groups, &8i32,
                         &$assignment_major, &mut status);
                 } else {
-                    let kernel = if candidate && screen_k64 && $tensor.kind == 12 && $assignment_major == 0 {
+                    let kernel = if candidate && screen == PanelScreen::TruePipeline {
+                        "residual_matmul_mma3_true_pipeline"
+                    } else if candidate && screen_k64 && $tensor.kind == 12 && $assignment_major == 0 {
                         "residual_matmul_mma3_sync_k64"
                     } else {
                         "residual_matmul_mma3"
@@ -884,9 +928,14 @@ pub(super) fn benchmark_gate_up(
         }
     }
     read_matrix_output(h, &status, &u)?;
-    if screen_mixed || screen_same_expert {
+    if screen_mixed || screen_same_expert || screen_same_expert_warp8 {
         let schedule = h.stream.clone_dtoh(&schedule_buffer).map_err(failure)?;
-        assert!(schedule[..8].iter().chain(&schedule[8 + schedule_words..]).all(|&x| x == -777));
+        assert!(
+            schedule[..8]
+                .iter()
+                .chain(&schedule[8 + schedule_words..])
+                .all(|&x| x == -777)
+        );
     }
     let check_guarded = |v: &[f32]| {
         assert!(v[..8].iter().chain(&v[v.len() - 8..]).all(|x| *x == 1337.0));
@@ -939,6 +988,10 @@ pub(super) fn benchmark_gate_up(
             "WIDE_EXPERT_PANEL_SCREEN"
         } else if screen_same_expert {
             "SAME_EXPERT_PANEL_SCREEN"
+        } else if screen_same_expert_warp8 {
+            "SAME_EXPERT_WARP8_PANEL_SCREEN"
+        } else if screen == PanelScreen::TruePipeline {
+            "TRUE_PIPELINE_PANEL_SCREEN"
         } else {
             "GATE_UP_SCREEN"
         },
@@ -989,6 +1042,32 @@ impl super::residual::MatrixCandidate for Matrix<'_> {
             },
             1,
         );
+        if self.kernel == "residual_matmul_mma3_splitk" {
+            let splits = self.splits as i32;
+            if self.splits <= 1 {
+                launch!(harness, "residual_matmul_mma3", grid;128,
+                    &p.tensor.bytes, &p.tensor.kind, &q, &scales, &sums, &mut y,
+                    &p.tensor.width, &p.tensor.rows, &tokens, p.groups, &used,
+                    &grouped, &p.assignment_major, &mut self.flag);
+            } else {
+                let count = p.tokens * p.tensor.rows as usize;
+                let total = count * self.splits as usize;
+                let partials = self
+                    .splitk_partials
+                    .as_mut()
+                    .ok_or_else(|| invalid("missing split-k partial buffer"))?;
+                let mut part = partials.slice_mut(8..8 + total);
+                let split_grid = (grid.0, grid.1, self.splits);
+                launch!(harness, "residual_matmul_mma3_splitk", split_grid;128,
+                    &p.tensor.bytes, &p.tensor.kind, &q, &scales, &sums, &mut part,
+                    &p.tensor.width, &p.tensor.rows, &tokens, &splits, &mut self.flag);
+                let part = part.as_view();
+                let count_i32 = count as i32;
+                launch!(harness, "residual_splitk_reduce", ((count as u32).div_ceil(256), 1, 1);256,
+                    &part, &mut y, &count_i32, &splits, &mut self.flag);
+            }
+            return Ok(());
+        }
         if matches!(
             self.kernel,
             "projection_fp16_control" | "projection_fp16_packed"
@@ -1031,6 +1110,24 @@ impl super::residual::MatrixCandidate for Matrix<'_> {
     }
 
     fn read(&self, output: &CudaSlice<f32>) -> Result<Vec<f32>> {
+        if let Some(partials) = &self.splitk_partials {
+            let total = self.projection.tokens
+                * self.projection.tensor.rows as usize
+                * self.splits as usize;
+            let host = self
+                .projection
+                .harness
+                .stream
+                .clone_dtoh(partials)
+                .map_err(failure)?;
+            assert!(
+                host[..8]
+                    .iter()
+                    .chain(&host[8 + total..])
+                    .all(|&v| v == 1337.0)
+            );
+            assert!(host[8..8 + total].iter().all(|v| v.is_finite()));
+        }
         super::residual::read_matrix_output(self.projection.harness, &self.flag, output)
     }
 }
@@ -1048,6 +1145,7 @@ pub(super) struct Experiment<'a> {
     wide_rows: bool,
     registers: bool,
     planar: bool,
+    splitk: bool,
 }
 
 impl<'a> Experiment<'a> {
@@ -1065,6 +1163,7 @@ impl<'a> Experiment<'a> {
             wide_rows: false,
             registers: false,
             planar: false,
+            splitk: false,
         }
     }
 
@@ -1124,6 +1223,13 @@ impl<'a> Experiment<'a> {
         }
     }
 
+    pub(super) fn new_splitk(harness: &'a Harness) -> Self {
+        Self {
+            splitk: true,
+            ..Self::new(harness, false)
+        }
+    }
+
     pub(super) fn probe(&mut self, probe: super::residual::Probe<'_>) -> Result<()> {
         let super::residual::Probe {
             tensor,
@@ -1157,7 +1263,9 @@ impl<'a> Experiment<'a> {
             let blocks = tensor.dims[0] / 256;
             let rows = tensor.dims[1];
             if grouped || rows % 32 != 0 || bytes.len() != rows * blocks * 144 {
-                return Err(invalid("planar replay requires complete dense 32-row tiles"));
+                return Err(invalid(
+                    "planar replay requires complete dense 32-row tiles",
+                ));
             }
             let start = std::time::Instant::now();
             let mut planar = vec![0; bytes.len()];
@@ -1195,6 +1303,8 @@ impl<'a> Experiment<'a> {
             projection: &projection,
             prepared,
             planar_weights: planar_weights.as_ref(),
+            splitk_partials: None,
+            splits: 1,
             flag: harness.stream.alloc_zeros::<i32>(1).map_err(failure)?,
             kernel: "residual_matmul_mma3",
         };
@@ -1277,6 +1387,16 @@ impl<'a> Experiment<'a> {
                 std::fs::write(directory.join("fixture.json"), metadata.to_string())?;
                 println!("MMA_PROFILE_FIXTURE {metadata}");
             }
+        }
+        if self.splitk {
+            return benchmark_pair(
+                &mut candidate,
+                prepared,
+                "residual_matmul_mma3_splitk",
+                expected,
+                name,
+                tensor_hash,
+            );
         }
         if self.planar || self.registers || self.wide_rows {
             return benchmark_pair(
@@ -1425,10 +1545,24 @@ fn benchmark_pair(
         expected,
         "paired projection actual production binding",
     )?;
+    let splits = if kernel == "residual_matmul_mma3_splitk" {
+        dense_mma3_splits(p.tensor.width, p.tensor.rows, p.tokens)
+    } else {
+        1
+    };
+    let splitk_partials = if splits > 1 {
+        let total = expected.len() * splits as usize;
+        assert!(total <= 1024 * 1024, "split-k buffer exceeded 4 MiB bound");
+        Some(super::residual::matrix_output(harness, total)?)
+    } else {
+        None
+    };
     let mut candidate = Matrix {
         projection: p,
         prepared,
         planar_weights: baseline.planar_weights,
+        splitk_partials,
+        splits,
         flag: harness.stream.alloc_zeros::<i32>(1).map_err(failure)?,
         kernel,
     };
@@ -1451,6 +1585,7 @@ fn benchmark_pair(
             ("cached_scales", "CACHED_SCALES_MATRIX", 5888, true)
         }
         "residual_matmul_mma3_rows64" => ("rows64", "WIDE_ROWS_MATRIX", 7424, true),
+        "residual_matmul_mma3_splitk" => ("splitk", "SPLITK_MATRIX", 5888, splits == 1),
         "residual_matmul_mma3_registers" => ("registers", "REGISTERS_MATRIX", 0, true),
         "residual_matmul_mma3_planar_q4" => ("planar", "PLANAR_MATRIX", 5888, true),
         "residual_matmul_mma3_cols8" => ("cols8", "NARROW_MATRIX", 2624, true),
@@ -1496,7 +1631,7 @@ fn benchmark_pair(
         json!({
             "tensor":name, "tensor_sha256":tensor_hash, "kind":p.tensor.kind,
             "input_sha256":baseline.prepared.input_hash,
-            "width":p.tensor.width, "rows":p.tensor.rows, "tokens":p.tokens,
+            "width":p.tensor.width, "rows":p.tensor.rows, "tokens":p.tokens, "splits":splits,
             "grouped":p.grouped, "assignment_major":p.assignment_major,
             "output_values":expected.len(), "production_binding_bitwise_equal":true,
             "baseline_output_sha256":super::model_replay::float_hash(&reference),

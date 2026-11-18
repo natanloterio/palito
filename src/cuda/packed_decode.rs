@@ -24,7 +24,15 @@ fn project(
     let mut y = output.slice_mut(8..8 + selections * tensor.rows as usize);
     let cfg = LaunchConfig {
         grid_dim: (tensor.rows as u32 + extra_rows, selections as u32, 1),
-        block_dim: (if name == "matvec_packed_k_pair" { 128 } else { 256 }, 1, 1),
+        block_dim: (
+            if name == "matvec_packed_k_pair" {
+                128
+            } else {
+                256
+            },
+            1,
+            1,
+        ),
         shared_mem_bytes: 0,
     };
     let mut args = harness.stream.launch_builder(&harness.functions[name]);
@@ -183,17 +191,44 @@ pub(super) fn benchmark_gate_up(
     let mut run = |arm: usize, output: &mut CudaSlice<f32>| -> Result<()> {
         if arm == 0 {
             project(h, "matvec_packed_f32", gate, &input, output, &ids, 1, 0, 0)?;
-            project(h, "matvec_packed_f32", up, &input, &mut scratch, &ids, 1, 0, 0)?;
+            project(
+                h,
+                "matvec_packed_f32",
+                up,
+                &input,
+                &mut scratch,
+                &ids,
+                1,
+                0,
+                0,
+            )?;
             let mut y = output.slice_mut(8..8 + count);
             let u = scratch.slice(8..8 + count);
             let count_i32 = count as i32;
-            launch!(h, "swiglu", ((count as u32).div_ceil(256), 1, 1),
-                &mut y, &u, &count_i32);
+            launch!(
+                h,
+                "swiglu",
+                ((count as u32).div_ceil(256), 1, 1),
+                &mut y,
+                &u,
+                &count_i32
+            );
         } else {
             let x = input.slice(8..input.len() - 8);
             let mut y = output.slice_mut(8..8 + count);
-            launch!(h, "matvec_packed_gate_up", (gate.rows as u32 + 1, routing.len() as u32, 1),
-                &gate.bytes, &gate.kind, &up.bytes, &up.kind, &x, &mut y, &gate.rows, &ids);
+            launch!(
+                h,
+                "matvec_packed_gate_up",
+                (gate.rows as u32 + 1, routing.len() as u32, 1),
+                &gate.bytes,
+                &gate.kind,
+                &up.bytes,
+                &up.kind,
+                &x,
+                &mut y,
+                &gate.rows,
+                &ids
+            );
         }
         Ok(())
     };
@@ -201,9 +236,15 @@ pub(super) fn benchmark_gate_up(
     for repetition in 0..10 {
         for slot in 0..2 {
             let arm = (repetition + slot) % 2;
-            let start = h.stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(failure)?;
+            let start = h
+                .stream
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(failure)?;
             run(arm, &mut outputs[arm])?;
-            let end = h.stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(failure)?;
+            let end = h
+                .stream
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(failure)?;
             end.synchronize().map_err(failure)?;
             if repetition >= 3 {
                 samples[arm].push(start.elapsed_ms(&end).map_err(failure)?);
@@ -213,7 +254,12 @@ pub(super) fn benchmark_gate_up(
     read_output(h, &scratch)?;
     let baseline = read_output(h, &outputs[0])?;
     let candidate = read_output(h, &outputs[1])?;
-    assert!(baseline.iter().zip(&candidate).all(|(&a, &b)| a.is_finite() && a.to_bits() == b.to_bits()));
+    assert!(
+        baseline
+            .iter()
+            .zip(&candidate)
+            .all(|(&a, &b)| a.is_finite() && a.to_bits() == b.to_bits())
+    );
     println!(
         "PACKED_GATE_UP_SCREEN {}",
         json!({"capture_sha256":capture_hash, "position":position, "kinds":[gate.kind, up.kind],
@@ -242,9 +288,25 @@ pub(super) fn benchmark_k_pair(
     for repetition in 0..10 {
         for slot in 0..2 {
             let arm = (repetition + slot) % 2;
-            let start = h.stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(failure)?;
-            project(h, kernels[arm], tensor, &input, &mut outputs[arm], &ids, 0, 0, arm as u32)?;
-            let end = h.stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(failure)?;
+            let start = h
+                .stream
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(failure)?;
+            project(
+                h,
+                kernels[arm],
+                tensor,
+                &input,
+                &mut outputs[arm],
+                &ids,
+                0,
+                0,
+                arm as u32,
+            )?;
+            let end = h
+                .stream
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(failure)?;
             end.synchronize().map_err(failure)?;
             if repetition >= 3 {
                 samples[arm].push(start.elapsed_ms(&end).map_err(failure)?);
@@ -253,7 +315,12 @@ pub(super) fn benchmark_k_pair(
     }
     let baseline = read_output(h, &outputs[0])?;
     let candidate = read_output(h, &outputs[1])?;
-    assert!(baseline.iter().zip(&candidate).all(|(&a, &b)| a.is_finite() && a.to_bits() == b.to_bits()));
+    assert!(
+        baseline
+            .iter()
+            .zip(&candidate)
+            .all(|(&a, &b)| a.is_finite() && a.to_bits() == b.to_bits())
+    );
     println!(
         "PACKED_K_PAIR_SCREEN {}",
         json!({"capture_sha256":capture_hash, "position":position, "tensor":tensor_name,

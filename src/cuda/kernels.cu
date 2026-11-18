@@ -28,8 +28,49 @@ __device__ float half_value(const u8 *p) {
 __device__ __forceinline__ float weight(const u8 *data, int kind, u64 index) {
     if (kind == 0) return ((const float *)data)[index];
     if (kind == 1) return half_value(data + index * 2);
+    if (kind == 30) {
+        const u8 *p = data + index * 2;
+        return __uint_as_float(((unsigned int)p[0] << 16) | ((unsigned int)p[1] << 24));
+    }
+    if (kind == 2) {
+        const u8 *p = data + (index / 32) * 18;
+        int i = index % 32;
+        int q = ((p[2 + i % 16] >> (4 * (i / 16))) & 15) - 8;
+        return half_value(p) * (float)q;
+    }
+    if (kind == 3 || kind == 7) {
+        const u8 *p = data + (index / 32) * (kind == 7 ? 24 : 20);
+        int i = index % 32;
+        int q = (p[(kind == 7 ? 8 : 4) + i % 16] >> (4 * (i / 16))) & 15;
+        if (kind == 7) q |= ((p[4 + i / 8] >> (i % 8)) & 1) << 4;
+        return half_value(p) * (float)q + half_value(p + 2);
+    }
+    if (kind == 10) {
+        const u8 *p = data + (index / 256) * 84;
+        int i = index % 256, group = p[i / 16], shift = 2 * ((i % 128) / 32);
+        int q = (p[16 + (i / 128) * 32 + i % 32] >> shift) & 3;
+        return half_value(p + 80) * (float)(group & 15) * (float)q
+               - half_value(p + 82) * (float)(group >> 4);
+    }
+    if (kind == 11) {
+        const u8 *p = data + (index / 256) * 110;
+        int i = index % 256, group = i / 16, shift = i / 32;
+        int lo = (p[96 + group % 8] >> (4 * (group / 8))) & 15;
+        int hi = (p[104 + group % 4] >> (2 * (group / 4))) & 3;
+        int multiplier = (lo | (hi << 4)) - 32;
+        int q = (p[32 + (i / 128) * 32 + i % 32] >> (2 * (shift % 4))) & 3;
+        if (!(p[i % 32] & (1 << shift))) q -= 4;
+        return half_value(p + 108) * (float)multiplier * (float)q;
+    }
+    if (kind == 20) {
+        constexpr signed char codebook[] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                            1, 13, 25, 38, 53, 69, 89, 113};
+        const u8 *p = data + (index / 32) * 18;
+        int i = index % 32, code = (p[2 + i % 16] >> (4 * (i / 16))) & 15;
+        return half_value(p) * (float)codebook[code];
+    }
     int block = (kind == 6 || kind == 8) ? 32 : 256;
-    int size = kind == 6 ? 22 : kind == 8 ? 34 : kind == 12 ? 144 : 210;
+    int size = kind == 6 ? 22 : kind == 8 ? 34 : kind == 12 ? 144 : kind == 13 ? 176 : 210;
     const u8 *p = data + (index / block) * size;
     int i = index % block;
     if (kind == 6) {
@@ -39,12 +80,14 @@ __device__ __forceinline__ float weight(const u8 *data, int kind, u64 index) {
         return half_value(p) * (float)q;
     }
     if (kind == 8) return half_value(p) * (float)((const signed char *)p)[2 + i];
-    if (kind == 12) {
+    if (kind == 12 || kind == 13) {
         const u8 *s = p + 4;
         int g = i / 32;
         int scale = g < 4 ? s[g] & 63 : (s[g + 4] & 15) | ((s[g - 4] >> 6) << 4);
         int minimum = g < 4 ? s[g + 4] & 63 : (s[g + 4] >> 4) | ((s[g] >> 6) << 4);
-        int q = (p[16 + (i / 64) * 32 + i % 32] >> (4 * (g % 2))) & 15;
+        int low_offset = kind == 13 ? 48 : 16;
+        int q = (p[low_offset + (i / 64) * 32 + i % 32] >> (4 * (g % 2))) & 15;
+        if (kind == 13) q |= ((p[16 + i % 32] >> g) & 1) << 4;
         return half_value(p) * (float)scale * (float)q - half_value(p + 2) * (float)minimum;
     }
     int h = i / 128, lane = i % 32, quarter = (i % 128) / 32;
@@ -184,10 +227,18 @@ extern "C" __global__ void matvec(const u8 *w, int kind, const float *x, float *
     switch (kind) {
         case 0: sum = matrix_row<0>(w, input, offset, width); break;
         case 1: sum = matrix_row<1>(w, input, offset, width); break;
+        case 2: sum = matrix_row<2>(w, input, offset, width); break;
+        case 3: sum = matrix_row<3>(w, input, offset, width); break;
         case 6: sum = matrix_row<6>(w, input, offset, width); break;
+        case 7: sum = matrix_row<7>(w, input, offset, width); break;
         case 8: sum = matrix_row<8>(w, input, offset, width); break;
+        case 10: sum = matrix_row<10>(w, input, offset, width); break;
+        case 11: sum = matrix_row<11>(w, input, offset, width); break;
         case 12: sum = matrix_row<12>(w, input, offset, width); break;
+        case 13: sum = matrix_row<13>(w, input, offset, width); break;
         case 14: sum = matrix_row<14>(w, input, offset, width); break;
+        case 20: sum = matrix_row<20>(w, input, offset, width); break;
+        case 30: sum = matrix_row<30>(w, input, offset, width); break;
         default: sum = __int_as_float(0x7fffffff); break;
     }
     if (threadIdx.x == 0) y[(u64)selected * rows + row] = sum;
@@ -299,6 +350,7 @@ extern "C" __global__ void matvec_packed_f32(const u8 *w, int kind, const float 
             case 6: sum = matrix_row<6>(w, input, offset, width); break;
             case 8: sum = matrix_row<8>(w, input, offset, width); break;
             case 12: sum = matrix_row<12>(w, input, offset, width); break;
+            case 13: sum = matrix_row<13>(w, input, offset, width); break;
             case 14: sum = matrix_row<14>(w, input, offset, width); break;
             default: sum = __int_as_float(0x7fffffff); break;
         }
@@ -325,6 +377,40 @@ extern "C" __global__ void matvec_packed_gate_up(const u8 *gate, int gate_kind,
         u = reduce_first_warp_256(up_partial, tid, u);
         if (tid == 0) y[(u64)selected * rows + row] = g / (1.0f + expf(-g)) * u;
     }
+}
+#endif
+
+#if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_DECODE_FUSION_RESEARCH)
+extern "C" __global__ void matvec_packed_qkv(
+    const u8 *wq, int q_kind, int q_rows, float *yq,
+    const u8 *wk, int k_kind, int k_rows, float *yk,
+    const u8 *wv, int v_kind, int v_rows, float *yv,
+    const float *x, int width) {
+    int row = blockIdx.x;
+    const u8 *w;
+    int kind;
+    float *y;
+    if (row < q_rows) {
+        w = wq;
+        kind = q_kind;
+        y = yq;
+    } else if (row < q_rows + k_rows) {
+        row -= q_rows;
+        w = wk;
+        kind = k_kind;
+        y = yk;
+    } else if (row < q_rows + k_rows + v_rows) {
+        row -= q_rows + k_rows;
+        w = wv;
+        kind = v_kind;
+        y = yv;
+    } else {
+        return;
+    }
+    u64 offset = (u64)row * width;
+    float sum = kind == 12 ? packed_matrix_row<12>(w, x, offset, width)
+                           : packed_matrix_row<14>(w, x, offset, width);
+    if (threadIdx.x == 0) y[row] = sum;
 }
 #endif
 
@@ -421,6 +507,36 @@ extern "C" __global__ void normalize(const float *x, const u8 *w, float *y, int 
     for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = x[i] * inverse * ((const float *)w)[i];
 }
 
+template<bool Affine>
+__device__ __forceinline__ void layer_norm_impl(const float *x, const float *w,
+                                                 const float *bias, float *y, int n, float epsilon) {
+    x += (u64)blockIdx.x * n;
+    y += (u64)blockIdx.x * n;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) sum += x[i];
+    float mean = sum_block(sum) / (float)n;
+    __syncthreads();
+    sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float centered = x[i] - mean;
+        sum += centered * centered;
+    }
+    float inverse = 1.0f / sqrtf(sum_block(sum) / (float)n + epsilon);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float centered = (x[i] - mean) * inverse;
+        y[i] = Affine ? centered * w[i] + bias[i] : centered;
+    }
+}
+
+extern "C" __global__ void layer_norm_affine(const float *x, const float *w,
+                                              const float *bias, float *y, int n, float epsilon) {
+    layer_norm_impl<true>(x, w, bias, y, n, epsilon);
+}
+
+extern "C" __global__ void layer_norm_plain(const float *x, float *y, int n, float epsilon) {
+    layer_norm_impl<false>(x, nullptr, nullptr, y, n, epsilon);
+}
+
 #if defined(CUDA_M8_PROTOTYPES) && defined(CUDA_BLOCK_REDUCTION_RESEARCH)
 extern "C" __global__ void normalize_retained2048(const float *x, const u8 *w, float *y, float epsilon) {
     __shared__ float partial[256], inverse;
@@ -455,28 +571,42 @@ extern "C" __global__ void head_norm(float *x, const u8 *w, int dim, float epsil
     for (int i = threadIdx.x; i < dim; i += blockDim.x) x[i] *= inverse * ((const float *)w)[i];
 }
 
-__device__ __forceinline__ void rotary_impl(float *x, int n, int dim, int position, float base, int neox) {
+template<bool Partial = false>
+__device__ __forceinline__ void rotary_impl(float *x, int n, int dim, int position, float base, int neox,
+                                           const float *factors, float magnitude, int rotary_dim = 0) {
     x += (u64)blockIdx.y * n;
     position += blockIdx.y;
     int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= n / 2) return;
-    int pair = p % (dim / 2), head = p / (dim / 2);
+    int rotated = Partial ? rotary_dim : dim;
+    if (p >= (Partial ? n / dim * (rotated / 2) : n / 2)) return;
+    int pair = p % (rotated / 2), head = p / (rotated / 2);
     int a = head * dim + (neox ? pair : 2 * pair);
-    int b = neox ? a + dim / 2 : a + 1;
-    float angle = (float)position * powf(base, -(float)(2 * pair) / (float)dim);
-    float sine = sinf(angle), cosine = cosf(angle);
+    int b = neox ? a + rotated / 2 : a + 1;
+    float angle = (float)position * powf(base, -(float)(2 * pair) / (float)rotated);
+    if (factors) angle /= factors[pair];
+    float sine = sinf(angle) * magnitude, cosine = cosf(angle) * magnitude;
     float u = x[a], v = x[b];
     x[a] = u * cosine - v * sine;
     x[b] = u * sine + v * cosine;
 }
 
 extern "C" __global__ void rotary(float *x, int n, int dim, int position, float base, int neox) {
-    rotary_impl(x, n, dim, position, base, neox);
+    rotary_impl(x, n, dim, position, base, neox, nullptr, 1.0f);
+}
+
+extern "C" __global__ void rotary_partial_neox(float *x, int n, int dim, int position,
+                                               float base, int rotary_dim) {
+    rotary_impl<true>(x, n, dim, position, base, 1, nullptr, 1.0f, rotary_dim);
+}
+
+extern "C" __global__ void rotary_factored(float *x, int n, int dim, int position, float base,
+                                           int neox, const float *factors, float magnitude) {
+    rotary_impl(x, n, dim, position, base, neox, factors, magnitude);
 }
 
 extern "C" __global__ void rotary_decode(float *x, int n, int dim, const int *control,
                                          float base, int neox) {
-    rotary_impl(x, n, dim, control[1], base, neox);
+    rotary_impl(x, n, dim, control[1], base, neox, nullptr, 1.0f);
 }
 
 __device__ __forceinline__ void cache_kv_impl(const float *k, const float *v,
@@ -502,31 +632,65 @@ extern "C" __global__ void cache_kv_decode(const float *k, const float *v,
     cache_kv_impl(k, v, keys, values, width, control[1]);
 }
 
-extern "C" __global__ void attention_scores(const float *q, const float *keys, float *scores,
-                                            int dim, int heads, int kv_heads, int context, int count) {
+template<bool Gemma, bool Alibi = false>
+__device__ __forceinline__ void attention_scores_impl(const float *q, const float *keys,
+    float *scores, int dim, int heads, int kv_heads, int context, int count, int window, float scale,
+    float softcap) {
     int head = blockIdx.x, time = blockIdx.y;
     count += blockIdx.z;
-    if (time >= count) return;
+    if (time >= count || (Gemma && window > 0 && time < count - window)) return;
     q += (u64)blockIdx.z * heads * dim;
     scores += (u64)blockIdx.z * heads * context;
     int kv_head = head / (heads / kv_heads);
     float sum = 0.0f;
     for (int i = threadIdx.x; i < dim; i += blockDim.x)
-        sum += q[(u64)head * dim + i] * keys[((u64)time * kv_heads + kv_head) * dim + i];
+        sum += (Gemma ? q[(u64)head * dim + i] * scale : q[(u64)head * dim + i])
+             * keys[((u64)time * kv_heads + kv_head) * dim + i];
     sum = sum_block(sum);
-    if (threadIdx.x == 0) scores[(u64)head * context + time] = sum / sqrtf((float)dim);
+    if (threadIdx.x == 0) {
+        float score = Gemma ? sum : sum / sqrtf((float)dim);
+        if (Gemma && softcap > 0.0f)
+            score = isfinite(score) ? softcap * tanhf(score * (1.0f / softcap))
+                                    : __int_as_float(0x7fffffff);
+        if (Alibi) {
+            int base_heads = 1 << (31 - __clz((unsigned int)heads));
+            float slope = head < base_heads
+                ? powf(exp2f(-scale / base_heads), head + 1)
+                : powf(exp2f(-scale / (2 * base_heads)), 2 * (head - base_heads) + 1);
+            score -= slope * (count - 1 - time);
+        }
+        scores[(u64)head * context + time] = score;
+    }
 }
 
-extern "C" __global__ void attention_values(float *scores, const float *values, float *output,
+extern "C" __global__ void attention_scores(const float *q, const float *keys, float *scores,
                                             int dim, int heads, int kv_heads, int context, int count) {
+    attention_scores_impl<false>(q, keys, scores, dim, heads, kv_heads, context, count, 0, 1.0f, 0.0f);
+}
+
+extern "C" __global__ void alibi_attention_scores(const float *q, const float *keys, float *scores,
+    int dim, int heads, int kv_heads, int context, int count, float max_bias) {
+    attention_scores_impl<false, true>(q, keys, scores, dim, heads, kv_heads,
+                                       context, count, 0, max_bias, 0.0f);
+}
+
+extern "C" __global__ void gemma_attention_scores(const float *q, const float *keys, float *scores,
+    int dim, int heads, int kv_heads, int context, int count, int window, float scale, float softcap) {
+    attention_scores_impl<true>(q, keys, scores, dim, heads, kv_heads, context, count, window, scale, softcap);
+}
+
+template<bool Gemma>
+__device__ __forceinline__ void attention_values_impl(float *scores, const float *values,
+    float *output, int dim, int heads, int kv_heads, int context, int count, int window) {
     count += blockIdx.y;
+    int start = Gemma && window > 0 && count > window ? count - window : 0;
     scores += (u64)blockIdx.y * heads * context;
     output += (u64)blockIdx.y * heads * dim;
     __shared__ float maxima[256];
     int head = blockIdx.x, lane = threadIdx.x;
     float *s = scores + (u64)head * context;
     float maximum = -__int_as_float(0x7f800000);
-    for (int t = lane; t < count; t += blockDim.x) maximum = fmaxf(maximum, s[t]);
+    for (int t = start + lane; t < count; t += blockDim.x) maximum = fmaxf(maximum, s[t]);
     maxima[lane] = maximum;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
@@ -535,7 +699,7 @@ extern "C" __global__ void attention_values(float *scores, const float *values, 
     }
     maximum = maxima[0];
     float total = 0.0f;
-    for (int t = lane; t < count; t += blockDim.x) {
+    for (int t = start + lane; t < count; t += blockDim.x) {
         s[t] = expf(s[t] - maximum);
         total += s[t];
     }
@@ -543,14 +707,56 @@ extern "C" __global__ void attention_values(float *scores, const float *values, 
     int kv_head = head / (heads / kv_heads);
     for (int i = lane; i < dim; i += blockDim.x) {
         float value = 0.0f;
-        for (int t = 0; t < count; t++)
+        for (int t = start; t < count; t++)
             value += s[t] / total * values[((u64)t * kv_heads + kv_head) * dim + i];
         output[(u64)head * dim + i] = value;
     }
 }
 
-extern "C" __global__ void router(const float *scores, int count, int used,
-                                 int *ids, float *weights, int *status) {
+extern "C" __global__ void attention_values(float *scores, const float *values, float *output,
+                                            int dim, int heads, int kv_heads, int context, int count) {
+    attention_values_impl<false>(scores, values, output, dim, heads, kv_heads, context, count, 0);
+}
+
+extern "C" __global__ void gemma_attention_values(float *scores, const float *values, float *output,
+    int dim, int heads, int kv_heads, int context, int count, int window) {
+    attention_values_impl<true>(scores, values, output, dim, heads, kv_heads, context, count, window);
+}
+
+extern "C" __global__ void gemma_embedding_scale(float *x, int count, float scale) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) x[i] *= scale;
+}
+
+__device__ __forceinline__ float gelu(float x) {
+    return 0.5f * x * (1.0f + tanhf(0.7978846f * x * (1.0f + 0.044715f * x * x)));
+}
+
+extern "C" __global__ void gemma_geglu(float *gate, const float *up, int count) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) gate[i] = gelu(gate[i]) * up[i];
+}
+
+extern "C" __global__ void gelu_row_bias(float *up, const float *bias, int width) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < width) {
+        u64 offset = (u64)blockIdx.y * width + i;
+        up[offset] = gelu(up[offset] + bias[i]);
+    }
+}
+
+extern "C" __global__ void gemma_softcap(float *logits, int count, float cap, int *status) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        float x = logits[i];
+        if (!isfinite(x)) atomicExch(status, 1);
+        else logits[i] = cap * tanhf(x / cap);
+    }
+}
+
+template<bool FullSoftmax>
+__device__ __forceinline__ void router_impl(const float *scores, int count, int used,
+                                            int *ids, float *weights, int *status) {
     __shared__ float best_scores[256];
     __shared__ int best_ids[256];
     __shared__ float maximum, total;
@@ -603,8 +809,163 @@ extern "C" __global__ void router(const float *scores, int count, int used,
         }
         __syncthreads();
     }
-    for (int s = lane; s < used; s += blockDim.x) weights[s] /= total;
+    float denominator = total;
+    if (FullSoftmax) {
+        float local = 0.0f;
+        for (int i = lane; i < count; i += blockDim.x) local += expf(scores[i] - maximum);
+        denominator = sum_block(local);
+    }
+    for (int s = lane; s < used; s += blockDim.x) weights[s] /= denominator;
 }
+
+extern "C" __global__ void router(const float *scores, int count, int used,
+                                  int *ids, float *weights, int *status) {
+    router_impl<false>(scores, count, used, ids, weights, status);
+}
+
+extern "C" __global__ void router_full_softmax(const float *scores, int count, int used,
+                                               int *ids, float *weights, int *status) {
+    router_impl<true>(scores, count, used, ids, weights, status);
+}
+#if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_DECODE_FUSION_RESEARCH)
+extern "C" __global__ void router_warp128(const float *scores, int used,
+                                          int *ids, float *weights, int *status) {
+    scores += (u64)blockIdx.x * 128;
+    ids += (u64)blockIdx.x * used;
+    weights += (u64)blockIdx.x * used;
+    int lane = threadIdx.x;
+    float val[4];
+    bool bad = false;
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        float v = scores[lane + k * 32];
+        val[k] = v;
+        if (!isfinite(v)) bad = true;
+    }
+    if (__any_sync(0xffffffffu, bad)) {
+        for (int i = lane; i < used; i += 32) {
+            ids[i] = 0;
+            weights[i] = 0.0f;
+        }
+        if (lane == 0) atomicExch(status, 1);
+        return;
+    }
+    bool chosen[4] = {false, false, false, false};
+    float maximum = 0.0f, total = 0.0f, my_weight = 0.0f;
+    for (int s = 0; s < used; s++) {
+        int best_id = -1;
+        float best_score = -__int_as_float(0x7f800000);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            int idx = lane + k * 32;
+            float sc = val[k];
+            if (!chosen[k] && (best_id < 0 || sc > best_score
+                || (sc == best_score && idx < best_id))) {
+                best_id = idx;
+                best_score = sc;
+            }
+        }
+        #pragma unroll
+        for (int stride = 16; stride > 0; stride /= 2) {
+            int other_id = __shfl_down_sync(0xffffffffu, best_id, stride);
+            float other_score = __shfl_down_sync(0xffffffffu, best_score, stride);
+            if (other_id >= 0 && (best_id < 0 || other_score > best_score
+                || (other_score == best_score && other_id < best_id))) {
+                best_id = other_id;
+                best_score = other_score;
+            }
+        }
+        int win_id = __shfl_sync(0xffffffffu, best_id, 0);
+        float win_score = __shfl_sync(0xffffffffu, best_score, 0);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            if (lane + k * 32 == win_id) chosen[k] = true;
+        }
+        if (s == 0) maximum = win_score;
+        float w = expf(win_score - maximum);
+        total += w;
+        if (lane == s) {
+            ids[s] = win_id;
+            my_weight = w;
+        }
+    }
+    if (lane < used) weights[lane] = my_weight / total;
+}
+
+__device__ __forceinline__ void qkv_head_norm_rope_cache_impl(
+    float *q, const u8 *q_norm, int heads,
+    float *k, const u8 *k_norm, const float *v,
+    float *keys, float *values, int kv_heads,
+    float epsilon, int position, float base, int neox) {
+    __shared__ float normed[128];
+    int b = blockIdx.x, tid = threadIdx.x;
+    bool is_q = b < heads;
+    int head = is_q ? b : b - heads;
+    if (!is_q && head >= kv_heads) return;
+    float *vec = (is_q ? q : k) + (u64)head * 128;
+    const float *nw = (const float *)(is_q ? q_norm : k_norm);
+    float val = tid < 128 ? vec[tid] : 0.0f;
+    float sq = tid < 128 ? val * val : 0.0f;
+    float inverse = 1.0f / sqrtf(sum_block(sq) / 128.0f + epsilon);
+    if (tid < 128) normed[tid] = val * (inverse * nw[tid]);
+    __syncthreads();
+    if (tid < 64) {
+        int pair = tid;
+        int a = neox ? pair : 2 * pair;
+        int b_idx = neox ? a + 64 : a + 1;
+        float angle = (float)position * powf(base, -(float)(2 * pair) / 128.0f);
+        float sine = sinf(angle), cosine = cosf(angle);
+        float u = normed[a], w_val = normed[b_idx];
+        float ra = u * cosine - w_val * sine;
+        float rb = u * sine + w_val * cosine;
+        vec[a] = ra;
+        vec[b_idx] = rb;
+        if (!is_q) {
+            u64 kv_base = ((u64)position * kv_heads + head) * 128;
+            keys[kv_base + a] = ra;
+            keys[kv_base + b_idx] = rb;
+        }
+    }
+    if (!is_q && tid >= 128) {
+        int i = tid - 128;
+        u64 kv_base = ((u64)position * kv_heads + head) * 128;
+        values[kv_base + i] = v[(u64)head * 128 + i];
+    }
+}
+
+extern "C" __global__ void qkv_head_norm_rope_cache(
+    float *q, const u8 *q_norm, int heads,
+    float *k, const u8 *k_norm, const float *v,
+    float *keys, float *values, int kv_heads,
+    float epsilon, int position, float base, int neox) {
+    qkv_head_norm_rope_cache_impl(
+        q, q_norm, heads, k, k_norm, v, keys, values, kv_heads, epsilon, position, base, neox);
+}
+
+extern "C" __global__ void qkv_head_norm_rope_cache_decode(
+    float *q, const u8 *q_norm, int heads,
+    float *k, const u8 *k_norm, const float *v,
+    float *keys, float *values, int kv_heads,
+    float epsilon, const int *control, float base, int neox) {
+    qkv_head_norm_rope_cache_impl(
+        q, q_norm, heads, k, k_norm, v, keys, values, kv_heads, epsilon, control[1], base, neox);
+}
+#endif
+
+#ifdef CUDA_M8_PROTOTYPES
+extern "C" __global__ void residual_normalize(float *x, const float *projected,
+    const u8 *w, float *y, int n, float epsilon) {
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float xi = x[i] + projected[i];
+        x[i] = xi;
+        sum += xi * xi;
+    }
+    float inverse = 1.0f / sqrtf(sum_block(sum) / (float)n + epsilon);
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        y[i] = x[i] * inverse * ((const float *)w)[i];
+}
+#endif
 
 extern "C" __global__ void swiglu(float *gate, const float *up, int count) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -614,6 +975,20 @@ extern "C" __global__ void swiglu(float *gate, const float *up, int count) {
 extern "C" __global__ void residual(float *x, const float *projected, int width) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < width) x[i] += projected[i];
+}
+
+extern "C" __global__ void add_row_bias(float *x, const float *bias, int width) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < width) x[(u64)blockIdx.y * width + i] += bias[i];
+}
+
+extern "C" __global__ void add_position_embedding(float *x, const u8 *table, int kind,
+                                                   int width, int position) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < width) {
+        u64 row = blockIdx.y;
+        x[row * width + i] += weight(table, kind, ((u64)position + row) * width + i);
+    }
 }
 
 extern "C" __global__ void combine(float *x, const float *experts, const float *weights, int width, int used) {

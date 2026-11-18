@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn packed_matmul_matches_expansion_across_formats_batches_and_rows() {
-        for kind in [1, 6, 8, 12, 14] {
+        for kind in [1, 6, 8, 12, 13, 14] {
             let (block, size, _) = layout(kind).unwrap();
             let width = block * 2;
             let mut bytes = vec![0; size * 6];
@@ -332,7 +332,7 @@ mod tests {
                 let scale_offset = if kind == 14 { 208 } else { 0 };
                 packed[scale_offset..scale_offset + 2]
                     .copy_from_slice(&f16::from_f32(0.125).to_bits().to_le_bytes());
-                if kind == 12 {
+                if matches!(kind, 12 | 13) {
                     packed[2..4].copy_from_slice(&f16::from_f32(0.0625).to_bits().to_le_bytes());
                 }
             }

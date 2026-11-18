@@ -13,7 +13,7 @@ The [standalone master Mermaid chart](../docs/architecture.mmd) is editable.
 ## Default CPU execution scope
 
 - One dense, decoder-only `llama` architecture model, one sequence, CPU execution.
-- GGUF v3 with an explicit tensor allowlist: F32, F16, Q5_0, Q8_0, Q4_K, Q6_K.
+- GGUF v3 with an explicit tensor allowlist: F32, F16, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K.
 - Own GGUF reader, tensor dequantization, RMSNorm, adjacent-pair RoPE, causal
   grouped-query attention, SwiGLU, residuals, and tied/separate output weights.
 - Packed GGUF matrices remain packed. Our kernels decode bounded blocks on demand
@@ -45,7 +45,303 @@ The default model's name is `Q4_K_M`, but its actual tensors include Q5_0, Q8_0,
 Q4_K, Q6_K, and F32. Capabilities are checked from the tensor directory, not inferred
 from the filename.
 
-## Independent CUDA and Qwen3-MoE
+## Native model compatibility
+
+This initial matrix uses llama.cpp revision
+[`6b01a476`](https://github.com/ggml-org/llama.cpp/tree/6b01a4767f8d3d0c416c410a49861333965c0982)
+as a test oracle only. Status applies to the named fixture, tokenizer and
+mode, not to an entire architecture or to performance parity.
+
+| GGUF architecture / fixture | Weight label / tokenizer | Mode | Default CPU | CPU reference | CUDA |
+|---|---|---|---|---|---|
+| `llama` / SmolLM2-135M-Instruct | Q4_K_M / `smollm` | Causal text | Validated | Validated | Validated |
+| `llama` / SmolLM2-135M-Instruct | Q4_1, Q5_1 / `smollm` | Causal text | Validated (short prompts, GGUF EOS) | Validated (short prompts, GGUF EOS) | Validated (short prompts, GGUF EOS; `f32`, no graph) |
+| `llama` / SmolLM2-135M-Instruct | IQ4_NL + Q3_K / `smollm` | Causal text | Validated (short prompts, GGUF EOS) | Validated (short prompts, GGUF EOS) | Validated (short prompts, GGUF EOS; `f32`, no graph) |
+| `llama` / Llama 3.2 1B Instruct | Q8_0 / `llama-bpe` | Causal text | Not supported | Validated | Validated (`f32`, no graph) |
+| `qwen3` / Qwen3-0.6B | F16, Q4_K_M / `qwen2` | Causal text | Not supported | Validated | Validated |
+| `qwen3` / Qwen3-0.6B | BF16 / `qwen2` | Causal text | Not supported | Validated | Validated (`f32`, no graph) |
+| `qwen3` / Qwen3-0.6B | Pure Q2_K / `qwen2` | Causal text | Not supported | Validated (short prompts) | Validated (short prompts; `f32`, no graph) |
+| `qwen3moe` / Qwen3-30B-A3B | Q4_K_M / `qwen2` | Causal text | Not supported | Validated | Validated |
+| `qwen2` / Qwen2.5 0.5B Instruct | Q8_0, Q4_K_M and Q4_0 / `qwen2` | Causal text | Not supported | Validated | Validated (`f32`, no graph) |
+| `gemma2` / Gemma 2 2B IT | Q8_0 / embedded SentencePiece | Causal text | Not supported | Validated | Validated (`f32`, no graph) |
+| `gemma3` / Gemma 3 270M IT | Q8_0 / embedded SentencePiece | Causal text | Not supported | Validated | Validated |
+| `phi3` / Phi-3 Mini 4K Instruct | Q8_0 / embedded SentencePiece | Causal text | Not supported | Validated | Validated (`f32`, no graph) |
+| `phi3` / Phi-3 Mini 4K Instruct | Q4_K_M / embedded SentencePiece | Causal text | Not supported | Validated | Validated (`f32`, no graph) |
+| `phi3` / Phi-3 Mini 128K Instruct | Q4_K_M / embedded SentencePiece | Causal text | Not supported | Both LongRoPE selections validated with short inputs | Both LongRoPE selections validated with short inputs (`f32`, no graph) |
+| `starcoder2` / StarCoder2-3B | Q4_K_M / `starcoder` | Causal text | Not supported | Validated (short prompts) | Validated (short prompts; `f32`, no graph) |
+| `gpt2` / GPT-2 small | Q8_0 / `gpt-2` | Causal text | Not supported | Validated (short prompts and 1024-token boundary) | Validated (same; `f32`, no graph) |
+| `bloom` / Bloom-560M | Q4_K_M / `bloom` | Causal text with ALiBi | Not supported | Validated (short prompts) | Validated (same; `f32`, no graph) |
+| `gptneox` / Pythia-70M | Q8_0 / `mpt` | Causal text with partial RoPE and parallel residuals | Not supported | Validated (short prompts) | Validated (same; `f32`, no graph) |
+| `olmo` / OLMo-1B-hf | Q4_K_M / `olmo` | Causal text, non-affine LayerNorm, no QKV clamp | Not supported | Validated (short prompts) | Validated (same; `f32`, no graph) |
+| `olmo2` / OLMo-2-0425-1B | Q4_K_M / `dbrx` | Causal text, full attention and post-RMSNorm | Not supported | Validated (short prompts) | Validated (same; `f32`, no graph) |
+| `olmoe` / OLMoE-1B-7B-0924-Instruct | Q4_K_M / `olmo` | Causal text, top-8 of 64 experts without selected-weight renormalization | Not supported | Validated (short prompts) | Validated (same; `f32`, no graph) |
+| `qwen35` / Qwen3.5-0.8B | Q4_K_M / `qwen35` | Causal text, gated full attention and Gated DeltaNet | Not supported | Validated (short prompts, 32-token configured boundary, and recurrent reset/replay) | Validated (same plus 128/140-token fixed-ID checks; batched prefill, `f32`, no graph) |
+| `mamba` / Mamba-130M-hf | Q4_K_M / `olmo` | Causal text, Mamba-1 selective scan without dt/B/C RMSNorm | Not supported | Validated (short prompts and recurrent reset/replay) | Not supported |
+| Other variants of the architectures above | Other layouts, formats or modes | Varies | Not validated | Not validated | Not validated |
+| Other model architectures in the pinned registry | All | All | Not supported | Not supported | Not supported |
+
+To list all architecture names and backend statuses in the pinned registry,
+run `bash scripts/model_inventory.sh /path/to/llama.cpp`. The inventory
+reports architecture-level coverage, not validation of individual modes.
+
+The shared loader supports Llama's shared `rope_freqs.weight` divisors and
+Phi-3's shared short/long divisors with an attention magnitude.
+Other scaled or partial RoPE, shared experts, and unrecognized tensor layouts
+are rejected. Sliding-window attention is implemented for Gemma 2 and Gemma 3
+on the CPU reference and CUDA; attention logit softcapping is supported for
+the validated Gemma 2 layout.
+The Qwen3 entry covers separate Q/K/V projections and either tied or
+separate output weights. It does not cover embeddings, reranking, chat templates,
+or CPU/GPU offload. Existing `qwen2` pretokenization applies NFC normalization;
+the parity check below uses NFC inputs and does not establish parity for
+decomposed Unicode.
+
+The [Llama 3.2 fixture](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/blob/067b946cf014b7c697f3654f621d577a3e3afd1c/Llama-3.2-1B-Instruct-Q8_0.gguf)
+uses F32 and Q8_0 tensors. The previous loader rejected its frequency tensor.
+CPU reference and RTX 5090 now pass all 128,256 logits at five checkpoints
+(1, 6, 7, 10 and 16 tokens) against the pinned F32-activation oracle,
+with maximum absolute errors of `2.15e-5` and `3.86e-6`, respectively.
+Exact text, BOS/header/turn IDs, four separately generated greedy IDs and
+bitwise reset/replay were checked. This is short-context evidence, not a
+validation of the advertised 128K context, other quants, or decode graphs.
+
+To reproduce the dense compatibility checkpoint, from `runtime/`:
+
+```sh
+git --no-pager -C ../llama.cpp rev-parse HEAD  # must match the pinned revision above
+git --no-pager -C ../llama.cpp status --short  # must be clean
+export CARGO_TARGET_DIR=target/compat-native
+cargo build --release --locked --features cuda
+mkdir -p results/compat-native
+python3 scripts/build_f32_oracle.py --output-dir results/compat-native/oracle-build
+export LLAMA32_GGUF=models/compat-llama32/Llama-3.2-1B-Instruct-Q8_0.gguf
+python3 scripts/validate_dense_compat.py --fixture llama32 --backend reference \
+  --model "$LLAMA32_GGUF" --rust "$CARGO_TARGET_DIR/release/local-inference" \
+  --oracle target/llama-f32-oracle/bin/logits-oracle \
+  --output results/compat-native/llama32-reference-new.json
+cargo test --release --locked --features cuda --test dense_compat \
+  llama32_reference -- --ignored --test-threads=1
+```
+
+For GPU validation, configure CUDA 13 NVRTC as below, verify the GPU is idle,
+then run the validator with `--backend cuda` and a new output file, and the same
+test command with `llama32_cuda`. The validator records exact IDs, per-checkpoint
+metrics and input/binary checksums. The existing arithmetic gate is unchanged:
+maximum absolute error <= 0.01, cosine >= 0.99999, identical argmax.
+
+[Phi-3 Mini 4K Instruct Q8_0](https://huggingface.co/bartowski/Phi-3-mini-4k-instruct-GGUF/blob/e1447f6da0be91f91683c5d19f938d4f51122d88/Phi-3-mini-4k-instruct-Q8_0.gguf)
+is the smallest Microsoft Phi-3 text variant, using the 4K version to avoid
+LongRoPE. The loader splits fused QKV and gate/up by stored row, without
+dequantizing or requantizing them. It reuses the existing projection and SwiGLU
+operators with split-half RoPE. The tokenizer uses the GGUF's SentencePiece
+scores, byte fallback, Phi-3 prefix/whitespace rules, and turn/end markers;
+it does not apply the chat template.
+
+On the Q8_0 file, all 32,064 logits at each of five checkpoints (1, 6, 7, 10 and
+15 tokens) passed, with maximum errors of `4.01e-4` on the CPU reference and
+`1.59e-5` on RTX 5090. Both matched all four greedy IDs and passed bitwise
+reset/replay. Reproduce using `--fixture phi3-mini-4k`, set `PHI3_GGUF` to the
+fixture path, and use the `phi3_reference` and `phi3_cuda` test filters. This
+does not validate the full 4K context, longer variants, or non-`f32` profiles.
+
+The [Q4_K_M fixture](https://huggingface.co/bartowski/Phi-3-mini-4k-instruct-GGUF/blob/e1447f6da0be91f91683c5d19f938d4f51122d88/Phi-3-mini-4k-instruct-Q4_K_M.gguf)
+also passes the same five full-logit, exact-ID, separate greedy and reset
+checks. It contains 32 Q5_K tensors alongside Q4_K, Q6_K and F32.
+The portable block decoder and dense CUDA F32 kernels now handle Q5_K without
+expanding whole matrices. Maximum absolute error was `2.67e-4` on the CPU
+reference and `1.02e-5` on RTX 5090. Reuse the Phi-3 commands with the Q4_K_M
+fixture path and a new output file. CUDA MoE, graphs and other matrix profiles
+with Q5_K are explicitly rejected.
+
+The shared compatibility changes are in [the transformer loader](src/transformer.rs),
+[GGUF parsing](src/gguf.rs), [the tokenizer](src/tokenizer.rs),
+[SentencePiece](src/tokenizer/sentencepiece.rs), [the CPU reference](src/cuda/reference.rs),
+and [CUDA decode](src/cuda.rs), [prefill](src/cuda/batch.rs) and [kernels](src/cuda/kernels.cu).
+[The external oracle](native/logits_oracle.cpp) adds a vocabulary-only tokenizer
+and a separate greedy run. [The lifecycle tests](tests/dense_compat.rs) verify
+prefill, explicit continuation, stop markers, stale-logit rejection, and reset.
+
+The official [Qwen2.5 0.5B Instruct fixtures](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/tree/9217f5db79a29953eb74d5343926648285ec7e67)
+use separate Q/K/V projections and biases. The native loader applies the biases
+before split-half RoPE on Q/K and before caching V. Each fixture passed all
+151,936 logits at five checkpoints (1, 5, 6, 9 and 15 tokens), exact NFC-input
+tokenization including control tokens, and separate four-token greedy and bitwise
+reset/replay checks. Maximum absolute error on CPU reference / RTX 5090 was
+`5.67e-5` / `2.27e-5` for Q8_0, `4.68e-5` / `3.85e-5` for Q4_K_M, and
+`5.61e-4` / `3.20e-5` for Q4_0. The Q4_K_M file contains Q5_0, Q8_0, Q4_K,
+Q6_K and F32 tensors; the Q4_0 file contains 169 Q4_0, 121 F32 and one Q8_0
+tensor. Q4_0 uses the portable block decoder and the dense F32 CUDA
+projection path; CUDA graphs, MoE and other CUDA math profiles with Q4_0
+are rejected. Reproduce
+with `--fixture qwen25`, `QWEN25_GGUF` set to the selected fixture, and
+the `qwen25_reference` and `qwen25_cuda` lifecycle test filters. This does
+not cover decomposed Unicode, automatic chat templating, or full context length.
+
+The [Gemma 2 2B IT Q8_0 fixture](https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/blob/855f67caed130e1befc571b52bd181be2e858883/gemma-2-2b-it-Q8_0.gguf)
+uses tied output weights, split-half RoPE, alternating local/global layers,
+and softcaps on the scaled attention scores and output logits. Against the
+pinned F32-GELU control, all 256,000 logits passed at input lengths 1, 6, 7,
+10 and 15, with maximum absolute error `1.72e-5` on CPU reference and
+`8.56e-6` on RTX 5090. Exact tokenization (including turn markers), separate
+four-token greedy generation, and prefill/decode/reset lifecycle also passed.
+A copy changing only `gemma2.attention.sliding_window` from 4096 to 8 passed
+the same checks, crossing the masking boundary at lengths 10 and 15
+(`2.06e-5` CPU / `9.51e-6` CUDA maximum absolute error). This is a controlled
+masking test, not validation of the original 4096-token window or 8192-token
+context. Other Gemma 2 sizes are not covered.
+
+Reproduce with `scripts/validate_dense_compat.py --fixture gemma2` using the
+F32-GELU oracle described below. For lifecycle checks, set `GEMMA2_GGUF` to the
+original file and run
+`cargo test --release --locked --features cuda --test dense_compat gemma2 -- --ignored --test-threads=1`.
+Eight full-logit comparisons with pre-change binaries (Gemma 3 Q8_0 and
+Qwen2.5 Q8_0, both backends, prefill chunks 1 and 4) were bitwise identical.
+
+The pinned inventory has 174 entries: nine have partial causal-text coverage
+and 165 have no native path. Other dense layouts
+and formats, shared experts/other MoE (including DeepSeek and GPT-OSS),
+Qwen3.5 hybrid recurrence and Mamba/Mamba2 remain open. CPU/GPU offload is a
+separate capability. Embeddings/pooling, encoder-decoder and multimodal modes
+are not covered by any causal-text row.
+
+The [Phi-3 Mini 128K Instruct Q4_K_M fixture](https://huggingface.co/QuantFactory/Phi-3-mini-128k-instruct-GGUF/blob/0cc851bb3014ecd709dbe418684c8d66baa35263/Phi-3-mini-128k-instruct.Q4_K_M.gguf)
+previously rejected `rope.scaling.attn_factor`. The loader now validates both
+F32 divisor tensors and selects one at model open based on the configured
+single-sequence context (padded to 256 by the oracle), not the current token
+position. It applies the GGUF's magnitude to the sine and cosine used for
+both Q and K. The CPU reference and RTX 5090 passed five full-vocabulary
+checkpoints each at contexts 4096 (short) and 4097 (long), exact tokenization,
+separate greedy generation, and bitwise reset/replay. Worst absolute error
+was `8.40e-4` on CPU reference and `4.44e-5` on CUDA. Switching contexts with
+identical IDs changed logits by up to `0.488`, so using the wrong factors would
+not pass the gate. This validates selection from position zero and the
+configured-context boundary, not sequences of 4096+ tokens or the advertised
+131072-token context.
+
+Reproduce with `scripts/validate_dense_compat.py --fixture phi3-mini-128k`
+and `--context 4096` or `--context 4097`, using the pinned F32-GELU oracle
+built with `scripts/build_f32_oracle.py --f32-gelu`. Set `PHI3_128K_GGUF`
+for `dense_compat` test filters `phi3_longrope_reference_lifecycle` and
+`phi3_longrope_cuda_lifecycle`. Use distinct output paths for each run.
+
+[SmolLM2-135M-Instruct Q4_1 and Q5_1](https://huggingface.co/QuantFactory/SmolLM2-135M-Instruct-GGUF/tree/476854d00ede130660aba430d15f9347ad2e7d0e)
+use packed affine blocks with an F16 scale and offset. Both passed the
+F32-GELU gate for all 49,152 logits at five checkpoints, exact tokenization,
+four separately generated greedy IDs, and reset/replay on default CPU,
+CPU reference and RTX 5090. Worst errors on CPU (both paths) / CUDA were
+`3.56e-5` / `2.16e-5` for Q4_1 and `6.49e-5` / `1.29e-5` for Q5_1.
+These checks do not establish parity for the oracle's extra EOG tokens:
+the default CPU path stops only at the GGUF's EOS ID; exact tokenization
+of those extra markers is covered. CUDA rejects MoE, graphs and non-F32
+profiles with Q4_1 or Q5_1. Reproduce with `--fixture smollm2` and backend
+`cpu`, `reference` or `cuda`. Set `SMOLLM2_Q4_1_GGUF` / `SMOLLM2_Q5_1_GGUF`
+for `dense_compat` filters `smollm2_q4_1` / `smollm2_q5_1` and run the CPU
+and CUDA tests separately.
+
+The QuantFactory file named `SmolLM2-135M-Instruct.Q2_K.gguf` in that same
+revision actually contains 180 IQ4_NL and 30 Q3_K tensors, plus Q8_0 and
+F32; it contains no Q2_K tensors. The same SmolLM2 gate and lifecycle checks
+passed on both CPUs and CUDA, with worst absolute errors `4.11e-5` and
+`1.94e-5`, respectively. Reproduce with `--fixture smollm2` and
+`SMOLLM2_IQ4_NL_GGUF` for the `smollm2_iq4_nl` test filters. This does not
+validate actual Q2_K tensors.
+
+A separate Qwen3-0.6B fixture, prepared from the pinned F16 model using
+`llama-quantize --pure INPUT.gguf OUTPUT.gguf Q2_K 4` at `6b01a476`,
+contains 198 actual Q2_K tensors. It passed all 151,936 logits at five
+checkpoints, exact IDs, separate greedy and reset/replay. Maximum errors
+were `7.54e-4` on the CPU reference and `3.40e-4` on CUDA. Reproduce with
+`--fixture qwen3`, `QWEN3_Q2_K_GGUF`, and `qwen3_q2_k` lifecycle filters.
+
+[StarCoder2-3B Q4_K_M](https://huggingface.co/QuantFactory/starcoder2-3b-GGUF/blob/1408543fccd214a5980b16d6d01200001d82193a/starcoder2-3b.Q4_K_M.gguf)
+uses affine LayerNorm, biased Q/K/V and attention output, and a biased
+ungated GELU FFN. The pinned F32-GELU gate passed all 49,152 logits at five
+checkpoints for a code prompt and fixed continuation. Worst absolute error
+was `2.01e-5` on the CPU reference and `2.68e-5` on RTX 5090. Both matched
+four separate greedy IDs and passed reset/replay, and tokenization matched
+including FIM and EOG markers. Gemma 2 and SmolLM2 logits stayed bitwise
+identical for prefill chunks 1 and 4 on both backends. Reproduce with
+`--fixture starcoder2` and `STARCODER2_GGUF` for the
+`starcoder2_reference_lifecycle` and `starcoder2_cuda_lifecycle` filters.
+This does not validate the full 16K context or other StarCoder2 variants.
+
+[GPT-2 small Q8_0](https://huggingface.co/igorbkz/gpt2-Q8_0-GGUF/blob/a1a3a46a01c0478277d60919465688e6f4a64350/gpt2.Q8_0.gguf)
+reuses the affine GELU transformer path, with split packed QKV rows and
+learned absolute position embeddings in place of RoPE. The pinned F32-GELU
+gate passed all 50,257 logits at five checkpoints; worst errors were
+`6.16e-5` on the CPU reference and `3.11e-5` on CUDA. Exact tokenizer IDs,
+separate greedy and reset/replay passed. Use `--fixture gpt2` and `GPT2_GGUF`
+for `gpt2_reference_lifecycle` and `gpt2_cuda_lifecycle`.
+The same gate also passed at 1023 and 1024 input tokens with a fixed
+repeated token sequence, covering the final learned position.
+
+Qwen3-0.6B fixtures:
+[ggml-org F16](https://huggingface.co/ggml-org/Qwen3-0.6B-GGUF/blob/afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-f16.gguf)
+(F16/F32 tensors) and
+[Unsloth Q4_K_M](https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/blob/50968a4468ef4233ed78cd7c3de230dd1d61a56b/Qwen3-0.6B-Q4_K_M.gguf)
+(Q4_K/Q6_K/F32 tensors). Each was compared against the pinned oracle using
+the same file in both engines: exact tokenizer IDs (including Qwen control
+tokens), 151,936 logits at three fixed-continuation checkpoints, and four
+greedy tokens in a separate generation run. The logit checkpoints were
+`The capital of France is` plus 0, 1, or 4 tokens from ` Paris. It is`.
+The largest observed absolute logit difference was `8.11e-5` for CPU
+reference and `1.06e-5` for CUDA. Logits used the matched-F32
+activation oracle described below (max absolute error <= 0.01, cosine >=
+0.99999, equal argmax). This does not claim bitwise equality with llama.cpp
+or compare its optimized activation-quantized path.
+
+The [ggml-org BF16 fixture](https://huggingface.co/ggml-org/Qwen3-0.6B-GGUF/blob/afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf)
+contains 198 BF16 and 113 F32 tensors. BF16 weights are decoded to F32 for
+arithmetic, not run through a BF16 tensor-core profile. The same 151,936 logits
+passed at lengths 1, 5, 6, 9 and 15 with maximum absolute error `1.60e-4` on
+CPU reference and `1.82e-5` on RTX 5090. NFC tokenizer IDs including special
+tokens, separate greedy generation and the prefill/decode/reset lifecycle
+also passed. Reproduce with `--fixture qwen3`, `QWEN3_BF16_GGUF` and the
+`qwen3_bf16` lifecycle test filter. CUDA graphs, MoE and other CUDA math
+profiles with BF16 weights are not supported.
+
+```sh
+cargo build --release --locked --features cuda
+target/release/local-inference generate --backend reference \
+  --model models/compat-qwen3/Qwen3-0.6B-Q4_K_M.gguf \
+  --prompt 'The capital of France is' --tokens 4
+# Use --backend cuda to run the same file on a configured CUDA machine.
+```
+
+The reference backend requires the `cuda` Cargo feature to expose its CLI entry,
+but runs entirely on CPU and does not require CUDA libraries or hardware.
+
+For Gemma 3, the CPU reference and CUDA implement alternating local/global layers,
+per-layer RoPE bases, embedding scaling, post-attention and post-FFN RMSNorm,
+and F32 GELU. Both accept explicit IDs and plain text.
+The embedded SentencePiece tokenizer preserves literal whitespace, supports UTF-8
+byte fallback, and uses the configured BOS and Gemma turn markers. `generate`
+stops on EOS or end-of-turn; no chat template is applied automatically.
+CUDA uses the unfused score-buffer path, supports only `--cuda-matmul f32`
+and rejects decode graphs. On the
+[270M IT Q8_0 fixture](https://huggingface.co/ggml-org/gemma-3-270m-it-GGUF/blob/e7647be17ae1108f2f605ed061ca0608b171afff/gemma-3-270m-it-Q8_0.gguf),
+all 262,144 logits pass the same `0.01` absolute error and `0.99999` cosine
+gates, with identical argmax across the 512-token window boundary. The largest
+absolute error across five checkpoints was `4.56e-4` on the CPU reference
+and `4.41e-4` on an RTX 5090. This uses
+the same Q8_0 file in both engines and the pinned correctness oracle with
+its F16 GELU lookup disabled. That variant does not replace the ordinary
+oracle and must not be used as a speed baseline or as evidence of parity
+with the unmodified llama.cpp GELU arithmetic.
+Tokenizer IDs match the pinned tokenizer for whitespace, Unicode, byte fallback
+and explicit turn markers. Two independent greedy continuations matched across
+the CPU reference, CUDA, and the F32-GELU oracle on this fixture.
+
+```sh
+python3 scripts/build_f32_oracle.py --f32-gelu --output-dir results/gemma3-oracle-NEW
+python3 scripts/validate_gemma3_logits.py \
+  --model models/compat-gemma3/gemma-3-270m-it-Q8_0.gguf \
+  --rust target/release/local-inference \
+  --oracle target/llama-f32-gelu-oracle/bin/logits-oracle
+# Add --backend cuda to validate CUDA on a configured machine.
+```
+
+## Independent CUDA and Qwen3
 
 The optional `cuda` feature uses our [CUDA kernels](src/cuda/kernels.cu), not
 llama.cpp, GGML, cuBLAS, Torch, or KTransformers numerical code. `cudarc` provides
@@ -56,8 +352,9 @@ and CUDA 13 NVRTC libraries on `LD_LIBRARY_PATH`.
 - `generate`, `bench`, and `logits` accept `--backend cuda`; the default remains
   `--backend cpu`. Missing hardware/libraries and unsupported options are errors,
   never an implicit CPU fallback.
-- Supports the dense `llama` layout used by SmolLM2, plus Qwen3-MoE's wider queries,
-  per-head Q/K RMSNorm, NeoX/split-half RoPE, and rank-three expert matrices.
+- Supports the dense `llama` layout used by SmolLM2 and dense Qwen3. Qwen3 and
+  Qwen3-MoE share per-head Q/K RMSNorm, support for wider queries, and
+  NeoX/split-half RoPE. Qwen3-MoE additionally uses rank-three expert matrices.
 - Router top-k selection uses lowest-index tie breaking and selected-probability
   renormalization. Only selected expert gate/up/down matrices execute; **all expert
   weights remain GPU-resident**. There is no independent CPU-expert offload yet.
@@ -76,7 +373,7 @@ and CUDA 13 NVRTC libraries on `LD_LIBRARY_PATH`.
   overhead, including driver-owned graph allocations. Graph control and sampling
   buffers are counted. `memory.allocation_domain` distinguishes `"cuda"` from `"host"`;
   CUDA's report excludes host tokenizer/model-loading copies and host logits.
-- Dense `llama` and Qwen3-MoE prefill are layer-wise batched: packed projections
+- Dense `llama`, dense Qwen3 and Qwen3-MoE prefill are layer-wise batched: packed projections
   reuse weights across prompt tokens, and each query sees only its causal KV prefix.
   Internal chunks contain at most 512 tokens; larger public batches are split.
   Default MoE assignments are grouped by expert in four-assignment tiles, then
@@ -588,6 +885,11 @@ Q4_K/Q6_K expert gate and up projections in single-token MMA3 execution. It
 preserves each packed reduction tree and writes the SwiGLU activation directly.
 Other shapes and default builds retain separate launches.
 
+`cuda-decode-fusion-research` combines bitwise-preserving single-launch Q/K/V
+packed decode matvecs, fused head RMSNorm/RoPE/KV-cache decode for 128-wide
+heads, and single-warp register top-k routing for 128 experts in MMA3 mode,
+without changing numerical reservation or default dispatch.
+
 `cuda-mma3-wide-rows-research` is an opt-in 64-row MMA3 tile for grouped
 expert projections at exactly 512 prefill tokens. It shares activation staging
 across more output rows without changing the K accumulation order. Dense
@@ -595,8 +897,15 @@ projections, smaller chunks, and default builds retain their existing dispatch.
 The separate `cuda-mma3-dense-wide-rows-research` feature also enables the
 tile for eligible dense MMA3 projections at 512 tokens only.
 
+`cuda-mma3-splitk-research` splits K across power-of-two CTA slices (minimum
+128 K elements, up to 1024 CTAs) for low-CTA dense MMA3 prefill projections and
+reduces slices in deterministic increasing order inside existing workspace
+scratch, adding no device reservation.
+
 `cuda-attention-query-pair-research` pairs adjacent causal queries for
 512-token MMA3 prefill with 128-wide heads and bounded fused attention.
+`cuda-attention-query-pair-even-research` extends this bitwise-preserving pair
+kernel to even prefill lengths of at least 32 tokens.
 Each query keeps its original score and value reduction order. Other attention
 shapes, including single-token decode, retain their prior dispatch.
 

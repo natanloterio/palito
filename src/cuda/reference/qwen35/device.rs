@@ -55,6 +55,7 @@ struct Hybrid {
     work: Work,
     logits: Vec<f32>,
     state: State,
+    capacity: usize,
 }
 
 struct Work {
@@ -98,17 +99,19 @@ pub(in crate::cuda) fn open(
     let history = CHANNELS * (KERNEL - 1);
     let state = GROUPS * STATE_DIM * STATE_DIM;
     let vocab = model.info.vocab_tokens as usize;
+    let capacity = config.prefill_chunk.min(512) as usize;
     let floats = 6 * 2 * kv
         + 18 * (history + state)
-        + 3 * model.width
-        + 2 * model.hidden
-        + CHANNELS
-        + 3 * INNER
-        + 2 * KV_HEADS * HEAD_DIM
-        + 2 * GROUPS
+        + capacity
+            * (3 * model.width
+                + 2 * model.hidden
+                + CHANNELS
+                + 3 * INNER
+                + 2 * KV_HEADS * HEAD_DIM
+                + 2 * GROUPS)
         + HEADS * context
         + vocab;
-    let required = weight_bytes + 4 * (floats as u64 + 1);
+    let required = weight_bytes + 4 * (floats as u64 + capacity as u64);
     if required > options.memory_limit_bytes {
         return Err(invalid(format!(
             "Qwen3.5 CUDA requires {required} device bytes"
@@ -128,7 +131,12 @@ pub(in crate::cuda) fn open(
     let ptx = cache::compile(
         options.kernel_cache_dir.as_deref(),
         concat!(
+            "#define CUDA_PACKED_DECODE 1\n",
             include_str!("../../kernels.cu"),
+            "\n#define CUDA_REGISTER_PREFILL 1\n",
+            include_str!("../../prefill.cu"),
+            "\n#define CUDA_NORMALIZED_ATTENTION 1\n",
+            include_str!("../../attention.cu"),
             "\n#define QWEN35_HYBRID\n",
             include_str!("../../qwen35_delta.cu")
         ),
@@ -142,7 +150,11 @@ pub(in crate::cuda) fn open(
     let mut functions = HashMap::new();
     for name in [
         "embedding",
+        "prefill_embedding",
+        "prefill_matmul",
+        "prefill_matmul_ref2x16",
         "matvec",
+        "matvec_packed_f32",
         "normalize",
         "residual",
         "swiglu",
@@ -151,10 +163,12 @@ pub(in crate::cuda) fn open(
         "cache_kv",
         "attention_scores",
         "attention_values",
+        "attention_fused",
         "qwen35_conv",
         "qwen35_l2",
         "qwen35_delta_gates",
-        "qwen35_delta_step",
+        "qwen35_delta_batch",
+        "qwen35_delta_panel",
         "qwen35_delta_norm",
         "qwen35_gate",
         "qwen35_split_qg",
@@ -207,22 +221,22 @@ pub(in crate::cuda) fn open(
         });
     }
     let work = Work {
-        x: alloc(model.width)?,
-        normalized: alloc(model.width)?,
-        projected: alloc(model.width)?,
-        gate: alloc(model.hidden)?,
-        up: alloc(model.hidden)?,
-        qkv: alloc(CHANNELS)?,
-        q: alloc(INNER)?,
-        k: alloc(KV_HEADS * HEAD_DIM)?,
-        v: alloc(KV_HEADS * HEAD_DIM)?,
-        attention_gate: alloc(INNER)?,
-        attended: alloc(INNER)?,
-        alpha: alloc(GROUPS)?,
-        beta: alloc(GROUPS)?,
+        x: alloc(capacity * model.width)?,
+        normalized: alloc(capacity * model.width)?,
+        projected: alloc(capacity * model.width)?,
+        gate: alloc(capacity * model.hidden)?,
+        up: alloc(capacity * model.hidden)?,
+        qkv: alloc(capacity * CHANNELS)?,
+        q: alloc(capacity * INNER)?,
+        k: alloc(capacity * KV_HEADS * HEAD_DIM)?,
+        v: alloc(capacity * KV_HEADS * HEAD_DIM)?,
+        attention_gate: alloc(capacity * INNER)?,
+        attended: alloc(capacity * INNER)?,
+        alpha: alloc(capacity * GROUPS)?,
+        beta: alloc(capacity * GROUPS)?,
         scores: alloc(HEADS * context)?,
         logits: alloc(vocab)?,
-        ids: stream.alloc_zeros(1).map_err(failure)?,
+        ids: stream.alloc_zeros(capacity).map_err(failure)?,
     };
     Ok(Box::new(Hybrid {
         embedding: upload(model.embedding)?,
@@ -241,15 +255,53 @@ pub(in crate::cuda) fn open(
         base: model.base,
         logits: vec![0.0; vocab],
         state: State::default(),
+        capacity,
     }))
 }
 
 macro_rules! project {
+    ($model:ident, $t:expr, $x:ident, $y:ident, $n:ident) => {{
+        let t = $t;
+        if $n == 1 {
+            project!($model, t, $x, $y);
+        } else {
+            // Only dispatch the wider tile for measured packed shapes and batch sizes.
+            let (kernel, rows, tokens) = match (t.kind, t.width, t.rows) {
+                (12, 1024, 2048 | 3584 | 4096) | (12, 2048 | 3584, 1024) | (14, 3584, 1024)
+                    if $n >= 128 =>
+                {
+                    ("prefill_matmul_ref2x16", 2, 16)
+                }
+                _ => ("prefill_matmul", 1, 4),
+            };
+            launch!(
+                $model,
+                kernel,
+                (
+                    (t.rows as u32).div_ceil(rows),
+                    ($n as u32).div_ceil(tokens),
+                    1
+                ),
+                &t.bytes,
+                &t.kind,
+                &$model.work.$x,
+                &mut $model.work.$y,
+                &t.width,
+                &t.rows,
+                &$n
+            );
+        }
+    }};
     ($model:ident, $t:expr, $x:ident, $y:ident) => {{
         let t = $t;
+        let kernel = if matches!(t.kind, 12 | 14) && t.width % 256 == 0 {
+            "matvec_packed_f32"
+        } else {
+            "matvec"
+        };
         launch!(
             $model,
-            "matvec",
+            kernel,
             (t.rows as u32, 1, 1),
             &t.bytes,
             &t.kind,
@@ -265,7 +317,7 @@ macro_rules! project {
 }
 
 impl Hybrid {
-    fn step(&mut self, token: i32, pos: i32) -> Result<()> {
+    fn chunk(&mut self, tokens: &[i32], pos: i32) -> Result<()> {
         let vector = |n: i32| ((n as u32).div_ceil(256), 1, 1);
         let w = self.embedding.width;
         let inner = INNER as i32;
@@ -275,22 +327,38 @@ impl Hybrid {
         let dim = HEAD_DIM as i32;
         let rotary = ROTARY as i32;
         let context = self.info.context_tokens as i32;
-        let count = pos + 1;
-        launch!(
-            self,
-            "embedding",
-            vector(w),
-            &self.embedding.bytes,
-            &self.embedding.kind,
-            &mut self.work.x,
-            &w,
-            &token
-        );
+        let n = tokens.len() as i32;
+        if let [token] = tokens {
+            launch!(
+                self,
+                "embedding",
+                vector(w),
+                &self.embedding.bytes,
+                &self.embedding.kind,
+                &mut self.work.x,
+                &w,
+                token
+            );
+        } else {
+            self.stream
+                .memcpy_htod(tokens, &mut self.work.ids.slice_mut(..tokens.len()))
+                .map_err(failure)?;
+            launch!(
+                self,
+                "prefill_embedding",
+                ((w as u32).div_ceil(256), n as u32, 1),
+                &self.embedding.bytes,
+                &self.embedding.kind,
+                &self.work.ids,
+                &mut self.work.x,
+                &w
+            );
+        }
         for layer in &mut self.layers {
             launch!(
                 self,
                 "normalize",
-                (1, 1, 1),
+                (n as u32, 1, 1),
                 &self.work.x,
                 &layer.input_norm.bytes,
                 &mut self.work.normalized,
@@ -308,25 +376,25 @@ impl Hybrid {
                     keys,
                     values,
                 } => {
-                    project!(self, qg, normalized, qkv);
-                    project!(self, k, normalized, k);
-                    project!(self, v, normalized, v);
+                    project!(self, qg, normalized, qkv, n);
+                    project!(self, k, normalized, k, n);
+                    project!(self, v, normalized, v, n);
                     launch!(
                         self,
                         "qwen35_split_qg",
-                        vector(inner),
+                        (vector(inner).0, n as u32, 1),
                         &self.work.qkv,
                         &mut self.work.q,
                         &mut self.work.attention_gate
                     );
                     for (data, weight, length) in [
-                        (&mut self.work.q, q_norm, inner),
-                        (&mut self.work.k, k_norm, kw),
+                        (&mut self.work.q, &*q_norm, inner),
+                        (&mut self.work.k, &*k_norm, kw),
                     ] {
                         launch!(
                             self,
                             "head_norm",
-                            ((length / dim) as u32, 1, 1),
+                            ((n * length / dim) as u32, 1, 1),
                             &mut *data,
                             &weight.bytes,
                             &dim,
@@ -335,7 +403,7 @@ impl Hybrid {
                         launch!(
                             self,
                             "rotary_partial_neox",
-                            vector(length / 2),
+                            (vector(length / 2).0, n as u32, 1),
                             data,
                             &length,
                             &dim,
@@ -347,7 +415,7 @@ impl Hybrid {
                     launch!(
                         self,
                         "cache_kv",
-                        vector(kw),
+                        (vector(kw).0, n as u32, 1),
                         &self.work.k,
                         &self.work.v,
                         &mut *keys,
@@ -355,41 +423,66 @@ impl Hybrid {
                         &kw,
                         &pos
                     );
-                    launch!(
-                        self,
-                        "attention_scores",
-                        (HEADS as u32, count as u32, 1),
-                        &self.work.q,
-                        &*keys,
-                        &mut self.work.scores,
-                        &dim,
-                        &heads,
-                        &kv_heads,
-                        &context,
-                        &count
-                    );
-                    launch!(
-                        self,
-                        "attention_values",
-                        (HEADS as u32, 1, 1),
-                        &mut self.work.scores,
-                        &*values,
-                        &mut self.work.attended,
-                        &dim,
-                        &heads,
-                        &kv_heads,
-                        &context,
-                        &count
-                    );
+                    // The fused kernel keeps at most 1024 scores per query in shared
+                    // memory and masks each query to its own causal prefix.
+                    if n > 1 && pos + n <= 1024 {
+                        let first_count = pos + 1;
+                        launch!(
+                            self,
+                            "attention_fused",
+                            (HEADS as u32, n as u32, 1),
+                            &self.work.q,
+                            &*keys,
+                            &*values,
+                            &mut self.work.attended,
+                            &dim,
+                            &heads,
+                            &kv_heads,
+                            &first_count
+                        );
+                    } else {
+                        for t in 0..tokens.len() {
+                            let count = pos + t as i32 + 1;
+                            let row = t * INNER..(t + 1) * INNER;
+                            let q_row = self.work.q.slice(row.clone());
+                            let mut out_row = self.work.attended.slice_mut(row);
+                            launch!(
+                                self,
+                                "attention_scores",
+                                (HEADS as u32, count as u32, 1),
+                                &q_row,
+                                &*keys,
+                                &mut self.work.scores,
+                                &dim,
+                                &heads,
+                                &kv_heads,
+                                &context,
+                                &count
+                            );
+                            launch!(
+                                self,
+                                "attention_values",
+                                (HEADS as u32, 1, 1),
+                                &mut self.work.scores,
+                                &*values,
+                                &mut out_row,
+                                &dim,
+                                &heads,
+                                &kv_heads,
+                                &context,
+                                &count
+                            );
+                        }
+                    }
                     launch!(
                         self,
                         "qwen35_gate",
-                        vector(inner),
+                        (vector(inner).0, n as u32, 1),
                         &mut self.work.attended,
                         &self.work.attention_gate,
                         &0i32
                     );
-                    project!(self, output, attended, projected);
+                    project!(self, output, attended, projected, n);
                 }
                 DeviceAttention::Delta {
                     qkv,
@@ -404,73 +497,81 @@ impl Hybrid {
                     history,
                     state,
                 } => {
-                    project!(self, qkv, normalized, qkv);
-                    project!(self, z, normalized, attention_gate);
-                    project!(self, alpha, normalized, alpha);
-                    project!(self, beta, normalized, beta);
+                    project!(self, qkv, normalized, qkv, n);
+                    project!(self, z, normalized, attention_gate, n);
+                    project!(self, alpha, normalized, alpha, n);
+                    project!(self, beta, normalized, beta, n);
                     launch!(
                         self,
                         "qwen35_conv",
                         vector(CHANNELS as i32),
                         &mut self.work.qkv,
                         history,
-                        &conv.bytes
+                        &conv.bytes,
+                        &n
                     );
-                    launch!(self, "qwen35_l2", (2 * GROUPS as u32, 1, 1); STATE_DIM as u32,
+                    launch!(self, "qwen35_l2", (2 * GROUPS as u32, n as u32, 1); STATE_DIM as u32,
                         &mut self.work.qkv, &self.epsilon);
-                    launch!(self, "qwen35_delta_gates", (1, 1, 1); GROUPS as u32,
+                    launch!(self, "qwen35_delta_gates", (n as u32, 1, 1); GROUPS as u32,
                         &mut self.work.alpha, &mut self.work.beta, &dt.bytes, &decay.bytes);
-                    launch!(self, "qwen35_delta_step", (GROUPS as u32, 1, 1); STATE_DIM as u32,
-                        &self.work.qkv, &self.work.alpha, &self.work.beta, state, &mut self.work.attended);
-                    launch!(self, "qwen35_delta_norm", (GROUPS as u32, 1, 1); STATE_DIM as u32,
+                    if n >= 16 {
+                        launch!(self, "qwen35_delta_panel", (GROUPS as u32, (STATE_DIM / 32) as u32, 1); 32,
+                            &self.work.qkv, &self.work.alpha, &self.work.beta, state, &mut self.work.attended, &n);
+                    } else {
+                        launch!(self, "qwen35_delta_batch", (GROUPS as u32, 1, 1); STATE_DIM as u32,
+                            &self.work.qkv, &self.work.alpha, &self.work.beta, state, &mut self.work.attended, &n);
+                    }
+                    launch!(self, "qwen35_delta_norm", (GROUPS as u32 * n as u32, 1, 1); STATE_DIM as u32,
                         &mut self.work.attended, &norm.bytes, &self.epsilon);
                     launch!(
                         self,
                         "qwen35_gate",
-                        vector(inner),
+                        ((inner as u32).div_ceil(256), n as u32, 1),
                         &mut self.work.attended,
                         &self.work.attention_gate,
                         &1i32
                     );
-                    project!(self, output, attended, projected);
+                    project!(self, output, attended, projected, n);
                 }
             }
+            let elements = n * w;
             launch!(
                 self,
                 "residual",
-                vector(w),
+                vector(elements),
                 &mut self.work.x,
                 &self.work.projected,
-                &w
+                &elements
             );
             launch!(
                 self,
                 "normalize",
-                (1, 1, 1),
+                (n as u32, 1, 1),
                 &self.work.x,
                 &layer.ffn_norm.bytes,
                 &mut self.work.normalized,
                 &w,
                 &self.epsilon
             );
-            project!(self, &layer.gate, normalized, gate);
-            project!(self, &layer.up, normalized, up);
+            project!(self, &layer.gate, normalized, gate, n);
+            project!(self, &layer.up, normalized, up, n);
+            let hidden_elements = n * layer.gate.rows;
             launch!(
                 self,
                 "swiglu",
-                vector(layer.gate.rows),
+                vector(hidden_elements),
                 &mut self.work.gate,
                 &self.work.up,
-                &layer.gate.rows
+                &hidden_elements
             );
-            project!(self, &layer.down, gate, projected);
+            project!(self, &layer.down, gate, projected, n);
             launch!(
                 self,
                 "residual",
-                vector(w),
+                vector(elements),
                 &mut self.work.x,
                 &self.work.projected,
-                &w
+                &elements
             );
         }
         Ok(())
@@ -502,15 +603,21 @@ impl Backend for Hybrid {
     }
     fn evaluate(&mut self, tokens: &[i32], position: u32) -> Result<()> {
         self.state.begin(tokens, position, &self.info)?;
-        for (i, &token) in tokens.iter().enumerate() {
-            self.step(token, position as i32 + i as i32)?;
+        let mut last = 0;
+        for (i, chunk) in tokens.chunks(self.capacity).enumerate() {
+            self.chunk(chunk, position as i32 + (i * self.capacity) as i32)?;
+            last = chunk.len() - 1;
         }
         let w = self.embedding.width;
+        let row = self
+            .work
+            .x
+            .slice(last * w as usize..(last + 1) * w as usize);
         launch!(
             self,
             "normalize",
             (1, 1, 1),
-            &self.work.x,
+            &row,
             &self.output_norm.bytes,
             &mut self.work.normalized,
             &w,

@@ -306,22 +306,51 @@ __device__ void projection_register_tiled(const u8 *w, const float *x, float *y,
     }
 }
 
-template<int Kind, int RowTile, int TokenTile>
+template<int Kind, int RowTile, int TokenTile, int FixedWidth = 0>
 __device__ void projection_reference_legacy(const u8 *w, const float *x, float *y,
                                            int width, int rows, int tokens,
                                            float partial[][TokenTile][128]) {
     int row = blockIdx.x * RowTile + threadIdx.x / 128;
     int lane = threadIdx.x % 128, first_token = blockIdx.y * TokenTile;
+    if constexpr (FixedWidth != 0) width = FixedWidth;
     float sums[2][TokenTile] = {};
     for (int first_k = 0; first_k < width; first_k += 256) {
+        float d = 0.0f, dm = 0.0f;
+        const u8 *p = nullptr;
+        int high_bits = 0;
+        if constexpr (FixedWidth != 0) {
+            constexpr int bytes = Kind == 12 ? 144 : Kind == 13 ? 176 : 210;
+            p = w + ((u64)row * (FixedWidth / 256) + first_k / 256) * bytes;
+            d = half_value(p + (Kind == 14 ? 208 : 0));
+            if constexpr (Kind != 14) dm = half_value(p + 2);
+            if constexpr (Kind == 13) high_bits = p[16 + lane % 32];
+        }
         #pragma unroll
         for (int half = 0; half < 2; half++) {
             int k = first_k + lane + half * 128;
-            if (k < width && row < rows) {
-                float decoded = weight(w, Kind, (u64)row * width + k);
+            if (FixedWidth != 0 || (k < width && row < rows)) {
+                float decoded;
+                if constexpr (FixedWidth != 0 && (Kind == 12 || Kind == 13)) {
+                    int g = lane / 32 + half * 4;
+                    const u8 *s = p + 4;
+                    int scale = half == 0 ? s[g] & 63 : (s[g + 4] & 15) | ((s[g - 4] >> 6) << 4);
+                    int minimum = half == 0 ? s[g + 4] & 63 : (s[g + 4] >> 4) | ((s[g] >> 6) << 4);
+                    constexpr int low = Kind == 13 ? 48 : 16;
+                    int q = (p[low + half * 64 + (lane / 64) * 32 + lane % 32] >> (4 * (g % 2))) & 15;
+                    if constexpr (Kind == 13) q |= ((high_bits >> g) & 1) << 4;
+                    decoded = d * (float)scale * (float)q - dm * (float)minimum;
+                } else if constexpr (FixedWidth != 0 && Kind == 14) {
+                    int quarter = lane / 32;
+                    int low = (p[half * 64 + lane % 32 + (quarter % 2) * 32] >> (4 * (quarter / 2))) & 15;
+                    int high = (p[128 + half * 32 + lane % 32] >> (2 * quarter)) & 3;
+                    decoded = d * (float)((const signed char *)p)[192 + half * 8 + lane / 16]
+                              * (float)((low | (high << 4)) - 32);
+                } else {
+                    decoded = weight(w, Kind, (u64)row * width + k);
+                }
                 #pragma unroll
                 for (int t = 0; t < TokenTile; t++)
-                    if (first_token + t < tokens)
+                    if (FixedWidth != 0 || first_token + t < tokens)
                         sums[half][t] += decoded * x[(u64)(first_token + t) * width + k];
             }
         }
@@ -331,19 +360,25 @@ __device__ void projection_reference_legacy(const u8 *w, const float *x, float *
     for (int t = 0; t < TokenTile; t++)
         partial[r][t][lane] = sums[0][t] + sums[1][t];
     __syncthreads();
-    if (lane < 64) {
+    if (FixedWidth == 0 && lane < 64) {
         #pragma unroll
         for (int t = 0; t < TokenTile; t++)
             partial[r][t][lane] += partial[r][t][lane + 64];
     }
-    __syncthreads();
+    if constexpr (FixedWidth == 0) __syncthreads();
     if (lane < 32) {
         #pragma unroll
         for (int t = 0; t < TokenTile; t++) {
-            float sum = partial[r][t][lane] + partial[r][t][lane + 32];
+            float sum;
+            if constexpr (FixedWidth != 0) {
+                sum = (partial[r][t][lane] + partial[r][t][lane + 64])
+                    + (partial[r][t][lane + 32] + partial[r][t][lane + 96]);
+            } else {
+                sum = partial[r][t][lane] + partial[r][t][lane + 32];
+            }
             for (int stride = 16; stride > 0; stride /= 2)
                 sum += __shfl_down_sync(0xffffffff, sum, stride);
-            if (lane == 0 && row < rows && first_token + t < tokens)
+            if (lane == 0 && (FixedWidth != 0 || (row < rows && first_token + t < tokens)))
                 y[(u64)(first_token + t) * rows + row] = sum;
         }
     }
@@ -512,20 +547,37 @@ extern "C" __global__ void prefill_matmul_ref2x16(const u8 *w, int kind, const f
     if (kind == 14) projection_reference_legacy<14, 2, 16>(w, x, y, width, rows, tokens, partial);
 #ifdef CUDA_M8_PROTOTYPES
     if (kind == 8) projection_reference_legacy<8, 2, 16>(w, x, y, width, rows, tokens, partial);
+#endif
+#if defined(CUDA_M8_PROTOTYPES) || defined(QWEN35_HYBRID)
     if (kind == 13) projection_reference_legacy<13, 2, 16>(w, x, y, width, rows, tokens, partial);
 #endif
 }
+#ifdef QWEN35_HYBRID
+// Only complete row pairs and token tiles enter these fixed-width instantiations.
+extern "C" __global__ void qwen35_projection_fixed(const u8 *w, int kind, const float *x,
+                                                 float *y, int width, int rows, int tokens) {
+    __shared__ float partial[2][16][128];
+    if (kind == 12 && width == 1024) projection_reference_legacy<12, 2, 16, 1024>(w, x, y, width, rows, tokens, partial);
+    if (kind == 12 && width == 2048) projection_reference_legacy<12, 2, 16, 2048>(w, x, y, width, rows, tokens, partial);
+    if (kind == 12 && width == 3584) projection_reference_legacy<12, 2, 16, 3584>(w, x, y, width, rows, tokens, partial);
+    if (kind == 13 && width == 1024) projection_reference_legacy<13, 2, 16, 1024>(w, x, y, width, rows, tokens, partial);
+    if (kind == 13 && width == 2048) projection_reference_legacy<13, 2, 16, 2048>(w, x, y, width, rows, tokens, partial);
+    if (kind == 14 && width == 3584) projection_reference_legacy<14, 2, 16, 3584>(w, x, y, width, rows, tokens, partial);
+}
+#endif
 #ifdef CUDA_M8_PROTOTYPES
 extern "C" __global__ void prefill_matmul_refinterleave2x16(const u8 *w, int kind, const float *x,
                                                          float *y, int width, int rows, int tokens) {
     __shared__ float partial[2][16][128];
     if (kind == 12) projection_reference_tiled<12, 2, 16, 1, false, 1, false, 128, true>(w, x, y, width, rows, tokens, partial);
+    if (kind == 13) projection_reference_tiled<13, 2, 16, 1, false, 1, false, 128, true>(w, x, y, width, rows, tokens, partial);
     if (kind == 14) projection_reference_tiled<14, 2, 16, 1, false, 1, false, 128, true>(w, x, y, width, rows, tokens, partial);
 }
 extern "C" __global__ void prefill_matmul_refinterleave2x8(const u8 *w, int kind, const float *x,
                                                         float *y, int width, int rows, int tokens) {
     __shared__ float partial[2][8][128];
     if (kind == 12) projection_reference_tiled<12, 2, 8, 1, false, 1, false, 128, true>(w, x, y, width, rows, tokens, partial);
+    if (kind == 13) projection_reference_tiled<13, 2, 8, 1, false, 1, false, 128, true>(w, x, y, width, rows, tokens, partial);
     if (kind == 14) projection_reference_tiled<14, 2, 8, 1, false, 1, false, 128, true>(w, x, y, width, rows, tokens, partial);
 }
 extern "C" __global__ void prefill_matmul_ref4x16(const u8 *w, int kind, const float *x,

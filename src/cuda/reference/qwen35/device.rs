@@ -132,11 +132,11 @@ pub(in crate::cuda) fn open(
         options.kernel_cache_dir.as_deref(),
         concat!(
             include_str!("../../kernels.cu"),
-            "\n#define CUDA_REGISTER_PREFILL 1\n",
+            "\n#define CUDA_REGISTER_PREFILL 1\n#define QWEN35_HYBRID\n",
             include_str!("../../prefill.cu"),
             "\n#define CUDA_NORMALIZED_ATTENTION 1\n",
             include_str!("../../attention.cu"),
-            "\n#define QWEN35_HYBRID\n",
+            "\n",
             include_str!("../../qwen35_delta.cu")
         ),
         CompileOptions {
@@ -152,6 +152,7 @@ pub(in crate::cuda) fn open(
         "prefill_embedding",
         "prefill_matmul",
         "prefill_matmul_ref2x16",
+        "qwen35_projection_fixed",
         "matvec",
         "normalize",
         "residual",
@@ -265,10 +266,19 @@ macro_rules! project {
         } else {
             // Only dispatch the wider tile for measured packed shapes and batch sizes.
             let (kernel, rows, tokens) = match (t.kind, t.width, t.rows) {
-                (12, 1024, 2048 | 3584 | 4096) | (12, 2048 | 3584, 1024) | (14, 3584, 1024)
+                (12, 1024, 2048 | 3584 | 4096)
+                | (12, 2048 | 3584, 1024)
+                | (13, 1024, 6144)
+                | (13, 2048, 1024)
+                | (14, 3584, 1024)
                     if $n >= 128 =>
                 {
-                    ("prefill_matmul_ref2x16", 2, 16)
+                    let kernel = if $n % 16 == 0 {
+                        "qwen35_projection_fixed"
+                    } else {
+                        "prefill_matmul_ref2x16"
+                    };
+                    (kernel, 2, 16)
                 }
                 _ => ("prefill_matmul", 1, 4),
             };
@@ -418,7 +428,7 @@ impl Hybrid {
                     );
                     // The fused kernel keeps at most 1024 scores per query in shared
                     // memory and masks each query to its own causal prefix.
-                    if n > 1 && pos + n <= 1024 {
+                    if pos + n <= 1024 {
                         let first_count = pos + 1;
                         launch!(
                             self,
@@ -511,7 +521,7 @@ impl Hybrid {
                         launch!(self, "qwen35_delta_panel", (GROUPS as u32, (STATE_DIM / 32) as u32, 1); 32,
                             &self.work.qkv, &self.work.alpha, &self.work.beta, state, &mut self.work.attended, &n);
                     } else {
-                        launch!(self, "qwen35_delta_batch", (GROUPS as u32, 1, 1); STATE_DIM as u32,
+                        launch!(self, "qwen35_delta_batch", (GROUPS as u32, (STATE_DIM / 32) as u32, 1); 32,
                             &self.work.qkv, &self.work.alpha, &self.work.beta, state, &mut self.work.attended, &n);
                     }
                     launch!(self, "qwen35_delta_norm", (GROUPS as u32 * n as u32, 1, 1); STATE_DIM as u32,

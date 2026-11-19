@@ -1679,10 +1679,10 @@ fn benchmark_qwen35_reference_prefill() -> Result<()> {
     }
     assert!(!shapes.is_empty(), "no packed Qwen3.5 projection matrices");
     for ((kind, width, rows), (name, tensor)) in shapes {
-        let modes = if matches!(kind, 12 | 14) {
-            &modes[..]
-        } else {
-            &modes[..2]
+        let modes = match kind {
+            12 | 14 => &modes[..],
+            13 => &modes[..4],
+            _ => &modes[..2],
         };
         let t = DeviceTensor::upload(tensor.expect("selected weight tensor"), &harness.stream)?;
         for tokens in [16, 128, 512] {

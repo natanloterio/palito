@@ -6,7 +6,7 @@ __device__ __forceinline__ void qwen35_update(const float *qkv, const float *dec
     constexpr int dim = 128;
     constexpr int inner = 16 * dim;
     int h = blockIdx.x;
-    int j = threadIdx.x;
+    int j = Transposed ? blockIdx.y * blockDim.x + threadIdx.x : threadIdx.x;
     const float *q = qkv + h * dim;
     const float *k = q + inner;
     const float *v = k + inner;

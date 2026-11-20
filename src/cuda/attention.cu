@@ -104,15 +104,14 @@ extern "C" __global__ void attention_fused_decode(const float *q, const float *k
     attention_fused_impl(q, keys, values, output, dim, heads, kv_heads, control[1] + 1);
 }
 
-#ifdef CUDA_QWEN3_SPLIT_DECODE_ATTENTION
-extern "C" __global__ void attention_decode_partials(const float *q, const float *keys,
+#if defined(CUDA_QWEN3_SPLIT_DECODE_ATTENTION) || defined(CUDA_QWEN35_SPLIT_DECODE_ATTENTION) || defined(CUDA_LLAMA_SPLIT_DECODE_ATTENTION)
+template<int dim>
+__device__ __forceinline__ void split_decode_partials(const float *q, const float *keys,
     const float *values, float *output, float *partials, int heads, int kv_heads,
-    unsigned tile_size, const int *control) {
-    constexpr int dim = 128;
+    unsigned tile_size, int count) {
     constexpr int warps = 8;
     __shared__ float scores[256], numerators[warps][dim];
     int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
-    int count = control[1] + 1;
     int start = blockIdx.y * tile_size;
     if (start >= count) return;
     if (count <= tile_size) {
@@ -126,14 +125,23 @@ extern "C" __global__ void attention_decode_partials(const float *q, const float
     keys += ((u64)start * kv_heads + kv_head) * dim;
     values += ((u64)start * kv_heads + kv_head) * dim;
     q += blockIdx.x * dim;
-    float4 query = {q[lane], q[lane + 32], q[lane + 64], q[lane + 96]};
+    float query[dim / 32];
+    #pragma unroll
+    for (int i = 0; i < dim / 32; ++i) query[i] = q[lane + 32 * i];
     for (int time = warp; time < local_count; time += warps) {
         const float *key = keys + (u64)time * stride + lane;
-        float score = (query.x * key[0] + query.z * key[64])
-                    + (query.y * key[32] + query.w * key[96]);
+        float score;
+        if constexpr (dim == 128) {
+            score = (query[0] * key[0] + query[2] * key[64])
+                  + (query[1] * key[32] + query[3] * key[96]);
+        } else {
+            score = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < dim / 32; ++i) score += query[i] * key[32 * i];
+        }
         for (int shift = 16; shift > 0; shift /= 2)
             score += __shfl_down_sync(0xffffffff, score, shift);
-        if (lane == 0) scores[time] = score / sqrtf(128.0f);
+        if (lane == 0) scores[time] = score / sqrtf((float)dim);
     }
     __syncthreads();
     float score = tid < local_count ? scores[tid] : -__int_as_float(0x7f800000);
@@ -151,7 +159,7 @@ extern "C" __global__ void attention_decode_partials(const float *q, const float
     __syncthreads();
 
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < dim / 32; ++i) {
         int col = lane + i * 32;
         float sum = 0.0f;
         for (int time = warp; time < local_count; time += warps)
@@ -172,10 +180,9 @@ extern "C" __global__ void attention_decode_partials(const float *q, const float
     }
 }
 
-extern "C" __global__ void attention_decode_merge(const float *partials, float *output,
-    unsigned tiles, unsigned tile_size, const int *control) {
-    constexpr int dim = 128;
-    unsigned count = control[1] + 1;
+template<int dim>
+__device__ __forceinline__ void split_decode_merge(const float *partials, float *output,
+    unsigned tiles, unsigned tile_size, unsigned count) {
     if (count <= tile_size) return;
     unsigned live_tiles = (count + tile_size - 1) / tile_size;
     const float *src = partials + blockIdx.x * tiles * (dim + 2);
@@ -191,6 +198,44 @@ extern "C" __global__ void attention_decode_merge(const float *partials, float *
     }
     output[blockIdx.x * dim + threadIdx.x] = numerator / denominator;
 }
+
+#ifdef CUDA_QWEN3_SPLIT_DECODE_ATTENTION
+extern "C" __global__ void attention_decode_partials(const float *q, const float *keys,
+    const float *values, float *output, float *partials, int heads, int kv_heads,
+    unsigned tile_size, const int *control) {
+    split_decode_partials<128>(q, keys, values, output, partials, heads, kv_heads,
+                               tile_size, control[1] + 1);
+}
+extern "C" __global__ void attention_decode_merge(const float *partials, float *output,
+    unsigned tiles, unsigned tile_size, const int *control) {
+    split_decode_merge<128>(partials, output, tiles, tile_size, control[1] + 1);
+}
+#endif
+
+#ifdef CUDA_LLAMA_SPLIT_DECODE_ATTENTION
+extern "C" __global__ void llama_split_decode_partials(const float *q, const float *keys,
+    const float *values, float *output, float *partials, int heads, int kv_heads,
+    unsigned tile_size, int count) {
+    split_decode_partials<64>(q, keys, values, output, partials, heads, kv_heads, tile_size, count);
+}
+extern "C" __global__ void llama_split_decode_merge(const float *partials, float *output,
+    unsigned tiles, unsigned tile_size, int count) {
+    split_decode_merge<64>(partials, output, tiles, tile_size, count);
+}
+#endif
+
+#ifdef CUDA_QWEN35_SPLIT_DECODE_ATTENTION
+extern "C" __global__ void qwen35_split_decode_partials(const float *q, const float *keys,
+    const float *values, float *output, float *partials, int heads, int kv_heads,
+    unsigned tile_size, int count, const int *control) {
+    split_decode_partials<256>(q, keys, values, output, partials, heads, kv_heads,
+                               tile_size, control ? control[1] + 1 : count);
+}
+extern "C" __global__ void qwen35_split_decode_merge(const float *partials, float *output,
+    unsigned tiles, unsigned tile_size, int count, const int *control) {
+    split_decode_merge<256>(partials, output, tiles, tile_size, control ? control[1] + 1 : count);
+}
+#endif
 #endif
 
 #if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_ATTENTION_QUERY_PAIR_RESEARCH) || defined(CUDA_LLAMA_PREFILL_QUERY_PAIR) || defined(CUDA_QWEN35_PREFILL_QUERY_PAIR)
@@ -343,18 +388,18 @@ extern "C" __global__ void llama_grouped_causal_softmax(float *scores, int n) {
     batched_causal_softmax<4>(scores, n);
 }
 template<bool Pack>
-__device__ void llama_grouped_layout(const float *src, float *dst) {
+__device__ void llama_grouped_layout(const float *src, float *dst, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int token = i / 2048, group = i / 256 % 8;
-    const int j = (group * 512 + token) * 256 + i % 256;
+    const int j = (group * n + token) * 256 + i % 256;
     if constexpr (Pack) dst[j] = src[i];
     else dst[i] = src[j];
 }
-extern "C" __global__ void llama_grouped_q_pack(const float *src, float *dst) {
-    llama_grouped_layout<true>(src, dst);
+extern "C" __global__ void llama_grouped_q_pack(const float *src, float *dst, int n) {
+    llama_grouped_layout<true>(src, dst, n);
 }
-extern "C" __global__ void llama_grouped_out_unpack(const float *src, float *dst) {
-    llama_grouped_layout<false>(src, dst);
+extern "C" __global__ void llama_grouped_out_unpack(const float *src, float *dst, int n) {
+    llama_grouped_layout<false>(src, dst, n);
 }
 #endif
 #ifdef CUDA_QWEN3_GROUPED_PREFILL_ATTENTION

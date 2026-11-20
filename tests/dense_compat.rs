@@ -149,7 +149,7 @@ fn qwen35_decode_graph_matches_eager() {
             ));
             for (position, &token) in tokens.iter().enumerate().skip(n) {
                 backend
-                    .evaluate_for_sampling(&[token], position as u32)
+                    .evaluate(&[token], position as u32)
                     .unwrap();
                 let logits: Vec<_> = backend.logits().unwrap().iter().map(|x| x.to_bits()).collect();
                 assert_eq!(logits.len(), backend.info().vocab_tokens as usize);
@@ -168,6 +168,67 @@ fn qwen35_decode_graph_matches_eager() {
             None,
             "first differing logit at step {i}"
         );
+    }
+}
+
+#[cfg(feature = "cuda-device-greedy-research")]
+#[test]
+#[ignore = "requires LLAMA32_GGUF, QWEN35_GGUF and CUDA 13 NVRTC/driver"]
+fn device_greedy_matches_full_logits() {
+    let config = Config {
+        context_tokens: 1024,
+        batch_tokens: 512,
+        prefill_chunk: 512,
+        threads: 4,
+    };
+    for (env, graph) in [
+        ("LLAMA32_GGUF", false),
+        ("QWEN35_GGUF", false),
+        ("QWEN35_GGUF", cfg!(feature = "cuda-qwen35-decode-graph-research")),
+    ] {
+        let path = std::env::var_os(env).unwrap_or_else(|| panic!("set {env}"));
+        let mut backend = local_inference::cuda::open_backend(
+            Path::new(&path),
+            &config,
+            CudaOptions {
+                decode_graph: graph,
+                ..CudaOptions::default()
+            },
+        )
+        .unwrap();
+        let seed = backend.tokenize("A sequence with distinct tokens.").unwrap();
+        for n in [512usize, 125, 46, 512] {
+            let prefix: Vec<_> = seed.iter().copied().cycle().take(n).collect();
+            let mut reference = Vec::new();
+            for token_only in [false, true] {
+                backend.reset().unwrap();
+                assert!(backend.logits().is_err());
+                assert!(backend.sample_greedy().is_err());
+                let mut next = None;
+                for step in 0..6 {
+                    let single = [next.unwrap_or(0)];
+                    let (input, pos) = if step == 0 {
+                        (prefix.as_slice(), 0)
+                    } else {
+                        (single.as_slice(), (n + step - 1) as u32)
+                    };
+                    if token_only {
+                        backend.evaluate_for_sampling(input, pos).unwrap();
+                        assert!(backend.logits().is_err());
+                    } else {
+                        backend.evaluate(input, pos).unwrap();
+                        assert_eq!(backend.logits().unwrap().len(), backend.info().vocab_tokens as usize);
+                    }
+                    let id = backend.sample_greedy().unwrap();
+                    if token_only {
+                        assert_eq!(id, reference[step], "{env} graph={graph} prefix={n} step={step}");
+                    } else {
+                        reference.push(id);
+                    }
+                    next = Some(id);
+                }
+            }
+        }
     }
 }
 
@@ -261,7 +322,7 @@ fn long_context_reset_replay_with_options(env: &str, options: CudaOptions) {
         .tokenize("A prefix with several distinct tokens.")
         .unwrap();
     let prompt: Vec<_> = seed.iter().copied().cycle().take(513).collect();
-    for n in [31, 32, 33, 127, 128, 129, 255, 256, 257, 512] {
+    for n in [31, 32, 33, 46, 127, 128, 129, 255, 256, 257, 512] {
         let run = |backend: &mut dyn Backend| {
             backend.evaluate(&prompt[..n], 0).unwrap();
             let prefill: Vec<_> = backend

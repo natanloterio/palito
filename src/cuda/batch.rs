@@ -403,10 +403,13 @@ impl CudaBackend {
                     mmq.project(&self.stream, tensor, &mut *output, n)?;
                 }
                 #[cfg(feature = "cuda-qwen3-prefill-kv-weight-only-research")]
-                let kv_weight_only = if !mmq_qkv
+                let qkv_weight_only = if !mmq_qkv
                     && position == 0
                     && n == 512
-                    && component != 0
+                    && (component != 0
+                        || (cfg!(feature = "cuda-qwen3-prefill-q-weight-only-research")
+                            && s.info.architecture == "qwen3"
+                            && tensor.rows == 2048))
                     && let Some(fp16) = self.fp16.as_mut()
                 {
                     fp16.project_qwen3_attention_weights(
@@ -416,8 +419,8 @@ impl CudaBackend {
                     false
                 };
                 #[cfg(not(feature = "cuda-qwen3-prefill-kv-weight-only-research"))]
-                let kv_weight_only = false;
-                if mmq_component || kv_weight_only
+                let qkv_weight_only = false;
+                if mmq_component || qkv_weight_only
                     || try_corrected_fp16!(self, tensor, normalized, &mut *output, n)
                 {
                 } else if residual_projection(matmul, tensor, n, packed_llama) {
@@ -603,14 +606,15 @@ impl CudaBackend {
                     feature = "cuda-llama-batched-attention-research"
                 ))]
                 {
-                    let llama_grouped = (n, heads, dim, kv_heads) == (512, 32, 64, 8)
+                    let llama_grouped = (heads, dim, kv_heads) == (32, 64, 8)
+                        && (n == 512 || (n == 256 && cfg!(feature = "cuda-llama-grouped-prefill-256-research")))
                         && self.functions.contains_key("llama_grouped_causal_softmax");
                     let qwen3_grouped = (n, heads, dim, kv_heads) == (512, 16, 128, 8)
                         && self.functions.contains_key("qwen3_grouped_causal_softmax");
                     let grouped = llama_grouped || qwen3_grouped;
                     let softmax = if grouped {
                         launch!(self, "llama_grouped_q_pack", vector(n * qw),
-                            &self.work.q, &mut self.work.attended);
+                            &self.work.q, &mut self.work.attended, &n);
                         if llama_grouped { "llama_grouped_causal_softmax" } else { "qwen3_grouped_causal_softmax" }
                     } else {
                         "qwen3_batched_causal_softmax"
@@ -638,7 +642,7 @@ impl CudaBackend {
                     )?;
                     if grouped {
                         launch!(self, "llama_grouped_out_unpack", vector(n * qw),
-                            &self.work.q, &mut self.work.attended);
+                            &self.work.q, &mut self.work.attended, &n);
                     }
                 }
             } else if fused_attention_supported(s)
@@ -1189,6 +1193,7 @@ impl CudaBackend {
             let projected_gate_up = if let Some(mmq) = self.ffn_mmq.as_mut().filter(|_| use_mmq) {
                 if cfg!(feature = "cuda-llama-prefill-fp16-gate-up-research")
                     && (n == 512
+                        || (n == 46 && cfg!(feature = "cuda-llama-prefill-fp16-gate-up-46-research"))
                         || (n == 256 && cfg!(feature = "cuda-llama-prefill-fp16-gate-up-256-research")))
                 {
                     #[cfg(feature = "cuda-llama-prefill-fp16-gate-up-research")]

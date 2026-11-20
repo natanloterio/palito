@@ -1,6 +1,65 @@
 use super::*;
 use cudarc::driver::CudaGraph;
 
+pub(super) struct DeviceGreedy {
+    scores: CudaSlice<f32>,
+    ids: CudaSlice<i32>,
+    token: CudaSlice<i32>,
+    pub sampled: Option<i32>,
+}
+
+impl DeviceGreedy {
+    pub fn bytes(vocabulary: usize) -> u64 {
+        (1 + 2 * vocabulary.div_ceil(256)) as u64 * 4
+    }
+
+    pub fn new(stream: &Arc<CudaStream>, vocabulary: usize) -> Result<Self> {
+        let blocks = vocabulary.div_ceil(256);
+        Ok(Self {
+            scores: stream.alloc_zeros(blocks).map_err(failure)?,
+            ids: stream.alloc_zeros(blocks).map_err(failure)?,
+            token: stream.alloc_zeros(1).map_err(failure)?,
+            sampled: None,
+        })
+    }
+
+    pub fn enqueue(
+        &mut self,
+        stream: &CudaStream,
+        functions: &HashMap<&'static str, CudaFunction>,
+        logits: &CudaSlice<f32>,
+        status: &mut CudaSlice<i32>,
+    ) -> Result<()> {
+        let count = logits.len() as i32;
+        let blocks = logits.len().div_ceil(256) as i32;
+        // Both kernels use one thread per reduction lane and the same stream.
+        unsafe {
+            stream.launch_builder(&functions["greedy_partials"])
+                .arg(logits).arg(&count).arg(&mut self.scores).arg(&mut self.ids)
+                .arg(&mut *status)
+                .launch(LaunchConfig { grid_dim: (blocks as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                .map_err(failure)?;
+            stream.launch_builder(&functions["greedy_finish_id"])
+                .arg(&self.scores).arg(&self.ids).arg(&blocks).arg(&mut self.token)
+                .arg(&*status)
+                .launch(LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                .map_err(failure)?;
+        }
+        Ok(())
+    }
+
+    pub fn read(&mut self, stream: &Arc<CudaStream>, vocabulary: u32) -> Result<()> {
+        let mut token = [-1];
+        stream.memcpy_dtoh(&self.token, &mut token).map_err(failure)?;
+        stream.synchronize().map_err(failure)?;
+        if token[0] < 0 || token[0] as u32 >= vocabulary {
+            return Err(failure("invalid device sample or nonfinite arithmetic; request poisoned"));
+        }
+        self.sampled = Some(token[0]);
+        Ok(())
+    }
+}
+
 pub(super) struct DecodeState {
     graph: Option<CudaGraph>,
     pub control: CudaSlice<i32>,

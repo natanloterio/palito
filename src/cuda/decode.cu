@@ -69,8 +69,7 @@ extern "C" __global__ void greedy_partials(const float *logits, int count,
     if (lane == 0) { scores[blockIdx.x] = values[0]; ids[blockIdx.x] = indices[0]; }
 }
 
-extern "C" __global__ void greedy_finish(const float *scores, const int *ids, int count,
-                                         int *control, int *tokens, int *status) {
+__device__ __forceinline__ int greedy_winner(const float *scores, const int *ids, int count) {
     __shared__ float values[256];
     __shared__ int indices[256];
     int lane = threadIdx.x, best = -1;
@@ -89,13 +88,25 @@ extern "C" __global__ void greedy_finish(const float *scores, const int *ids, in
         }
         __syncthreads();
     }
-    if (lane == 0) {
+    return indices[0];
+}
+
+extern "C" __global__ void greedy_finish(const float *scores, const int *ids, int count,
+                                         int *control, int *tokens, int *status) {
+    const int best = greedy_winner(scores, ids, count);
+    if (threadIdx.x == 0) {
         int slot = control[2];
-        if (slot < 0 || slot >= 8 || indices[0] < 0) atomicExch(status, 1);
-        else tokens[slot] = indices[0];
+        if (slot < 0 || slot >= 8 || best < 0) atomicExch(status, 1);
+        else tokens[slot] = best;
         tokens[8] = *status;
-        control[0] = indices[0];
+        control[0] = best;
         control[1]++;
         control[2]++;
     }
+}
+
+extern "C" __global__ void greedy_finish_id(const float *scores, const int *ids, int count,
+                                            int *token, const int *status) {
+    const int best = greedy_winner(scores, ids, count);
+    if (threadIdx.x == 0) token[0] = *status == 0 ? best : -1;
 }

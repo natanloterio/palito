@@ -796,6 +796,7 @@ mod residual_precise;
 pub struct CudaBackend {
     // Destroy captured references before their buffers and modules.
     decode: Option<decode::DecodeState>,
+    device_greedy: Option<decode::DeviceGreedy>,
     #[cfg(any(
         feature = "cuda-qwen3-batched-attention-research",
         feature = "cuda-llama-batched-attention-research"
@@ -913,7 +914,7 @@ impl CudaBackend {
         } else {
             base_source
         };
-        let base_source = if options.decode_graph {
+        let base_source = if options.decode_graph || cfg!(feature = "cuda-device-greedy-research") {
             format!("{base_source}\n{}", include_str!("cuda/decode.cu"))
         } else {
             base_source.to_owned()
@@ -1027,6 +1028,8 @@ impl CudaBackend {
         };
         let q8_dp4a = packed_llama && cfg!(feature = "cuda-llama-q8-dp4a-research");
         let warp_scores = packed_llama && cfg!(feature = "cuda-llama-warp-scores-research");
+        let split_llama_attention = packed_llama
+            && cfg!(feature = "cuda-llama-split-decode-attention-research");
         if warp_scores {
             compiler_options.push("-DCUDA_LLAMA_WARP_SCORES=1".into());
         }
@@ -1090,6 +1093,9 @@ impl CudaBackend {
             && cfg!(feature = "cuda-qwen3-split-decode-attention-research");
         if split_decode_attention {
             compiler_options.push("-DCUDA_QWEN3_SPLIT_DECODE_ATTENTION=1".into());
+        }
+        if split_llama_attention {
+            compiler_options.push("-DCUDA_LLAMA_SPLIT_DECODE_ATTENTION=1".into());
         }
         let source = if k_dp4a_head {
             compiler_options.push("-DCUDA_DENSE_PACKED_REPLAY=1".into());
@@ -1157,6 +1163,11 @@ impl CudaBackend {
         }
         if split_decode_attention {
             for name in ["attention_decode_partials", "attention_decode_merge"] {
+                functions.insert(name, module.load_function(name).map_err(failure)?);
+            }
+        }
+        if split_llama_attention {
+            for name in ["llama_split_decode_partials", "llama_split_decode_merge"] {
                 functions.insert(name, module.load_function(name).map_err(failure)?);
             }
         }
@@ -1345,6 +1356,15 @@ impl CudaBackend {
         }
         let weights = Weights::open(path, config)?;
         let s = &weights.spec;
+        let device_greedy = cfg!(feature = "cuda-device-greedy-research")
+            && !options.decode_graph
+            && s.experts == 0
+            && s.info.architecture == "llama";
+        if device_greedy {
+            for name in ["greedy_partials", "greedy_finish_id"] {
+                functions.insert(name, module.load_function(name).map_err(failure)?);
+            }
+        }
         if matches!(
             s.info.architecture.as_str(),
             "gpt2" | "starcoder2" | "bloom" | "gptneox" | "olmo" | "olmo2" | "olmoe"
@@ -1529,17 +1549,18 @@ impl CudaBackend {
         let workspace_bytes = workspace_bytes
             .checked_add(ffn_mmq.as_ref().map_or(0, ffn_mmq::Bridge::bytes))
             .ok_or_else(|| invalid("FFN MMQ workspace byte overflow"))?;
+        let token_bytes = if options.decode_graph {
+            decode::DecodeState::bytes(s.info.vocab_tokens as usize)
+        } else if device_greedy {
+            decode::DeviceGreedy::bytes(s.info.vocab_tokens as usize)
+        } else {
+            0
+        };
         let reservation = weight_bytes
             .checked_add(kv_bytes)
             .and_then(|n| n.checked_add(workspace_bytes))
             .and_then(|n| n.checked_add(logits_bytes))
-            .and_then(|n| {
-                n.checked_add(if options.decode_graph {
-                    decode::DecodeState::bytes(s.info.vocab_tokens as usize)
-                } else {
-                    0
-                })
-            })
+            .and_then(|n| n.checked_add(token_bytes))
             .ok_or_else(|| invalid("device reservation overflow"))?;
         let (free, _) = result::mem_get_info().map_err(failure)?;
         admit(reservation, options.memory_limit_bytes, free as u64)?;
@@ -1550,11 +1571,7 @@ impl CudaBackend {
             kv_live_bytes: 0,
             workspace_allocated_bytes: workspace_bytes,
             logits_allocated_bytes: logits_bytes,
-            token_state_allocated_bytes: if options.decode_graph {
-                decode::DecodeState::bytes(s.info.vocab_tokens as usize)
-            } else {
-                0
-            },
+            token_state_allocated_bytes: token_bytes,
             prefix_capacity_bytes: 0,
             prefix_allocated_bytes: 0,
             worker_scratch_bound_bytes: 0,
@@ -1578,6 +1595,9 @@ impl CudaBackend {
             None
         };
         let work = Workspace::new(s, &stream, options.matmul, precise)?;
+        let device_greedy = device_greedy
+            .then(|| decode::DeviceGreedy::new(&stream, s.info.vocab_tokens as usize))
+            .transpose()?;
         let mut keys = Vec::new();
         let mut values = Vec::new();
         for _ in &weights.layers {
@@ -1607,6 +1627,7 @@ impl CudaBackend {
         stream.synchronize().map_err(failure)?;
         let mut backend = Self {
             decode,
+            device_greedy,
             #[cfg(any(
                 feature = "cuda-qwen3-batched-attention-research",
                 feature = "cuda-llama-batched-attention-research"
@@ -2028,6 +2049,20 @@ impl CudaBackend {
                         control
                     );
                 }
+            } else if (dim, heads, kv_heads) == (64, 32, 8)
+                && count > 128
+                && self.functions.contains_key("llama_split_decode_partials")
+            {
+                const TILE: u32 = 128;
+                let tiles = (count as u32).div_ceil(TILE);
+                // With count > TILE, the existing heads × context score workspace fits 66 floats per tile.
+                debug_assert!(heads as usize * tiles as usize * 66 <= self.work.scores.len());
+                launch!(self, "llama_split_decode_partials", (heads as u32, tiles, 1),
+                    &self.work.q, &self.keys[index], &self.values[index],
+                    &mut self.work.attended, &mut self.work.scores, &heads,
+                    &kv_heads, &TILE, &count);
+                launch!(self, "llama_split_decode_merge", (heads as u32, 1, 1); 64,
+                    &self.work.scores, &mut self.work.attended, &tiles, &TILE, &count);
             } else {
                 if dim == 64 && self.functions.contains_key("llama_warp_scores_64") {
                     launch!(self, "llama_warp_scores_64", (heads as u32, (count as u32).div_ceil(4), 1); 128,
@@ -2452,7 +2487,9 @@ impl Backend for CudaBackend {
         &self.weights.spec.info
     }
     fn logits(&self) -> Result<&[f32]> {
-        if self.decode.as_ref().is_some_and(|d| d.sampled.is_some()) {
+        if self.decode.as_ref().is_some_and(|d| d.sampled.is_some())
+            || self.device_greedy.as_ref().is_some_and(|d| d.sampled.is_some())
+        {
             return Err(failure(
                 "token-only evaluation; use evaluate to materialize host logits",
             ));
@@ -2486,20 +2523,25 @@ impl Backend for CudaBackend {
         if let Some(decode) = &mut self.decode {
             decode.sampled = None;
         }
+        if let Some(device) = &mut self.device_greedy {
+            device.sampled = None;
+        }
         Ok(())
     }
     fn evaluate(&mut self, tokens: &[i32], position: u32) -> Result<()> {
         self.evaluate_inner(tokens, position, true)
     }
     fn evaluate_for_sampling(&mut self, tokens: &[i32], position: u32) -> Result<()> {
-        self.evaluate_inner(tokens, position, self.decode.is_none())
+        self.evaluate_inner(tokens, position, self.decode.is_none() && self.device_greedy.is_none())
     }
     fn sample_tokens(&mut self, maximum: usize, mode: crate::GenerationMode) -> Result<Vec<i32>> {
         self.sample_decode_tokens(maximum, mode)
     }
     fn sample_greedy(&mut self) -> Result<i32> {
         self.state.logits(&[])?;
-        if let Some(token) = self.decode.as_ref().and_then(|d| d.sampled) {
+        if let Some(token) = self.decode.as_ref().and_then(|d| d.sampled)
+            .or_else(|| self.device_greedy.as_ref().and_then(|d| d.sampled))
+        {
             Ok(token)
         } else {
             greedy(self.logits()?)
@@ -2529,6 +2571,9 @@ impl CudaBackend {
         if let Some(decode) = &mut self.decode {
             decode.sampled = None;
         }
+        if let Some(device) = &mut self.device_greedy {
+            device.sampled = None;
+        }
         let capacity = prefill_capacity(&self.weights.spec);
         for (index, chunk) in tokens.chunks(capacity).enumerate() {
             let offset = index * capacity;
@@ -2543,6 +2588,9 @@ impl CudaBackend {
         }
         if host_logits {
             self.finish_evaluation()?;
+        } else if let Some(device) = &mut self.device_greedy {
+            device.enqueue(&self.stream, &self.functions, &self.work.logits, &mut self.work.status)?;
+            device.read(&self.stream, self.weights.spec.info.vocab_tokens)?;
         } else {
             // Batched prefill is not captured, so run its final device reduction here.
             if tokens.len() != 1 {

@@ -184,7 +184,11 @@ impl Prefill {
         let Some([high, low]) = t.fp16.as_ref().filter(|_| {
             self.qwen3_down_weight_only
                 && matches!(t.kind, 12 | 14)
-                && (t.width, t.rows) == (width, 1024)
+                && t.width == width
+                && (t.rows == 1024
+                    || (cfg!(feature = "cuda-qwen3-prefill-q-weight-only-research")
+                        && width == 1024
+                        && t.rows == 2048))
         }) else {
             return Ok(false);
         };
@@ -193,8 +197,8 @@ impl Prefill {
             return Err(invalid("FP16 attention projection input exceeds workspace"));
         }
         expand(&self.gemm.stream, &self.expand, x, 0, &mut self.x[0], count, false)?;
-        self.gemm.project(high, &self.x[0], y, width, 1024, 512, 1.0, 0.0)?;
-        self.gemm.project(low, &self.x[0], y, width, 1024, 512, 1.0 / 1024.0, 1.0)?;
+        self.gemm.project(high, &self.x[0], y, width, t.rows, 512, 1.0, 0.0)?;
+        self.gemm.project(low, &self.x[0], y, width, t.rows, 512, 1.0 / 1024.0, 1.0)?;
         Ok(true)
     }
 
@@ -225,10 +229,13 @@ impl Prefill {
                     && (t.kind, t.width, t.rows) == (12, 1024, 3072)));
         #[cfg(not(feature = "cuda-qwen3-fp16-down-weight-only-research"))]
         let qwen3_weight_only = false;
+        let hybrid_gate_up_short =
+            n == 46 && cfg!(feature = "cuda-qwen35-ffn-gate-up-single-term-46-research");
         #[cfg(feature = "cuda-qwen35-ffn-weight-only-research")]
         let hybrid_ffn = self.hybrid_ffn_weight_only
             && (n == 512
-                || (cfg!(feature = "cuda-qwen35-ffn-weight-only-256-research") && n == 256))
+                || (cfg!(feature = "cuda-qwen35-ffn-weight-only-256-research") && n == 256)
+                || hybrid_gate_up_short)
             && (t.kind, t.width, t.rows) == (12, 1024, 3584);
         #[cfg(not(feature = "cuda-qwen35-ffn-weight-only-research"))]
         let hybrid_ffn = false;
@@ -278,7 +285,8 @@ impl Prefill {
                     && hybrid_ffn
                     && (n == 512
                         || (n == 256
-                            && cfg!(feature = "cuda-qwen35-ffn-gate-up-single-term-256-research")));
+                            && cfg!(feature = "cuda-qwen35-ffn-gate-up-single-term-256-research"))
+                        || hybrid_gate_up_short);
             if hybrid_gate_up_single_term
                 || (cfg!(feature = "cuda-llama-prefill-qo-single-term-research")
                     && n == 512

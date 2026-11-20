@@ -43,6 +43,7 @@ struct DeviceLayer {
 
 struct Hybrid {
     graph: Option<DecodeGraph>,
+    device_greedy: Option<(crate::cuda::decode::DeviceGreedy, CudaSlice<i32>)>,
     #[cfg(feature = "cuda-qwen35-recurrent-gdn-512-research")]
     gdn: Option<Gdn512>,
     #[cfg(feature = "cuda-fp16-corrected-prefill-research")]
@@ -283,6 +284,11 @@ fn open_hybrid(
     } else {
         0
     };
+    let scores = HEADS * if cfg!(feature = "cuda-qwen35-split-decode-attention-research") && context > 512 {
+        context.max(context.div_ceil(128) * (HEAD_DIM + 2))
+    } else {
+        context
+    };
     let floats = 6 * 2 * kv
         + 18 * (history + state)
         + capacity
@@ -292,7 +298,7 @@ fn open_hybrid(
                 + 3 * INNER
                 + 2 * KV_HEADS * HEAD_DIM
                 + 2 * GROUPS)
-        + HEADS * context
+        + scores
         + vocab;
     let packed_bytes = if packed {
         3 * packed_count + 24 * packed_count.div_ceil(32) + 4
@@ -302,7 +308,12 @@ fn open_hybrid(
     let required = weight_bytes
         + 4 * (floats as u64 + capacity as u64 + splitk_elements as u64)
         + packed_bytes as u64
-        + if decode_graph { 8 } else { 0 };
+        + if decode_graph { 8 } else { 0 }
+        + if cfg!(feature = "cuda-device-greedy-research") {
+            crate::cuda::decode::DeviceGreedy::bytes(vocab) + 4
+        } else {
+            0
+        };
     #[cfg(feature = "cuda-qwen35-matvec-cache-research")]
     let required = required
         .checked_add(coefficient_bytes)
@@ -379,6 +390,13 @@ fn open_hybrid(
     } else {
         source
     };
+    let greedy_source;
+    let source = if cfg!(feature = "cuda-device-greedy-research") {
+        greedy_source = format!("{source}\n{}", include_str!("../../decode.cu"));
+        &greedy_source
+    } else {
+        source
+    };
     let ptx = cache::compile(
         options.kernel_cache_dir.as_deref(),
         source,
@@ -391,6 +409,9 @@ fn open_hybrid(
                 );
                 if decode_graph {
                     options.push("-DCUDA_QWEN35_DECODE_GRAPH=1".into());
+                }
+                if cfg!(feature = "cuda-qwen35-split-decode-attention-research") {
+                    options.push("-DCUDA_QWEN35_SPLIT_DECODE_ATTENTION=1".into());
                 }
                 if projection_probe {
                     options.push("-DCUDA_QWEN35_PROJECTION_PROBE=1".into());
@@ -466,6 +487,16 @@ fn open_hybrid(
     )?;
     let module = cuda.load_module(ptx).map_err(failure)?;
     let mut functions = HashMap::new();
+    if cfg!(feature = "cuda-qwen35-split-decode-attention-research") {
+        for name in ["qwen35_split_decode_partials", "qwen35_split_decode_merge"] {
+            functions.insert(name, module.load_function(name).map_err(failure)?);
+        }
+    }
+    if cfg!(feature = "cuda-device-greedy-research") {
+        for name in ["greedy_partials", "greedy_finish_id"] {
+            functions.insert(name, module.load_function(name).map_err(failure)?);
+        }
+    }
     if cfg!(feature = "cuda-qwen35-residual-norm-research") {
         let name = "residual_normalize";
         functions.insert(name, module.load_function(name).map_err(failure)?);
@@ -718,7 +749,7 @@ fn open_hybrid(
         attended: alloc(capacity * INNER)?,
         alpha: alloc(capacity * GROUPS)?,
         beta: alloc(capacity * GROUPS)?,
-        scores: alloc(HEADS * context)?,
+        scores: alloc(scores)?,
         logits: alloc(vocab)?,
         ids: stream.alloc_zeros(capacity).map_err(failure)?,
     };
@@ -737,8 +768,17 @@ fn open_hybrid(
     } else {
         None
     };
+    let device_greedy = if cfg!(feature = "cuda-device-greedy-research") {
+        Some((
+            crate::cuda::decode::DeviceGreedy::new(&stream, vocab)?,
+            stream.alloc_zeros(1).map_err(failure)?,
+        ))
+    } else {
+        None
+    };
     Ok(Hybrid {
         graph,
+        device_greedy,
         #[cfg(feature = "cuda-qwen35-recurrent-gdn-512-research")]
         gdn,
         #[cfg(feature = "cuda-fp16-corrected-prefill-research")]
@@ -1440,7 +1480,28 @@ impl Hybrid {
                     }
                     // The fused kernel keeps at most 1024 scores per query in shared
                     // memory and masks each query to its own causal prefix.
-                    if let Some((score_grid, split)) = capture {
+                    let live_count = pos + 1;
+                    let bucket = capture.map_or(live_count as u32, |(grid, _)| grid);
+                    if n == 1 && bucket > 512
+                        && self.functions.contains_key("qwen35_split_decode_partials")
+                    {
+                        let tile = 128u32;
+                        let tiles = bucket.div_ceil(tile);
+                        macro_rules! split_attention {
+                            ($position:expr) => {
+                                launch!(self, "qwen35_split_decode_partials", (HEADS as u32, tiles, 1),
+                                    &self.work.q, &*keys, &*values, &mut self.work.attended,
+                                    &mut self.work.scores, &heads, &kv_heads, &tile, &live_count, $position);
+                                launch!(self, "qwen35_split_decode_merge", (HEADS as u32, 1, 1),
+                                    &self.work.scores, &mut self.work.attended, &tiles, &tile, &live_count, $position);
+                            };
+                        }
+                        if let Some(control) = control {
+                            split_attention!(control);
+                        } else {
+                            split_attention!(&0u64);
+                        }
+                    } else if let Some((score_grid, split)) = capture {
                         let control = control.unwrap();
                         launch!(self, "qwen35_attention_scores_graph", (HEADS as u32, score_grid, 1),
                             &self.work.q, &*keys, &mut self.work.scores, &dim, &heads, &kv_heads, &context, control);
@@ -1757,10 +1818,42 @@ impl Backend for Hybrid {
         }
         self.stream.synchronize().map_err(failure)?;
         self.state = State::default();
+        if let Some((device, _)) = &mut self.device_greedy {
+            device.sampled = None;
+        }
         Ok(())
     }
     fn evaluate(&mut self, tokens: &[i32], position: u32) -> Result<()> {
+        self.evaluate_inner(tokens, position, true)
+    }
+    fn evaluate_for_sampling(&mut self, tokens: &[i32], position: u32) -> Result<()> {
+        self.evaluate_inner(tokens, position, self.device_greedy.is_none())
+    }
+    fn logits(&self) -> Result<&[f32]> {
+        if self.device_greedy.as_ref().is_some_and(|(device, _)| device.sampled.is_some()) {
+            return Err(failure("token-only evaluation; use evaluate to materialize host logits"));
+        }
+        self.state.logits(&self.logits)
+    }
+    fn sample_greedy(&mut self) -> Result<i32> {
+        self.state.logits(&[])?;
+        if let Some(token) = self.device_greedy.as_ref().and_then(|(device, _)| device.sampled) {
+            Ok(token)
+        } else {
+            greedy(self.logits()?)
+        }
+    }
+    fn is_eog(&self, token: i32) -> bool {
+        self.eog.contains(&token)
+    }
+}
+
+impl Hybrid {
+    fn evaluate_inner(&mut self, tokens: &[i32], position: u32, host_logits: bool) -> Result<()> {
         self.state.begin(tokens, position, &self.info)?;
+        if let Some((device, _)) = &mut self.device_greedy {
+            device.sampled = None;
+        }
         let head_dp4a = cfg!(feature = "cuda-qwen35-dp4a-head-research")
             && self.functions.contains_key("k_dp4a_head");
         let packed = (tokens.len() >= 32 || head_dp4a) && self.work.packed.is_some();
@@ -1778,6 +1871,19 @@ impl Backend for Hybrid {
                 last = chunk.len() - 1;
             }
             self.project_logits(last, head_dp4a)?;
+        }
+        if !host_logits {
+            let (device, scratch_status) = self.device_greedy.as_mut().unwrap();
+            let status = if packed {
+                &mut self.work.packed.as_mut().unwrap().status
+            } else {
+                self.stream.memset_zeros(scratch_status).map_err(failure)?;
+                scratch_status
+            };
+            device.enqueue(&self.stream, &self.functions, &self.work.logits, status)?;
+            device.read(&self.stream, self.info.vocab_tokens)?;
+            self.state.finish(tokens.len());
+            return Ok(());
         }
         self.stream
             .memcpy_dtoh(&self.work.logits, &mut self.logits)
@@ -1800,18 +1906,6 @@ impl Backend for Hybrid {
         self.state.finish(tokens.len());
         Ok(())
     }
-    fn logits(&self) -> Result<&[f32]> {
-        self.state.logits(&self.logits)
-    }
-    fn sample_greedy(&mut self) -> Result<i32> {
-        greedy(self.logits()?)
-    }
-    fn is_eog(&self, token: i32) -> bool {
-        self.eog.contains(&token)
-    }
-}
-
-impl Hybrid {
     fn project_logits(&mut self, last: usize, head_dp4a: bool) -> Result<()> {
         let w = self.embedding.width;
         let row = self

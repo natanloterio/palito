@@ -3,7 +3,10 @@
 #include "ggml-backend.h"
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
+#include <iomanip>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -24,7 +27,7 @@ static std::vector<llama_token> ids_from(const std::string & line) {
 
 int main(int argc, char ** argv) {
     try {
-        check(argc == 5, "usage: matched-timing MODEL FIXTURE WARMUPS RUNS");
+        check(argc == 5 || argc == 6, "usage: matched-timing MODEL FIXTURE WARMUPS RUNS [PREFILL_LOGITS_JSON]");
         int warmups = std::stoi(argv[3]), runs = std::stoi(argv[4]);
         check(warmups >= 0 && warmups <= 20 && runs > 0 && runs <= 100, "invalid timing counts");
         std::ifstream input(argv[2]);
@@ -64,6 +67,19 @@ int main(int argc, char ** argv) {
         llama_sampler_seq_config sampler_config{0, sampler.get()};
         cp.samplers = &sampler_config;
         cp.n_samplers = 1;
+        std::vector<float> prefill_logits;
+        if (argc == 6) {
+            // Read the graph tensor without removing the benchmark's backend sampler.
+            cp.cb_eval_user_data = &prefill_logits;
+            cp.cb_eval = [](ggml_tensor * tensor, bool ask, void * data) {
+                auto & logits = *static_cast<std::vector<float> *>(data);
+                if (ask) return logits.empty() && std::strcmp(tensor->name, "result_output") == 0;
+                if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor)) return false;
+                logits.resize(ggml_nelements(tensor));
+                ggml_backend_tensor_get(tensor, logits.data(), 0, ggml_nbytes(tensor));
+                return true;
+            };
+        }
         std::unique_ptr<llama_context, decltype(&llama_free)> context(
             llama_init_from_model(model.get(), cp), llama_free);
         check(context != nullptr && llama_n_ctx(context.get()) == 1024, "matched context unavailable");
@@ -101,6 +117,18 @@ int main(int argc, char ** argv) {
                     std::printf(j ? ",%d" : "%d", generated[j]);
                 std::puts("]}");
             }
+        }
+        if (argc == 6) {
+            check(prefill_logits.size() == static_cast<size_t>(vocab_size), "expected one full prefill logits row");
+            std::ofstream out(argv[5]);
+            out << std::setprecision(std::numeric_limits<float>::max_digits10) << "{\"logits\":[";
+            for (size_t i = 0; i < prefill_logits.size(); ++i) {
+                if (i) out << ',';
+                out << prefill_logits[i];
+            }
+            out << "]}\n";
+            out.close();
+            check(bool(out), "could not write prefill logits");
         }
         return 0;
     } catch (const std::exception & error) {

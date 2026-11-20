@@ -1,11 +1,10 @@
 // Test-only higher-accuracy decomposition. FMA accounts for product rounding
 // when forming each residual; it does not change ordinary inference profiles.
 template<int Components>
-__device__ __forceinline__ void residual_quantize32_precise(const float *x,
+__device__ __forceinline__ void residual_quantize32_lane(float remaining, int i,
     signed char *q, float *scales, int *sums, int count, int *status) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x, lane = threadIdx.x % 32;
-    if (i >= count) return;
-    float remaining = x[i], reconstructed = 0.0f;
+    int lane = threadIdx.x % 32;
+    float reconstructed = 0.0f;
     if (__any_sync(0xffffffff, !isfinite(remaining))) {
         atomicOr(status, 1);
         return;
@@ -36,12 +35,33 @@ __device__ __forceinline__ void residual_quantize32_precise(const float *x,
     }
 }
 
+template<int Components>
+__device__ __forceinline__ void residual_quantize32_precise(const float *x,
+    signed char *q, float *scales, int *sums, int count, int *status) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count)
+        residual_quantize32_lane<Components>(x[i], i, q, scales, sums, count, status);
+}
+
+#ifdef CUDA_LLAMA_Q8_NORM_PACK
+extern "C" __global__ void llama_q8_norm_pack(const float *x, const u8 *w,
+    signed char *q, float *scales, int *sums, int *status, float epsilon) {
+    constexpr int width = 2048;
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < width; j += blockDim.x) sum += x[j] * x[j];
+    float inv = 1.0f / sqrtf(sum_block(sum) / (float)width + epsilon);
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    float normalized = x[i] * inv * reinterpret_cast<const float *>(w)[i];
+    residual_quantize32_lane<3>(normalized, i, q, scales, sums, width, status);
+}
+#endif
+
 extern "C" __global__ void residual_quantize32_precise3(const float *x,
     signed char *q, float *scales, int *sums, int count, int *status) {
     residual_quantize32_precise<3>(x, q, scales, sums, count, status);
 }
 
-#ifdef CUDA_M8_PROTOTYPES
+#if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_DENSE_PACKED_REPLAY)
 extern "C" __global__ void residual_quantize32_precise1(const float *x,
     signed char *q, float *scales, int *sums, int count, int *status) {
     residual_quantize32_precise<1>(x, q, scales, sums, count, status);

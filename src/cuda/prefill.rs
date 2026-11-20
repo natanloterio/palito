@@ -134,7 +134,7 @@ impl Harness {
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
             .map_err(failure)?;
         let source = format!(
-            "{}\n{}\n{}\n{}\n#define CUDA_M8_PROTOTYPES 1\n#define CUDA_NATIVE_HALF 1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n#define CUDA_M8_PROTOTYPES 1\n#define CUDA_NATIVE_HALF 1\n#define CUDA_DENSE_PACKED_REPLAY 1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             if block_reduction {
                 "#define CUDA_BLOCK_REDUCTION_RESEARCH 1"
             } else {
@@ -171,6 +171,14 @@ impl Harness {
             include_str!("fp16_projection.cu"),
             DECODE_CHECK_SOURCE,
         );
+        let source = if std::env::var_os("LI_REPLAY_Q8_ALIGNED").is_some() {
+            format!(
+                "{source}\n#define CUDA_LLAMA_Q8_ALIGNED_REPLAY 1\n{}",
+                include_str!("q8_decode.cu")
+            )
+        } else {
+            source
+        };
         let ptx = compile_ptx_with_opts(
             source,
             CompileOptions {
@@ -187,6 +195,10 @@ impl Harness {
             "matvec_packed_down_two_row",
             "matvec_packed_down_warp",
             "prefill_matmul",
+            "dense_packed_replay_mma1",
+            "dense_packed_replay_mma3",
+            "dense_q8_replay_mma3_rows64",
+            "dense_q8_replay_mma3_wide_warp",
             "group_experts",
             "grouped_matmul",
             "prefill_matmul8",
@@ -306,6 +318,13 @@ impl Harness {
         ]
         .into_iter()
         .chain(block_reduction.then_some("normalize_retained2048"))
+        .chain(
+            std::env::var_os("LI_REPLAY_Q8_ALIGNED")
+                .is_some()
+                .then_some(["llama_q8_dp4a", "llama_q8_dp4a_aligned", "llama_q8_repack"])
+                .into_iter()
+                .flatten(),
+        )
         .map(|name| {
             let function = module
                 .load_function(name)

@@ -13,11 +13,21 @@ fn reference_dense_shape(
         && matches!((width, rows), (2048, 4096) | (4096, 2048) | (2048, 512))
 }
 
-fn residual_projection(matmul: CudaMatmul, tensor: &DeviceTensor, tokens: i32) -> bool {
-    matmul.residual_components() > 0
-        && tokens >= matmul.residual_min_tokens() as i32
-        && matches!(tensor.kind, 12 | 14)
-        && tensor.width % 256 == 0
+fn residual_projection(
+    matmul: CudaMatmul,
+    tensor: &DeviceTensor,
+    tokens: i32,
+    packed_llama: bool,
+) -> bool {
+    #[cfg(feature = "cuda-fp16-corrected-prefill-research")]
+    if tokens >= 32 && tensor.fp16.is_some() {
+        return false;
+    }
+    (packed_llama && tokens >= 32 && tensor.kind == 8 && tensor.width % 32 == 0)
+        || (matmul.residual_components() > 0
+            && tokens >= matmul.residual_min_tokens() as i32
+            && matches!(tensor.kind, 12 | 14)
+            && tensor.width % 256 == 0)
 }
 
 fn dense_mma3_splits(width: i32, rows: i32, tokens: i32, scratch_floats: usize) -> u32 {
@@ -41,7 +51,7 @@ fn dense_mma3_splits(width: i32, rows: i32, tokens: i32, scratch_floats: usize) 
 macro_rules! prepare_residual {
     ($backend:ident,$input:expr,$count:expr) => {{
         let count: i32 = $count;
-        if $backend.matmul == CudaMatmul::ResidualMma3Research {
+        if $backend.work.residual_mma3.is_some() {
             let work = $backend
                 .work
                 .residual_mma3
@@ -100,7 +110,7 @@ macro_rules! project_residual {
             launch!($backend,"projection_fp16_packed",grid;128,
                 &tensor.bytes,&tensor.kind,$input,$output,&tensor.width,&tensor.rows,
                 &tokens,groups,&used,&grouped,&major,&mut $backend.work.status);
-        } else if $backend.matmul == CudaMatmul::ResidualMma3Research {
+        } else if $backend.work.residual_mma3.is_some() {
             let work = $backend.work.residual_mma3.as_ref()
                 .ok_or_else(||failure("residual MMA3 workspace missing"))?;
             let splits = if cfg!(feature = "cuda-mma3-splitk-research") && grouped == 0 {
@@ -113,7 +123,11 @@ macro_rules! project_residual {
             } else {
                 1
             };
-            if splits > 1 {
+            if tensor.kind == 8 && grouped == 0 {
+                launch!($backend,"dense_packed_replay_mma3",grid;128,
+                    &tensor.bytes,&tensor.kind,&work.values,&work.scales,&work.sums,
+                    $output,&tensor.width,&tensor.rows,&tokens,&mut $backend.work.status);
+            } else if splits > 1 {
                 let partials = scratch.as_deref_mut()
                     .ok_or_else(||failure("residual MMA3 split-k scratch missing"))?;
                 let splits_i32 = splits as i32;
@@ -164,6 +178,20 @@ macro_rules! capture_projection {
     };
 }
 
+macro_rules! try_corrected_fp16 {
+    ($backend:ident, $t:expr, $x:ident, $y:expr, $n:expr) => {{
+        #[cfg(feature = "cuda-fp16-corrected-prefill-research")]
+        let done = if let Some(fp16) = &mut $backend.fp16 {
+            fp16.project($t, &$backend.work.$x, $y, $n)?
+        } else {
+            false
+        };
+        #[cfg(not(feature = "cuda-fp16-corrected-prefill-research"))]
+        let done = false;
+        done
+    }};
+}
+
 impl CudaBackend {
     pub(super) fn batched_prefill(
         &mut self,
@@ -193,8 +221,19 @@ impl CudaBackend {
             CudaMatmul::Tf32x3Tiled => ("prefill_matmul", "grouped_matmul_tf32x3_tiled", 1, 4, 128),
         };
         let matmul = self.matmul;
+        let packed_llama = cfg!(feature = "cuda-packed-prefill-research")
+            && self.work.residual_mma3.is_some()
+            && self.functions.contains_key("dense_packed_replay_mma3");
+        #[cfg(feature = "cuda-fp16-corrected-prefill-research")]
+        let packed_llama = packed_llama && self.fp16.is_none();
         let dense_projection = |t: &DeviceTensor| {
-            if reference_dense_shape(matmul, t.kind, t.width, t.rows, n) {
+            let qwen3_two_rows = cfg!(feature = "cuda-qwen3-prefill-2x16-research")
+                && matmul == CudaMatmul::F32
+                && s.info.architecture == "qwen3"
+                && n >= 128
+                && t.width % 256 == 0
+                && matches!(t.kind, 12 | 14);
+            if qwen3_two_rows || reference_dense_shape(matmul, t.kind, t.width, t.rows, n) {
                 ("prefill_matmul_ref2x16", 2, 16)
             } else {
                 (projection, row_tile, token_tile)
@@ -280,7 +319,7 @@ impl CudaBackend {
                 && gate.is_some_and(|gate| {
                     [gate, &l.up, &l.down]
                         .iter()
-                        .all(|t| residual_projection(matmul, t, n))
+                        .all(|t| residual_projection(matmul, t, n, false))
                 });
             let register_groups = register_group_shape(s, matmul, tokens.len())
                 && gate.is_some_and(|gate| {
@@ -328,9 +367,23 @@ impl CudaBackend {
                 &self.work.normalized,
                 s.width
             );
-            if [&l.q, &l.k, &l.v]
-                .iter()
-                .any(|t| residual_projection(matmul, t, n))
+            #[cfg(feature = "cuda-llama-attn-mmq-joined-research")]
+            let mmq_qkv = position == 0
+                && n == 512
+                && self.ffn_mmq.is_some()
+                && [(&l.q, 2048), (&l.k, 512), (&l.v, 512)]
+                    .iter()
+                    .all(|(weight, rows)| ffn_mmq::supports_attention(weight, *rows));
+            #[cfg(not(feature = "cuda-llama-attn-mmq-joined-research"))]
+            let mmq_qkv = false;
+            #[cfg(feature = "cuda-llama-attn-mmq-joined-research")]
+            if let Some(mmq) = self.ffn_mmq.as_mut().filter(|_| mmq_qkv) {
+                mmq.pack(&self.stream, &self.work.normalized, l.q.width, n)?;
+            }
+            if !mmq_qkv
+                && [&l.q, &l.k, &l.v]
+                    .iter()
+                    .any(|t| residual_projection(matmul, t, n, packed_llama))
             {
                 prepare_residual!(self, &self.work.normalized, n * w);
             }
@@ -343,7 +396,31 @@ impl CudaBackend {
             .enumerate()
             {
                 let (projection, row_tile, token_tile) = dense_projection(tensor);
-                if residual_projection(matmul, tensor, n) {
+                let mmq_component = mmq_qkv
+                    && !(component == 0 && cfg!(feature = "cuda-llama-prefill-qo-single-term-research"));
+                #[cfg(feature = "cuda-llama-attn-mmq-joined-research")]
+                if let Some(mmq) = self.ffn_mmq.as_mut().filter(|_| mmq_component) {
+                    mmq.project(&self.stream, tensor, &mut *output, n)?;
+                }
+                #[cfg(feature = "cuda-qwen3-prefill-kv-weight-only-research")]
+                let kv_weight_only = if !mmq_qkv
+                    && position == 0
+                    && n == 512
+                    && component != 0
+                    && let Some(fp16) = self.fp16.as_mut()
+                {
+                    fp16.project_qwen3_attention_weights(
+                        tensor, &self.work.normalized, &mut *output, 1024,
+                    )?
+                } else {
+                    false
+                };
+                #[cfg(not(feature = "cuda-qwen3-prefill-kv-weight-only-research"))]
+                let kv_weight_only = false;
+                if mmq_component || kv_weight_only
+                    || try_corrected_fp16!(self, tensor, normalized, &mut *output, n)
+                {
+                } else if residual_projection(matmul, tensor, n, packed_llama) {
                     project_residual!(
                         self,
                         tensor,
@@ -395,10 +472,35 @@ impl CudaBackend {
                     )?;
                 }
             }
+            let fused_head_rope = if cfg!(feature = "cuda-qwen3-prefill-fused-head-rope-research")
+                && n == 512
+                && position == 0
+                && dim == 128
+                && s.rotary_dim == 128
+                && neox == 1
+                && position_embedding.is_none()
+                && embedding_norm.is_none()
+                && self.weights.rope_factors.is_none()
+                && self.functions.contains_key("prefill_qkv_head_norm_rope_cache")
+                && let (Some(q_norm), Some(k_norm)) = (&l.q_norm, &l.k_norm)
+            {
+                launch!(self, "prefill_qkv_head_norm_rope_cache",
+                    ((heads + kv_heads) as u32, n as u32, 1),
+                    &mut self.work.q, &q_norm.bytes, &heads,
+                    &mut self.work.k, &k_norm.bytes, &self.work.v,
+                    &mut self.keys[index], &mut self.values[index], &kv_heads,
+                    &s.epsilon, &pos, &rope_base);
+                true
+            } else {
+                false
+            };
             for (norm, values, size) in [
                 (&l.q_norm, &mut self.work.q, qw),
                 (&l.k_norm, &mut self.work.k, kw),
             ] {
+                if fused_head_rope {
+                    break;
+                }
                 if let Some(norm) = norm {
                     let norm_width = if olmo2 || olmoe { size } else { dim };
                     launch!(
@@ -455,17 +557,19 @@ impl CudaBackend {
                 &self.work.v,
                 kw as usize
             );
-            launch!(
-                self,
-                "cache_kv",
-                ((kw as u32).div_ceil(256), n as u32, 1),
-                &self.work.k,
-                &self.work.v,
-                &mut self.keys[index],
-                &mut self.values[index],
-                &kw,
-                &pos
-            );
+            if !fused_head_rope {
+                launch!(
+                    self,
+                    "cache_kv",
+                    ((kw as u32).div_ceil(256), n as u32, 1),
+                    &self.work.k,
+                    &self.work.v,
+                    &mut self.keys[index],
+                    &mut self.values[index],
+                    &kw,
+                    &pos
+                );
+            }
             // Future KV rows are already written; each query can only see its prefix.
             if embedding_norm.is_some() {
                 alibi_attention!(self, index, heads, kv_heads, dim, context, count, n);
@@ -483,18 +587,80 @@ impl CudaBackend {
                     scale,
                     gemma.unwrap().attention_softcap
                 );
-            } else if cfg!(feature = "cuda-attention-query-pair-research")
-                && self.matmul == CudaMatmul::ResidualMma3Research
-                && fused_attention_supported(s)
-                && dim == 128
-                && (n == 512
-                    || (cfg!(feature = "cuda-attention-query-pair-even-research")
-                        && n >= 32
-                        && n % 2 == 0))
+            } else if cfg!(any(
+                feature = "cuda-qwen3-batched-attention-research",
+                feature = "cuda-llama-batched-attention-research"
+            )) && position == 0
+                && (256..=512).contains(&n)
+                && n % 2 == 0
+                && (s.info.architecture != "llama"
+                    || n == 512
+                    || (n == 256 && cfg!(feature = "cuda-llama-batched-attention-256-research")))
+                && self.functions.contains_key("qwen3_batched_causal_softmax")
+            {
+                #[cfg(any(
+                    feature = "cuda-qwen3-batched-attention-research",
+                    feature = "cuda-llama-batched-attention-research"
+                ))]
+                {
+                    let llama_grouped = (n, heads, dim, kv_heads) == (512, 32, 64, 8)
+                        && self.functions.contains_key("llama_grouped_causal_softmax");
+                    let qwen3_grouped = (n, heads, dim, kv_heads) == (512, 16, 128, 8)
+                        && self.functions.contains_key("qwen3_grouped_causal_softmax");
+                    let grouped = llama_grouped || qwen3_grouped;
+                    let softmax = if grouped {
+                        launch!(self, "llama_grouped_q_pack", vector(n * qw),
+                            &self.work.q, &mut self.work.attended);
+                        if llama_grouped { "llama_grouped_causal_softmax" } else { "qwen3_grouped_causal_softmax" }
+                    } else {
+                        "qwen3_batched_causal_softmax"
+                    };
+                    qwen3_batched_attention(
+                        &self.stream,
+                        self.attention_blas
+                            .as_ref()
+                            .ok_or_else(|| invalid("missing Qwen3 attention BLAS handle"))?,
+                        &self.functions[softmax],
+                        &mut self.work,
+                        &self.keys[index],
+                        &self.values[index],
+                        n,
+                        heads,
+                        dim,
+                        grouped,
+                        match (s.info.architecture.as_str(), heads, dim) {
+                            ("llama", 32, 64) => cfg!(feature = "cuda-llama-batched-attention-tf32-research")
+                                && (n == 512
+                                    || (n == 256 && cfg!(feature = "cuda-llama-batched-attention-256-research"))),
+                            ("qwen3", 16, 128) => n == 512 && cfg!(feature = "cuda-qwen3-batched-attention-tf32-research"),
+                            _ => false,
+                        },
+                    )?;
+                    if grouped {
+                        launch!(self, "llama_grouped_out_unpack", vector(n * qw),
+                            &self.work.q, &mut self.work.attended);
+                    }
+                }
+            } else if fused_attention_supported(s)
+                && ((dim == 64
+                    && n >= 32
+                    && n % 2 == 0
+                    && self.functions.contains_key("attention_fused_query_pair_64"))
+                    || (cfg!(feature = "cuda-attention-query-pair-research")
+                        && self.matmul == CudaMatmul::ResidualMma3Research
+                        && dim == 128
+                        && (n == 512
+                            || (cfg!(feature = "cuda-attention-query-pair-even-research")
+                                && n >= 32
+                                && n % 2 == 0))))
             {
                 launch!(
                     self,
-                    "attention_fused_query_pair",
+                    if dim == 64 {
+                        "attention_fused_query_pair_64"
+                    } else {
+                        "attention_fused_query_pair"
+                    },
                     (heads as u32, n as u32 / 2, 1),
                     &self.work.q,
                     &self.keys[index],
@@ -546,6 +712,146 @@ impl CudaBackend {
                     &count
                 );
             }
+
+            #[cfg(any(
+                feature = "cuda-qwen3-batched-attention-research",
+                feature = "cuda-llama-batched-attention-research"
+            ))]
+            fn qwen3_batched_attention(
+                stream: &Arc<CudaStream>,
+                blas: &cudarc::cublas::CudaBlas,
+                softmax: &CudaFunction,
+                work: &mut Workspace,
+                keys: &CudaSlice<f32>,
+                values: &CudaSlice<f32>,
+                n: i32,
+                heads: i32,
+                dim: i32,
+                grouped: bool,
+                tf32_values: bool,
+            ) -> Result<()> {
+                use cudarc::{
+                    cublas::{result, sys},
+                    driver::{DevicePtr, DevicePtrMut},
+                };
+                const KV: i32 = 8;
+                let ratio = heads / KV;
+                let qw = heads * dim;
+                let kw = KV * dim;
+                let scores = (heads * n * n) as usize;
+                if work.scores.len() < scores
+                    || work.q.len() < (n * qw) as usize
+                    || work.attended.len() < (n * qw) as usize
+                    || keys.len().min(values.len()) < (n * kw) as usize
+                {
+                    return Err(invalid("batched attention workspace too small"));
+                }
+                let ty = sys::cudaDataType::CUDA_R_32F;
+                let nn = sys::cublasOperation_t::CUBLAS_OP_N;
+                let tn = sys::cublasOperation_t::CUBLAS_OP_T;
+                let value_compute = if tf32_values {
+                    sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
+                } else {
+                    sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_PEDANTIC
+                };
+                let zero = 0.0f32;
+                let mm = |op, m, inner, alpha: f32, a, lda, sa, b, ldb, sb, c, ldc, sc, compute| {
+                    unsafe {
+                        result::gemm_strided_batched_ex(
+                            *blas.handle(),
+                            op,
+                            nn,
+                            m,
+                            if grouped { ratio * n } else { n },
+                            inner,
+                            (&alpha as *const f32).cast(),
+                            a as *const _,
+                            ty,
+                            lda,
+                            sa,
+                            b as *const _,
+                            ty,
+                            ldb,
+                            sb,
+                            (&zero as *const f32).cast(),
+                            c as *mut _,
+                            ty,
+                            ldc,
+                            sc,
+                            KV,
+                            compute,
+                            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                        )
+                    }
+                    .map_err(failure)
+                };
+                stream.context().bind_to_thread().map_err(failure)?;
+                {
+                    let (q, _q) = if grouped { &work.attended } else { &work.q }.device_ptr(stream);
+                    let (k, _k) = keys.device_ptr(stream);
+                    let (s, _s) = work.scores.device_ptr_mut(stream);
+                    for slot in 0..if grouped { 1 } else { ratio as u64 } {
+                        mm(
+                            tn,
+                            n,
+                            dim,
+                            1.0 / (dim as f32).sqrt(),
+                            k,
+                            kw,
+                            dim.into(),
+                            q + slot * dim as u64 * 4,
+                            if grouped { dim } else { qw },
+                            (if grouped { n * ratio * dim } else { ratio * dim }).into(),
+                            s + slot * (n * n) as u64 * 4,
+                            n,
+                            (ratio * n * n).into(),
+                            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_PEDANTIC,
+                        )?;
+                    }
+                }
+                let mut args = stream.launch_builder(softmax);
+                args.arg(&mut work.scores).arg(&n);
+                unsafe {
+                    args.launch(LaunchConfig {
+                        grid_dim: (
+                            if cfg!(feature = "cuda-batched-attention-warp-softmax-research") {
+                                (n as u32).div_ceil(8)
+                            } else {
+                                n as u32
+                            },
+                            heads as u32,
+                            1,
+                        ),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(failure)?;
+                {
+                    let (v, _v) = values.device_ptr(stream);
+                    let (s, _s) = work.scores.device_ptr(stream);
+                    let (y, _y) = if grouped { &mut work.q } else { &mut work.attended }.device_ptr_mut(stream);
+                    for slot in 0..if grouped { 1 } else { ratio as u64 } {
+                        mm(
+                            nn,
+                            dim,
+                            n,
+                            1.0,
+                            v,
+                            kw,
+                            dim.into(),
+                            s + slot * (n * n) as u64 * 4,
+                            n,
+                            (ratio * n * n).into(),
+                            y + slot * dim as u64 * 4,
+                            if grouped { dim } else { qw },
+                            (if grouped { n * ratio * dim } else { ratio * dim }).into(),
+                            value_compute,
+                        )?;
+                    }
+                }
+                Ok(())
+            }
             let t = &l.output;
             let (output_projection, output_rows, output_tokens) = dense_projection(t);
             capture_projection!(
@@ -557,7 +863,37 @@ impl CudaBackend {
                 &self.work.attended,
                 t.width as usize
             );
-            if residual_projection(matmul, t, n) {
+            #[cfg(feature = "cuda-llama-attn-mmq-joined-research")]
+            let mmq_output = if let Some(mmq) = self
+                .ffn_mmq
+                .as_mut()
+                .filter(|_| !cfg!(feature = "cuda-llama-prefill-qo-single-term-research")
+                    && position == 0 && n == 512 && ffn_mmq::supports_attention(t, 2048))
+            {
+                mmq.pack(&self.stream, &self.work.attended, t.width, n)?;
+                mmq.project(&self.stream, t, &mut self.work.projected, n)?;
+                true
+            } else {
+                false
+            };
+            #[cfg(not(feature = "cuda-llama-attn-mmq-joined-research"))]
+            let mmq_output = false;
+            #[cfg(feature = "cuda-qwen3-prefill-output-weight-only-research")]
+            let weight_only_output = if !mmq_output && position == 0 && n == 512
+                && let Some(fp16) = self.fp16.as_mut()
+            {
+                fp16.project_qwen3_attention_weights(
+                    t, &self.work.attended, &mut self.work.projected, 2048,
+                )?
+            } else {
+                false
+            };
+            #[cfg(not(feature = "cuda-qwen3-prefill-output-weight-only-research"))]
+            let weight_only_output = false;
+            if mmq_output || weight_only_output
+                || try_corrected_fp16!(self, t, attended, &mut self.work.projected, n)
+            {
+            } else if residual_projection(matmul, t, n, packed_llama) {
                 prepare_residual!(self, &self.work.attended, n * t.width);
                 project_residual!(
                     self,
@@ -619,6 +955,56 @@ impl CudaBackend {
                     &self.work.projected,
                     &total_width
                 );
+            }
+            #[cfg(feature = "cuda-llama-prefill-last-ffn-research")]
+            if output_logits
+                && position == 0
+                && n == 512
+                && index + 1 == self.weights.layers.len()
+                && self.diagnostic.is_none()
+                && s.info.architecture == "llama"
+                && s.experts == 0
+                && s.used == 1
+                && !s.parallel_residual
+                && affine.is_none()
+                && l.post_norms.is_none()
+                && let Some(gate) = gate
+                && (gate.kind, gate.width, gate.rows) == (8, 2048, 8192)
+                && (l.up.kind, l.up.width, l.up.rows) == (8, 2048, 8192)
+                && (l.down.kind, l.down.width, l.down.rows) == (8, 8192, 2048)
+                && self.functions.contains_key("llama_q8_dp4a_swiglu")
+                && self.functions.contains_key("llama_q8_dp4a")
+                && self.work.residual_mma3.is_some()
+            {
+                // This layer's KV is already populated. Only the last FFN row can affect logits.
+                let offset = (tokens.len() - 1) * s.width;
+                let epsilon = s.epsilon;
+                let last = self.work.x.slice(offset..offset + s.width);
+                transformer_norm!(self, &last, l.ffn_norm.as_ref(), None::<&DeviceTensor>, 1, w, epsilon);
+                let scratch = self.work.residual_mma3.as_mut().unwrap();
+                if 3 * s.width > scratch.values.len()
+                    || 3 * (s.width / 32) > scratch.scales.len().min(scratch.sums.len())
+                {
+                    return Err(invalid("last-row Q8 FFN input exceeds workspace"));
+                }
+                launch!(self, "residual_quantize32_precise3", vector(w),
+                    &self.work.normalized, &mut scratch.values, &mut scratch.scales,
+                    &mut scratch.sums, &w, &mut self.work.status);
+                let (kernel, rows_per_block) = if self.functions.contains_key("llama_q8_dp4a_swiglu_pairs") {
+                    ("llama_q8_dp4a_swiglu_pairs", 8)
+                } else {
+                    ("llama_q8_dp4a_swiglu", 4)
+                };
+                launch!(self, kernel, ((gate.rows as u32).div_ceil(rows_per_block), 1, 1); 128,
+                    &gate.bytes, &l.up.bytes, &scratch.values, &scratch.scales,
+                    &mut self.work.gate, &w, &gate.rows);
+                if !q8_dp4a!(self, &l.down, gate, &mut self.work.down) {
+                    return Err(invalid("last-row Q8 FFN down kernel unavailable"));
+                }
+                let mut last = self.work.x.slice_mut(offset..offset + s.width);
+                launch!(self, "combine", vector(w), &mut last, &self.work.down,
+                    &self.work.probabilities, &w, &used);
+                continue;
             }
             capture_projection!(
                 self,
@@ -785,12 +1171,56 @@ impl CudaBackend {
                 || (s.experts == 0
                     && [gate, &l.up]
                         .iter()
-                        .any(|t| residual_projection(matmul, t, n)))
+                        .any(|t| residual_projection(matmul, t, n, packed_llama)))
             {
                 prepare_residual!(self, &self.work.normalized, n * w);
             }
+            #[cfg(feature = "cuda-llama-ffn-mmq-research")]
+            let use_mmq = position == 0
+                && ffn_mmq::supports_chunk(n)
+                && [
+                    (gate, 2048, 8192),
+                    (&l.up, 2048, 8192),
+                    (&l.down, 8192, 2048),
+                ]
+                .iter()
+                .all(|(t, width, rows)| (t.kind, t.width, t.rows) == (8, *width, *rows));
+            #[cfg(feature = "cuda-llama-ffn-mmq-research")]
+            let projected_gate_up = if let Some(mmq) = self.ffn_mmq.as_mut().filter(|_| use_mmq) {
+                if cfg!(feature = "cuda-llama-prefill-fp16-gate-up-research")
+                    && (n == 512
+                        || (n == 256 && cfg!(feature = "cuda-llama-prefill-fp16-gate-up-256-research")))
+                {
+                    #[cfg(feature = "cuda-llama-prefill-fp16-gate-up-research")]
+                    self.fp16
+                        .as_mut()
+                        .ok_or_else(|| invalid("missing FP16 prefill workspace"))?
+                        .project_q8_gate_up(
+                            &self.work.normalized,
+                            gate,
+                            &l.up,
+                            &mut self.work.gate,
+                            &mut self.work.up,
+                            n,
+                        )?;
+                } else {
+                    mmq.pack(&self.stream, &self.work.normalized, gate.width, n)?;
+                    mmq.project(&self.stream, gate, &mut self.work.gate, n)?;
+                    mmq.project(&self.stream, &l.up, &mut self.work.up, n)?;
+                }
+                true
+            } else {
+                false
+            };
             for (t, out) in [(gate, &mut self.work.gate), (&l.up, &mut self.work.up)] {
-                if integer_groups || (s.experts == 0 && residual_projection(matmul, t, n)) {
+                #[cfg(feature = "cuda-llama-ffn-mmq-research")]
+                if projected_gate_up {
+                    break;
+                }
+                if try_corrected_fp16!(self, t, normalized, &mut *out, n) {
+                } else if integer_groups
+                    || (s.experts == 0 && residual_projection(matmul, t, n, packed_llama))
+                {
                     project_residual!(
                         self,
                         t,
@@ -882,7 +1312,20 @@ impl CudaBackend {
                 s.hidden * s.used
             );
             let t = &l.down;
-            if integer_groups || (s.experts == 0 && residual_projection(matmul, t, n)) {
+            #[cfg(feature = "cuda-llama-ffn-mmq-research")]
+            let mmq_down = if let Some(mmq) = self.ffn_mmq.as_mut().filter(|_| use_mmq) {
+                mmq.pack(&self.stream, &self.work.gate, t.width, n)?;
+                mmq.project(&self.stream, t, &mut self.work.down, n)?;
+                true
+            } else {
+                false
+            };
+            #[cfg(not(feature = "cuda-llama-ffn-mmq-research"))]
+            let mmq_down = false;
+            if mmq_down || try_corrected_fp16!(self, t, gate, &mut self.work.down, n) {
+            } else if integer_groups
+                || (s.experts == 0 && residual_projection(matmul, t, n, packed_llama))
+            {
                 prepare_residual!(
                     self,
                     &self.work.gate,

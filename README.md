@@ -408,6 +408,10 @@ and CUDA 13 NVRTC libraries on `LD_LIBRARY_PATH`.
   Full-logit calls still download logits; token-only calls do not expose stale
   host logits. Reset clears sampling state, and numerical failures require reset.
   This is not a universal decode speedup; MoE remains limited by device execution.
+  For Qwen3.5, the separate `cuda-qwen35-decode-graph-research` Cargo feature
+  enables `--cuda-decode-graph` for single-token decode after prefill. This path
+  captures on first use per attention grid bucket, still downloads the full
+  logits each step and does not use device-side greedy or multi-step replay.
 - `--cuda-matmul tf32x3-tiled` is a separate approximate expert-only experiment.
   It **fails** the strict real-model MoE logit gate (0.08683 maximum error versus
   the 0.01 limit), despite matching bounded generated IDs. Do not treat it as
@@ -908,6 +912,327 @@ scratch, adding no device reservation.
 kernel to even prefill lengths of at least 32 tokens.
 Each query keeps its original score and value reduction order. Other attention
 shapes, including single-token decode, retain their prior dispatch.
+
+`cuda-decode-score-reuse-research` is an opt-in F32 fallback attention
+experiment. It divides each softmax score once and reuses the result across
+value dimensions without changing the order of the weighted sum or the KV
+format. It does not change default dispatch, Gemma attention, or the MMA3
+profile. The local [overnight checkpoint](results/llama-qwen-overnight/state.json)
+records scoped gains versus clean Rust and the remaining gap to llama.cpp.
+
+`cuda-qwen3-prefill-2x16-research` opts the dense Qwen3 F32 path into the
+reference-order two-row, 16-token tile for aligned Q4_K/Q6_K projections in
+chunks of at least 128 tokens. Small chunks, decode, other architectures,
+and default builds retain their existing dispatch.
+
+`cuda-qwen35-q5-prefill-research` uses the reference-order 2×16 F32 tile on
+the hybrid Qwen3.5 Q5_K projections of width/rows 1024/6144 and 2048/1024,
+only for chunks of 256 tokens or more. It does not change recurrent state,
+decode, the KV format, or the default dispatch.
+
+`cuda-qwen35-splitk-research` builds on that opt-in. On compute capability
+8.0 or newer, it runs only the Q5_K 1024-to-6144 projection through staged
+TF32x3 tensor cores, splitting K into four equal slices and merging in
+fixed order in F32. This changes rounding and is not bitwise equivalent.
+The reusable partials are charged to the device memory limit: 24 MiB
+at a 256-token chunk or 48 MiB at 512. The 2048-to-1024 projection,
+short chunks, decode, and the default build retain their previous paths.
+On the Qwen3.5 0.8B fixture the 256/512-token prefills gained about
+1.075x/1.083x over the F32 tile alone, with full-vocabulary checks and
+greedy IDs passing against the F32 oracle at both lengths. This does not
+establish parity with the pinned llama.cpp or validate other fixtures.
+
+`cuda-qwen35-down-splitk-research` is an unvalidated extension of that opt-in.
+It uses eight slices for the Q5_K 2048-to-1024 projection at the same chunk
+threshold, reusing the larger QKV partials buffer without increasing device
+memory. The 256-token paired screen measured about 1.012x prefill speedup
+over the four-slice QKV opt-in alone. The 512-token paired screen and the
+full correctness gates are still pending; default dispatch is unchanged.
+
+The ignored `benchmark_dense_packed_projection_replay` test screens one-
+and three-component INT8 Tensor Core projections on captured Llama and dense
+Qwen3 operands. Set `DENSE_REPLAY_MODEL`, `DENSE_REPLAY_MODEL_SHA256`, and
+`DENSE_REPLAY_CAPTURE` to the GGUF, its expected SHA-256, and the F32 capture.
+Use the local GPU guard and an authorized run window. The replay measures
+activation preparation and projection together, with scratch allocation
+outside the event interval, and reports projection error against the F32
+capture. It does not change inference dispatch, validate full-model logits,
+or demonstrate end-to-end speedup.
+
+`cuda-packed-prefill-research` uses the three-component INT8 Tensor Core
+path for aligned Q8_0 projections in dense Llama and aligned Q4_K/Q5_K/Q6_K
+projections in hybrid Qwen3.5, starting at 32 tokens on SM80+. It accounts
+for the activation workspace in memory admission and leaves the F32 KV
+format, factored RoPE, and default dispatch unchanged. The frozen fixtures
+passed long full-vocabulary, greedy, reset/replay, and memory checks.
+
+`cuda-qwen35-decode-panel-research` applies the existing recurrent panel to
+single-token decode; `cuda-qwen35-matvec-reduction-research` preserves the
+legacy addition tree while removing two block barriers. Both are separate
+opt-ins. Scoped gains versus Rust do not establish parity with llama.cpp.
+
+`cuda-fp16-prefill-research` is a test-only projection replay using
+expanded FP16 weights and activations with F32-accumulating cuBLAS GEMM.
+It requires a matching CUDA 13 cuBLAS library. The single-component FP16
+inference experiment exceeded the held-out logit error limit and is not
+dispatched by inference.
+
+`cuda-fp16-corrected-prefill-research` is a separate inference opt-in.
+It caches high and residual FP16 weight planes and uses three GEMMs with
+F32 accumulation for eligible layer projections in chunks of at least
+32 tokens. It supports the F32 Llama and Qwen3.5 profiles and the dense
+Qwen3 MMA3 profile. Packed weights remain resident for decode; both
+expanded planes and activation scratch count toward the device budget.
+This option requires CUDA 13 cuBLAS and does not change default dispatch.
+`cuda-qwen3-async-prefill-research` uses a double-buffered Tensor Core
+tile for selected dense Qwen3 attention projections at chunks of 256
+tokens or more. It keeps both first-order correction terms and uses
+the same cached weight planes and activation workspace.
+`cuda-qwen3-fp16-down-weight-only-research` omits the activation correction
+on the dense Qwen3 3072-to-1024 FFN down projection only for 512-token
+chunks. It keeps the weight correction and FP32 accumulation.
+`cuda-qwen3-fp16-gate-up-weight-only-research` extends the same schedule
+to the dense Qwen3 Q4_K 1024-to-3072 gate/up projections at 512 tokens.
+`cuda-qwen3-fp16-ffn-weight-only-256-research` also enables the two-term
+schedule for gate, up, and down at exactly 256 tokens.
+`cuda-qwen3-fp16-ffn-weight-only-46-research` also enables it at the
+validated 46-token chunk size.
+`cuda-qwen35-ffn-weight-only-research` omits the activation correction on
+Qwen3.5 Q4_K 1024-to-3584 FFN gate/up projections for 512-token chunks.
+It keeps the weight correction, FP32 accumulation, and the existing scratch
+and device-memory budgets. `cuda-qwen35-ffn-weight-only-256-research` also
+enables it at exactly 256 tokens. Other chunk sizes and decode are unchanged.
+`cuda-qwen35-qkv-weight-only-research` additionally omits the activation
+correction on the hybrid Q5_K 1024-to-6144 recurrent QKV projection at
+512 tokens, with the same FP32 accumulation and device-memory budget.
+`cuda-qwen35-down-weight-only-research` also applies that schedule to
+the hybrid Q4_K/Q6_K 3584-to-1024 FFN down projection at 512 tokens.
+`cuda-qwen35-qkv-down-weight-only-256-research` extends the QKV and FFN
+down schedules to 256-token chunks.
+`cuda-llama-async-prefill-research` uses the same tile for selected
+Llama Q8_0 K/V and gate/up projections, only for 512-token chunks.
+For Llama Q8_0 FFN at 256 or 512 tokens, the separate
+`cuda-llama-fp16-down-weight-only-research` opt-in omits the activation
+correction on the 8192-to-2048 down projection.
+`cuda-llama-fp16-wide-weight-only-research` extends this to the 2048-to-8192
+gate/up projections and takes precedence over their async tile.
+`cuda-llama-short-ffn-weight-only-research` also enables the same FFN
+gate/up/down schedule at exactly 46 tokens.
+`cuda-llama-ffn-mmq-research` is a separate RTX 5090 experiment for the
+first 512-token chunk of dense Llama in the F32 profile (Q8_0 FFN weights,
+2048 model width, 8192 hidden width). It shares the gate/up activation
+pack, repacks after SwiGLU, and uses Stream-K for both the primary Q8
+activation and its quantized residual. It reserves 37,392,384 additional
+device bytes. Shorter and later chunks and decode keep the existing paths.
+This feature requires a local CUDA research bridge built against the pinned
+llama.cpp CUDA sources and libraries; the default build does not use it.
+`cuda-llama-ffn-mmq-joined-research` packs both activation planes directly
+along the token dimension, runs one Stream-K projection per weight matrix,
+and sums the two output planes in F32. It applies to initial chunks of
+exactly 46, 256, or 512 tokens and reserves 54,169,600 additional device
+bytes. Use the same local CUDA research bridge built with joined support.
+`cuda-llama-attn-mmq-joined-research` also uses the two-plane path for
+Q/K/V and attention output on the first 512-token chunk of the same
+Llama fixture. Q/K/V share their activation pack. This uses the existing
+Joined-N scratch and does not change attention, KV cache, or decode.
+`cuda-llama-prefill-last-ffn-research` runs the final layer's FFN for only
+the last token of an initial 512-token chunk that emits logits. It still
+writes every attention KV entry and uses the existing corrected Q8_0
+matvecs for that final row. Diagnostic captures, shorter chunks, and decode
+keep their existing paths.
+`cuda-llama-prefill-fp16-gate-up-research` replaces Joined-N only for the
+batched Q8_0 gate and up projections of the initial 512-token Llama chunk.
+It converts their shared input once, reuses the existing leading FP16
+weight terms, and runs one FP16 GEMM with FP32 accumulation per projection.
+It adds no weight cache. Down, attention, the opt-in single-row final FFN,
+and other chunk sizes keep their existing paths.
+`cuda-llama-grouped-prefill-attention-research` groups four query heads per
+KV head for the initial 512-token Llama chunk (32 query heads, 64 dimensions).
+It replaces four batched score GEMMs and four batched value GEMMs with one
+batched GEMM for each product. The two layout conversions reuse existing
+scratch. Scores and persistent KV stay F32; the value GEMM retains the
+selected math mode. This is not Flash Attention: it still materializes
+scores. Shorter chunks, continuation, and decode keep their existing paths.
+`cuda-qwen3-grouped-prefill-attention-research` applies the same layout
+to the initial 512-token dense Qwen3 chunk (16 query heads, 128 dimensions,
+two query heads per KV head), with unchanged score and value math modes.
+`cuda-qwen3-prefill-fused-head-rope-research` also fuses Q/K head
+normalization, RoPE, and F32 K/V cache writes for the same initial
+512-token Qwen3 chunk. Partial and factored RoPE, shorter chunks,
+continuation, and decode keep their existing paths.
+`cuda-qwen3-prefill-kv-weight-only-research` uses two FP32-accumulating
+GEMMs for each K/V projection in the initial 512-token Qwen3 chunk. It
+retains both FP16 weight terms, packs only the leading FP16 activation
+term, and reuses the existing weights and scratch.
+`cuda-qwen3-prefill-output-weight-only-research` uses the same two-weight
+FP16 schedule for the 2048-to-1024 attention output projection of the
+initial 512-token Qwen3 chunk.
+`cuda-qwen3-prefill-gate-up-single-term-research` uses one leading FP16
+weight term per gate/up projection at 512 tokens, with FP32 accumulation.
+The low weight term is omitted only for these gate/up projections.
+`cuda-llama-prefill-qo-single-term-research` uses the leading FP16 terms
+and FP32 accumulation for Llama Q and attention output at 512 tokens.
+The initial K/V projections retain both Joined-N planes and F32 cache.
+`cuda-llama-prefill-fp16-gate-up-256-research` extends the shared
+activation pack and leading FP16 gate/up schedule to the initial
+256-token Llama chunk. Down stays on the corrected Joined-N path.
+`cuda-llama-attention-projection-weight-only-research` applies the two
+weight terms to the Q8_0 2048-to-2048 attention Q and output projections
+at 512 tokens, retaining FP32 accumulation.
+`cuda-llama-attention-projection-weight-only-256-research` extends the
+same schedule to exactly 256 tokens.
+
+`cuda-llama-q8-dp4a-research` uses three-component activation quantization
+and packed integer dot products for aligned Q8_0 Llama decode projections
+and the vocabulary head. It preserves F32 KV storage and works independently
+of corrected FP16 prefill. Neither option establishes parity with llama.cpp.
+`cuda-llama-q8-prep-reuse-research` shares identical activation preparation
+across sibling projections. `cuda-llama-q8-norm-pack-research` fuses the
+2048-wide RMSNorm and activation packing before the fused QKV projection,
+retaining the original 256-lane reduction order.
+`cuda-llama-q8-fused-qkv-research` also combines
+the three aligned Q8_0 decode projections into one launch without changing
+their dot products. `cuda-llama-q8-fused-swiglu-research` combines the aligned
+Q8_0 gate and up projections with SwiGLU in one launch for dense Llama decode.
+`cuda-llama-q8-swiglu-pairs-research` lets each warp process two SwiGLU rows
+when the row count is even, reusing activation values and scales without
+changing the per-row reduction. It does not change prefill dispatch.
+`cuda-llama-decode-value-split-research` uses
+a separate F32 value reduction for Llama decode at contexts of at least
+128 tokens with 64- or 128-wide heads.
+`cuda-llama-warp-scores-research` groups four KV positions per CUDA block
+for 64-wide Llama decode heads. Each warp preserves the original F32 score
+reduction order for its position.
+`cuda-llama-value-unroll-research` unrolls the time loop in the long-context
+value reduction without changing its partitions or F32 accumulation order.
+`cuda-qwen35-value-columns-research` splits the fallback 256-wide attention
+value reduction across column tiles at contexts of at least 128 tokens.
+It preserves the softmax and per-column F32 accumulation order.
+
+`cuda-qwen35-dp4a-head-research` and `cuda-qwen3-dp4a-head-research` use
+packed K-format dot products with three-component activation quantization
+for supported vocabulary heads. The Qwen3 option is scoped to the dense
+MMA3 profile and reuses its preallocated workspace during CUDA graph replay.
+Both options use the same head in prefill and decode.
+`cuda-qwen3-warp-reduction-research` uses a first-warp reduction for dense Qwen3
+MMA3 layer matvecs, preserving the original addition tree. It does not enable
+the corresponding MoE experiment.
+`cuda-qwen3-fused-qkv-research` also combines aligned Q4_K/Q6_K query, key,
+and value decode projections in the dense MMA3 profile.
+`cuda-qwen3-fused-head-rope-research` additionally combines head RMSNorm,
+RoPE, and F32 KV writes on supported 128-wide heads in that profile.
+`cuda-qwen3-qkv-128-research` uses 128 threads for the fused QKV projection,
+preserving the independent accumulation chains and their reduction order.
+`cuda-qwen3-layer-matvec-128-research` applies the same reduction to aligned
+Q4_K/Q6_K attention-output and FFN layer projections in dense Qwen3 decode.
+`cuda-qwen3-decode-tile-128-research` uses shorter split-attention tiles in
+the dense decode graph and accounts for any extra partials in device admission.
+`cuda-qwen3-batched-attention-research` uses F32 batched GEMMs and causal
+softmax for the first 256–512-token even chunk on dense Qwen3 with 16 query
+heads, eight KV heads, and 128-wide heads in the MMA3 profile. It changes
+FP32 accumulation order, reserves up to 16 MiB for scores in the device
+budget, and leaves later chunks and decode on their existing paths.
+`cuda-qwen35-prefill-query-pair-research` shares F32 K/V reads between
+adjacent queries in the hybrid model's 256-wide dense-attention heads.
+It applies to even prefill chunks of at least 32 tokens within 1024 positions.
+`cuda-qwen35-recurrent-stage-qk-research` stages Q/K rows in shared memory
+for the recurrent panel without changing the state layout or arithmetic.
+`cuda-qwen35-recurrent-panel64-research` shares that staging across two
+warps for prefill chunks of at least 32 tokens.
+`cuda-qwen35-recurrent-warp-research` splits each DeltaNet state row's dot
+products into four warp-reduced partials for chunks of at least 256 tokens.
+It changes the FP32 summation order without changing state layout or decode.
+`cuda-qwen35-recurrent-direct-qk-research` reads Q/K directly on that warp
+path instead of staging them in shared memory. It removes the staging
+barriers without changing the warp path's FP32 arithmetic or decode.
+`cuda-qwen35-recurrent-eight-segments-research` halves the number of
+state terms accumulated per lane on the direct-Q/K warp path for chunks
+of at least 256 tokens. It changes FP32 summation order without changing
+the state layout or decode.
+`cuda-qwen35-recurrent-norm-gate-research` combines recurrent output
+normalization and SiLU gating without changing the reduction tree or
+intermediate F32 precision.
+`cuda-qwen35-residual-norm-research` fuses the attention residual update
+with the following FFN RMS normalization, preserving the per-token F32 sum tree.
+`cuda-qwen35-conv-tile-research` saves the three preceding inputs for each
+16-token convolution tile, then processes the tiles independently in place.
+It reuses the dense-query scratch in recurrent layers and leaves decode
+and chunks shorter than 32 tokens on the original path.
+
+`cuda-qwen3-split-decode-attention-research` splits long-context attention
+into KV tiles in the dense MMA3 decode graph for 128-wide heads. It keeps
+F32 KV storage, reuses the attention workspace, and merges tile numerators
+with a stable softmax. Short contexts still use the original reduction.
+
+`cuda-llama-prefill-query-pair-research` shares K/V reads between adjacent
+queries for 64-wide Llama F32 heads on even prefill chunks of at least
+32 tokens, without changing the reduction order.
+`cuda-llama-batched-attention-research` uses F32 batched GEMMs and causal
+softmax for the first chunk of exactly 512 tokens on dense Llama with 32
+query heads, eight KV heads, and 64-wide heads in the F32 profile. It changes
+FP32 accumulation order, reserves up to 32 MiB for scores in the device
+budget, and leaves shorter chunks, later chunks, and decode unchanged.
+`cuda-batched-attention-warp-softmax-research` uses one warp per causal
+score row when either batched-attention feature is active. It keeps F32
+scores and changes the softmax summation order without changing dispatch.
+`cuda-llama-batched-attention-tf32-research` uses TF32 multiplication with
+F32 accumulation only for the attention value product on the initial
+512-token chunk with 32 query heads of width 64. Score computation and the
+KV cache remain F32; other chunk sizes and decode are unchanged.
+`cuda-qwen3-batched-attention-tf32-research` applies the same value-only mode
+to the initial 512-token dense Qwen3 chunk with 16 query heads of width 128.
+
+`cuda-qwen35-matvec-cache-research` precomputes the F32 scale and minimum
+coefficients for aligned K-format layer weights. It retains packed weights,
+uses 64 extra bytes per 256 weights, and preserves the decode reduction order.
+`cuda-qwen35-matvec-fixed-width-research` specializes cached decode for
+1024- and 2048-wide inputs without changing the accumulation order or
+adding scratch. Other widths, fused SwiGLU, and batched prefill are unchanged.
+`cuda-qwen35-matvec-ffn-width-research` extends the same specialization
+to the 3584-wide FFN down projection on the cached single-token path.
+`cuda-qwen35-fused-ffn-decode-research` combines the cached Q4_K gate and up
+projections with SwiGLU for single-token decode, preserving the FP32 dot
+products and their reduction order. Batched prefill is unchanged.
+`cuda-qwen35-fused-ffn-fixed-width-research` specializes that fused path
+for 1024-wide input while retaining the same reductions.
+
+`cuda-qwen35-recurrent-fma-research` uses fused F32 multiply-adds in
+both Qwen3.5 recurrent kernels. The two paths still agree bitwise across
+chunk boundaries, but the result is not bitwise identical to non-FMA inference.
+`cuda-qwen35-recurrent-four-chains-research` uses four independent F32
+accumulators per lane in the long-chunk recurrent kernel, shortening the
+dependency chains without changing the state layout or decode dispatch.
+This changes the F32 summation order for chunks of 256 tokens or more.
+`cuda-qwen35-recurrent-gdn-512-research` uses the pinned llama.cpp CUDA
+DeltaNet MMA kernel for 512-token Qwen3.5 chunks on SM120. It uses
+16-token panels and 32 value columns per block, transposing the recurrent
+state into scratch and back without changing its persistent F32 layout.
+Shorter chunks and decode keep the existing dispatch. Build the research
+bridge with the frozen harness's `validate-hybrid-ffn-weight-only.sh gdn-512`;
+the feature requires that bridge and its pinned CUDA library at runtime.
+
+`cuda-qwen35-ffn-gate-up-single-term-research` uses just the leading FP16
+weight term for the 1024-to-3584 Q4_K gate/up projections at 512 tokens.
+Accumulation remains F32; FFN down, shorter chunks, and decode are unchanged.
+`cuda-qwen35-ffn-gate-up-single-term-256-research` also enables this gate/up
+path for exact 256-token chunks.
+`cuda-qwen35-ffn-down-single-term-research` separately applies one FP16 weight
+term to the 3584-to-1024 Q4_K/Q6_K FFN down projection at 512 tokens.
+`cuda-qwen35-ffn-down-single-term-256-research` also applies it at 256 tokens.
+`cuda-qwen35-output-weight-only-research` keeps both FP16 weight terms
+but omits activation correction in the 2048-to-1024 mixer output
+projections, also only at 512 tokens.
+`cuda-qwen35-output-single-term-research` further uses just the leading FP16
+weight term for those same mixer outputs at 512 tokens.
+`cuda-qwen35-output-single-term-256-research` also applies it at 256 tokens.
+`cuda-qwen35-qkv-single-term-research` uses one FP16 weight term for the
+1024-to-6144 recurrent mixer QKV projection at 512 tokens.
+`cuda-qwen35-qkv-single-term-256-research` also applies it at 256 tokens.
+`cuda-qwen3-fp16-down-single-term-research` uses the leading FP16 weight term
+for the dense Qwen3 3072-to-1024 weight-only FFN down path at 512 tokens.
+`cuda-llama-batched-attention-256-research` extends the Llama batched attention
+path to the initial 256-token chunk. It uses TF32 only for the value product
+and retains F32 KV storage and pedantic F32 scores.
 
 Two additional MMA3 opt-in features preserve the original reduction order:
 `cuda-block-reduction-research` for shared 256-thread sums and

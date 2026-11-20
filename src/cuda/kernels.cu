@@ -103,7 +103,7 @@ template<int Kind>
 __device__ __forceinline__ float warp_weight(const u8 *data, u64 index) {
     if (Kind == 0 || Kind == 1) return weight(data, Kind, index);
     int block = (Kind == 6 || Kind == 8) ? 32 : 256;
-    int size = Kind == 6 ? 22 : Kind == 8 ? 34 : Kind == 12 ? 144 : 210;
+    int size = Kind == 6 ? 22 : Kind == 8 ? 34 : Kind == 12 ? 144 : Kind == 13 ? 176 : 210;
     const u8 *p = data + (index / block) * size;
     int i = index % block, lane = threadIdx.x % 32;
     float d = lane == 0 ? half_value(p + (Kind == 14 ? 208 : 0)) : 0.0f;
@@ -116,7 +116,7 @@ __device__ __forceinline__ float warp_weight(const u8 *data, u64 index) {
         return d * (float)q;
     }
     if (Kind == 8) return d * (float)((const signed char *)p)[2 + i];
-    if (Kind == 12) {
+    if (Kind == 12 || Kind == 13) {
         int packed = 0, g = i / 32;
         float minimum_d = lane == 0 ? half_value(p + 2) : 0.0f;
         minimum_d = __shfl_sync(0xffffffff, minimum_d, 0);
@@ -127,7 +127,8 @@ __device__ __forceinline__ float warp_weight(const u8 *data, u64 index) {
             packed = scale | (minimum << 8);
         }
         packed = __shfl_sync(0xffffffff, packed, 0);
-        int q = (p[16 + (i / 64) * 32 + i % 32] >> (4 * (g % 2))) & 15;
+        int q = (p[(Kind == 13 ? 48 : 16) + (i / 64) * 32 + i % 32] >> (4 * (g % 2))) & 15;
+        if (Kind == 13) q |= ((p[16 + i % 32] >> g) & 1) << 4;
         return d * (float)(packed & 255) * (float)q - minimum_d * (float)(packed >> 8);
     }
     int scale = lane % 16 == 0 ? (int)((const signed char *)p)[192 + i / 16] : 0;
@@ -138,7 +139,7 @@ __device__ __forceinline__ float warp_weight(const u8 *data, u64 index) {
     return d * (float)scale * (float)((low | (high << 4)) - 32);
 }
 
-#if defined(CUDA_PACKED_REDUCTION_RESEARCH) || defined(CUDA_BLOCK_REDUCTION_RESEARCH) || defined(CUDA_M8_PROTOTYPES)
+#if defined(CUDA_PACKED_REDUCTION_RESEARCH) || defined(CUDA_BLOCK_REDUCTION_RESEARCH) || defined(CUDA_M8_PROTOTYPES) || defined(CUDA_QWEN35_MATVEC_REDUCTION)
 __device__ __forceinline__ float reduce_first_warp_256(const float *partial, int lane, float value) {
     // Keep the 128/64/32 addition tree before reducing the last warp.
     float a = value + partial[lane + 128];
@@ -204,6 +205,9 @@ __device__ float matrix_row(const u8 *w, const float *x, u64 offset, int width) 
     int lane = threadIdx.x;
     partial[lane] = sum;
     __syncthreads();
+#ifdef CUDA_QWEN35_MATVEC_REDUCTION
+    return lane < 32 ? reduce_first_warp_256(partial, lane, sum) : 0.0f;
+#else
     for (int stride = 128; stride >= 64; stride /= 2) {
         if (lane < stride) partial[lane] += partial[lane + stride];
         __syncthreads();
@@ -215,6 +219,7 @@ __device__ float matrix_row(const u8 *w, const float *x, u64 offset, int width) 
             sum += __shfl_down_sync(0xffffffff, sum, stride);
     }
     return sum;
+#endif
 }
 
 extern "C" __global__ void matvec(const u8 *w, int kind, const float *x, float *y,
@@ -243,6 +248,113 @@ extern "C" __global__ void matvec(const u8 *w, int kind, const float *x, float *
     }
     if (threadIdx.x == 0) y[(u64)selected * rows + row] = sum;
 }
+
+#ifdef CUDA_QWEN35_MATVEC_CACHE
+extern "C" __global__ void qwen35_expand_k_coefficients(const u8 *w, int kind,
+    float *out, int count) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    int sub = i % 16;
+    int stride = kind == 12 ? 144 : kind == 13 ? 176 : 210;
+    const u8 *p = w + (u64)(i / 16) * stride;
+    if (kind == 14) {
+        out[i] = half_value(p + 208) * (float)((const signed char *)p)[192 + sub];
+    } else {
+        const u8 *s = p + 4;
+        int g = sub % 8;
+        int scale = g < 4 ? s[g] & 63 : (s[g + 4] & 15) | ((s[g - 4] >> 6) << 4);
+        int minimum = g < 4 ? s[g + 4] & 63 : (s[g + 4] >> 4) | ((s[g] >> 6) << 4);
+        out[i] = sub < 8 ? half_value(p) * (float)scale
+                         : half_value(p + 2) * (float)minimum;
+    }
+}
+
+template<int Kind, int Blocks = 0>
+__device__ float qwen35_cached_dot(const u8 *w, const float *coefficients,
+    const float *x, int width) {
+    constexpr int stride = Kind == 12 ? 144 : Kind == 13 ? 176 : 210;
+    int i = threadIdx.x, g = i / 32, lane = i % 32;
+    float sum = 0.0f;
+    for (int block = 0; block < (Blocks ? Blocks : width / 256); ++block) {
+        const u8 *p = w + (u64)block * stride;
+        const float *c = coefficients + (u64)block * 16;
+        float dequant;
+        if constexpr (Kind == 14) {
+            int h = i / 128, q = g % 4;
+            int low = (p[h * 64 + lane + (q % 2) * 32] >> (4 * (q / 2))) & 15;
+            int high = (p[128 + h * 32 + lane] >> (2 * q)) & 3;
+            dequant = c[i / 16] * (float)((low | (high << 4)) - 32);
+        } else {
+            int q = (p[(Kind == 13 ? 48 : 16) + (i / 64) * 32 + lane] >> (4 * (g % 2))) & 15;
+            if constexpr (Kind == 13) q |= ((p[16 + lane] >> g) & 1) << 4;
+            dequant = c[g] * (float)q - c[g + 8];
+        }
+        sum += dequant * x[block * 256 + i];
+    }
+    return sum;
+}
+
+template<int Blocks>
+__device__ float qwen35_cached_kind_dot(const u8 *w, const float *c, int kind,
+                                       const float *x, int width, u64 offset) {
+    switch (kind) {
+        case 12: return qwen35_cached_dot<12, Blocks>(w + offset * 144, c, x, width);
+        case 13: return qwen35_cached_dot<13, Blocks>(w + offset * 176, c, x, width);
+        default: return qwen35_cached_dot<14, Blocks>(w + offset * 210, c, x, width);
+    }
+}
+
+extern "C" __global__ void qwen35_cached_matvec(const u8 *w, const float *coefficients,
+    int kind, const float *x, float *y, int width) {
+    __shared__ float partial[256];
+    int row = blockIdx.x, tid = threadIdx.x;
+    u64 offset = (u64)row * (width / 256);
+    coefficients += offset * 16;
+    float sum;
+#ifdef CUDA_QWEN35_MATVEC_FIXED_WIDTH
+    if (width == 1024) sum = qwen35_cached_kind_dot<4>(w, coefficients, kind, x, width, offset);
+    else if (width == 2048) sum = qwen35_cached_kind_dot<8>(w, coefficients, kind, x, width, offset);
+#ifdef CUDA_QWEN35_MATVEC_FFN_WIDTH
+    else if (width == 3584) sum = qwen35_cached_kind_dot<14>(w, coefficients, kind, x, width, offset);
+#endif
+    else
+#endif
+    sum = qwen35_cached_kind_dot<0>(w, coefficients, kind, x, width, offset);
+    partial[tid] = sum;
+    __syncthreads();
+    if (tid < 32) {
+        sum = reduce_first_warp_256(partial, tid, sum);
+        if (tid == 0) y[row] = sum;
+    }
+}
+#ifdef CUDA_QWEN35_FUSED_FFN
+extern "C" __global__ void qwen35_cached_swiglu(const u8 *gate, const float *gate_coeff,
+    const u8 *up, const float *up_coeff, const float *x, float *y, int width) {
+    __shared__ float pg[256], pu[256];
+    int tid = threadIdx.x, row = blockIdx.x;
+    u64 offset = (u64)row * (width / 256);
+    float g, u;
+#ifdef CUDA_QWEN35_SWIGLU_FIXED_WIDTH
+    if (width == 1024) {
+        g = qwen35_cached_dot<12, 4>(gate + offset * 144, gate_coeff + offset * 16, x, width);
+        u = qwen35_cached_dot<12, 4>(up + offset * 144, up_coeff + offset * 16, x, width);
+    } else
+#endif
+    {
+        g = qwen35_cached_dot<12>(gate + offset * 144, gate_coeff + offset * 16, x, width);
+        u = qwen35_cached_dot<12>(up + offset * 144, up_coeff + offset * 16, x, width);
+    }
+    pg[tid] = g;
+    pu[tid] = u;
+    __syncthreads();
+    if (tid < 32) {
+        g = reduce_first_warp_256(pg, tid, g);
+        u = reduce_first_warp_256(pu, tid, u);
+        if (tid == 0) y[row] = g / (1.0f + expf(-g)) * u;
+    }
+}
+#endif
+#endif
 
 #if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_PACKED_DECODE)
 #ifdef CUDA_PACKED_REDUCTION_RESEARCH
@@ -380,7 +492,37 @@ extern "C" __global__ void matvec_packed_gate_up(const u8 *gate, int gate_kind,
 }
 #endif
 
-#if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_DECODE_FUSION_RESEARCH)
+#if defined(CUDA_QWEN3_QKV_128)
+template<int Kind>
+__device__ __forceinline__ float qwen3_qkv_reduce_128(const u8 *w, const float *x,
+    u64 offset, int width) {
+    __shared__ float partial[128];
+    int tid = threadIdx.x;
+    float pair = packed_matrix_lane<Kind>(w, x, offset, width, tid)
+               + packed_matrix_lane<Kind>(w, x, offset, width, tid + 128);
+    partial[tid] = pair;
+    __syncthreads();
+    if (tid >= 32) return 0.0f;
+    float sum = (pair + partial[tid + 64]) +
+                (partial[tid + 32] + partial[tid + 96]);
+    #pragma unroll
+    for (int stride = 16; stride > 0; stride /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, stride);
+    return sum;
+}
+#ifdef CUDA_QWEN3_LAYER_MATVEC_128
+extern "C" __global__ void qwen3_layer_matvec_128(const u8 *w, int kind,
+    const float *x, float *y, int width) {
+    const int row = blockIdx.x;
+    const u64 offset = (u64)row * width;
+    float sum = kind == 12 ? qwen3_qkv_reduce_128<12>(w, x, offset, width)
+                           : qwen3_qkv_reduce_128<14>(w, x, offset, width);
+    if (threadIdx.x == 0) y[row] = sum;
+}
+#endif
+#endif
+
+#if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_DECODE_FUSION_RESEARCH) || defined(CUDA_QWEN3_FUSED_QKV)
 extern "C" __global__ void matvec_packed_qkv(
     const u8 *wq, int q_kind, int q_rows, float *yq,
     const u8 *wk, int k_kind, int k_rows, float *yk,
@@ -408,8 +550,13 @@ extern "C" __global__ void matvec_packed_qkv(
         return;
     }
     u64 offset = (u64)row * width;
+#ifdef CUDA_QWEN3_QKV_128
+    float sum = kind == 12 ? qwen3_qkv_reduce_128<12>(w, x, offset, width)
+                           : qwen3_qkv_reduce_128<14>(w, x, offset, width);
+#else
     float sum = kind == 12 ? packed_matrix_row<12>(w, x, offset, width)
                            : packed_matrix_row<14>(w, x, offset, width);
+#endif
     if (threadIdx.x == 0) y[row] = sum;
 }
 #endif
@@ -599,6 +746,13 @@ extern "C" __global__ void rotary_partial_neox(float *x, int n, int dim, int pos
     rotary_impl<true>(x, n, dim, position, base, 1, nullptr, 1.0f, rotary_dim);
 }
 
+#ifdef CUDA_QWEN35_DECODE_GRAPH
+extern "C" __global__ void qwen35_rotary_graph(float *x, int n, int dim, const int *control,
+                                                float base, int rotary_dim) {
+    rotary_impl<true>(x, n, dim, control[1], base, 1, nullptr, 1.0f, rotary_dim);
+}
+#endif
+
 extern "C" __global__ void rotary_factored(float *x, int n, int dim, int position, float base,
                                            int neox, const float *factors, float magnitude) {
     rotary_impl(x, n, dim, position, base, neox, factors, magnitude);
@@ -668,6 +822,25 @@ extern "C" __global__ void attention_scores(const float *q, const float *keys, f
     attention_scores_impl<false>(q, keys, scores, dim, heads, kv_heads, context, count, 0, 1.0f, 0.0f);
 }
 
+#ifdef CUDA_LLAMA_WARP_SCORES
+extern "C" __global__ void llama_warp_scores_64(const float *q, const float *keys,
+    float *scores, int heads, int kv_heads, int context, int count) {
+    const int head = blockIdx.x;
+    const int time = blockIdx.y * 4 + threadIdx.x / 32;
+    if (time >= count) return;
+    const int lane = threadIdx.x & 31;
+    const int kv_head = head / (heads / kv_heads);
+    const float *query = q + head * 64;
+    const float *key = keys + ((u64)time * kv_heads + kv_head) * 64;
+    float sum = (0.0f + query[lane] * key[lane])
+              + (0.0f + query[lane + 32] * key[lane + 32]);
+    #pragma unroll
+    for (int stride = 16; stride != 0; stride /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, stride);
+    if (lane == 0) scores[(u64)head * context + time] = sum / 8.0f;
+}
+#endif
+
 extern "C" __global__ void alibi_attention_scores(const float *q, const float *keys, float *scores,
     int dim, int heads, int kv_heads, int context, int count, float max_bias) {
     attention_scores_impl<false, true>(q, keys, scores, dim, heads, kv_heads,
@@ -679,13 +852,13 @@ extern "C" __global__ void gemma_attention_scores(const float *q, const float *k
     attention_scores_impl<true>(q, keys, scores, dim, heads, kv_heads, context, count, window, scale, softcap);
 }
 
-template<bool Gemma>
+template<bool Gemma, bool Split = false, bool NormalizeOnly = false>
 __device__ __forceinline__ void attention_values_impl(float *scores, const float *values,
     float *output, int dim, int heads, int kv_heads, int context, int count, int window) {
     count += blockIdx.y;
     int start = Gemma && window > 0 && count > window ? count - window : 0;
     scores += (u64)blockIdx.y * heads * context;
-    output += (u64)blockIdx.y * heads * dim;
+    if constexpr (!NormalizeOnly) output += (u64)blockIdx.y * heads * dim;
     __shared__ float maxima[256];
     int head = blockIdx.x, lane = threadIdx.x;
     float *s = scores + (u64)head * context;
@@ -704,11 +877,47 @@ __device__ __forceinline__ void attention_values_impl(float *scores, const float
         total += s[t];
     }
     total = sum_block(total);
+#ifdef CUDA_DECODE_SCORE_REUSE_RESEARCH
+    if (!Gemma) {
+        for (int t = start + lane; t < count; t += blockDim.x)
+            s[t] /= total;
+        __syncthreads();
+    }
+#endif
+    if constexpr (NormalizeOnly) return;
     int kv_head = head / (heads / kv_heads);
+#ifdef CUDA_LLAMA_DECODE_VALUE_SPLIT
+    if constexpr (Split) {
+        __shared__ float partial_values[256];
+        const int part = lane / dim;
+        const int i = lane % dim;
+        const int parts = 256 / dim;
+        const int begin = (count * part) / parts;
+        const int end = (count * (part + 1)) / parts;
+        float value = 0.0f;
+#ifdef CUDA_LLAMA_VALUE_UNROLL
+        #pragma unroll 4
+#endif
+        for (int t = begin; t < end; ++t)
+            value += s[t] * values[((u64)t * kv_heads + kv_head) * dim + i];
+        partial_values[lane] = value;
+        __syncthreads();
+        if (part == 0) {
+            value = partial_values[i] + partial_values[i + dim];
+            if (parts == 4) value += partial_values[i + 2 * dim] + partial_values[i + 3 * dim];
+            output[(u64)head * dim + i] = value;
+        }
+        return;
+    }
+#endif
     for (int i = lane; i < dim; i += blockDim.x) {
         float value = 0.0f;
         for (int t = start; t < count; t++)
+#ifdef CUDA_DECODE_SCORE_REUSE_RESEARCH
+            value += (Gemma ? s[t] / total : s[t]) * values[((u64)t * kv_heads + kv_head) * dim + i];
+#else
             value += s[t] / total * values[((u64)t * kv_heads + kv_head) * dim + i];
+#endif
         output[(u64)head * dim + i] = value;
     }
 }
@@ -717,6 +926,65 @@ extern "C" __global__ void attention_values(float *scores, const float *values, 
                                             int dim, int heads, int kv_heads, int context, int count) {
     attention_values_impl<false>(scores, values, output, dim, heads, kv_heads, context, count, 0);
 }
+
+#ifdef CUDA_QWEN35_DECODE_GRAPH
+extern "C" __global__ void qwen35_attention_scores_graph(const float *q, const float *keys, float *scores,
+    int dim, int heads, int kv_heads, int context, const int *control) {
+    attention_scores_impl<false>(q, keys, scores, dim, heads, kv_heads, context, control[1] + 1, 0, 1.0f, 0.0f);
+}
+
+extern "C" __global__ void qwen35_attention_values_graph(float *scores, const float *values, float *output,
+    int dim, int heads, int kv_heads, int context, const int *control) {
+    attention_values_impl<false>(scores, values, output, dim, heads, kv_heads, context, control[1] + 1, 0);
+}
+#endif
+
+#if defined(CUDA_QWEN35_VALUE_COLUMNS) && defined(CUDA_DECODE_SCORE_REUSE_RESEARCH)
+extern "C" __global__ void qwen35_attention_normalize(float *scores,
+    int heads, int kv_heads, int context, int count) {
+    attention_values_impl<false, false, true>(
+        scores, nullptr, nullptr, 256, heads, kv_heads, context, count, 0);
+}
+
+__device__ __forceinline__ void qwen35_attention_value_columns_impl(const float *scores,
+    const float *values, float *output, int heads, int kv_heads, int context, int count) {
+    constexpr int dim = 256;
+    const int head = blockIdx.x;
+    const int col = blockIdx.y * 32 + threadIdx.x;
+    const int kv_head = head / (heads / kv_heads);
+    const float *score = scores + (u64)head * context;
+    const float *value = values + kv_head * dim + col;
+    float sum = 0.0f;
+    for (int t = 0; t < count; ++t)
+        sum += score[t] * value[(u64)t * kv_heads * dim];
+    output[head * dim + col] = sum;
+}
+
+extern "C" __global__ void qwen35_attention_value_columns(const float *scores,
+    const float *values, float *output, int heads, int kv_heads, int context, int count) {
+    qwen35_attention_value_columns_impl(scores, values, output, heads, kv_heads, context, count);
+}
+
+#ifdef CUDA_QWEN35_DECODE_GRAPH
+extern "C" __global__ void qwen35_attention_normalize_graph(float *scores,
+    int heads, int kv_heads, int context, const int *control) {
+    attention_values_impl<false, false, true>(
+        scores, nullptr, nullptr, 256, heads, kv_heads, context, control[1] + 1, 0);
+}
+
+extern "C" __global__ void qwen35_attention_value_columns_graph(const float *scores,
+    const float *values, float *output, int heads, int kv_heads, int context, const int *control) {
+    qwen35_attention_value_columns_impl(scores, values, output, heads, kv_heads, context, control[1] + 1);
+}
+#endif
+#endif
+
+#ifdef CUDA_LLAMA_DECODE_VALUE_SPLIT
+extern "C" __global__ void attention_values_split(float *scores, const float *values, float *output,
+    int dim, int heads, int kv_heads, int context, int count) {
+    attention_values_impl<false, true>(scores, values, output, dim, heads, kv_heads, context, count, 0);
+}
+#endif
 
 extern "C" __global__ void gemma_attention_values(float *scores, const float *values, float *output,
     int dim, int heads, int kv_heads, int context, int count, int window) {
@@ -892,6 +1160,9 @@ extern "C" __global__ void router_warp128(const float *scores, int used,
     if (lane < used) weights[lane] = my_weight / total;
 }
 
+#endif
+
+#if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_DECODE_FUSION_RESEARCH) || defined(CUDA_QWEN3_FUSED_HEAD_ROPE) || defined(CUDA_QWEN3_PREFILL_FUSED_HEAD_ROPE)
 __device__ __forceinline__ void qkv_head_norm_rope_cache_impl(
     float *q, const u8 *q_norm, int heads,
     float *k, const u8 *k_norm, const float *v,
@@ -933,6 +1204,20 @@ __device__ __forceinline__ void qkv_head_norm_rope_cache_impl(
     }
 }
 
+#ifdef CUDA_QWEN3_PREFILL_FUSED_HEAD_ROPE
+extern "C" __global__ void prefill_qkv_head_norm_rope_cache(
+    float *q, const u8 *q_norm, int heads,
+    float *k, const u8 *k_norm, const float *v,
+    float *keys, float *values, int kv_heads,
+    float epsilon, int position, float base) {
+    u64 row = blockIdx.y;
+    qkv_head_norm_rope_cache_impl(
+        q + row * heads * 128, q_norm, heads,
+        k + row * kv_heads * 128, k_norm, v + row * kv_heads * 128,
+        keys, values, kv_heads, epsilon, position + (int)row, base, 1);
+}
+#endif
+
 extern "C" __global__ void qkv_head_norm_rope_cache(
     float *q, const u8 *q_norm, int heads,
     float *k, const u8 *k_norm, const float *v,
@@ -952,9 +1237,15 @@ extern "C" __global__ void qkv_head_norm_rope_cache_decode(
 }
 #endif
 
-#ifdef CUDA_M8_PROTOTYPES
+#if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_QWEN35_RESIDUAL_NORM)
 extern "C" __global__ void residual_normalize(float *x, const float *projected,
     const u8 *w, float *y, int n, float epsilon) {
+#ifdef CUDA_QWEN35_RESIDUAL_NORM
+    const u64 offset = (u64)blockIdx.x * n;
+    x += offset;
+    projected += offset;
+    y += offset;
+#endif
     float sum = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         float xi = x[i] + projected[i];

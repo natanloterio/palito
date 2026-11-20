@@ -104,27 +104,117 @@ extern "C" __global__ void attention_fused_decode(const float *q, const float *k
     attention_fused_impl(q, keys, values, output, dim, heads, kv_heads, control[1] + 1);
 }
 
-#if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_ATTENTION_QUERY_PAIR_RESEARCH)
-// Launch with even query count, 128-wide heads and 256 threads.
-extern "C" __global__ void attention_fused_query_pair(const float *q, const float *keys,
+#ifdef CUDA_QWEN3_SPLIT_DECODE_ATTENTION
+extern "C" __global__ void attention_decode_partials(const float *q, const float *keys,
+    const float *values, float *output, float *partials, int heads, int kv_heads,
+    unsigned tile_size, const int *control) {
+    constexpr int dim = 128;
+    constexpr int warps = 8;
+    __shared__ float scores[256], numerators[warps][dim];
+    int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    int count = control[1] + 1;
+    int start = blockIdx.y * tile_size;
+    if (start >= count) return;
+    if (count <= tile_size) {
+        attention_fused_impl(q, keys, values, output, dim, heads, kv_heads, count);
+        return;
+    }
+
+    int kv_head = blockIdx.x / (heads / kv_heads);
+    int local_count = min(static_cast<int>(tile_size), count - start);
+    int stride = kv_heads * dim;
+    keys += ((u64)start * kv_heads + kv_head) * dim;
+    values += ((u64)start * kv_heads + kv_head) * dim;
+    q += blockIdx.x * dim;
+    float4 query = {q[lane], q[lane + 32], q[lane + 64], q[lane + 96]};
+    for (int time = warp; time < local_count; time += warps) {
+        const float *key = keys + (u64)time * stride + lane;
+        float score = (query.x * key[0] + query.z * key[64])
+                    + (query.y * key[32] + query.w * key[96]);
+        for (int shift = 16; shift > 0; shift /= 2)
+            score += __shfl_down_sync(0xffffffff, score, shift);
+        if (lane == 0) scores[time] = score / sqrtf(128.0f);
+    }
+    __syncthreads();
+    float score = tid < local_count ? scores[tid] : -__int_as_float(0x7f800000);
+    float maximum = score;
+    for (int shift = 16; shift > 0; shift /= 2)
+        maximum = fmaxf(maximum, __shfl_down_sync(0xffffffff, maximum, shift));
+    if (lane == 0) numerators[warp][0] = maximum;
+    __syncthreads();
+    maximum = numerators[0][0];
+    #pragma unroll
+    for (int i = 1; i < warps; ++i) maximum = fmaxf(maximum, numerators[i][0]);
+    float weight = expf(score - maximum);
+    float total = sum_block(weight);
+    scores[tid] = weight;
+    __syncthreads();
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int col = lane + i * 32;
+        float sum = 0.0f;
+        for (int time = warp; time < local_count; time += warps)
+            sum += scores[time] * values[(u64)time * stride + col];
+        numerators[warp][col] = sum;
+    }
+    __syncthreads();
+    float *dst = partials + (blockIdx.x * gridDim.y + blockIdx.y) * (dim + 2);
+    if (tid < dim) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < warps; ++i) sum += numerators[i][tid];
+        dst[tid] = sum;
+    }
+    if (tid == 0) {
+        dst[dim] = maximum;
+        dst[dim + 1] = total;
+    }
+}
+
+extern "C" __global__ void attention_decode_merge(const float *partials, float *output,
+    unsigned tiles, unsigned tile_size, const int *control) {
+    constexpr int dim = 128;
+    unsigned count = control[1] + 1;
+    if (count <= tile_size) return;
+    unsigned live_tiles = (count + tile_size - 1) / tile_size;
+    const float *src = partials + blockIdx.x * tiles * (dim + 2);
+    float peak = -__int_as_float(0x7f800000);
+    for (unsigned tile = 0; tile < live_tiles; ++tile)
+        peak = fmaxf(peak, src[tile * (dim + 2) + dim]);
+    float numerator = 0.0f, denominator = 0.0f;
+    for (unsigned tile = 0; tile < live_tiles; ++tile) {
+        const float *part = src + tile * (dim + 2);
+        float scale = expf(part[dim] - peak);
+        numerator += part[threadIdx.x] * scale;
+        denominator += part[dim + 1] * scale;
+    }
+    output[blockIdx.x * dim + threadIdx.x] = numerator / denominator;
+}
+#endif
+
+#if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_ATTENTION_QUERY_PAIR_RESEARCH) || defined(CUDA_LLAMA_PREFILL_QUERY_PAIR) || defined(CUDA_QWEN35_PREFILL_QUERY_PAIR)
+template<int Dim>
+__device__ __forceinline__ void attention_query_pair(const float *q, const float *keys,
     const float *values, float *output, int heads, int kv_heads, int count) {
     __shared__ float scores[2][1024], maxima[2][256], peak[2];
     int head = blockIdx.x, token = blockIdx.y * 2, tid = threadIdx.x;
     int lane = tid % 32, warp = tid / 32, kv_head = head / (heads / kv_heads);
     int limit = count + token;
-    u64 query_offset = ((u64)token * heads + head) * 128;
-    float query[2][4];
+    u64 query_offset = ((u64)token * heads + head) * Dim;
+    constexpr int parts = Dim == 256 ? 8 : 4;
+    float query[2][parts];
     #pragma unroll
-    for (int p = 0; p < 4; ++p) {
+    for (int p = 0; p < Dim / 32; ++p) {
         int i = lane + p * 32;
         query[0][p] = q[query_offset + i];
-        query[1][p] = q[query_offset + heads * 128 + i];
+        query[1][p] = q[query_offset + heads * Dim + i];
     }
     for (int time = warp; time <= limit; time += 8) {
-        float products[2][4];
+        float products[2][parts] = {};
         #pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            float key = keys[((u64)time * kv_heads + kv_head) * 128 + lane + p * 32];
+        for (int p = 0; p < Dim / 32; ++p) {
+            float key = keys[((u64)time * kv_heads + kv_head) * Dim + lane + p * 32];
             products[0][p] = query[0][p] * key;
             products[1][p] = query[1][p] * key;
         }
@@ -132,12 +222,19 @@ extern "C" __global__ void attention_fused_query_pair(const float *q, const floa
         for (int j = 0; j < 2; ++j) {
             if (time >= limit + j) continue;
             // The original 256-lane tree includes four inactive products.
-            float sum = (__fadd_rn(products[j][0], 0.0f) + __fadd_rn(products[j][2], 0.0f))
-                      + (__fadd_rn(products[j][1], 0.0f) + __fadd_rn(products[j][3], 0.0f));
+            float sum;
+            if constexpr (Dim == 256) {
+                const float *p = products[j];
+                sum = ((p[0] + p[4]) + (p[2] + p[6]))
+                    + ((p[1] + p[5]) + (p[3] + p[7]));
+            } else {
+                sum = (__fadd_rn(products[j][0], 0.0f) + __fadd_rn(products[j][2], 0.0f))
+                    + (__fadd_rn(products[j][1], 0.0f) + __fadd_rn(products[j][3], 0.0f));
+            }
             #pragma unroll
             for (int stride = 16; stride > 0; stride /= 2)
                 sum += __shfl_down_sync(0xffffffff, sum, stride);
-            if (lane == 0) scores[j][time] = sum / sqrtf(128.0f);
+            if (lane == 0) scores[j][time] = sum / sqrtf((float)Dim);
         }
     }
     __syncthreads();
@@ -171,16 +268,117 @@ extern "C" __global__ void attention_fused_query_pair(const float *q, const floa
         for (int time = tid; time < limit + j; time += 256) scores[j][time] /= total;
         __syncthreads();
     }
-    if (tid < 128) {
+    if (tid < Dim) {
         float a = 0.0f, b = 0.0f;
         for (int time = 0; time < limit; ++time) {
-            float value = values[((u64)time * kv_heads + kv_head) * 128 + tid];
+            float value = values[((u64)time * kv_heads + kv_head) * Dim + tid];
             a += scores[0][time] * value;
             b += scores[1][time] * value;
         }
-        b += scores[1][limit] * values[((u64)limit * kv_heads + kv_head) * 128 + tid];
+        b += scores[1][limit] * values[((u64)limit * kv_heads + kv_head) * Dim + tid];
         output[query_offset + tid] = a;
-        output[query_offset + heads * 128 + tid] = b;
+        output[query_offset + heads * Dim + tid] = b;
     }
 }
+#if defined(CUDA_QWEN3_BATCHED_ATTENTION) || defined(CUDA_LLAMA_BATCHED_ATTENTION)
+template<int Group = 1>
+__device__ void batched_causal_softmax(float *scores, int n) {
+#ifdef CUDA_BATCHED_ATTENTION_WARP_SOFTMAX
+    const int lane = threadIdx.x % 32, query = blockIdx.x * 8 + threadIdx.x / 32;
+    if (query >= n) return;
+    const int row_idx = Group > 1 ? (blockIdx.y / Group * n + query) * Group + blockIdx.y % Group
+                                : blockIdx.y * n + query;
+    float *row = scores + row_idx * n;
+    float x[16], peak = -__int_as_float(0x7f800000);
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int col = i * 32 + lane;
+        x[i] = col <= query ? row[col] : -__int_as_float(0x7f800000);
+        peak = fmaxf(peak, x[i]);
+    }
+    for (int offset = 16; offset; offset /= 2)
+        peak = fmaxf(peak, __shfl_xor_sync(0xffffffff, peak, offset));
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        x[i] = expf(x[i] - peak);
+        sum += x[i];
+    }
+    for (int offset = 16; offset; offset /= 2)
+        sum += __shfl_xor_sync(0xffffffff, sum, offset);
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int col = i * 32 + lane;
+        if (col < n) row[col] = x[i] / sum;
+    }
+#else
+    const int tid = threadIdx.x, query = blockIdx.x;
+    const int row_idx = Group > 1 ? (blockIdx.y / Group * n + query) * Group + blockIdx.y % Group
+                                : blockIdx.y * n + query;
+    float *row = scores + row_idx * n;
+    __shared__ float maxima[256];
+    float peak = -__int_as_float(0x7f800000);
+    for (int i = tid; i <= query; i += 256) peak = fmaxf(peak, row[i]);
+    maxima[tid] = peak;
+    __syncthreads();
+    for (int s = 128; s; s /= 2) {
+        if (tid < s) maxima[tid] = fmaxf(maxima[tid], maxima[tid + s]);
+        __syncthreads();
+    }
+    peak = maxima[0];
+    float total = 0.0f;
+    for (int i = tid; i <= query; i += 256) {
+        row[i] = expf(row[i] - peak);
+        total += row[i];
+    }
+    total = sum_block(total);
+    for (int i = tid; i < n; i += 256) row[i] = i <= query ? row[i] / total : 0.0f;
+#endif
+}
+extern "C" __global__ void qwen3_batched_causal_softmax(float *scores, int n) {
+    batched_causal_softmax(scores, n);
+}
+#ifdef CUDA_LLAMA_GROUPED_PREFILL_ATTENTION
+extern "C" __global__ void llama_grouped_causal_softmax(float *scores, int n) {
+    batched_causal_softmax<4>(scores, n);
+}
+template<bool Pack>
+__device__ void llama_grouped_layout(const float *src, float *dst) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int token = i / 2048, group = i / 256 % 8;
+    const int j = (group * 512 + token) * 256 + i % 256;
+    if constexpr (Pack) dst[j] = src[i];
+    else dst[i] = src[j];
+}
+extern "C" __global__ void llama_grouped_q_pack(const float *src, float *dst) {
+    llama_grouped_layout<true>(src, dst);
+}
+extern "C" __global__ void llama_grouped_out_unpack(const float *src, float *dst) {
+    llama_grouped_layout<false>(src, dst);
+}
+#endif
+#ifdef CUDA_QWEN3_GROUPED_PREFILL_ATTENTION
+extern "C" __global__ void qwen3_grouped_causal_softmax(float *scores, int n) {
+    batched_causal_softmax<2>(scores, n);
+}
+#endif
+#endif
+#if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_ATTENTION_QUERY_PAIR_RESEARCH)
+extern "C" __global__ void attention_fused_query_pair(const float *q, const float *keys,
+    const float *values, float *output, int heads, int kv_heads, int count) {
+    attention_query_pair<128>(q, keys, values, output, heads, kv_heads, count);
+}
+#endif
+#ifdef CUDA_LLAMA_PREFILL_QUERY_PAIR
+extern "C" __global__ void attention_fused_query_pair_64(const float *q, const float *keys,
+    const float *values, float *output, int heads, int kv_heads, int count) {
+    attention_query_pair<64>(q, keys, values, output, heads, kv_heads, count);
+}
+#endif
+#ifdef CUDA_QWEN35_PREFILL_QUERY_PAIR
+extern "C" __global__ void attention_fused_query_pair_256(const float *q, const float *keys,
+    const float *values, float *output, int heads, int kv_heads, int count) {
+    attention_query_pair<256>(q, keys, values, output, heads, kv_heads, count);
+}
+#endif
 #endif

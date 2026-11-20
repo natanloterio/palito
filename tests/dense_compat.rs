@@ -80,6 +80,228 @@ fn llama32_cuda_lifecycle() {
     run_fixture("LLAMA32_GGUF", true, &[128001, 128008, 128009]);
 }
 
+#[cfg(feature = "cuda-decode-score-reuse-research")]
+#[test]
+#[ignore = "requires LLAMA32_GGUF and CUDA 13 NVRTC/driver"]
+fn llama32_decode_score_reuse_reset_replay() {
+    long_context_reset_replay("LLAMA32_GGUF");
+}
+
+#[cfg(any(
+    feature = "cuda-decode-score-reuse-research",
+    feature = "cuda-qwen3-prefill-2x16-research"
+))]
+#[test]
+#[ignore = "requires QWEN3_GGUF and CUDA 13 NVRTC/driver"]
+fn qwen3_long_context_reset_replay() {
+    long_context_reset_replay("QWEN3_GGUF");
+}
+
+#[cfg(any(
+    feature = "cuda-decode-score-reuse-research",
+    feature = "cuda-qwen35-q5-prefill-research",
+    feature = "cuda-packed-prefill-research"
+))]
+#[test]
+#[ignore = "requires QWEN35_GGUF and CUDA 13 NVRTC/driver"]
+fn qwen35_long_context_reset_replay() {
+    long_context_reset_replay("QWEN35_GGUF");
+}
+
+#[cfg(feature = "cuda-qwen35-decode-graph-research")]
+#[test]
+#[ignore = "requires QWEN35_GGUF and CUDA 13 NVRTC/driver"]
+fn qwen35_decode_graph_matches_eager() {
+    let path = std::env::var_os("QWEN35_GGUF").expect("set QWEN35_GGUF");
+    let config = Config {
+        context_tokens: 1024,
+        batch_tokens: 512,
+        prefill_chunk: 512,
+        threads: 4,
+    };
+    let run = |decode_graph| {
+        let mut backend = local_inference::cuda::open_backend(
+            Path::new(&path),
+            &config,
+            CudaOptions {
+                decode_graph,
+                ..CudaOptions::default()
+            },
+        )
+        .unwrap();
+        let seed = backend.tokenize("A prefix with distinct tokens.").unwrap();
+        let other = backend.tokenize("A different sequence starts here.").unwrap();
+        let mut captures = Vec::new();
+        for (n, seed) in [
+            (512, &seed),
+            (125, &other),
+            (46, &seed),
+            (125, &other),
+            (512, &seed),
+        ] {
+            let tokens: Vec<_> = seed.iter().copied().cycle().take(n + 5).collect();
+            backend.reset().unwrap();
+            assert!(backend.logits().is_err());
+            backend.evaluate(&tokens[..n], 0).unwrap();
+            captures.push((
+                backend.logits().unwrap().iter().map(|x| x.to_bits()).collect(),
+                backend.sample_greedy().unwrap(),
+            ));
+            for (position, &token) in tokens.iter().enumerate().skip(n) {
+                backend
+                    .evaluate_for_sampling(&[token], position as u32)
+                    .unwrap();
+                let logits: Vec<_> = backend.logits().unwrap().iter().map(|x| x.to_bits()).collect();
+                assert_eq!(logits.len(), backend.info().vocab_tokens as usize);
+                captures.push((logits, backend.sample_greedy().unwrap()));
+            }
+        }
+        captures
+    };
+    let eager = run(false);
+    let graph = run(true);
+    for (i, ((a, expected), (b, actual))) in eager.iter().zip(&graph).enumerate() {
+        assert_eq!(expected, actual, "greedy at step {i}");
+        assert_eq!(a.len(), b.len());
+        assert_eq!(
+            a.iter().zip(b).position(|(a, b)| a != b),
+            None,
+            "first differing logit at step {i}"
+        );
+    }
+}
+
+#[cfg(all(
+    feature = "cuda-qwen35-conv-tile-research",
+    not(feature = "cuda-fp16-corrected-prefill-research"),
+    not(feature = "cuda-packed-prefill-research")
+))]
+#[test]
+#[ignore = "requires QWEN35_GGUF and CUDA 13 NVRTC/driver"]
+fn qwen35_convolution_tile_history_replay() {
+    let path = std::env::var_os("QWEN35_GGUF").expect("set the GGUF fixture path");
+    let config = Config {
+        context_tokens: 96,
+        batch_tokens: 64,
+        prefill_chunk: 64,
+        threads: 4,
+    };
+    let mut backend =
+        local_inference::cuda::open_backend(Path::new(&path), &config, CudaOptions::default())
+            .unwrap();
+    let seed = backend.tokenize("A prefix with distinct tokens.").unwrap();
+    let prompt: Vec<_> = seed.iter().copied().cycle().take(36).collect();
+    let run = |backend: &mut dyn Backend, split: usize| {
+        backend.reset().unwrap();
+        backend.evaluate(&prompt[..split], 0).unwrap();
+        backend.evaluate(&prompt[split..35], split as u32).unwrap();
+        let before: Vec<_> = backend
+            .logits()
+            .unwrap()
+            .iter()
+            .map(|f| f.to_bits())
+            .collect();
+        backend.evaluate(&prompt[35..], 35).unwrap();
+        let after: Vec<_> = backend
+            .logits()
+            .unwrap()
+            .iter()
+            .map(|f| f.to_bits())
+            .collect();
+        (before, after)
+    };
+    // Both arms use the same recurrent math. Only the tiled arm sends the
+    // second chunk (33 tokens, with a one-token tail) through tiled convolution.
+    let tiled = run(backend.as_mut(), 2);
+    let sequential = run(backend.as_mut(), 4);
+    assert_eq!(tiled, sequential);
+}
+
+#[cfg(any(
+    feature = "cuda-decode-score-reuse-research",
+    feature = "cuda-qwen3-prefill-2x16-research",
+    feature = "cuda-qwen35-q5-prefill-research",
+    feature = "cuda-packed-prefill-research"
+))]
+fn long_context_reset_replay(env: &str) {
+    long_context_reset_replay_with_options(env, CudaOptions::default());
+}
+
+#[cfg(feature = "cuda-packed-prefill-research")]
+#[test]
+#[ignore = "requires QWEN3_GGUF and CUDA 13 NVRTC/driver"]
+fn qwen3_mma3_graph_reset_replay() {
+    long_context_reset_replay_with_options(
+        "QWEN3_GGUF",
+        CudaOptions {
+            matmul: local_inference::cuda::CudaMatmul::ResidualMma3Research,
+            decode_graph: true,
+            ..CudaOptions::default()
+        },
+    );
+}
+
+#[cfg(any(
+    feature = "cuda-decode-score-reuse-research",
+    feature = "cuda-qwen3-prefill-2x16-research",
+    feature = "cuda-qwen35-q5-prefill-research",
+    feature = "cuda-packed-prefill-research"
+))]
+fn long_context_reset_replay_with_options(env: &str, options: CudaOptions) {
+    let path = std::env::var_os(env).unwrap_or_else(|| panic!("set {env}"));
+    let config = Config {
+        context_tokens: 1024,
+        batch_tokens: 512,
+        prefill_chunk: 512,
+        threads: 4,
+    };
+    let mut backend =
+        local_inference::cuda::open_backend(Path::new(&path), &config, options).unwrap();
+    let seed = backend
+        .tokenize("A prefix with several distinct tokens.")
+        .unwrap();
+    let prompt: Vec<_> = seed.iter().copied().cycle().take(513).collect();
+    for n in [31, 32, 33, 127, 128, 129, 255, 256, 257, 512] {
+        let run = |backend: &mut dyn Backend| {
+            backend.evaluate(&prompt[..n], 0).unwrap();
+            let prefill: Vec<_> = backend
+                .logits()
+                .unwrap()
+                .iter()
+                .map(|f| f.to_bits())
+                .collect();
+            let first = backend.sample_greedy().unwrap();
+            backend
+                .evaluate_for_sampling(&prompt[n..=n], n as u32)
+                .unwrap();
+            let sampled = backend.sample_greedy().unwrap();
+            backend.reset().unwrap();
+            backend.evaluate(&prompt[..n], 0).unwrap();
+            backend.evaluate(&prompt[n..=n], n as u32).unwrap();
+            let decode: Vec<_> = backend
+                .logits()
+                .unwrap()
+                .iter()
+                .map(|f| f.to_bits())
+                .collect();
+            let decoded = backend.sample_greedy().unwrap();
+            assert_eq!(sampled, decoded, "sampling path at {n} tokens");
+            (prefill, first, decode, decoded)
+        };
+        backend.reset().unwrap();
+        let expected = run(backend.as_mut());
+        backend.reset().unwrap();
+        assert!(backend.logits().is_err());
+        backend.evaluate(&prompt[1..3], 0).unwrap();
+        backend.reset().unwrap();
+        assert_eq!(
+            expected,
+            run(backend.as_mut()),
+            "reset replay at {n} tokens"
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires PHI3_GGUF"]
 fn phi3_reference_lifecycle() {

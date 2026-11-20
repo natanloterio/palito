@@ -56,6 +56,19 @@ __device__ __forceinline__ int residual_quant(const u8 *p, int i) {
 
 template<int Kind>
 __device__ __forceinline__ unsigned int residual_packed_quant(const u8 *p, int i) {
+#ifdef CUDA_DENSE_PACKED_REPLAY
+    if constexpr (Kind == 8) {
+        // The 34-byte Q8_0 stride guarantees only two-byte alignment.
+        const unsigned short *q = (const unsigned short *)(p + 2 + i);
+        return (unsigned int)q[0] | ((unsigned int)q[1] << 16);
+    }
+    if constexpr (Kind == 13) {
+        const unsigned int low = *(const unsigned int *)(p + 48 + (i / 64) * 32 + i % 32);
+        const unsigned int high = *(const unsigned int *)(p + 16 + i % 32);
+        return ((low >> (4 * ((i / 32) % 2))) & 0x0f0f0f0fu)
+            | (((high >> (i / 32)) & 0x01010101u) << 4);
+    }
+#endif
     if (Kind == 12) {
         unsigned int bits = *(const unsigned int *)(p + 16 + (i / 64) * 32 + i % 32);
         return (bits >> (4 * ((i / 32) % 2))) & 0x0f0f0f0fu;
@@ -74,7 +87,9 @@ __device__ __forceinline__ unsigned int residual_packed_quant(const u8 *p, int i
 template<int Kind>
 __device__ __forceinline__ void residual_parameters_scaled(const u8 *p, int i, float d, float dm,
     float &a0, float &a1, float &b) {
-    if (Kind == 12) {
+    if (Kind == 8) {
+        a0 = d;
+    } else if (Kind == 12 || Kind == 13) {
         int g = i / 32;
         const u8 *m = p + 4;
         int sc = g < 4 ? m[g] & 63 : (m[g + 4] & 15) | ((m[g - 4] >> 6) << 4);
@@ -90,8 +105,8 @@ __device__ __forceinline__ void residual_parameters_scaled(const u8 *p, int i, f
 template<int Kind>
 __device__ __forceinline__ void residual_parameters(const u8 *p, int i,
     float &a0, float &a1, float &b) {
-    float d = half_value(p + (Kind == 12 ? 0 : 208));
-    float dm = Kind == 12 ? half_value(p + 2) : 0.0f;
+    float d = half_value(p + (Kind == 14 ? 208 : 0));
+    float dm = Kind == 12 || Kind == 13 ? half_value(p + 2) : 0.0f;
     residual_parameters_scaled<Kind>(p, i, d, dm, a0, a1, b);
 }
 

@@ -146,7 +146,7 @@ extern "C" __global__ void grouped_matmul(const u8 *w, int kind, const float *x,
 
 // Each warp owns one row at a time and broadcasts quant-block metadata.
 // The padded row stride avoids bank conflicts when compute lanes select rows.
-template<int Kind, int RowTile, int KTile, int Warps = 8>
+template<int Kind, int RowTile, int KTile, int Warps = 8, bool Q5Warp = false>
 __device__ void projection_weights(const u8 *w, float weights[][KTile + 1],
                                    int width, int rows, int expert, int first_row, int first_k) {
     int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
@@ -156,6 +156,16 @@ __device__ void projection_weights(const u8 *w, float weights[][KTile + 1],
             for (int k = lane; k < KTile; k += 32) weights[r][k] = 0.0f;
             continue;
         }
+#ifdef CUDA_QWEN35_SPLITK_PROBE
+        if (Kind == 13 && (!Q5Warp || KTile != 32 || first_k + 32 > width || width % 32 != 0)) {
+            for (int k = lane; k < KTile; k += 32) {
+                int col = first_k + k;
+                weights[r][k] = col < width
+                    ? weight(w, Kind, ((u64)expert * rows + row) * width + col) : 0.0f;
+            }
+            continue;
+        }
+#endif
         if (KTile == 32 && Kind != 0 && Kind != 1) {
             u64 index = ((u64)expert * rows + row) * width + first_k;
             if (first_k + 32 <= width && index % 32 == 0) {
@@ -510,8 +520,10 @@ extern "C" __global__ void prefill_matmul_ref2x16(const u8 *w, int kind, const f
     __shared__ float partial[2][16][128];
     if (kind == 12) projection_reference_legacy<12, 2, 16>(w, x, y, width, rows, tokens, partial);
     if (kind == 14) projection_reference_legacy<14, 2, 16>(w, x, y, width, rows, tokens, partial);
-#ifdef CUDA_M8_PROTOTYPES
+#if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_QWEN35_PROJECTION_PROBE)
     if (kind == 8) projection_reference_legacy<8, 2, 16>(w, x, y, width, rows, tokens, partial);
+#endif
+#if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_QWEN35_PROJECTION_PROBE) || defined(CUDA_QWEN35_Q5_PREFILL_RESEARCH)
     if (kind == 13) projection_reference_legacy<13, 2, 16>(w, x, y, width, rows, tokens, partial);
 #endif
 }

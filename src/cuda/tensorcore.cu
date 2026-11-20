@@ -132,20 +132,31 @@ extern "C" __global__ void grouped_matmul_tf32x3(const u8 *w, int kind, const fl
 #if __CUDA_ARCH__ >= 800
 // Eight warps cover 128 rows and all eight assignment columns. Operands are
 // cooperatively staged once per K=32 slab, rather than loaded by every warp.
-template<int Kind, bool Grouped>
+template<int Kind, bool Grouped, bool Split = false, bool Packed = false, bool Q5Warp = false>
 __device__ void tensor_core_tiled(const u8 *w, const float *x, float *y,
                                   int width, int rows, int tokens, const int *groups,
                                   int used, int batched, float weights[][33],
-                                  float activations[][8]) {
+                                  float activations[][8], unsigned int lows[][8] = nullptr) {
     int expert = Grouped ? groups[blockIdx.y * 9] : 0;
     if (expert < 0) return;
     int lane = threadIdx.x % 32, group = lane / 4, thread = lane % 4;
     int first_row = blockIdx.x * 128;
     int row = (threadIdx.x / 32) * 16 + group;
     float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
-    for (int first_k = 0; first_k < width; first_k += 32) {
-        projection_weights<Kind, 128, 32>(w, weights, width, rows, expert, first_row, first_k);
-        projection_inputs<Grouped, 32>(x, activations, width, tokens, groups, used, batched, first_k);
+    const int span = Split ? width / gridDim.z : width;
+    const int begin = Split ? blockIdx.z * span : 0;
+    if (Split) y += (u64)blockIdx.z * rows * tokens;
+    for (int first_k = begin; first_k < begin + span; first_k += 32) {
+        projection_weights<Kind, 128, 32, 8, Q5Warp>(w, weights, width, rows, expert, first_row, first_k);
+        if (Packed) {
+            const int k = threadIdx.x / 8, token = threadIdx.x % 8;
+            const u64 index = ((u64)blockIdx.y * width + first_k + k) * 8 + token;
+            const uint2 pair = reinterpret_cast<const uint2 *>(x)[index];
+            activations[k][token] = __uint_as_float(pair.x);
+            lows[k][token] = pair.y;
+        } else {
+            projection_inputs<Grouped, 32>(x, activations, width, tokens, groups, used, batched, first_k);
+        }
         __syncthreads();
         #pragma unroll
         for (int k = 0; k < 32; k += 8) {
@@ -158,9 +169,10 @@ __device__ void tensor_core_tiled(const u8 *w, const float *x, float *y,
             }
             float x0 = activations[k + thread][group];
             float x1 = activations[k + thread + 4][group];
-            unsigned int b0 = as_tf32(x0), b1 = as_tf32(x1);
-            unsigned int low0 = as_tf32(x0 - __uint_as_float(b0));
-            unsigned int low1 = as_tf32(x1 - __uint_as_float(b1));
+            unsigned int b0 = Packed ? __float_as_uint(x0) : as_tf32(x0);
+            unsigned int b1 = Packed ? __float_as_uint(x1) : as_tf32(x1);
+            unsigned int low0 = Packed ? lows[k + thread][group] : as_tf32(x0 - __uint_as_float(b0));
+            unsigned int low1 = Packed ? lows[k + thread + 4][group] : as_tf32(x1 - __uint_as_float(b1));
             asm volatile(
                 "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -186,6 +198,82 @@ __device__ void tensor_core_tiled(const u8 *w, const float *x, float *y,
         int assignment = projection_assignment<Grouped>(groups, blockIdx.y, thread * 2 + i % 2, tokens);
         if (r < rows && assignment >= 0) y[(u64)assignment * rows + r] = result[i];
     }
+}
+#endif
+
+#ifdef CUDA_QWEN35_SPLITK_PROBE
+#ifdef CUDA_QWEN35_Q5_WARP_RESEARCH
+extern "C" __global__ void qwen35_q5_tf32x3_warp_split(const u8 *w, const float *x,
+                                                      float *y, int width, int rows, int tokens) {
+#if __CUDA_ARCH__ >= 800
+    __shared__ float weights[128][33], activations[32][8];
+    tensor_core_tiled<13, false, true, false, true>(w, x, y, width, rows, tokens, nullptr, 1, 0,
+                                                   weights, activations);
+#else
+    asm("trap;");
+#endif
+}
+#endif
+#ifdef CUDA_QWEN35_PROJECTION_PROBE
+extern "C" __global__ void qwen35_pack_tf32x3(const float *x, uint2 *packed,
+                                             int width, int tokens) {
+#if __CUDA_ARCH__ >= 800
+    // Load contiguous K values and transpose the eight tokens on store.
+    const int k = blockIdx.x * 32 + threadIdx.x % 32;
+    const int slot = threadIdx.x / 32;
+    const int token = blockIdx.y * 8 + slot;
+    const float value = token < tokens ? x[(u64)token * width + k] : 0.0f;
+    const unsigned int high = as_tf32(value);
+    packed[((u64)blockIdx.y * width + k) * 8 + slot] =
+        make_uint2(high, as_tf32(value - __uint_as_float(high)));
+#else
+    asm("trap;");
+#endif
+}
+
+extern "C" __global__ void qwen35_q5_tf32x3_packed_split(const u8 *w, const float *packed,
+                                                        float *y, int width, int rows, int tokens) {
+#if __CUDA_ARCH__ >= 800
+    __shared__ float weights[128][33], highs[32][8];
+    __shared__ unsigned int lows[32][8];
+    tensor_core_tiled<13, false, true, true>(w, packed, y, width, rows, tokens, nullptr, 1, 0,
+                                            weights, highs, lows);
+#else
+    asm("trap;");
+#endif
+}
+
+extern "C" __global__ void qwen35_q4_tf32x3_packed(const u8 *w, const float *packed,
+                                                  float *y, int width, int rows, int tokens) {
+#if __CUDA_ARCH__ >= 800
+    __shared__ float weights[128][33], highs[32][8];
+    __shared__ unsigned int lows[32][8];
+    tensor_core_tiled<12, false, false, true>(w, packed, y, width, rows, tokens, nullptr, 1, 0,
+                                             weights, highs, lows);
+#else
+    asm("trap;");
+#endif
+}
+#endif
+
+extern "C" __global__ void qwen35_q5_tf32x3_split(const u8 *w, const float *x,
+                                                 float *y, int width, int rows, int tokens) {
+#if __CUDA_ARCH__ >= 800
+    __shared__ float weights[128][33], activations[32][8];
+    tensor_core_tiled<13, false, true>(w, x, y, width, rows, tokens, nullptr, 1, 0,
+                                      weights, activations);
+#else
+    asm("trap;");
+#endif
+}
+
+extern "C" __global__ void qwen35_q5_split_reduce(const float *partial, float *output,
+                                                 int count, int splits) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    float sum = partial[i];
+    for (int s = 1; s < splits; ++s) sum += partial[(u64)s * count + i];
+    output[i] = sum;
 }
 #endif
 

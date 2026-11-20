@@ -11,7 +11,7 @@ using ResidualMmaTile = ResidualMmaTileComponents<3>;
 template<int Kind>
 __device__ __forceinline__ void residual_mma_group(unsigned int a0, unsigned int a1,
     unsigned int a2, unsigned int a3, unsigned int b0, unsigned int b1, int (&d)[4]) {
-    if (Kind == 12) {
+    if (Kind != 14) {
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
             : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
@@ -30,11 +30,11 @@ __device__ __forceinline__ void residual_mma_accumulate(
     float (&total)[Components][WarpTiles][4], int warp_row, int warp_token,
     int group, int thread, bool first, bool second) {
     #pragma unroll
-    for (int half = 0; half < (K == 12 ? 1 : 2); half++) {
+    for (int half = 0; half < (K == 14 ? 2 : 1); half++) {
         int r = warp_row + group, pack = thread + half * 4;
         unsigned int a0 = s.weights[P][r][pack], a1 = s.weights[P][r + 8][pack];
-        unsigned int a2 = K == 12 ? s.weights[P][r][thread + 4] : 0;
-        unsigned int a3 = K == 12 ? s.weights[P][r + 8][thread + 4] : 0;
+        unsigned int a2 = K != 14 ? s.weights[P][r][thread + 4] : 0;
+        unsigned int a3 = K != 14 ? s.weights[P][r + 8][thread + 4] : 0;
         #pragma unroll
         for (int component = 0; component < Components; component++) {
             #pragma unroll
@@ -42,7 +42,7 @@ __device__ __forceinline__ void residual_mma_accumulate(
                 if (SkipEmpty && !(tile == 0 ? first : second)) continue;
                 int token = warp_token + tile * 8 + group;
                 unsigned int b0 = s.values[component][token][pack];
-                unsigned int b1 = K == 12 ? s.values[component][token][thread + 4] : 0;
+                unsigned int b1 = K != 14 ? s.values[component][token][thread + 4] : 0;
                 int dot[4] = {};
                 residual_mma_group<K>(a0, a1, a2, a3, b0, b1, dot);
                 #pragma unroll
@@ -50,7 +50,7 @@ __device__ __forceinline__ void residual_mma_accumulate(
                     int output_row = r + item / 2 * 8;
                     int output_token = warp_token + tile * 8 + thread * 2 + item % 2;
                     float value = s.coefficient[P][output_row][half] * (float)dot[item];
-                    if (K == 12)
+                    if (K == 12 || K == 13)
                         value -= s.minimum[P][output_row] * (float)s.sums[output_token][component];
                     total[component][tile][item] += value * s.scales[output_token][component];
                 }
@@ -59,7 +59,7 @@ __device__ __forceinline__ void residual_mma_accumulate(
     }
 }
 
-template<int Kind, int Components, bool SkipEmpty, int Columns, bool CacheScales, int UpKind = 0, int Rows = 32, int Descriptor = 33, bool PlanarQ4 = false, bool Subgroup = false>
+template<int Kind, int Components, bool SkipEmpty, int Columns, bool CacheScales, int UpKind = 0, int Rows = 32, int Descriptor = 33, bool PlanarQ4 = false, bool Subgroup = false, bool WideWarp = false>
 __device__ void residual_mma_tile(const u8 *weights, const signed char *values,
     const float *scales, const int *sums, float *output, int width, int rows,
     int tokens, const int *groups, int used, int grouped, int assignment_major,
@@ -68,17 +68,20 @@ __device__ void residual_mma_tile(const u8 *weights, const signed char *values,
     static_assert(!UpKind || (Components == 3 && !CacheScales && !SkipEmpty));
     static_assert(!PlanarQ4 || (Kind == 12 && Rows == 32 && !UpKind && !CacheScales));
     static_assert(!Subgroup || (Columns == 8 && Rows == 32 && !UpKind));
+    static_assert(!WideWarp || (Kind == 8 && Columns == 32 && !UpKind && !SkipEmpty && !Subgroup));
     constexpr int Projections = UpKind ? 2 : 1;
+    constexpr int Block = Kind == 8 ? 32 : 256;
+    constexpr int Bytes = Kind == 8 ? 34 : Kind == 12 ? 144 : Kind == 13 ? 176 : 210;
     int slot = Subgroup ? descriptor_slot : (descriptor_slot < 0 ? (int)blockIdx.y : descriptor_slot);
     int expert = grouped ? (slot >= 0 ? groups[slot * Descriptor] : -1) : 0;
     if (!Subgroup && expert < 0) return;
     int tid = Subgroup ? threadIdx.x % 64 : threadIdx.x;
     int warp = tid / 32, lane = tid % 32;
     int group = lane / 4, thread = lane % 4;
-    constexpr int Threads = Rows * (Columns >= 32 ? 4 : 2);
-    constexpr int WarpTiles = Columns == 8 ? 1 : Columns == 64 ? 4 : 2;
-    int first_row = blockIdx.x * Rows, warp_row = (Columns >= 32 ? warp / 2 : warp) * 16;
-    int warp_token = Columns >= 32 ? warp % 2 * WarpTiles * 8 : 0;
+    constexpr int Threads = Rows * (Columns >= 32 && !WideWarp ? 4 : 2);
+    constexpr int WarpTiles = Columns == 8 ? 1 : Columns == 64 || WideWarp ? 4 : 2;
+    int first_row = blockIdx.x * Rows, warp_row = (Columns >= 32 && !WideWarp ? warp / 2 : warp) * 16;
+    int warp_token = Columns >= 32 && !WideWarp ? warp % 2 * WarpTiles * 8 : 0;
     int input_count = width * tokens * (grouped && assignment_major ? used : 1);
     if (tid < Columns) {
         int source_slot = Columns == 64 && tid >= 32 ? paired_slot : slot;
@@ -104,9 +107,9 @@ __device__ void residual_mma_tile(const u8 *weights, const signed char *values,
                 unsigned bits = plane[(4 + (k % 256) / 64 * 8 + pack) * 32 + row];
                 packed = (bits >> (4 * ((k / 32) % 2))) & 0x0f0f0f0fu;
             } else if ((!Subgroup || expert >= 0) && first_row + row < rows) {
-                const u8 *p = weights + (((u64)(expert * rows + first_row + row) * width + k) / 256)
-                    * (Kind == 12 ? 144 : 210);
-                packed = residual_packed_quant<Kind>(p, k % 256 + pack * 4);
+                const u8 *p = weights + (((u64)(expert * rows + first_row + row) * width + k) / Block)
+                    * Bytes;
+                packed = residual_packed_quant<Kind>(p, k % Block + pack * 4);
             }
             s.weights[0][row][pack] = packed;
             if constexpr (UpKind != 0) {
@@ -153,8 +156,8 @@ __device__ void residual_mma_tile(const u8 *weights, const signed char *values,
                 a0 = half_value_bits(halves & 65535) * (float)sc;
                 b = half_value_bits(halves >> 16) * (float)mn;
             } else if ((!Subgroup || expert >= 0) && first_row + tid < rows) {
-                const u8 *p = weights + (((u64)(expert * rows + first_row + tid) * width + k) / 256)
-                    * (Kind == 12 ? 144 : 210);
+                const u8 *p = weights + (((u64)(expert * rows + first_row + tid) * width + k) / Block)
+                    * Bytes;
                 if (CacheScales) {
                     if (k % 256 == 0) {
                         block_d = half_value(p + (Kind == 12 ? 0 : 208));
@@ -162,7 +165,7 @@ __device__ void residual_mma_tile(const u8 *weights, const signed char *values,
                     }
                     residual_parameters_scaled<Kind>(p, k % 256, block_d, block_dm, a0, a1, b);
                 } else {
-                    residual_parameters<Kind>(p, k % 256, a0, a1, b);
+                    residual_parameters<Kind>(p, k % Block, a0, a1, b);
                 }
             }
             s.coefficient[0][tid][0] = a0;
@@ -248,6 +251,71 @@ extern "C" __global__ void Name(const u8 *weights, int kind, \
 }
 
 RESIDUAL_MMA_ENTRY(residual_matmul_mma3, 3, false, false, 32)
+
+#ifdef CUDA_DENSE_PACKED_REPLAY
+template<int Components>
+__device__ void dense_packed_replay(const u8 *weights, int kind, const signed char *values,
+    const float *scales, const int *sums, float *output, int width, int rows, int tokens, int *status) {
+#if __CUDA_ARCH__ >= 800
+    __shared__ ResidualMmaTileComponents<Components> tile;
+    if (width > 0 && width % (kind == 8 ? 32 : 256) == 0) {
+        switch (kind) {
+            case 8: residual_mma_tile<8, Components, false, 32, false>(weights, values, scales, sums,
+                output, width, rows, tokens, nullptr, 1, 0, 0, status, tile); return;
+            case 12: case 14: residual_matmul_mma_dispatch<Components, false>(weights, kind, values,
+                scales, sums, output, width, rows, tokens, nullptr, 1, 0, 0, status); return;
+            case 13: residual_mma_tile<13, Components, false, 32, false>(weights, values, scales, sums,
+                output, width, rows, tokens, nullptr, 1, 0, 0, status, tile); return;
+        }
+    }
+    if (threadIdx.x == 0) atomicOr(status, 8);
+#else
+    if (threadIdx.x == 0) atomicOr(status, 16);
+#endif
+}
+
+#define DENSE_PACKED_REPLAY_ENTRY(Name, Components) \
+extern "C" __global__ void Name(const u8 *weights, int kind, const signed char *values, \
+    const float *scales, const int *sums, float *output, int width, int rows, int tokens, int *status) { \
+    dense_packed_replay<Components>(weights, kind, values, scales, sums, output, width, rows, tokens, status); \
+}
+DENSE_PACKED_REPLAY_ENTRY(dense_packed_replay_mma1, 1)
+DENSE_PACKED_REPLAY_ENTRY(dense_packed_replay_mma3, 3)
+#undef DENSE_PACKED_REPLAY_ENTRY
+#ifdef CUDA_M8_PROTOTYPES
+extern "C" __global__ void dense_q8_replay_mma3_wide_warp(const u8 *weights, int kind,
+    const signed char *values, const float *scales, const int *sums,
+    float *output, int width, int rows, int tokens, int *status) {
+#if __CUDA_ARCH__ >= 800
+    __shared__ ResidualMmaTile tile;
+    if (kind == 8 && width > 0 && width % 32 == 0) {
+        residual_mma_tile<8, 3, false, 32, false, 0, 32, 33, false, false, true>(
+            weights, values, scales, sums, output, width, rows, tokens, nullptr, 1, 0, 0, status, tile);
+    } else {
+        if (threadIdx.x == 0) atomicOr(status, 8);
+    }
+#else
+    if (threadIdx.x == 0) atomicOr(status, 16);
+#endif
+}
+
+extern "C" __global__ void dense_q8_replay_mma3_rows64(const u8 *weights, int kind,
+    const signed char *values, const float *scales, const int *sums, float *output,
+    int width, int rows, int tokens, int *status) {
+#if __CUDA_ARCH__ >= 800
+    __shared__ ResidualMmaTileComponents<3, 32, 1, 64> tile;
+    if (kind == 8 && width > 0 && width % 32 == 0) {
+        residual_mma_tile<8, 3, false, 32, false, 0, 64>(weights, values, scales, sums,
+            output, width, rows, tokens, nullptr, 1, 0, 0, status, tile);
+    } else if (threadIdx.x == 0) {
+        atomicOr(status, 8);
+    }
+#else
+    if (threadIdx.x == 0) atomicOr(status, 16);
+#endif
+}
+#endif
+#endif
 #if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_MMA3_WIDE_ROWS_RESEARCH)
 RESIDUAL_MMA_ENTRY(residual_matmul_mma3_rows64, 3, false, false, 64)
 #endif

@@ -168,6 +168,10 @@ fn greedy(logits: &[f32]) -> Result<i32> {
 
 struct DeviceTensor {
     bytes: CudaSlice<u8>,
+    #[cfg(feature = "cuda-qwen35-matvec-cache-research")]
+    k_coefficients: Option<CudaSlice<f32>>,
+    #[cfg(feature = "cuda-fp16-corrected-prefill-research")]
+    fp16: Option<[CudaSlice<u16>; 2]>,
     kind: i32,
     width: i32,
     rows: i32,
@@ -181,6 +185,10 @@ impl DeviceTensor {
         };
         Ok(Self {
             bytes: stream.clone_htod(&bytes).map_err(failure)?,
+            #[cfg(feature = "cuda-qwen35-matvec-cache-research")]
+            k_coefficients: None,
+            #[cfg(feature = "cuda-fp16-corrected-prefill-research")]
+            fp16: None,
             kind,
             width: tensor.dims[0] as i32,
             rows: tensor.dims.get(1).copied().unwrap_or(1) as i32,
@@ -258,10 +266,32 @@ fn prefill_capacity(spec: &Spec) -> usize {
     (spec.info.batch_tokens as usize).min(512)
 }
 
+fn decode_score_reuse_options(arch: String, f32_profile: bool) -> Vec<String> {
+    let mut options = vec![arch];
+    if cfg!(feature = "cuda-decode-score-reuse-research") && f32_profile {
+        options.push("-DCUDA_DECODE_SCORE_REUSE_RESEARCH=1".into());
+    }
+    options
+}
+
 fn fused_attention_supported(spec: &Spec) -> bool {
     spec.dim <= 256
         && spec.info.context_tokens <= 1024
         && !matches!(spec.info.architecture.as_str(), "gemma2" | "gemma3")
+}
+
+#[cfg(any(
+    feature = "cuda-qwen3-batched-attention-research",
+    feature = "cuda-llama-batched-attention-research"
+))]
+fn batched_attention_supported(spec: &Spec) -> bool {
+    let shape = (spec.heads, spec.kv_heads, spec.dim);
+    let model = match spec.info.architecture.as_str() {
+        "qwen3" => cfg!(feature = "cuda-qwen3-batched-attention-research") && shape == (16, 8, 128),
+        "llama" => cfg!(feature = "cuda-llama-batched-attention-research") && shape == (32, 8, 64),
+        _ => false,
+    };
+    model && spec.experts == 0 && fused_attention_supported(spec) && prefill_capacity(spec) >= 256
 }
 
 fn routing_elements(spec: &Spec) -> Result<usize> {
@@ -314,6 +344,12 @@ fn group_workspace_elements(spec: &Spec, matmul: CudaMatmul) -> Result<usize> {
     }
 }
 
+const QWEN3_DECODE_TILE: u32 = if cfg!(feature = "cuda-qwen3-decode-tile-128-research") {
+    128
+} else {
+    160
+};
+
 fn workspace_sizes(spec: &Spec) -> Result<[usize; 12]> {
     let product = |a: usize, b: usize| {
         a.checked_mul(b)
@@ -336,8 +372,23 @@ fn workspace_sizes(spec: &Spec) -> Result<[usize; 12]> {
     for size in &mut sizes[..10] {
         *size = product(*size, prefill_capacity(spec))?;
     }
-    if !fused_attention_supported(spec) {
+    if cfg!(feature = "cuda-qwen3-decode-tile-128-research")
+        && spec.info.architecture == "qwen3"
+        && spec.dim == 128
+        && fused_attention_supported(spec)
+    {
+        let tiles = spec.info.context_tokens.div_ceil(QWEN3_DECODE_TILE) as usize;
+        sizes[10] = sizes[10].max(product(spec.heads, product(tiles, 130)?)?);
+    } else if !fused_attention_supported(spec) {
         sizes[10] = product(sizes[10], prefill_capacity(spec))?;
+    }
+    #[cfg(any(
+        feature = "cuda-qwen3-batched-attention-research",
+        feature = "cuda-llama-batched-attention-research"
+    ))]
+    if batched_attention_supported(spec) {
+        let capacity = prefill_capacity(spec).min(512);
+        sizes[10] = sizes[10].max(product(spec.heads, product(capacity, capacity)?)?);
     }
     if spec.experts > 0 {
         sizes[11] = product(sizes[11], prefill_capacity(spec))?;
@@ -360,7 +411,12 @@ fn parallel_group_count_elements(spec: &Spec, matmul: CudaMatmul) -> usize {
 }
 
 impl Workspace {
-    fn new(spec: &Spec, stream: &Arc<CudaStream>, matmul: CudaMatmul) -> Result<Self> {
+    fn new(
+        spec: &Spec,
+        stream: &Arc<CudaStream>,
+        matmul: CudaMatmul,
+        precise: CudaMatmul,
+    ) -> Result<Self> {
         let [w, _, qw, kw, _, _, _, gates, _, down, scores, router] = workspace_sizes(spec)?;
         let alloc = |n| stream.alloc_zeros::<f32>(n).map_err(failure);
         Ok(Self {
@@ -420,8 +476,8 @@ impl Workspace {
                 }
             },
             residual_mma3: {
-                let count = residual_workspace_elements(spec, matmul)?;
-                if count == 0 || matmul != CudaMatmul::ResidualMma3Research {
+                let count = residual_workspace_elements(spec, precise)?;
+                if count == 0 || precise != CudaMatmul::ResidualMma3Research {
                     None
                 } else {
                     Some(PreciseWorkspace {
@@ -445,6 +501,58 @@ macro_rules! launch {
     }};
     ($backend:ident, $name:expr, $grid:expr, $($arg:expr),+ $(,)?) => {{
         launch!($backend, $name, $grid; 256, $($arg),+)
+    }};
+}
+
+macro_rules! q8_dp4a {
+    ($b:ident, $t:expr, $x:ident, $y:expr) => {{
+        q8_dp4a!($b, $t, $x, $y, None::<i32>)
+    }};
+    ($b:ident, $t:expr, $x:ident, $y:expr, $prepared:expr) => {{
+        let t = $t;
+        if cfg!(feature = "cuda-llama-q8-dp4a-research")
+            && t.kind == 8
+            && t.width > 0
+            && t.width % 32 == 0
+            && $b.functions.contains_key("llama_q8_dp4a")
+            && let Some(work) = $b.work.residual_mma3.as_mut()
+        {
+            let width = t.width as usize;
+            if width > $b.work.$x.len()
+                || 3 * width > work.values.len()
+                || 3 * (width / 32) > work.scales.len().min(work.sums.len())
+            {
+                return Err(invalid("Q8 DP4A input exceeds workspace"));
+            }
+
+            if !cfg!(feature = "cuda-llama-q8-prep-reuse-research") || $prepared != Some(t.width) {
+                launch!($b, "residual_quantize32_precise3", ((t.width as u32).div_ceil(256), 1, 1),
+                    &$b.work.$x, &mut work.values, &mut work.scales, &mut work.sums,
+                    &t.width, &mut $b.work.status);
+            }
+            launch!($b, "llama_q8_dp4a", ((t.rows as u32).div_ceil(4), 1, 1); 128,
+                &t.bytes, &work.values, &work.scales, $y, &t.width, &t.rows);
+            true
+        } else {
+            false
+        }
+    }};
+}
+
+macro_rules! qwen3_matvec_128 {
+    ($b:ident, $t:expr, $x:ident, $y:expr) => {{
+        let t = $t;
+        if cfg!(feature = "cuda-qwen3-layer-matvec-128-research")
+            && matches!(t.kind, 12 | 14)
+            && t.width % 256 == 0
+            && $b.functions.contains_key("qwen3_layer_matvec_128")
+        {
+            launch!($b, "qwen3_layer_matvec_128", (t.rows as u32, 1, 1); 128,
+                &t.bytes, &t.kind, &$b.work.$x, $y, &t.width);
+            true
+        } else {
+            false
+        }
     }};
 }
 
@@ -688,6 +796,11 @@ mod residual_precise;
 pub struct CudaBackend {
     // Destroy captured references before their buffers and modules.
     decode: Option<decode::DecodeState>,
+    #[cfg(any(
+        feature = "cuda-qwen3-batched-attention-research",
+        feature = "cuda-llama-batched-attention-research"
+    ))]
+    attention_blas: Option<cudarc::cublas::CudaBlas>,
     weights: Weights<DeviceTensor>,
     stream: Arc<CudaStream>,
     functions: HashMap<&'static str, CudaFunction>,
@@ -699,6 +812,10 @@ pub struct CudaBackend {
     memory: MemoryUsage,
     matmul: CudaMatmul,
     diagnostic: Option<diagnostics::Capture>,
+    #[cfg(feature = "cuda-fp16-corrected-prefill-research")]
+    fp16: Option<fp16_gemm::Prefill>,
+    #[cfg(feature = "cuda-llama-ffn-mmq-research")]
+    ffn_mmq: Option<ffn_mmq::ReplayKernel>,
 }
 
 /// Open the native CUDA backend for the model's architecture.
@@ -867,7 +984,155 @@ impl CudaBackend {
             } else {
                 ""
             };
-            format!("{pair}#define CUDA_ATTENTION_REUSE_RESEARCH 1\n{source}")
+            let batched = if cfg!(feature = "cuda-qwen3-batched-attention-research") {
+                "#define CUDA_QWEN3_BATCHED_ATTENTION 1\n"
+            } else {
+                ""
+            };
+            format!("{pair}{batched}#define CUDA_ATTENTION_REUSE_RESEARCH 1\n{source}")
+        } else {
+            source
+        };
+        let qwen3_two_rows = cfg!(feature = "cuda-qwen3-prefill-2x16-research")
+            && options.matmul == CudaMatmul::F32
+            && matches!(
+                crate::gguf::Gguf::read_metadata(path)?.get("general.architecture"),
+                Some(crate::gguf::Value::Text(arch)) if arch == "qwen3"
+            );
+        let mut compiler_options = decode_score_reuse_options(
+            format!("--gpu-architecture=compute_{major}{minor}"),
+            options.matmul == CudaMatmul::F32,
+        );
+        if qwen3_two_rows {
+            compiler_options.push("-DCUDA_REGISTER_PREFILL=1".into());
+        }
+        let packed_llama = cfg!(feature = "cuda-packed-prefill-research")
+            && options.matmul == CudaMatmul::F32
+            && !options.decode_graph
+            && major >= 8
+            && matches!(
+                crate::gguf::Gguf::read_metadata(path)?.get("general.architecture"),
+                Some(crate::gguf::Value::Text(arch)) if arch == "llama"
+            );
+        let source = if packed_llama {
+            compiler_options.push("-DCUDA_DENSE_PACKED_REPLAY=1".into());
+            format!(
+                "{source}\n{}\n{}\n{}",
+                include_str!("cuda/residual.cu"),
+                include_str!("cuda/residual_precise.cu"),
+                include_str!("cuda/residual_mma.cu"),
+            )
+        } else {
+            source
+        };
+        let q8_dp4a = packed_llama && cfg!(feature = "cuda-llama-q8-dp4a-research");
+        let warp_scores = packed_llama && cfg!(feature = "cuda-llama-warp-scores-research");
+        if warp_scores {
+            compiler_options.push("-DCUDA_LLAMA_WARP_SCORES=1".into());
+        }
+        let q8_qkv = q8_dp4a && cfg!(feature = "cuda-llama-q8-fused-qkv-research");
+        if q8_qkv {
+            compiler_options.push("-DCUDA_LLAMA_Q8_FUSED_QKV=1".into());
+        }
+        let q8_norm_pack = q8_qkv && cfg!(feature = "cuda-llama-q8-norm-pack-research");
+        if q8_norm_pack {
+            compiler_options.push("-DCUDA_LLAMA_Q8_NORM_PACK=1".into());
+        }
+        let q8_swiglu = q8_dp4a && cfg!(feature = "cuda-llama-q8-fused-swiglu-research");
+        let q8_swiglu_pairs = q8_swiglu && cfg!(feature = "cuda-llama-q8-swiglu-pairs-research");
+        if q8_swiglu_pairs {
+            compiler_options.push("-DCUDA_LLAMA_Q8_SWIGLU_PAIRS=1".into());
+        }
+        if q8_swiglu {
+            compiler_options.push("-DCUDA_LLAMA_Q8_FUSED_SWIGLU=1".into());
+        }
+        let qwen3_mma3 = (cfg!(feature = "cuda-qwen3-dp4a-head-research")
+            || cfg!(feature = "cuda-qwen3-split-decode-attention-research")
+            || cfg!(feature = "cuda-qwen3-warp-reduction-research"))
+            && options.matmul == CudaMatmul::ResidualMma3Research
+            && matches!(
+                crate::gguf::Gguf::read_metadata(path)?.get("general.architecture"),
+                Some(crate::gguf::Value::Text(arch)) if arch == "qwen3"
+            );
+        if qwen3_mma3
+            && cfg!(feature = "cuda-qwen3-warp-reduction-research")
+            && !cfg!(feature = "cuda-packed-reduction-research")
+        {
+            compiler_options.push("-DCUDA_PACKED_REDUCTION_RESEARCH=1".into());
+        }
+        let qwen3_qkv = qwen3_mma3 && cfg!(feature = "cuda-qwen3-fused-qkv-research");
+        if qwen3_qkv {
+            compiler_options.push("-DCUDA_QWEN3_FUSED_QKV=1".into());
+            if cfg!(feature = "cuda-qwen3-qkv-128-research") {
+                compiler_options.push("-DCUDA_QWEN3_QKV_128=1".into());
+            }
+        }
+        let qwen3_head_rope = qwen3_qkv && cfg!(feature = "cuda-qwen3-fused-head-rope-research");
+        let qwen3_prefill_head_rope = cfg!(feature = "cuda-qwen3-prefill-fused-head-rope-research")
+            && matches!(
+                crate::gguf::Gguf::read_metadata(path)?.get("general.architecture"),
+                Some(crate::gguf::Value::Text(arch)) if arch == "qwen3"
+            );
+        if qwen3_prefill_head_rope {
+            compiler_options.push("-DCUDA_QWEN3_PREFILL_FUSED_HEAD_ROPE=1".into());
+        }
+        let qwen3_layer_matvec =
+            qwen3_qkv && cfg!(feature = "cuda-qwen3-layer-matvec-128-research");
+        if qwen3_layer_matvec {
+            compiler_options.push("-DCUDA_QWEN3_LAYER_MATVEC_128=1".into());
+        }
+        if qwen3_head_rope {
+            compiler_options.push("-DCUDA_QWEN3_FUSED_HEAD_ROPE=1".into());
+        }
+        let k_dp4a_head = qwen3_mma3 && cfg!(feature = "cuda-qwen3-dp4a-head-research");
+        let split_decode_attention = qwen3_mma3
+            && options.decode_graph
+            && cfg!(feature = "cuda-qwen3-split-decode-attention-research");
+        if split_decode_attention {
+            compiler_options.push("-DCUDA_QWEN3_SPLIT_DECODE_ATTENTION=1".into());
+        }
+        let source = if k_dp4a_head {
+            compiler_options.push("-DCUDA_DENSE_PACKED_REPLAY=1".into());
+            format!("{source}\n{}", include_str!("cuda/k_dp4a.cu"))
+        } else {
+            source
+        };
+        let value_split = cfg!(feature = "cuda-llama-decode-value-split-research")
+            && options.matmul == CudaMatmul::F32
+            && matches!(
+                crate::gguf::Gguf::read_metadata(path)?.get("general.architecture"),
+                Some(crate::gguf::Value::Text(arch)) if arch == "llama"
+            );
+        if value_split {
+            compiler_options.push("-DCUDA_LLAMA_DECODE_VALUE_SPLIT=1".into());
+            if cfg!(feature = "cuda-llama-value-unroll-research") {
+                compiler_options.push("-DCUDA_LLAMA_VALUE_UNROLL=1".into());
+            }
+        }
+        let query_pair_64 = cfg!(feature = "cuda-llama-prefill-query-pair-research")
+            && options.matmul == CudaMatmul::F32
+            && matches!(
+                crate::gguf::Gguf::read_metadata(path)?.get("general.architecture"),
+                Some(crate::gguf::Value::Text(arch)) if arch == "llama"
+            );
+        if query_pair_64 {
+            compiler_options.push("-DCUDA_LLAMA_PREFILL_QUERY_PAIR=1".into());
+        }
+        if cfg!(feature = "cuda-llama-batched-attention-research") {
+            compiler_options.push("-DCUDA_LLAMA_BATCHED_ATTENTION=1".into());
+            if cfg!(feature = "cuda-llama-grouped-prefill-attention-research") {
+                compiler_options.push("-DCUDA_LLAMA_GROUPED_PREFILL_ATTENTION=1".into());
+            }
+        }
+        if cfg!(feature = "cuda-batched-attention-warp-softmax-research") {
+            compiler_options.push("-DCUDA_BATCHED_ATTENTION_WARP_SOFTMAX=1".into());
+        }
+        if cfg!(feature = "cuda-qwen3-grouped-prefill-attention-research") {
+            compiler_options.push("-DCUDA_QWEN3_GROUPED_PREFILL_ATTENTION=1".into());
+            compiler_options.push("-DCUDA_LLAMA_GROUPED_PREFILL_ATTENTION=1".into());
+        }
+        let source = if q8_dp4a {
+            format!("{source}\n{}", include_str!("cuda/q8_decode.cu"))
         } else {
             source
         };
@@ -876,12 +1141,53 @@ impl CudaBackend {
             &source,
             CompileOptions {
                 fmad: Some(false),
-                options: vec![format!("--gpu-architecture=compute_{major}{minor}")],
+                options: compiler_options,
                 ..Default::default()
             },
         )?;
         let module = context.load_module(ptx).map_err(failure)?;
         let mut functions = HashMap::new();
+        if qwen3_layer_matvec {
+            let name = "qwen3_layer_matvec_128";
+            functions.insert(name, module.load_function(name).map_err(failure)?);
+        }
+        if query_pair_64 {
+            let name = "attention_fused_query_pair_64";
+            functions.insert(name, module.load_function(name).map_err(failure)?);
+        }
+        if split_decode_attention {
+            for name in ["attention_decode_partials", "attention_decode_merge"] {
+                functions.insert(name, module.load_function(name).map_err(failure)?);
+            }
+        }
+        if k_dp4a_head {
+            let name = "k_dp4a_head";
+            functions.insert(name, module.load_function(name).map_err(failure)?);
+        }
+        if value_split {
+            let name = "attention_values_split";
+            functions.insert(name, module.load_function(name).map_err(failure)?);
+        }
+        if q8_dp4a {
+            let name = "llama_q8_dp4a";
+            functions.insert(name, module.load_function(name).map_err(failure)?);
+        }
+        if warp_scores {
+            let name = "llama_warp_scores_64";
+            functions.insert(name, module.load_function(name).map_err(failure)?);
+        }
+        if q8_qkv {
+            let name = "llama_q8_dp4a_qkv";
+            functions.insert(name, module.load_function(name).map_err(failure)?);
+        }
+        if q8_swiglu {
+            let name = "llama_q8_dp4a_swiglu";
+            functions.insert(name, module.load_function(name).map_err(failure)?);
+        }
+        if q8_swiglu_pairs {
+            let name = "llama_q8_dp4a_swiglu_pairs";
+            functions.insert(name, module.load_function(name).map_err(failure)?);
+        }
         for name in [
             "embedding",
             "check_finite",
@@ -926,6 +1232,23 @@ impl CudaBackend {
                 name
             };
             functions.insert(name, module.load_function(entry).map_err(failure)?);
+        }
+        if qwen3_prefill_head_rope {
+            let name = "prefill_qkv_head_norm_rope_cache";
+            functions.insert(name, module.load_function(name).map_err(failure)?);
+        }
+        if qwen3_two_rows {
+            let name = "prefill_matmul_ref2x16";
+            functions.insert(name, module.load_function(name).map_err(failure)?);
+        }
+        if packed_llama {
+            for name in ["residual_quantize32_precise3", "dense_packed_replay_mma3"] {
+                functions.insert(name, module.load_function(name).map_err(failure)?);
+            }
+        }
+        if q8_norm_pack {
+            let name = "llama_q8_norm_pack";
+            functions.insert(name, module.load_function(name).map_err(failure)?);
         }
         if options.matmul.f32_tiled() {
             for name in [
@@ -973,6 +1296,17 @@ impl CudaBackend {
                         "qkv_head_norm_rope_cache_decode",
                     ] {
                         functions.insert(name, module.load_function(name).map_err(failure)?);
+                    }
+                } else if qwen3_qkv {
+                    let name = "matvec_packed_qkv";
+                    functions.insert(name, module.load_function(name).map_err(failure)?);
+                    if qwen3_head_rope {
+                        for name in [
+                            "qkv_head_norm_rope_cache",
+                            "qkv_head_norm_rope_cache_decode",
+                        ] {
+                            functions.insert(name, module.load_function(name).map_err(failure)?);
+                        }
                     }
                 }
                 for name in ["residual_quantize32_precise3", "residual_matmul_mma3"] {
@@ -1085,6 +1419,60 @@ impl CudaBackend {
             return Err(invalid("expert batch exceeds CUDA indexing"));
         }
         let weight_bytes = weights.bytes();
+        #[cfg(any(
+            feature = "cuda-qwen3-batched-attention-research",
+            feature = "cuda-llama-batched-attention-research"
+        ))]
+        let batched_attention = major >= 8
+            && batched_attention_supported(s)
+            && matches!(
+                (s.info.architecture.as_str(), options.matmul),
+                ("qwen3", CudaMatmul::ResidualMma3Research) | ("llama", CudaMatmul::F32)
+            );
+        #[cfg(any(
+            feature = "cuda-qwen3-batched-attention-research",
+            feature = "cuda-llama-batched-attention-research"
+        ))]
+        if batched_attention {
+            let name = "qwen3_batched_causal_softmax";
+            functions.insert(name, module.load_function(name).map_err(failure)?);
+            let llama_grouped = cfg!(feature = "cuda-llama-grouped-prefill-attention-research")
+                && s.info.architecture == "llama";
+            let qwen3_grouped = cfg!(feature = "cuda-qwen3-grouped-prefill-attention-research")
+                && s.info.architecture == "qwen3";
+            if llama_grouped || qwen3_grouped
+            {
+                for name in [
+                    if llama_grouped { "llama_grouped_causal_softmax" } else { "qwen3_grouped_causal_softmax" },
+                    "llama_grouped_q_pack",
+                    "llama_grouped_out_unpack",
+                ] {
+                    functions.insert(name, module.load_function(name).map_err(failure)?);
+                }
+            }
+        }
+        #[cfg(feature = "cuda-fp16-corrected-prefill-research")]
+        let is_llama = s.info.architecture == "llama";
+        #[cfg(feature = "cuda-fp16-corrected-prefill-research")]
+        let (fp16_bytes, fp16_inputs) = if major >= 8
+            && s.experts == 0
+            && ((is_llama && options.matmul == CudaMatmul::F32)
+                || (s.info.architecture == "qwen3"
+                    && options.matmul == CudaMatmul::ResidualMma3Research))
+            && prefill_capacity(s) >= 32
+        {
+            let sizes = workspace_sizes(s)?;
+            (
+                fp16_gemm::dense_bytes(&weights, is_llama)?,
+                sizes[0].max(sizes[2]).max(sizes[7]),
+            )
+        } else {
+            (0, 0)
+        };
+        #[cfg(feature = "cuda-fp16-corrected-prefill-research")]
+        let weight_bytes = weight_bytes
+            .checked_add(fp16_bytes)
+            .ok_or_else(|| invalid("FP16 weight byte overflow"))?;
         let kv_elements = (s.kv_heads as u64)
             .checked_mul(s.dim as u64)
             .and_then(|n| n.checked_mul(u64::from(config.context_tokens)))
@@ -1109,10 +1497,38 @@ impl CudaBackend {
             })
             .and_then(|n| n.checked_mul(4))
             .ok_or_else(|| invalid("workspace byte overflow"))?;
+        let precise = if packed_llama && s.experts == 0 {
+            CudaMatmul::ResidualMma3Research
+        } else {
+            options.matmul
+        };
         let workspace_bytes = workspace_bytes
-            .checked_add(residual_workspace_bytes(s, options.matmul)?)
+            .checked_add(residual_workspace_bytes(s, precise)?)
             .ok_or_else(|| invalid("workspace byte overflow"))?;
+        #[cfg(feature = "cuda-fp16-corrected-prefill-research")]
+        let workspace_bytes = workspace_bytes
+            .checked_add(if fp16_bytes > 0 {
+                4 * fp16_inputs as u64
+            } else {
+                0
+            })
+            .ok_or_else(|| invalid("FP16 workspace byte overflow"))?;
         let logits_bytes = u64::from(s.info.vocab_tokens) * 4;
+        #[cfg(feature = "cuda-llama-ffn-mmq-research")]
+        let ffn_mmq = (major == 12
+            && minor == 0
+            && is_llama
+            && options.matmul == CudaMatmul::F32
+            && s.experts == 0
+            && s.width == 2048
+            && s.hidden == 8192
+            && prefill_capacity(s) >= 512)
+            .then(|| ffn_mmq::Bridge::open(&context))
+            .transpose()?;
+        #[cfg(feature = "cuda-llama-ffn-mmq-research")]
+        let workspace_bytes = workspace_bytes
+            .checked_add(ffn_mmq.as_ref().map_or(0, ffn_mmq::Bridge::bytes))
+            .ok_or_else(|| invalid("FFN MMQ workspace byte overflow"))?;
         let reservation = weight_bytes
             .checked_add(kv_bytes)
             .and_then(|n| n.checked_add(workspace_bytes))
@@ -1161,7 +1577,7 @@ impl CudaBackend {
         } else {
             None
         };
-        let work = Workspace::new(s, &stream, options.matmul)?;
+        let work = Workspace::new(s, &stream, options.matmul, precise)?;
         let mut keys = Vec::new();
         let mut values = Vec::new();
         for _ in &weights.layers {
@@ -1169,7 +1585,20 @@ impl CudaBackend {
             values.push(stream.alloc_zeros(kv_elements as usize).map_err(failure)?);
         }
         let logits = vec![0.0; s.info.vocab_tokens as usize];
+        #[cfg(any(
+            feature = "cuda-qwen3-batched-attention-research",
+            feature = "cuda-llama-batched-attention-research"
+        ))]
+        let attention_blas = batched_attention
+            .then(|| cudarc::cublas::CudaBlas::new(stream.clone()).map_err(failure))
+            .transpose()?;
         let mut weights = weights.map(|t| DeviceTensor::upload(t, &stream))?;
+        #[cfg(feature = "cuda-fp16-corrected-prefill-research")]
+        let fp16 = (fp16_bytes > 0)
+            .then(|| fp16_gemm::Prefill::dense(&stream, &mut weights, fp16_inputs, is_llama))
+            .transpose()?;
+        #[cfg(feature = "cuda-llama-ffn-mmq-research")]
+        let ffn_mmq = ffn_mmq.map(|bridge| bridge.allocate(&stream)).transpose()?;
         weights.spec.info.backend = format!(
             "rust-cuda-packed:device{}:{}",
             options.device,
@@ -1178,6 +1607,11 @@ impl CudaBackend {
         stream.synchronize().map_err(failure)?;
         let mut backend = Self {
             decode,
+            #[cfg(any(
+                feature = "cuda-qwen3-batched-attention-research",
+                feature = "cuda-llama-batched-attention-research"
+            ))]
+            attention_blas,
             weights,
             stream,
             functions,
@@ -1189,6 +1623,10 @@ impl CudaBackend {
             memory,
             matmul: options.matmul,
             diagnostic: None,
+            #[cfg(feature = "cuda-fp16-corrected-prefill-research")]
+            fp16,
+            #[cfg(feature = "cuda-llama-ffn-mmq-research")]
+            ffn_mmq,
         };
         if options.decode_graph {
             backend.capture_decode_graph()?;
@@ -1272,6 +1710,22 @@ impl CudaBackend {
             let affine = l.affine.as_ref();
             let olmo2 = s.info.architecture == "olmo2";
             let olmoe = s.info.architecture == "olmoe";
+            let packed_qkv = self.functions.contains_key("llama_q8_dp4a_qkv")
+                && l.q.kind == 8
+                && l.k.kind == 8
+                && l.v.kind == 8
+                && l.q.width == w
+                && l.k.width == w
+                && l.v.width == w
+                && w % 32 == 0
+                && l.k.rows == l.v.rows
+                && self.work.residual_mma3.is_some();
+            let norm_pack = l.norm.as_ref().filter(|_| {
+                packed_qkv
+                    && w == 2048
+                    && affine.is_none()
+                    && self.functions.contains_key("llama_q8_norm_pack")
+            });
             if olmo2 {
                 self.stream
                     .memcpy_dtod(
@@ -1279,7 +1733,7 @@ impl CudaBackend {
                         &mut self.work.normalized.slice_mut(..s.width),
                     )
                     .map_err(failure)?;
-            } else {
+            } else if norm_pack.is_none() {
                 transformer_norm!(
                     self,
                     &self.work.x,
@@ -1290,7 +1744,44 @@ impl CudaBackend {
                     s.epsilon
                 );
             }
-            if cfg!(feature = "cuda-decode-fusion-research")
+            if packed_qkv && let Some(scratch) = self.work.residual_mma3.as_mut() {
+                if 3 * w as usize > scratch.values.len()
+                    || 3 * (w as usize / 32) > scratch.scales.len().min(scratch.sums.len())
+                {
+                    return Err(invalid("Q8 DP4A QKV input exceeds workspace"));
+                }
+                if let Some(norm) = norm_pack {
+                    launch!(
+                        self,
+                        "llama_q8_norm_pack",
+                        (8, 1, 1),
+                        &self.work.x,
+                        &norm.bytes,
+                        &mut scratch.values,
+                        &mut scratch.scales,
+                        &mut scratch.sums,
+                        &mut self.work.status,
+                        &s.epsilon
+                    );
+                } else {
+                    launch!(
+                        self,
+                        "residual_quantize32_precise3",
+                        ((w as u32).div_ceil(256), 1, 1),
+                        &self.work.normalized,
+                        &mut scratch.values,
+                        &mut scratch.scales,
+                        &mut scratch.sums,
+                        &w,
+                        &mut self.work.status
+                    );
+                }
+                launch!(self, "llama_q8_dp4a_qkv", ((l.q.rows.max(l.k.rows) as u32).div_ceil(4), 3, 1); 128,
+                    &l.q.bytes, &l.k.bytes, &l.v.bytes, &scratch.values, &scratch.scales,
+                    &mut self.work.q, &mut self.work.k, &mut self.work.v, &w, &l.q.rows, &l.k.rows);
+            } else if (cfg!(feature = "cuda-decode-fusion-research")
+                || (cfg!(feature = "cuda-qwen3-fused-qkv-research")
+                    && self.functions.contains_key("matvec_packed_qkv")))
                 && self.matmul == CudaMatmul::ResidualMma3Research
                 && l.q.width == l.k.width
                 && l.k.width == l.v.width
@@ -1300,10 +1791,17 @@ impl CudaBackend {
                 && matches!(l.v.kind, 12 | 14)
             {
                 let total_rows = (l.q.rows + l.k.rows + l.v.rows) as u32;
+                let threads = if cfg!(feature = "cuda-qwen3-qkv-128-research")
+                    && s.info.architecture == "qwen3"
+                {
+                    128
+                } else {
+                    256
+                };
                 launch!(
                     self,
                     "matvec_packed_qkv",
-                    (total_rows, 1, 1),
+                    (total_rows, 1, 1); threads,
                     &l.q.bytes,
                     &l.q.kind,
                     &l.q.rows,
@@ -1320,11 +1818,16 @@ impl CudaBackend {
                     &l.q.width
                 );
             } else {
+                let mut prepared = None;
                 for (tensor, output) in [
                     (&l.q, &mut self.work.q),
                     (&l.k, &mut self.work.k),
                     (&l.v, &mut self.work.v),
                 ] {
+                    if q8_dp4a!(self, tensor, normalized, &mut *output, prepared) {
+                        prepared = Some(tensor.width);
+                        continue;
+                    }
                     launch!(
                         self,
                         "matvec",
@@ -1356,7 +1859,9 @@ impl CudaBackend {
                     );
                 }
             }
-            if cfg!(feature = "cuda-decode-fusion-research")
+            if (cfg!(feature = "cuda-decode-fusion-research")
+                || (cfg!(feature = "cuda-qwen3-fused-head-rope-research")
+                    && self.functions.contains_key("qkv_head_norm_rope_cache")))
                 && self.matmul == CudaMatmul::ResidualMma3Research
                 && dim == 128
                 && qw == heads * 128
@@ -1478,36 +1983,81 @@ impl CudaBackend {
                     .as_ref()
                     .ok_or_else(|| failure("decode control missing"))?
                     .control;
-                launch!(
-                    self,
-                    "attention_fused_decode",
-                    (heads as u32, 1, 1),
-                    &self.work.q,
-                    &self.keys[index],
-                    &self.values[index],
-                    &mut self.work.attended,
-                    &dim,
-                    &heads,
-                    &kv_heads,
-                    control
-                );
+                const TILE: u32 = QWEN3_DECODE_TILE;
+                let tiles = (context as u32).div_ceil(TILE);
+                if dim == 128
+                    && (tiles as usize) * 130 * heads as usize <= self.work.scores.len()
+                    && self.functions.contains_key("attention_decode_partials")
+                {
+                    launch!(
+                        self,
+                        "attention_decode_partials",
+                        (heads as u32, tiles, 1),
+                        &self.work.q,
+                        &self.keys[index],
+                        &self.values[index],
+                        &mut self.work.attended,
+                        &mut self.work.scores,
+                        &heads,
+                        &kv_heads,
+                        &TILE,
+                        control
+                    );
+                    launch!(
+                        self,
+                        "attention_decode_merge",
+                        (heads as u32, 1, 1); 128,
+                        &self.work.scores,
+                        &mut self.work.attended,
+                        &tiles,
+                        &TILE,
+                        control
+                    );
+                } else {
+                    launch!(
+                        self,
+                        "attention_fused_decode",
+                        (heads as u32, 1, 1),
+                        &self.work.q,
+                        &self.keys[index],
+                        &self.values[index],
+                        &mut self.work.attended,
+                        &dim,
+                        &heads,
+                        &kv_heads,
+                        control
+                    );
+                }
             } else {
+                if dim == 64 && self.functions.contains_key("llama_warp_scores_64") {
+                    launch!(self, "llama_warp_scores_64", (heads as u32, (count as u32).div_ceil(4), 1); 128,
+                        &self.work.q, &self.keys[index], &mut self.work.scores, &heads,
+                        &kv_heads, &context, &count);
+                } else {
+                    launch!(
+                        self,
+                        "attention_scores",
+                        (heads as u32, count as u32, 1),
+                        &self.work.q,
+                        &self.keys[index],
+                        &mut self.work.scores,
+                        &dim,
+                        &heads,
+                        &kv_heads,
+                        &context,
+                        &count
+                    );
+                }
                 launch!(
                     self,
-                    "attention_scores",
-                    (heads as u32, count as u32, 1),
-                    &self.work.q,
-                    &self.keys[index],
-                    &mut self.work.scores,
-                    &dim,
-                    &heads,
-                    &kv_heads,
-                    &context,
-                    &count
-                );
-                launch!(
-                    self,
-                    "attention_values",
+                    if count >= 128
+                        && matches!(dim, 64 | 128)
+                        && self.functions.contains_key("attention_values_split")
+                    {
+                        "attention_values_split"
+                    } else {
+                        "attention_values"
+                    },
                     (heads as u32, 1, 1),
                     &mut self.work.scores,
                     &self.values[index],
@@ -1520,20 +2070,24 @@ impl CudaBackend {
                 );
             }
             let t = &l.output;
-            launch!(
-                self,
-                "matvec",
-                (t.rows as u32, 1, 1),
-                &t.bytes,
-                &t.kind,
-                &self.work.attended,
-                &mut self.work.projected,
-                &t.width,
-                &t.rows,
-                &self.work.ids,
-                &0i32,
-                &0i32
-            );
+            if !q8_dp4a!(self, t, attended, &mut self.work.projected)
+                && !qwen3_matvec_128!(self, t, attended, &mut self.work.projected)
+            {
+                launch!(
+                    self,
+                    "matvec",
+                    (t.rows as u32, 1, 1),
+                    &t.bytes,
+                    &t.kind,
+                    &self.work.attended,
+                    &mut self.work.projected,
+                    &t.width,
+                    &t.rows,
+                    &self.work.ids,
+                    &0i32,
+                    &0i32
+                );
+            }
             if let Some(b) = affine {
                 launch!(
                     self,
@@ -1628,7 +2182,46 @@ impl CudaBackend {
             }
             let moe = i32::from(l.router.is_some());
             let gate = l.gate.as_ref().expect("gated CUDA layer");
-            if cfg!(feature = "cuda-packed-gate-up-research")
+            if self.functions.contains_key("llama_q8_dp4a_swiglu")
+                && moe == 0
+                && gemma.is_none()
+                && s.used == 1
+                && gate.kind == 8
+                && l.up.kind == 8
+                && gate.width == w
+                && l.up.width == w
+                && w % 32 == 0
+                && gate.rows == l.up.rows
+                && gate.rows as usize == s.hidden
+                && let Some(scratch) = self.work.residual_mma3.as_mut()
+            {
+                if 3 * w as usize > scratch.values.len()
+                    || 3 * (w as usize / 32) > scratch.scales.len().min(scratch.sums.len())
+                {
+                    return Err(invalid("Q8 DP4A SwiGLU input exceeds workspace"));
+                }
+                launch!(
+                    self,
+                    "residual_quantize32_precise3",
+                    ((w as u32).div_ceil(256), 1, 1),
+                    &self.work.normalized,
+                    &mut scratch.values,
+                    &mut scratch.scales,
+                    &mut scratch.sums,
+                    &w,
+                    &mut self.work.status
+                );
+                let (kernel, rows_per_block) = if gate.rows % 2 == 0
+                    && self.functions.contains_key("llama_q8_dp4a_swiglu_pairs")
+                {
+                    ("llama_q8_dp4a_swiglu_pairs", 8)
+                } else {
+                    ("llama_q8_dp4a_swiglu", 4)
+                };
+                launch!(self, kernel, ((gate.rows as u32).div_ceil(rows_per_block), 1, 1); 128,
+                    &gate.bytes, &l.up.bytes, &scratch.values, &scratch.scales,
+                    &mut self.work.gate, &w, &gate.rows);
+            } else if cfg!(feature = "cuda-packed-gate-up-research")
                 && self.matmul == CudaMatmul::ResidualMma3Research
                 && moe != 0
                 && gate.width == 2048
@@ -1651,7 +2244,15 @@ impl CudaBackend {
                     &self.work.ids
                 );
             } else {
+                let mut prepared = None;
                 for (t, out) in [(gate, &mut self.work.gate), (&l.up, &mut self.work.up)] {
+                    if moe == 0 && q8_dp4a!(self, t, normalized, &mut *out, prepared) {
+                        prepared = Some(t.width);
+                        continue;
+                    }
+                    if moe == 0 && qwen3_matvec_128!(self, t, normalized, &mut *out) {
+                        continue;
+                    }
                     launch!(
                         self,
                         "matvec",
@@ -1699,7 +2300,10 @@ impl CudaBackend {
                     &t.rows,
                     &self.work.ids
                 );
-            } else {
+            } else if moe != 0
+                || (!q8_dp4a!(self, t, gate, &mut self.work.down)
+                    && !qwen3_matvec_128!(self, t, gate, &mut self.work.down))
+            {
                 launch!(
                     self,
                     "matvec",
@@ -1763,20 +2367,42 @@ impl CudaBackend {
             .output
             .as_ref()
             .unwrap_or(&self.weights.embedding);
-        launch!(
-            self,
-            "matvec",
-            (t.rows as u32, 1, 1),
-            &t.bytes,
-            &t.kind,
-            &self.work.normalized,
-            &mut self.work.logits,
-            &t.width,
-            &t.rows,
-            &self.work.ids,
-            &0i32,
-            &0i32
-        );
+        if cfg!(feature = "cuda-qwen3-dp4a-head-research")
+            && matches!(t.kind, 12 | 14)
+            && t.width % 256 == 0
+            && self.functions.contains_key("k_dp4a_head")
+            && let Some(scratch) = self.work.residual_mma3.as_mut()
+        {
+            launch!(
+                self,
+                "residual_quantize32_precise3",
+                ((w as u32).div_ceil(256), 1, 1),
+                &self.work.normalized,
+                &mut scratch.values,
+                &mut scratch.scales,
+                &mut scratch.sums,
+                &w,
+                &mut self.work.status
+            );
+            launch!(self, "k_dp4a_head", ((t.rows as u32).div_ceil(4), 1, 1); 128,
+                &t.bytes, &t.kind, &scratch.values, &scratch.scales,
+                &mut self.work.logits, &w, &t.rows);
+        } else if !q8_dp4a!(self, t, normalized, &mut self.work.logits) {
+            launch!(
+                self,
+                "matvec",
+                (t.rows as u32, 1, 1),
+                &t.bytes,
+                &t.kind,
+                &self.work.normalized,
+                &mut self.work.logits,
+                &t.width,
+                &t.rows,
+                &self.work.ids,
+                &0i32,
+                &0i32
+            );
+        }
         if let Some(gemma) = &self.weights.gemma
             && gemma.final_softcap > 0.0
         {
@@ -2373,3 +2999,10 @@ mod tests {
         assert!(admit(1, 1, 0).is_err());
     }
 }
+#[cfg(feature = "cuda-llama-ffn-mmq-research")]
+mod ffn_mmq;
+#[cfg(any(
+    all(test, feature = "cuda-fp16-prefill-research"),
+    feature = "cuda-fp16-corrected-prefill-research"
+))]
+mod fp16_gemm;

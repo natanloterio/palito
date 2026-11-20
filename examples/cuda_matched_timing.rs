@@ -9,15 +9,28 @@ fn main() {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use local_inference::{
         Config,
-        backend::Backend,
-        cuda::{CudaBackend, CudaMatmul, CudaOptions},
+        cuda::{CudaMatmul, CudaOptions, open_backend},
     };
     use serde_json::json;
     use std::{fs, path::Path, time::Instant};
 
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let [model, fixture, warmups, runs] = args.as_slice() else {
-        return Err("usage: cuda_matched_timing MODEL FIXTURE WARMUPS RUNS".into());
+    let (model, fixture, warmups, runs, profile) =
+        match args.as_slice() {
+            [model, fixture, warmups, runs] => (model, fixture, warmups, runs, "mma3-graph"),
+            [model, fixture, warmups, runs, profile] => {
+                (model, fixture, warmups, runs, profile.as_str())
+            }
+            _ => return Err(
+                "usage: cuda_matched_timing MODEL FIXTURE WARMUPS RUNS [f32|f32-graph|mma3-graph]"
+                    .into(),
+            ),
+        };
+    let (matmul, decode_graph) = match profile {
+        "f32" => (CudaMatmul::F32, false),
+        "f32-graph" => (CudaMatmul::F32, true),
+        "mma3-graph" => (CudaMatmul::ResidualMma3Research, true),
+        _ => return Err("unknown timing profile".into()),
     };
     let (warmups, runs): (usize, usize) = (warmups.parse()?, runs.parse()?);
     if runs == 0 || runs > 100 || warmups > 20 {
@@ -38,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if prompt.is_empty() || prompt.len() > 512 || continuation.len() > 31 {
         return Err("fixture exceeds timing shape limits".into());
     }
-    let mut backend = CudaBackend::open(
+    let mut backend = open_backend(
         Path::new(model),
         &Config {
             context_tokens: 1024,
@@ -47,8 +60,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             threads: 4,
         },
         CudaOptions {
-            matmul: CudaMatmul::ResidualMma3Research,
-            decode_graph: true,
+            matmul,
+            decode_graph,
             ..Default::default()
         },
     )?;

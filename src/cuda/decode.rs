@@ -180,6 +180,79 @@ impl CudaBackend {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "cuda-qwen3-split-decode-attention-research")]
+    #[test]
+    #[ignore = "requires QWEN3_GGUF, LI_QWEN3_GRAPH_CASES and CUDA 13"]
+    fn qwen3_graph_full_vocab_against_oracle() -> Result<()> {
+        let model = std::env::var("QWEN3_GGUF").expect("set QWEN3_GGUF");
+        let cases = std::env::var("LI_QWEN3_GRAPH_CASES").expect("set LI_QWEN3_GRAPH_CASES");
+        let cases = Path::new(&cases);
+        let mut backend = CudaBackend::open(
+            Path::new(&model),
+            &Config {
+                context_tokens: 1024,
+                batch_tokens: 512,
+                prefill_chunk: 512,
+                threads: 4,
+            },
+            CudaOptions {
+                matmul: CudaMatmul::ResidualMma3Research,
+                decode_graph: true,
+                ..CudaOptions::default()
+            },
+        )?;
+        assert!(backend.functions.contains_key("attention_decode_partials"));
+        for n in [46, 256, 257, 512] {
+            let (prompt, oracle) = if n == 256 || n == 512 {
+                (
+                    cases.join(format!("prefill-followup/ids-{n}.json")),
+                    cases.join(format!("parity/qwen3-oracle-{n}.json")),
+                )
+            } else {
+                let dir = cases.join("parity/corrected-dp4a-qwen3-held");
+                (
+                    dir.join(format!("{n}.json")),
+                    dir.join(format!("{n}-oracle.json")),
+                )
+            };
+            let ids: Vec<i32> = serde_json::from_slice(&std::fs::read(prompt).unwrap()).unwrap();
+            let oracle: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(oracle).unwrap()).unwrap();
+            let expected: Vec<f32> = serde_json::from_value(oracle["logits"].clone()).unwrap();
+            let (last, prefix) = ids.split_last().unwrap();
+            backend.reset()?;
+            backend.evaluate(prefix, 0)?;
+            backend.replay_decode(*last, prefix.len())?;
+            let mut actual = vec![0.0; expected.len()];
+            backend
+                .stream
+                .memcpy_dtoh(&backend.work.logits, &mut actual)
+                .map_err(failure)?;
+            backend.stream.synchronize().map_err(failure)?;
+            if let Some(dir) = std::env::var_os("LI_QWEN3_GRAPH_BITS_DIR") {
+                let path = Path::new(&dir).join(format!("{n}.bin"));
+                let bytes: Vec<u8> = actual.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(path, bytes)?;
+            }
+            assert_eq!(greedy(&actual)?, greedy(&expected)?, "prefix {n}");
+            let mut dot = 0.0;
+            let mut aa = 0.0;
+            let mut bb = 0.0;
+            let mut error = 0.0_f64;
+            for (&a, &b) in actual.iter().zip(&expected) {
+                let (a, b) = (f64::from(a), f64::from(b));
+                dot += a * b;
+                aa += a * a;
+                bb += b * b;
+                error = error.max((a - b).abs());
+            }
+            let cosine = dot / (aa * bb).sqrt();
+            eprintln!("prefix {n}: max error {error}, cosine {cosine}");
+            assert!(error <= 0.01 && cosine >= 0.99999, "prefix {n}");
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires CUDA 13; run serially in release mode"]
     fn warp_decode_matvec_is_bitwise_and_measures_representative_shapes() -> Result<()> {

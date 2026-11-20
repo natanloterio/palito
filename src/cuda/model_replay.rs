@@ -1,5 +1,6 @@
 //! Research-only replay of real packed model weights and complete capture operands.
 use super::{grouped_bench::RoutingFixture, prefill::Harness, *};
+use cudarc::driver::CudaViewMut;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -323,6 +324,868 @@ pub(super) fn assert_output(actual: &[f32], expected: &[f32], kernel: &str) -> R
 #[ignore = "requires M8_REPLAY_MODEL, M8_REPLAY_MODEL_SHA256, M8_REPLAY_CAPTURE, M8_REPLAY_LAYER; serial release --nocapture"]
 fn benchmark_model_projection_replay() -> Result<()> {
     run_model_projection_replay(Replay::Structural)
+}
+
+#[test]
+#[ignore = "requires DENSE_REPLAY_MODEL, DENSE_REPLAY_MODEL_SHA256, DENSE_REPLAY_CAPTURE; serial GPU"]
+fn benchmark_qwen3_dense_projection_replay() -> Result<()> {
+    run_dense_projection_replay(false)
+}
+
+#[test]
+#[ignore = "requires a serial SM80+ GPU and DENSE_REPLAY_* real F32 operand captures"]
+fn benchmark_dense_packed_projection_replay() -> Result<()> {
+    run_dense_projection_replay(true)
+}
+
+fn replay_aligned_q8(
+    harness: &Harness,
+    t: &DeviceTensor,
+    input: &CudaSlice<f32>,
+    tokens: i32,
+    name: &str,
+) -> Result<()> {
+    let bytes = t
+        .width
+        .checked_mul(t.rows)
+        .filter(|&n| {
+            n > 0 && t.width % 32 == 0 && t.kind == 8 && t.bytes.len() == n as usize / 32 * 34
+        })
+        .ok_or_else(|| invalid("aligned Q8 replay requires complete Q8_0 rows"))?;
+    let s = &harness.stream;
+    let f = &harness.functions;
+    let mut values = s.alloc_zeros::<u8>(bytes as usize).map_err(failure)?;
+    let mut weight_scales = s.alloc_zeros::<u8>(bytes as usize / 16).map_err(failure)?;
+    let mut args = s.launch_builder(&f["llama_q8_repack"]);
+    args.arg(&t.bytes)
+        .arg(&mut values)
+        .arg(&mut weight_scales)
+        .arg(&bytes);
+    unsafe { args.launch(LaunchConfig::for_num_elems(bytes as u32)) }.map_err(failure)?;
+
+    let width = t.width as usize;
+    let mut q = s.alloc_zeros::<i8>(3 * width).map_err(failure)?;
+    let mut scales = s.alloc_zeros::<f32>(3 * width / 32).map_err(failure)?;
+    let mut sums = s.alloc_zeros::<i32>(scales.len()).map_err(failure)?;
+    let mut status = s.alloc_zeros::<i32>(1).map_err(failure)?;
+    let end = 8 + t.rows as usize;
+    let mut guard = vec![1337.0; end + 8];
+    guard[8..end].fill(f32::NAN);
+    for pos in [0, tokens as usize - 1] {
+        let x = input.slice(pos * width..(pos + 1) * width);
+        let mut args = s.launch_builder(&f["residual_quantize32_precise3"]);
+        args.arg(&x)
+            .arg(&mut q)
+            .arg(&mut scales)
+            .arg(&mut sums)
+            .arg(&t.width)
+            .arg(&mut status);
+        unsafe { args.launch(LaunchConfig::for_num_elems(t.width as u32)) }.map_err(failure)?;
+        let mut outputs = Vec::new();
+        let mut samples = [Vec::new(), Vec::new()];
+        for aligned in [false, true] {
+            let mut output = s.clone_htod(&guard).map_err(failure)?;
+            let mut launch = || -> Result<()> {
+                let mut out = output.slice_mut(8..end);
+                let mut args = s.launch_builder(
+                    &f[if aligned {
+                        "llama_q8_dp4a_aligned"
+                    } else {
+                        "llama_q8_dp4a"
+                    }],
+                );
+                if aligned {
+                    args.arg(&values).arg(&weight_scales);
+                } else {
+                    args.arg(&t.bytes);
+                }
+                args.arg(&q)
+                    .arg(&scales)
+                    .arg(&mut out)
+                    .arg(&t.width)
+                    .arg(&t.rows);
+                unsafe {
+                    args.launch(LaunchConfig {
+                        grid_dim: ((t.rows as u32).div_ceil(4), 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(failure)?;
+                Ok(())
+            };
+            for _ in 0..3 {
+                launch()?;
+            }
+            for _ in 0..7 {
+                let flags = Some(sys::CUevent_flags::CU_EVENT_DEFAULT);
+                let start = s.record_event(flags).map_err(failure)?;
+                for _ in 0..32 {
+                    launch()?;
+                }
+                let stop = s.record_event(flags).map_err(failure)?;
+                samples[usize::from(aligned)]
+                    .push(start.elapsed_ms(&stop).map_err(failure)? / 32.0);
+            }
+            let out = s.clone_dtoh(&output).map_err(failure)?;
+            if out[..8] != guard[..8]
+                || out[end..] != guard[end..]
+                || out[8..end].iter().any(|v| !v.is_finite())
+            {
+                return Err(invalid(format!("invalid Q8 replay output at {name}:{pos}")));
+            }
+            outputs.push(out);
+        }
+        if s.clone_dtoh(&status).map_err(failure)? != [0]
+            || !outputs[0]
+                .iter()
+                .zip(&outputs[1])
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        {
+            return Err(invalid(format!(
+                "aligned Q8 replay mismatch at {name}:{pos}"
+            )));
+        }
+        println!(
+            "DENSE_Q8_ALIGNED_REPLAY {}",
+            json!({
+                "tensor": name, "position": pos, "original_ms": samples[0], "aligned_ms": samples[1],
+                "expanded_weight_bytes": values.len() + weight_scales.len(),
+            })
+        );
+    }
+    Ok(())
+}
+
+fn run_dense_projection_replay(packed: bool) -> Result<()> {
+    let required = |key| std::env::var(key).map_err(failure);
+    let model_path = PathBuf::from(required("DENSE_REPLAY_MODEL")?);
+    let capture_path = PathBuf::from(required("DENSE_REPLAY_CAPTURE")?);
+    let model_hash = file_hash(&model_path)?;
+    if model_hash != required("DENSE_REPLAY_MODEL_SHA256")?
+        || File::open(&capture_path)?.metadata()?.len() > MAX_CAPTURE_BYTES
+    {
+        return Err(invalid("dense replay model hash or capture size mismatch"));
+    }
+    let capture_hash = file_hash(&capture_path)?;
+    let mut operands: BTreeMap<usize, Operands> = BTreeMap::new();
+    let mut metadata = false;
+    for line in BufReader::new(File::open(capture_path)?).lines() {
+        match serde_json::from_str::<Record>(&line?)? {
+            Record::Metadata { version: 1, matmul } if !metadata && matmul == "f32" => {
+                metadata = true;
+            }
+            record @ Record::Projection { layer, .. } if metadata => {
+                operands.entry(layer).or_default().push(record, layer)?;
+            }
+            _ => return Err(invalid("expected a dense F32 capture")),
+        }
+    }
+    if operands.is_empty() || operands.len() > 3 {
+        return Err(invalid("dense replay requires one to three layers"));
+    }
+    let mut model = crate::gguf::Gguf::open(&model_path, false)?;
+    if !matches!(model.metadata.get("general.architecture"), Some(crate::gguf::Value::Text(a)) if a == "qwen3" || (packed && a == "llama"))
+    {
+        return Err(invalid("dense replay requires Qwen3 or packed Llama"));
+    }
+    let plans = [
+        ("attn_q", "attn_norm", "Qproj"),
+        ("attn_k", "attn_norm", "Kproj"),
+        ("attn_v", "attn_norm", "Vproj"),
+        ("attn_output", "attn_attended", "attn_output"),
+        ("ffn_gate", "ffn_norm", "ffn_gate"),
+        ("ffn_up", "ffn_norm", "ffn_up"),
+        ("ffn_down", "ffn_down_inp", "ffn_down"),
+    ];
+    let mut panels = Vec::new();
+    for (layer, capture) in operands {
+        let tokens = capture
+            .projections
+            .get("attn_norm")
+            .map_or(0, BTreeMap::len);
+        if !(matches!(tokens, 256 | 512) || packed && tokens == 46) {
+            return Err(invalid(
+                "dense replay requires a full 256- or 512-token chunk (or 46 for packed replay)",
+            ));
+        }
+        let panel_start = panels.len();
+        for (name, input, output) in plans {
+            let name = format!("blk.{layer}.{name}.weight");
+            let tensor = model
+                .tensors
+                .remove(&name)
+                .ok_or_else(|| invalid(format!("missing {name}")))?;
+            if tensor.dims.len() != 2
+                || !(matches!(tensor.storage, Storage::Packed { kind: 12 | 14, .. })
+                    || packed && matches!(tensor.storage, Storage::Packed { kind: 8 | 13, .. }))
+            {
+                return Err(invalid(format!("unsupported dense projection {name}")));
+            }
+            let x = capture.matrix(input, tensor.dims[0], tokens)?;
+            let y = capture.matrix(output, tensor.dims[1], tokens)?;
+            panels.push((name, tensor, tokens as i32, x, y));
+        }
+        if packed && std::env::var_os("LI_REPLAY_STACKED_GATE_UP").is_some() {
+            let (_, gate, _, x, yg) = &panels[panel_start + 4];
+            let (_, up, _, xu, yu) = &panels[panel_start + 5];
+            let (Storage::Packed { kind: 8, bytes: g }, Storage::Packed { kind: 8, bytes: u }) =
+                (&gate.storage, &up.storage)
+            else {
+                return Err(invalid("stacked gate/up replay requires Q8_0"));
+            };
+            if gate.dims != up.dims || x != xu {
+                return Err(invalid(
+                    "stacked gate/up requires identical input and shape",
+                ));
+            }
+            let rows = gate.dims[1];
+            let y = yg
+                .chunks_exact(rows)
+                .zip(yu.chunks_exact(rows))
+                .flat_map(|(g, u)| g.iter().chain(u))
+                .copied()
+                .collect();
+            let tensor = Tensor {
+                dims: vec![gate.dims[0], rows * 2],
+                storage: Storage::Packed {
+                    kind: 8,
+                    bytes: g.iter().chain(u).copied().collect(),
+                },
+                accelerated: gate.accelerated,
+                block_elements: gate.block_elements,
+            };
+            panels.push((
+                format!("blk.{layer}.ffn_gate_up.stacked"),
+                tensor,
+                tokens as i32,
+                x.clone(),
+                y,
+            ));
+        }
+    }
+    drop(model);
+    if let Some(dir) = std::env::var_os("LI_REPLAY_EXPORT_QWEN3_K") {
+        let dir = PathBuf::from(dir);
+        let mut manifest = Vec::new();
+        for (name, tensor, tokens, x, y) in panels {
+            let Storage::Packed { kind, bytes } = tensor.storage else {
+                return Err(invalid("Qwen3 replay export requires original packed weights"));
+            };
+            if !matches!(kind, 12 | 14) {
+                continue;
+            }
+            let width = tensor.dims[0];
+            let rows = tensor.dims[1];
+            let block_bytes = if kind == 12 { 144 } else { 210 };
+            if width % 256 != 0 || bytes.len() != width / 256 * rows * block_bytes {
+                return Err(invalid("Qwen3 K-quant replay tensor shape mismatch"));
+            }
+            let stem = format!("{name}-{tokens}");
+            std::fs::write(dir.join(format!("{stem}.packed")), bytes)?;
+            for (suffix, values) in [("input", x), ("output", y)] {
+                let bytes: Vec<_> = values.into_iter().flat_map(f32::to_le_bytes).collect();
+                std::fs::write(dir.join(format!("{stem}-{suffix}.f32")), bytes)?;
+            }
+            manifest.push(json!({
+                "stem": stem, "tokens": tokens, "kind": kind, "width": width, "rows": rows,
+            }));
+        }
+        if manifest.is_empty() {
+            return Err(invalid("no Q4_K or Q6_K projections in the capture"));
+        }
+        println!(
+            "{}",
+            json!({"model_sha256": model_hash, "capture_sha256": capture_hash, "panels": manifest})
+        );
+        return Ok(());
+    }
+    if let Some(dir) = std::env::var_os("LI_REPLAY_EXPORT_LLAMA_FFN") {
+        let dir = PathBuf::from(dir);
+        for (name, tensor, tokens, x, y) in panels {
+            let Some((layer, stage)) = name
+                .strip_suffix(".weight")
+                .and_then(|name| name.rsplit_once('.'))
+            else {
+                return Err(invalid("unexpected FFN replay tensor name"));
+            };
+            let (width, rows) = match stage {
+                "ffn_gate" | "ffn_up" => (2048, 8192),
+                "ffn_down" => (8192, 2048),
+                _ => continue,
+            };
+            let Storage::Packed { kind: 8, bytes } = tensor.storage else {
+                return Err(invalid("Llama FFN export requires original Q8_0 bytes"));
+            };
+            if tensor.dims != [width, rows] || bytes.len() != width * rows / 32 * 34 {
+                return Err(invalid("Llama FFN export tensor shape mismatch"));
+            }
+            let stem = format!("{layer}-{tokens}-{stage}");
+            std::fs::write(dir.join(format!("{stem}.q8")), bytes)?;
+            for (suffix, values) in [("input", x), ("output", y)] {
+                let bytes: Vec<_> = values.into_iter().flat_map(f32::to_le_bytes).collect();
+                std::fs::write(dir.join(format!("{stem}-{suffix}.f32")), bytes)?;
+            }
+        }
+        println!("LLAMA_FFN_EXPORT model_sha256={model_hash} capture_sha256={capture_hash}");
+        return Ok(());
+    }
+    let harness = Harness::new()?;
+    #[cfg(feature = "cuda-fp16-prefill-research")]
+    let fp16 = packed
+        .then(|| -> Result<_> {
+            Ok((
+                fp16_gemm::compile(&harness.stream)?,
+                fp16_gemm::Gemm::new(&harness.stream)?,
+            ))
+        })
+        .transpose()?;
+    let modes = [
+        Mode {
+            kernel: "prefill_matmul",
+            rows: 1,
+            tokens: 4,
+            threads: 256,
+        },
+        DENSE[0],
+        DENSE[1],
+    ];
+    for (name, tensor, tokens, x, y) in panels {
+        if std::env::var_os("LI_REPLAY_STACKED_GATE_UP").is_some() {
+            #[cfg(feature = "cuda-fp16-prefill-research")]
+            if name.contains(".ffn_gate") || name.ends_with(".ffn_up.weight") {
+                let (expand, gemm) = fp16.as_ref().expect("stacked replay requires packed mode");
+                let tensor = DeviceTensor::upload(tensor, &harness.stream)?;
+                let input = harness.stream.clone_htod(&x).map_err(failure)?;
+                benchmark_dense_fp16_panel(
+                    &harness.stream,
+                    expand,
+                    gemm,
+                    &tensor,
+                    &input,
+                    tokens,
+                    &y,
+                    &name,
+                )?;
+            }
+            continue;
+        }
+        let tensor = DeviceTensor::upload(tensor, &harness.stream)?;
+        let input = harness.stream.clone_htod(&x).map_err(failure)?;
+        if harness.functions.contains_key("llama_q8_repack") {
+            replay_aligned_q8(&harness, &tensor, &input, tokens, &name)?;
+            continue;
+        }
+        let mut guarded = vec![1337.0; y.len() + 16];
+        guarded[8..8 + y.len()].fill(f32::NAN);
+        for mode in modes.into_iter().filter(|mode| {
+            mode.kernel != "prefill_matmul_refcompact2x16" || matches!(tensor.kind, 12 | 14)
+        }) {
+            let f = &harness.functions[mode.kernel];
+            let launch = |output: &mut CudaViewMut<'_, f32>| {
+                let mut args = harness.stream.launch_builder(f);
+                args.arg(&tensor.bytes)
+                    .arg(&tensor.kind)
+                    .arg(&input)
+                    .arg(output)
+                    .arg(&tensor.width)
+                    .arg(&tensor.rows)
+                    .arg(&tokens);
+                unsafe {
+                    args.launch(LaunchConfig {
+                        grid_dim: (
+                            (tensor.rows as u32).div_ceil(mode.rows),
+                            (tokens as u32).div_ceil(mode.tokens),
+                            1,
+                        ),
+                        block_dim: (mode.threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(failure)?;
+                Ok::<_, Error>(())
+            };
+            let mut output = harness.stream.clone_htod(&guarded).map_err(failure)?;
+            launch(&mut output.slice_mut(8..8 + y.len()))?;
+            assert_output(
+                &harness.stream.clone_dtoh(&output).map_err(failure)?,
+                &y,
+                mode.kernel,
+            )?;
+            let mut output = output.slice_mut(8..8 + y.len());
+            for _ in 0..3 {
+                launch(&mut output)?;
+            }
+            let mut samples = Vec::new();
+            for _ in 0..7 {
+                let flag = Some(sys::CUevent_flags::CU_EVENT_DEFAULT);
+                let start = harness.stream.record_event(flag).map_err(failure)?;
+                for _ in 0..8 {
+                    launch(&mut output)?;
+                }
+                let end = harness.stream.record_event(flag).map_err(failure)?;
+                samples.push(start.elapsed_ms(&end).map_err(failure)? / 8.0);
+            }
+            println!(
+                "DENSE_REPLAY {}",
+                json!({
+                    "tensor":name, "tokens":tokens, "kind":tensor.kind, "width":tensor.width,
+                    "rows":tensor.rows, "kernel":mode.kernel, "event_ms":samples,
+                    "output_sha256":float_hash(&y), "model_sha256":model_hash, "capture_sha256":capture_hash,
+                    "registers":f.num_regs().map_err(failure)?,
+                    "shared_bytes":f.shared_size_bytes().map_err(failure)?,
+                    "local_bytes":f.local_size_bytes().map_err(failure)?,
+                })
+            );
+        }
+        if packed {
+            benchmark_dense_packed_panel(
+                &harness.stream,
+                &harness.functions,
+                &tensor,
+                &input,
+                tokens,
+                &y,
+                &name,
+            )?;
+        }
+        #[cfg(feature = "cuda-fp16-prefill-research")]
+        if let Some((expand, gemm)) = &fp16 {
+            benchmark_dense_fp16_panel(
+                &harness.stream,
+                expand,
+                gemm,
+                &tensor,
+                &input,
+                tokens,
+                &y,
+                &name,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-fp16-prefill-research")]
+pub(super) fn benchmark_dense_fp16_panel(
+    s: &Arc<CudaStream>,
+    expand: &CudaFunction,
+    gemm: &fp16_gemm::Gemm,
+    t: &DeviceTensor,
+    input: &CudaSlice<f32>,
+    tokens: i32,
+    reference: &[f32],
+    name: &str,
+) -> Result<()> {
+    let count = t
+        .width
+        .checked_mul(t.rows)
+        .ok_or_else(|| invalid("FP16 weight replay overflow"))?;
+    let inputs = t
+        .width
+        .checked_mul(tokens)
+        .ok_or_else(|| invalid("FP16 input replay overflow"))?;
+    if std::env::var_os("LI_REPLAY_BF16X9").is_some() {
+        gemm.replay_f32(t, input, tokens, reference, name, false)?;
+    }
+    if std::env::var_os("LI_REPLAY_TF32").is_some() {
+        gemm.replay_f32(t, input, tokens, reference, name, true)?;
+    }
+    let mut weights = s.alloc_zeros::<u16>(count as usize).map_err(failure)?;
+    fp16_gemm::expand(s, expand, &t.bytes, t.kind, &mut weights, count, false)?;
+    let mut low_weights = s.alloc_zeros::<u16>(count as usize).map_err(failure)?;
+    fp16_gemm::expand(s, expand, &t.bytes, t.kind, &mut low_weights, count, true)?;
+    let nn_weights = if std::env::var_os("LI_REPLAY_FP16_NN").is_some() {
+        Some([
+            gemm.transpose_weights(&weights, t.width, t.rows)?,
+            gemm.transpose_weights(&low_weights, t.width, t.rows)?,
+        ])
+    } else {
+        None
+    };
+    let mut x = s.alloc_zeros::<u16>(inputs as usize).map_err(failure)?;
+    let mut low_x = s.alloc_zeros::<u16>(inputs as usize).map_err(failure)?;
+    if let Some(dir) = std::env::var_os("LI_REPLAY_EXPORT_FP16") {
+        if (t.kind, t.width, t.rows, tokens) == (8, 2048, 8192, 512) {
+            fp16_gemm::expand(s, expand, input, 0, &mut x, inputs, false)?;
+            let dir = PathBuf::from(dir);
+            for (suffix, src) in [("high", &weights), ("low", &low_weights), ("input", &x)] {
+                let values = s.clone_dtoh(src).map_err(failure)?;
+                let bytes: Vec<_> = values.into_iter().flat_map(u16::to_le_bytes).collect();
+                std::fs::write(dir.join(format!("{name}-{suffix}.f16")), bytes).map_err(failure)?;
+            }
+        }
+        return Ok(());
+    }
+    let mut guarded = vec![1337.0; reference.len() + 16];
+    let end = 8 + reference.len();
+    guarded[8..end].fill(f32::NAN);
+    let mut merge = if std::env::var_os("LI_REPLAY_FP16_MERGE").is_some() {
+        let count = i32::try_from(reference.len()).map_err(failure)?;
+        Some((
+            fp16_gemm::compile_replay_merge(s)?,
+            count,
+            s.alloc_zeros::<f32>(reference.len()).map_err(failure)?,
+            s.alloc_zeros::<f32>(reference.len()).map_err(failure)?,
+        ))
+    } else {
+        None
+    };
+    let tile_variant = std::env::var_os("LI_REPLAY_FP16_TILE");
+    let split = tile_variant.as_deref().is_some_and(|v| v == "async-split2");
+    if split && (t.width, t.rows) != (3072, 1024) {
+        return Ok(());
+    }
+    let (tile_rows, tile_tokens, tile_depth, name_tile) =
+        match tile_variant.as_deref().and_then(|v| v.to_str()) {
+            Some("async-n128") => (32, 128, 32, "corrected_fp16_tile_async_n128"),
+            Some("async-n64") => (32, 64, 64, "corrected_fp16_tile_async_n64"),
+            Some("async-weight-first") => (32, 64, 64, "corrected_fp16_tile_async_weight_first"),
+            Some("async-split2") => (32, 64, 128, "corrected_fp16_tile_async_split2"),
+            Some("async-wide") => (64, 64, 64, "corrected_fp16_tile_async_wide"),
+            Some("async-k64") => (32, 32, 64, "corrected_fp16_tile_async_k64"),
+            Some("async") => (32, 32, 32, "corrected_fp16_tile_async"),
+            Some("64") => (64, 32, 32, "corrected_fp16_tile64"),
+            _ => (32, 32, 32, "corrected_fp16_tile32"),
+        };
+    let tile = if tile_variant.is_some() && t.width % tile_depth == 0 {
+        Some(fp16_gemm::compile_tile(s, name_tile)?)
+    } else {
+        None
+    };
+    let mut fixup = if split {
+        let count = t
+            .rows
+            .checked_mul(tokens)
+            .ok_or_else(|| invalid("split output overflow"))?;
+        Some((
+            fp16_gemm::compile_tile(s, "corrected_fp16_split2_fixup")?,
+            count,
+            s.alloc_zeros::<f32>(2 * count as usize).map_err(failure)?,
+        ))
+    } else {
+        None
+    };
+    let modes: &[&str] = if tile.is_some() {
+        &["both", "both-tile"]
+    } else if merge.is_some() {
+        &["both", "both-merge"]
+    } else if std::env::var_os("LI_REPLAY_STACKED_GATE_UP").is_some() {
+        &["weight"]
+    } else if std::env::var_os("LI_REPLAY_FP16_TERMS").is_some() {
+        &["none", "activation", "weight", "both"]
+    } else if nn_weights.is_some() {
+        &["both", "both-nn", "weight", "weight-nn"]
+    } else {
+        &["none", "both"]
+    };
+    for &mode in modes {
+        let mut y = s.clone_htod(&guarded).map_err(failure)?;
+        let mut launch = || -> Result<()> {
+            fp16_gemm::expand(s, expand, input, 0, &mut x, inputs, false)?;
+            let mut out = y.slice_mut(8..end);
+            if mode == "both-tile" {
+                fp16_gemm::expand(s, expand, input, 0, &mut low_x, inputs, true)?;
+                if let Some((fix, count, partials)) = fixup.as_mut() {
+                    fp16_gemm::launch_tile_parts(
+                        s,
+                        tile.as_ref().expect("split tile"),
+                        &weights,
+                        &low_weights,
+                        &x,
+                        &low_x,
+                        partials,
+                        t.width,
+                        t.rows,
+                        tokens,
+                        tile_rows,
+                        tile_tokens,
+                        2,
+                    )?;
+                    let mut args = s.launch_builder(fix);
+                    args.arg(&mut out).arg(&*partials).arg(&*count);
+                    unsafe { args.launch(LaunchConfig::for_num_elems(*count as u32)) }
+                        .map_err(failure)?;
+                    return Ok(());
+                }
+                return fp16_gemm::launch_tile(
+                    s,
+                    tile.as_ref().expect("tile replay kernel"),
+                    &weights,
+                    &low_weights,
+                    &x,
+                    &low_x,
+                    &mut out,
+                    t.width,
+                    t.rows,
+                    tokens,
+                    tile_rows,
+                    tile_tokens,
+                );
+            }
+            if matches!(mode, "both-nn" | "weight-nn") {
+                let [high, low] = nn_weights.as_ref().expect("NN replay weights");
+                gemm.project_nn(high, &x, &mut out, t.width, t.rows, tokens, 1.0, 0.0)?;
+                if mode == "both-nn" {
+                    fp16_gemm::expand(s, expand, input, 0, &mut low_x, inputs, true)?;
+                    gemm.project_nn(
+                        high,
+                        &low_x,
+                        &mut out,
+                        t.width,
+                        t.rows,
+                        tokens,
+                        1.0 / 1024.0,
+                        1.0,
+                    )?;
+                }
+                gemm.project_nn(
+                    low,
+                    &x,
+                    &mut out,
+                    t.width,
+                    t.rows,
+                    tokens,
+                    1.0 / 1024.0,
+                    1.0,
+                )?;
+                return Ok(());
+            }
+            gemm.project(&weights, &x, &mut out, t.width, t.rows, tokens, 1.0, 0.0)?;
+            if mode == "both-merge" {
+                let (kernel, count, a, b) = merge.as_mut().expect("merge replay scratch");
+                fp16_gemm::expand(s, expand, input, 0, &mut low_x, inputs, true)?;
+                gemm.project(
+                    &weights,
+                    &low_x,
+                    a,
+                    t.width,
+                    t.rows,
+                    tokens,
+                    1.0 / 1024.0,
+                    0.0,
+                )?;
+                gemm.project(
+                    &low_weights,
+                    &x,
+                    b,
+                    t.width,
+                    t.rows,
+                    tokens,
+                    1.0 / 1024.0,
+                    0.0,
+                )?;
+                let mut args = s.launch_builder(kernel);
+                args.arg(&mut out).arg(&*a).arg(&*b).arg(&*count);
+                unsafe { args.launch(LaunchConfig::for_num_elems(*count as u32)) }
+                    .map_err(failure)?;
+            }
+            if matches!(mode, "activation" | "both") {
+                fp16_gemm::expand(s, expand, input, 0, &mut low_x, inputs, true)?;
+                // Omit the second-order product of the two residuals.
+                gemm.project(
+                    &weights,
+                    &low_x,
+                    &mut out,
+                    t.width,
+                    t.rows,
+                    tokens,
+                    1.0 / 1024.0,
+                    1.0,
+                )?;
+            }
+            if matches!(mode, "weight" | "both") {
+                gemm.project(
+                    &low_weights,
+                    &x,
+                    &mut out,
+                    t.width,
+                    t.rows,
+                    tokens,
+                    1.0 / 1024.0,
+                    1.0,
+                )?;
+            }
+            Ok(())
+        };
+        for _ in 0..3 {
+            launch()?;
+        }
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            let flag = Some(sys::CUevent_flags::CU_EVENT_DEFAULT);
+            let start = s.record_event(flag).map_err(failure)?;
+            launch()?;
+            let finish = s.record_event(flag).map_err(failure)?;
+            samples.push(start.elapsed_ms(&finish).map_err(failure)?);
+        }
+        let actual = s.clone_dtoh(&y).map_err(failure)?;
+        if actual[..8] != guarded[..8]
+            || actual[end..] != guarded[end..]
+            || actual[8..end].iter().any(|a| !a.is_finite())
+        {
+            return Err(failure(format!("FP16 replay {name} invalid output")));
+        }
+        let max_abs = actual[8..end]
+            .iter()
+            .zip(reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        println!(
+            "DENSE_FP16_REPLAY {}",
+            json!({
+                "tensor":name, "tokens":tokens, "kind":t.kind, "prep_plus_matmul_ms":samples,
+                "max_abs_vs_f32_capture":max_abs, "residual_correction":mode != "none",
+                "correction_terms":mode,
+                "expanded_weight_bytes":(if matches!(mode, "weight" | "weight-nn" | "both" | "both-nn" | "both-merge" | "both-tile") { 4 } else { 2 }) * weights.len(),
+                "merge_scratch_bytes": if mode == "both-merge" || (split && mode == "both-tile") { 2 * reference.len() * size_of::<f32>() } else { 0 }
+            })
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn benchmark_dense_packed_panel(
+    s: &Arc<CudaStream>,
+    functions: &HashMap<&'static str, CudaFunction>,
+    t: &DeviceTensor,
+    input: &CudaSlice<f32>,
+    tokens: i32,
+    reference: &[f32],
+    name: &str,
+) -> Result<()> {
+    let count = t
+        .width
+        .checked_mul(tokens)
+        .ok_or_else(|| invalid("packed replay input too large"))?;
+    let block = if t.kind == 8 { 32 } else { 256 };
+    if t.width <= 0 || t.width % block != 0 {
+        return Err(invalid("packed replay requires GGUF-aligned rows"));
+    }
+    for (components, prep, kernel) in [
+        (
+            1,
+            "residual_quantize32_precise1",
+            "dense_packed_replay_mma1",
+        ),
+        (
+            3,
+            "residual_quantize32_precise3",
+            "dense_packed_replay_mma3",
+        ),
+    ]
+    .into_iter()
+    .chain(
+        (t.kind == 8 && functions.contains_key("dense_q8_replay_mma3_rows64")).then_some((
+            3,
+            "residual_quantize32_precise3",
+            "dense_q8_replay_mma3_rows64",
+        )),
+    )
+    .chain(
+        (t.kind == 8 && functions.contains_key("dense_q8_replay_mma3_wide_warp")).then_some((
+            3,
+            "residual_quantize32_precise3",
+            "dense_q8_replay_mma3_wide_warp",
+        )),
+    ) {
+        let tile_rows = if kernel == "dense_q8_replay_mma3_rows64" {
+            64
+        } else {
+            32
+        };
+        let mut q = s
+            .alloc_zeros::<i8>(count as usize * components)
+            .map_err(failure)?;
+        let mut scales = s
+            .alloc_zeros::<f32>(count as usize / 32 * components)
+            .map_err(failure)?;
+        let mut sums = s.alloc_zeros::<i32>(scales.len()).map_err(failure)?;
+        let mut status = s.alloc_zeros::<i32>(1).map_err(failure)?;
+        let mut guarded = vec![1337.0; reference.len() + 16];
+        guarded[8..8 + reference.len()].fill(f32::NAN);
+        let mut output = s.clone_htod(&guarded).map_err(failure)?;
+        let mut launch = || -> Result<()> {
+            let mut args = s.launch_builder(&functions[prep]);
+            args.arg(input)
+                .arg(&mut q)
+                .arg(&mut scales)
+                .arg(&mut sums)
+                .arg(&count)
+                .arg(&mut status);
+            unsafe { args.launch(LaunchConfig::for_num_elems(count as u32)) }.map_err(failure)?;
+            let mut view = output.slice_mut(8..8 + reference.len());
+            let mut args = s.launch_builder(&functions[kernel]);
+            args.arg(&t.bytes)
+                .arg(&t.kind)
+                .arg(&q)
+                .arg(&scales)
+                .arg(&sums)
+                .arg(&mut view)
+                .arg(&t.width)
+                .arg(&t.rows)
+                .arg(&tokens)
+                .arg(&mut status);
+            unsafe {
+                args.launch(LaunchConfig {
+                    grid_dim: (
+                        (t.rows as u32).div_ceil(tile_rows),
+                        (tokens as u32).div_ceil(32),
+                        1,
+                    ),
+                    block_dim: (
+                        if kernel == "dense_q8_replay_mma3_wide_warp" {
+                            64
+                        } else {
+                            tile_rows * 4
+                        },
+                        1,
+                        1,
+                    ),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(failure)?;
+            Ok(())
+        };
+        for _ in 0..3 {
+            launch()?;
+        }
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            let flag = Some(sys::CUevent_flags::CU_EVENT_DEFAULT);
+            let start = s.record_event(flag).map_err(failure)?;
+            launch()?;
+            let end = s.record_event(flag).map_err(failure)?;
+            samples.push(start.elapsed_ms(&end).map_err(failure)?);
+        }
+        let code = s.clone_dtoh(&status).map_err(failure)?[0];
+        let actual = s.clone_dtoh(&output).map_err(failure)?;
+        let end = 8 + reference.len();
+        if code != 0
+            || actual[..8] != guarded[..8]
+            || actual[end..] != guarded[end..]
+            || actual[8..end].iter().any(|a| !a.is_finite())
+        {
+            return Err(failure(format!(
+                "packed replay {name} {kernel} invalid output (status {code})"
+            )));
+        }
+        let max_abs = actual[8..end]
+            .iter()
+            .zip(reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        println!(
+            "DENSE_PACKED_REPLAY {}",
+            json!({
+                "tensor":name, "tokens":tokens, "kind":t.kind, "components":components,
+                "kernel":kernel,
+                "prep_plus_matmul_ms":samples, "max_abs_vs_f32_capture":max_abs
+            })
+        );
+    }
+    Ok(())
 }
 
 #[test]

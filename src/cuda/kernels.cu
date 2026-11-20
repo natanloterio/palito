@@ -718,6 +718,28 @@ extern "C" __global__ void head_norm(float *x, const u8 *w, int dim, float epsil
     for (int i = threadIdx.x; i < dim; i += blockDim.x) x[i] *= inverse * ((const float *)w)[i];
 }
 
+__device__ __forceinline__ void rotary_pair(float *x, int p, int dim, int rotated,
+    int position, float base, int neox, const float *factors, float magnitude,
+    const float *v_row = nullptr, float *k_dst = nullptr, float *v_dst = nullptr) {
+    int pair = p % (rotated / 2), head = p / (rotated / 2);
+    int a = head * dim + (neox ? pair : 2 * pair);
+    int b = neox ? a + rotated / 2 : a + 1;
+    float angle = (float)position * powf(base, -(float)(2 * pair) / (float)rotated);
+    if (factors) angle /= factors[pair];
+    float sine = sinf(angle) * magnitude, cosine = cosf(angle) * magnitude;
+    float u = x[a], v = x[b];
+    float xa = u * cosine - v * sine, xb = u * sine + v * cosine;
+    if (k_dst) {
+        k_dst[a] = xa;
+        k_dst[b] = xb;
+        v_dst[a] = v_row[a];
+        v_dst[b] = v_row[b];
+    } else {
+        x[a] = xa;
+        x[b] = xb;
+    }
+}
+
 template<bool Partial = false>
 __device__ __forceinline__ void rotary_impl(float *x, int n, int dim, int position, float base, int neox,
                                            const float *factors, float magnitude, int rotary_dim = 0) {
@@ -726,15 +748,20 @@ __device__ __forceinline__ void rotary_impl(float *x, int n, int dim, int positi
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     int rotated = Partial ? rotary_dim : dim;
     if (p >= (Partial ? n / dim * (rotated / 2) : n / 2)) return;
-    int pair = p % (rotated / 2), head = p / (rotated / 2);
-    int a = head * dim + (neox ? pair : 2 * pair);
-    int b = neox ? a + rotated / 2 : a + 1;
-    float angle = (float)position * powf(base, -(float)(2 * pair) / (float)rotated);
-    if (factors) angle /= factors[pair];
-    float sine = sinf(angle) * magnitude, cosine = cosf(angle) * magnitude;
-    float u = x[a], v = x[b];
-    x[a] = u * cosine - v * sine;
-    x[b] = u * sine + v * cosine;
+    rotary_pair(x, p, dim, rotated, position, base, neox, factors, magnitude);
+}
+
+extern "C" __global__ void llama_factored_rope_cache(float *q, float *k, const float *v,
+    float *keys, float *values, int qw, int kw, int position, float base,
+    int neox, const float *factors, float magnitude) {
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < qw / 2) {
+        rotary_pair(q, p, 64, 64, position, base, neox, factors, magnitude);
+    } else if (p < (qw + kw) / 2) {
+        const u64 dst = (u64)position * kw;
+        rotary_pair(k, p - qw / 2, 64, 64, position, base, neox, factors, magnitude,
+                    v, keys + dst, values + dst);
+    }
 }
 
 extern "C" __global__ void rotary(float *x, int n, int dim, int position, float base, int neox) {

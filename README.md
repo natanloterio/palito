@@ -421,7 +421,8 @@ and CUDA 13 NVRTC libraries on `LD_LIBRARY_PATH`.
   Persistent F32 KV and recurrent state are unchanged.
   `cuda-llama-split-decode-attention-research` uses 128-token F32 tiles
   for Llama eager decode with 32 query heads, eight KV heads, 64 dimensions,
-  and more than 128 live tokens. It preserves F32 KV.
+  and at least 128 live tokens. A single tile writes the output directly.
+  The path preserves F32 KV.
 - `--cuda-matmul tf32x3-tiled` is a separate approximate expert-only experiment.
   It **fails** the strict real-model MoE logit gate (0.08683 maximum error versus
   the 0.01 limit), despite matching bounded generated IDs. Do not treat it as
@@ -1027,7 +1028,7 @@ correction on the 8192-to-2048 down projection.
 `cuda-llama-fp16-wide-weight-only-research` extends this to the 2048-to-8192
 gate/up projections and takes precedence over their async tile.
 `cuda-llama-short-ffn-weight-only-research` also enables the same FFN
-gate/up/down schedule at exactly 46 tokens.
+gate/up/down schedule for batches of 32–127 tokens.
 `cuda-llama-ffn-mmq-research` is a separate RTX 5090 experiment for the
 first 512-token chunk of dense Llama in the F32 profile (Q8_0 FFN weights,
 2048 model width, 8192 hidden width). It shares the gate/up activation
@@ -1039,10 +1040,10 @@ llama.cpp CUDA sources and libraries; the default build does not use it.
 `cuda-llama-ffn-mmq-joined-research` packs both activation planes directly
 along the token dimension, runs one Stream-K projection per weight matrix,
 and sums the two output planes in F32. It applies to initial chunks of
-exactly 46, 256, or 512 tokens and reserves 54,169,600 additional device
+32–512 tokens and reserves 54,169,600 additional device
 bytes. Use the same local CUDA research bridge built with joined support.
 `cuda-llama-attn-mmq-joined-research` also uses the two-plane path for
-Q/K/V and attention output on the first 512-token chunk of the same
+Q/K/V and attention output on initial chunks of 384–512 tokens of the same
 Llama fixture. Q/K/V share their activation pack. This uses the existing
 Joined-N scratch and does not change attention, KV cache, or decode.
 `cuda-llama-prefill-last-ffn-research` runs the final layer's FFN for only
@@ -1051,40 +1052,42 @@ writes every attention KV entry and uses the existing corrected Q8_0
 matvecs for that final row. Diagnostic captures, shorter chunks, and decode
 keep their existing paths.
 `cuda-llama-prefill-fp16-gate-up-research` replaces Joined-N only for the
-batched Q8_0 gate and up projections of the initial 512-token Llama chunk.
+batched Q8_0 gate and up projections of initial Llama chunks of 384–512 tokens.
 It converts their shared input once, reuses the existing leading FP16
 weight terms, and runs one FP16 GEMM with FP32 accumulation per projection.
 It adds no weight cache. Down, attention, the opt-in single-row final FFN,
 and other chunk sizes keep their existing paths.
-`cuda-llama-prefill-fp16-gate-up-46-research` separately enables this
-gate/up schedule for the initial 46-token chunk, leaving down on Joined-N.
+The existing `cuda-llama-prefill-fp16-gate-up-256-research` and
+`cuda-llama-prefill-fp16-gate-up-46-research` opt-ins lower that minimum
+to 128 and 32 tokens, respectively, leaving down on Joined-N.
 `cuda-llama-grouped-prefill-attention-research` groups four query heads per
-KV head for the initial 512-token Llama chunk (32 query heads, 64 dimensions).
+KV head for even initial Llama chunks of 384–512 tokens (32 query heads, 64 dimensions).
 It replaces four batched score GEMMs and four batched value GEMMs with one
 batched GEMM for each product. The two layout conversions reuse existing
 scratch. Scores and persistent KV stay F32; the value GEMM retains the
 selected math mode. This is not Flash Attention: it still materializes
 scores. Shorter chunks, continuation, and decode keep their existing paths.
 `cuda-llama-grouped-prefill-256-research` separately enables the same layout
-for an initial 256-token Llama chunk. Continuation and decode are unchanged.
+for even initial Llama chunks of 256–512 tokens. Continuation and decode are unchanged.
 `cuda-qwen3-grouped-prefill-attention-research` applies the same layout
-to the initial 512-token dense Qwen3 chunk (16 query heads, 128 dimensions,
+to even initial dense Qwen3 chunks of 384–512 tokens (16 query heads, 128 dimensions,
 two query heads per KV head), with unchanged score and value math modes.
 `cuda-qwen3-prefill-fused-head-rope-research` also fuses Q/K head
-normalization, RoPE, and F32 K/V cache writes for the same initial
-512-token Qwen3 chunk. Partial and factored RoPE, shorter chunks,
+normalization, RoPE, and F32 K/V cache writes for initial
+Qwen3 chunks from 384 tokens. Partial and factored RoPE, shorter chunks,
 continuation, and decode keep their existing paths.
 `cuda-qwen3-prefill-kv-weight-only-research` uses two FP32-accumulating
-GEMMs for each K/V projection in the initial 512-token Qwen3 chunk. It
+GEMMs for each K/V projection in initial Qwen3 chunks of 384–512 tokens
+aligned to 128 tokens. It
 retains both FP16 weight terms, packs only the leading FP16 activation
 term, and reuses the existing weights and scratch.
 `cuda-qwen3-prefill-output-weight-only-research` uses the same two-weight
 FP16 schedule for the 2048-to-1024 attention output projection of the
-initial 512-token Qwen3 chunk.
+same tile-aligned Qwen3 chunks.
 `cuda-qwen3-prefill-q-weight-only-research` uses that schedule for the
 1024-to-2048 query projection of the same initial chunk.
 `cuda-qwen3-prefill-gate-up-single-term-research` uses one leading FP16
-weight term per gate/up projection at 512 tokens, with FP32 accumulation.
+weight term per gate/up projection in the same aligned regime, with FP32 accumulation.
 The low weight term is omitted only for these gate/up projections.
 `cuda-llama-prefill-qo-single-term-research` uses the leading FP16 terms
 and FP32 accumulation for Llama Q and attention output at 512 tokens.
@@ -1220,20 +1223,21 @@ accumulators per lane in the long-chunk recurrent kernel, shortening the
 dependency chains without changing the state layout or decode dispatch.
 This changes the F32 summation order for chunks of 256 tokens or more.
 `cuda-qwen35-recurrent-gdn-512-research` uses the pinned llama.cpp CUDA
-DeltaNet MMA kernel for 512-token Qwen3.5 chunks on SM120. It uses
+DeltaNet MMA kernel for 128–512-token Qwen3.5 chunks on SM120. It uses
 16-token panels and 32 value columns per block, transposing the recurrent
 state into scratch and back without changing its persistent F32 layout.
 Shorter chunks and decode keep the existing dispatch. Build the research
 bridge with the frozen harness's `validate-hybrid-ffn-weight-only.sh gdn-512`;
-the feature requires that bridge and its pinned CUDA library at runtime.
+the feature requires a rebuilt bridge exposing `li_qwen35_gdn_chunk`
+and its pinned CUDA library at runtime.
 
 `cuda-qwen35-ffn-gate-up-single-term-research` uses just the leading FP16
-weight term for the 1024-to-3584 Q4_K gate/up projections at 512 tokens.
+weight term for the 1024-to-3584 Q4_K gate/up projections from 384 tokens.
 Accumulation remains F32; FFN down, shorter chunks, and decode are unchanged.
 `cuda-qwen35-ffn-gate-up-single-term-256-research` also enables this gate/up
-path for exact 256-token chunks.
-`cuda-qwen35-ffn-gate-up-single-term-46-research` enables it for exact
-46-token chunks; it does not change down or decode.
+path from 128 tokens.
+`cuda-qwen35-ffn-gate-up-single-term-46-research` enables it for batches
+of 32–127 tokens; it does not change down or decode.
 `cuda-qwen35-ffn-down-single-term-research` separately applies one FP16 weight
 term to the 3584-to-1024 Q4_K/Q6_K FFN down projection at 512 tokens.
 `cuda-qwen35-ffn-down-single-term-256-research` also applies it at 256 tokens.

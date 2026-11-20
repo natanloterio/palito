@@ -137,6 +137,7 @@ fn qwen35_decode_graph_matches_eager() {
             (125, &other),
             (46, &seed),
             (125, &other),
+            (173, &seed),
             (512, &seed),
         ] {
             let tokens: Vec<_> = seed.iter().copied().cycle().take(n + 5).collect();
@@ -322,7 +323,7 @@ fn long_context_reset_replay_with_options(env: &str, options: CudaOptions) {
         .tokenize("A prefix with several distinct tokens.")
         .unwrap();
     let prompt: Vec<_> = seed.iter().copied().cycle().take(513).collect();
-    for n in [31, 32, 33, 46, 127, 128, 129, 255, 256, 257, 512] {
+    for n in [31, 32, 33, 46, 127, 128, 129, 173, 255, 256, 257, 386, 387, 512] {
         let run = |backend: &mut dyn Backend| {
             backend.evaluate(&prompt[..n], 0).unwrap();
             let prefill: Vec<_> = backend

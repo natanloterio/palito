@@ -114,7 +114,7 @@ __device__ __forceinline__ void split_decode_partials(const float *q, const floa
     int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     int start = blockIdx.y * tile_size;
     if (start >= count) return;
-    if (count <= tile_size) {
+    if (dim != 64 && count <= tile_size) {
         attention_fused_impl(q, keys, values, output, dim, heads, kv_heads, count);
         return;
     }
@@ -172,9 +172,12 @@ __device__ __forceinline__ void split_decode_partials(const float *q, const floa
         float sum = 0.0f;
         #pragma unroll
         for (int i = 0; i < warps; ++i) sum += numerators[i][tid];
-        dst[tid] = sum;
+        if (dim == 64 && count == tile_size)
+            output[blockIdx.x * dim + tid] = sum / total;
+        else
+            dst[tid] = sum;
     }
-    if (tid == 0) {
+    if (tid == 0 && !(dim == 64 && count == tile_size)) {
         dst[dim] = maximum;
         dst[dim + 1] = total;
     }

@@ -1,13 +1,13 @@
 #include "gated-delta-net-mma.cuh"
 
 namespace {
-constexpr int heads = 16, dim = 128, tokens = 512;
+constexpr int heads = 16, dim = 128, max_tokens = 512;
 constexpr int inner = heads * dim, qkv_width = 3 * inner;
 constexpr int state_size = heads * dim * dim, threads = 256;
 
-__global__ void log_decay(const float *decay, float *logs) {
+__global__ void log_decay(const float *decay, float *logs, int count) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    logs[i] = logf(decay[i]);
+    if (i < count) logs[i] = logf(decay[i]);
 }
 
 __global__ void transpose_state(const float *src, float *dst) {
@@ -16,12 +16,15 @@ __global__ void transpose_state(const float *src, float *dst) {
 }
 }
 
-extern "C" int li_qwen35_gdn_512(
+extern "C" int li_qwen35_gdn_chunk(
     cudaStream_t stream, const float *qkv, const float *decay, const float *beta,
-    float *state, float *out, float *logs, float *transposed_in, float *transposed_out) {
+    float *state, float *out, float *logs, float *transposed_in, float *transposed_out,
+    int tokens) {
+    if (tokens < 64 || tokens > max_tokens) return cudaErrorInvalidValue;
     int device;
     if (const auto status = cudaGetDevice(&device); status != cudaSuccess) return status;
-    log_decay<<<tokens * heads / threads, threads, 0, stream>>>(decay, logs);
+    const int count = tokens * heads;
+    log_decay<<<(count + threads - 1) / threads, threads, 0, stream>>>(decay, logs, count);
     transpose_state<<<state_size / threads, threads, 0, stream>>>(state, transposed_in);
     if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
     ggml_cuda_gdn_mma_args args{};
@@ -45,4 +48,11 @@ extern "C" int li_qwen35_gdn_512(
     if (!ggml_cuda_gdn_mma_launch(device, args, stream)) return cudaErrorNotSupported;
     transpose_state<<<state_size / threads, threads, 0, stream>>>(transposed_out, state);
     return cudaGetLastError();
+}
+
+extern "C" int li_qwen35_gdn_512(
+    cudaStream_t stream, const float *qkv, const float *decay, const float *beta,
+    float *state, float *out, float *logs, float *transposed_in, float *transposed_out) {
+    return li_qwen35_gdn_chunk(stream, qkv, decay, beta, state, out, logs,
+                              transposed_in, transposed_out, max_tokens);
 }

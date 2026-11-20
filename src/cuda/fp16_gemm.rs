@@ -180,6 +180,7 @@ impl Prefill {
         x: &CudaSlice<f32>,
         y: &mut CudaSlice<f32>,
         width: i32,
+        n: i32,
     ) -> Result<bool> {
         let Some([high, low]) = t.fp16.as_ref().filter(|_| {
             self.qwen3_down_weight_only
@@ -192,13 +193,13 @@ impl Prefill {
         }) else {
             return Ok(false);
         };
-        let count = width * 512;
+        let count = width * n;
         if x.len() < count as usize {
             return Err(invalid("FP16 attention projection input exceeds workspace"));
         }
         expand(&self.gemm.stream, &self.expand, x, 0, &mut self.x[0], count, false)?;
-        self.gemm.project(high, &self.x[0], y, width, t.rows, 512, 1.0, 0.0)?;
-        self.gemm.project(low, &self.x[0], y, width, t.rows, 512, 1.0 / 1024.0, 1.0)?;
+        self.gemm.project(high, &self.x[0], y, width, t.rows, n, 1.0, 0.0)?;
+        self.gemm.project(low, &self.x[0], y, width, t.rows, n, 1.0 / 1024.0, 1.0)?;
         Ok(true)
     }
 
@@ -221,27 +222,27 @@ impl Prefill {
         expand(s, &self.expand, x, 0, &mut self.x[0], count, false)?;
         #[cfg(feature = "cuda-qwen3-fp16-down-weight-only-research")]
         let qwen3_weight_only = self.qwen3_down_weight_only
-            && (n == 512
-                || (cfg!(feature = "cuda-qwen3-fp16-ffn-weight-only-256-research") && n == 256)
-                || (cfg!(feature = "cuda-qwen3-fp16-ffn-weight-only-46-research") && n == 46))
+            && (n >= 384
+                || (cfg!(feature = "cuda-qwen3-fp16-ffn-weight-only-256-research") && n >= 128)
+                || cfg!(feature = "cuda-qwen3-fp16-ffn-weight-only-46-research"))
             && (matches!((t.kind, t.width, t.rows), (12 | 14, 3072, 1024))
                 || (cfg!(feature = "cuda-qwen3-fp16-gate-up-weight-only-research")
                     && (t.kind, t.width, t.rows) == (12, 1024, 3072)));
         #[cfg(not(feature = "cuda-qwen3-fp16-down-weight-only-research"))]
         let qwen3_weight_only = false;
         let hybrid_gate_up_short =
-            n == 46 && cfg!(feature = "cuda-qwen35-ffn-gate-up-single-term-46-research");
+            (32..128).contains(&n) && cfg!(feature = "cuda-qwen35-ffn-gate-up-single-term-46-research");
         #[cfg(feature = "cuda-qwen35-ffn-weight-only-research")]
         let hybrid_ffn = self.hybrid_ffn_weight_only
-            && (n == 512
-                || (cfg!(feature = "cuda-qwen35-ffn-weight-only-256-research") && n == 256)
+            && (n >= 384
+                || (cfg!(feature = "cuda-qwen35-ffn-weight-only-256-research") && n >= 128)
                 || hybrid_gate_up_short)
             && (t.kind, t.width, t.rows) == (12, 1024, 3584);
         #[cfg(not(feature = "cuda-qwen35-ffn-weight-only-research"))]
         let hybrid_ffn = false;
         #[cfg(feature = "cuda-qwen35-qkv-weight-only-research")]
-        let hybrid_large_chunk = n == 512
-            || (cfg!(feature = "cuda-qwen35-qkv-down-weight-only-256-research") && n == 256);
+        let hybrid_large_chunk = n >= 384
+            || (cfg!(feature = "cuda-qwen35-qkv-down-weight-only-256-research") && n >= 128);
         #[cfg(feature = "cuda-qwen35-qkv-weight-only-research")]
         let hybrid_qkv = self.hybrid_ffn_weight_only
             && hybrid_large_chunk
@@ -256,7 +257,7 @@ impl Prefill {
         let hybrid_down = false;
         let hybrid_output = cfg!(feature = "cuda-qwen35-output-weight-only-research")
             && self.hybrid_ffn_weight_only
-            && (n == 512 || (n == 256 && cfg!(feature = "cuda-qwen35-output-single-term-256-research")))
+            && (n >= 384 || (n >= 128 && cfg!(feature = "cuda-qwen35-output-single-term-256-research")))
             && matches!((t.kind, t.width, t.rows), (12..=14, 2048, 1024));
         if qwen3_weight_only
             || hybrid_ffn
@@ -264,13 +265,13 @@ impl Prefill {
             || hybrid_down
             || hybrid_output
             || (cfg!(feature = "cuda-llama-short-ffn-weight-only-research")
-                && n == 46
+                && (32..128).contains(&n)
                 && matches!((t.kind, t.width, t.rows), (8, 2048, 8192) | (8, 8192, 2048)))
             || (cfg!(feature = "cuda-llama-attention-projection-weight-only-research")
-                && (n == 512
+                && (n >= 384
                     || (cfg!(
                         feature = "cuda-llama-attention-projection-weight-only-256-research"
-                    ) && n == 256))
+                    ) && n >= 128))
                 && (t.kind, t.width, t.rows) == (8, 2048, 2048))
             || (cfg!(feature = "cuda-llama-fp16-down-weight-only-research")
                 && ((matches!(n, 256 | 512) && (t.kind, t.width, t.rows) == (8, 8192, 2048))
@@ -283,28 +284,28 @@ impl Prefill {
             let hybrid_gate_up_single_term =
                 cfg!(feature = "cuda-qwen35-ffn-gate-up-single-term-research")
                     && hybrid_ffn
-                    && (n == 512
-                        || (n == 256
+                    && (n >= 384
+                        || (n >= 128
                             && cfg!(feature = "cuda-qwen35-ffn-gate-up-single-term-256-research"))
                         || hybrid_gate_up_short);
             if hybrid_gate_up_single_term
                 || (cfg!(feature = "cuda-llama-prefill-qo-single-term-research")
-                    && n == 512
+                    && n >= 384
                     && (t.kind, t.width, t.rows) == (8, 2048, 2048))
                 || (cfg!(feature = "cuda-qwen35-ffn-down-single-term-research")
                     && hybrid_down
-                    && (n == 512
-                        || (n == 256
+                    && (n >= 384
+                        || (n >= 128
                             && cfg!(feature = "cuda-qwen35-ffn-down-single-term-256-research"))))
                 || (cfg!(feature = "cuda-qwen35-output-single-term-research") && hybrid_output)
                 || (cfg!(feature = "cuda-qwen35-qkv-single-term-research")
                     && hybrid_qkv
-                    && (n == 512 || (n == 256 && cfg!(feature = "cuda-qwen35-qkv-single-term-256-research"))))
-                || (n == 512
+                    && (n >= 384 || (n >= 128 && cfg!(feature = "cuda-qwen35-qkv-single-term-256-research"))))
+                || (n >= 384 && n % 128 == 0
                     && cfg!(feature = "cuda-qwen3-prefill-gate-up-single-term-research")
                     && qwen3_weight_only
                     && (t.kind, t.width, t.rows) == (12, 1024, 3072))
-                || (n == 512
+                || (n >= 384 && n % 128 == 0
                     && cfg!(feature = "cuda-qwen3-fp16-down-single-term-research")
                     && qwen3_weight_only
                     && matches!((t.kind, t.width, t.rows), (12 | 14, 3072, 1024)))

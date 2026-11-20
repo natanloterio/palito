@@ -1187,6 +1187,10 @@ impl CudaBackend {
             let name = "llama_warp_scores_64";
             functions.insert(name, module.load_function(name).map_err(failure)?);
         }
+        if packed_llama && cfg!(feature = "cuda-llama-factored-rope-cache-research") {
+            let name = "llama_factored_rope_cache";
+            functions.insert(name, module.load_function(name).map_err(failure)?);
+        }
         if q8_qkv {
             let name = "llama_q8_dp4a_qkv";
             functions.insert(name, module.load_function(name).map_err(failure)?);
@@ -1913,6 +1917,20 @@ impl CudaBackend {
                     &pos,
                     [&s.rope_base, &neox]
                 );
+            } else if !device_state
+                && (dim, heads, kv_heads) == (64, 32, 8)
+                && s.rotary_dim == s.dim
+                && position_embedding.is_none()
+                && embedding_norm.is_none()
+                && l.q_norm.is_none()
+                && l.k_norm.is_none()
+                && self.functions.contains_key("llama_factored_rope_cache")
+                && let Some(factors) = &self.weights.rope_factors
+            {
+                launch!(self, "llama_factored_rope_cache", vector((qw + kw) / 2),
+                    &mut self.work.q, &self.work.k, &self.work.v,
+                    &mut self.keys[index], &mut self.values[index], &qw, &kw,
+                    &pos, &rope_base, &neox, &factors.bytes, &s.rope_attn_factor);
             } else {
                 for (norm, vector, size) in [
                     (&l.q_norm, &mut self.work.q, qw),
@@ -2050,19 +2068,21 @@ impl CudaBackend {
                     );
                 }
             } else if (dim, heads, kv_heads) == (64, 32, 8)
-                && count > 128
+                && count >= 128
                 && self.functions.contains_key("llama_split_decode_partials")
             {
                 const TILE: u32 = 128;
                 let tiles = (count as u32).div_ceil(TILE);
-                // With count > TILE, the existing heads × context score workspace fits 66 floats per tile.
+                // At least 128 live tokens leave room for 66 floats per tile.
                 debug_assert!(heads as usize * tiles as usize * 66 <= self.work.scores.len());
                 launch!(self, "llama_split_decode_partials", (heads as u32, tiles, 1),
                     &self.work.q, &self.keys[index], &self.values[index],
                     &mut self.work.attended, &mut self.work.scores, &heads,
                     &kv_heads, &TILE, &count);
-                launch!(self, "llama_split_decode_merge", (heads as u32, 1, 1); 64,
-                    &self.work.scores, &mut self.work.attended, &tiles, &TILE, &count);
+                if tiles > 1 {
+                    launch!(self, "llama_split_decode_merge", (heads as u32, 1, 1); 64,
+                        &self.work.scores, &mut self.work.attended, &tiles, &TILE, &count);
+                }
             } else {
                 if dim == 64 && self.functions.contains_key("llama_warp_scores_64") {
                     launch!(self, "llama_warp_scores_64", (heads as u32, (count as u32).div_ceil(4), 1); 128,

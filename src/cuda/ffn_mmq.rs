@@ -9,7 +9,11 @@ const DELTA_ELEMENTS: usize = 512 * 8192;
 const JOINED: bool = cfg!(feature = "cuda-llama-ffn-mmq-joined-research");
 
 pub(super) fn supports_chunk(n: i32) -> bool {
-    n == 512 || (JOINED && matches!(n, 46 | 256))
+    if JOINED {
+        (32..=512).contains(&n)
+    } else {
+        n == 512
+    }
 }
 
 pub(super) fn supports_attention(weight: &DeviceTensor, rows: i32) -> bool {
@@ -160,7 +164,7 @@ impl ReplayKernel {
         let valid_shape = matches!(
             (weight.kind, weight.width, weight.rows),
             (8, 2048, 8192) | (8, 8192, 2048)
-        ) || (n == 512 && supports_attention(weight, weight.rows));
+        ) || (n >= 256 && supports_attention(weight, weight.rows));
         if !valid_shape
             || weight.bytes.len() < (weight.width * weight.rows / 32 * 34) as usize
             || !supports_chunk(n)

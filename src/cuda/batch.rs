@@ -369,7 +369,7 @@ impl CudaBackend {
             );
             #[cfg(feature = "cuda-llama-attn-mmq-joined-research")]
             let mmq_qkv = position == 0
-                && n == 512
+                && (384..=512).contains(&n)
                 && self.ffn_mmq.is_some()
                 && [(&l.q, 2048), (&l.k, 512), (&l.v, 512)]
                     .iter()
@@ -405,7 +405,8 @@ impl CudaBackend {
                 #[cfg(feature = "cuda-qwen3-prefill-kv-weight-only-research")]
                 let qkv_weight_only = if !mmq_qkv
                     && position == 0
-                    && n == 512
+                    && (384..=512).contains(&n)
+                    && n % 128 == 0
                     && (component != 0
                         || (cfg!(feature = "cuda-qwen3-prefill-q-weight-only-research")
                             && s.info.architecture == "qwen3"
@@ -413,7 +414,7 @@ impl CudaBackend {
                     && let Some(fp16) = self.fp16.as_mut()
                 {
                     fp16.project_qwen3_attention_weights(
-                        tensor, &self.work.normalized, &mut *output, 1024,
+                        tensor, &self.work.normalized, &mut *output, 1024, n,
                     )?
                 } else {
                     false
@@ -476,7 +477,7 @@ impl CudaBackend {
                 }
             }
             let fused_head_rope = if cfg!(feature = "cuda-qwen3-prefill-fused-head-rope-research")
-                && n == 512
+                && n >= 384
                 && position == 0
                 && dim == 128
                 && s.rotary_dim == 128
@@ -597,8 +598,8 @@ impl CudaBackend {
                 && (256..=512).contains(&n)
                 && n % 2 == 0
                 && (s.info.architecture != "llama"
-                    || n == 512
-                    || (n == 256 && cfg!(feature = "cuda-llama-batched-attention-256-research")))
+                    || cfg!(feature = "cuda-llama-batched-attention-256-research")
+                    || n >= 384)
                 && self.functions.contains_key("qwen3_batched_causal_softmax")
             {
                 #[cfg(any(
@@ -607,9 +608,9 @@ impl CudaBackend {
                 ))]
                 {
                     let llama_grouped = (heads, dim, kv_heads) == (32, 64, 8)
-                        && (n == 512 || (n == 256 && cfg!(feature = "cuda-llama-grouped-prefill-256-research")))
+                        && (n >= 384 || cfg!(feature = "cuda-llama-grouped-prefill-256-research"))
                         && self.functions.contains_key("llama_grouped_causal_softmax");
-                    let qwen3_grouped = (n, heads, dim, kv_heads) == (512, 16, 128, 8)
+                    let qwen3_grouped = n >= 384 && (heads, dim, kv_heads) == (16, 128, 8)
                         && self.functions.contains_key("qwen3_grouped_causal_softmax");
                     let grouped = llama_grouped || qwen3_grouped;
                     let softmax = if grouped {
@@ -634,9 +635,8 @@ impl CudaBackend {
                         grouped,
                         match (s.info.architecture.as_str(), heads, dim) {
                             ("llama", 32, 64) => cfg!(feature = "cuda-llama-batched-attention-tf32-research")
-                                && (n == 512
-                                    || (n == 256 && cfg!(feature = "cuda-llama-batched-attention-256-research"))),
-                            ("qwen3", 16, 128) => n == 512 && cfg!(feature = "cuda-qwen3-batched-attention-tf32-research"),
+                                && (n >= 384 || cfg!(feature = "cuda-llama-batched-attention-256-research")),
+                            ("qwen3", 16, 128) => n >= 384 && cfg!(feature = "cuda-qwen3-batched-attention-tf32-research"),
                             _ => false,
                         },
                     )?;
@@ -872,7 +872,7 @@ impl CudaBackend {
                 .ffn_mmq
                 .as_mut()
                 .filter(|_| !cfg!(feature = "cuda-llama-prefill-qo-single-term-research")
-                    && position == 0 && n == 512 && ffn_mmq::supports_attention(t, 2048))
+                    && position == 0 && (384..=512).contains(&n) && ffn_mmq::supports_attention(t, 2048))
             {
                 mmq.pack(&self.stream, &self.work.attended, t.width, n)?;
                 mmq.project(&self.stream, t, &mut self.work.projected, n)?;
@@ -883,11 +883,12 @@ impl CudaBackend {
             #[cfg(not(feature = "cuda-llama-attn-mmq-joined-research"))]
             let mmq_output = false;
             #[cfg(feature = "cuda-qwen3-prefill-output-weight-only-research")]
-            let weight_only_output = if !mmq_output && position == 0 && n == 512
+            let weight_only_output = if !mmq_output && position == 0 && (384..=512).contains(&n)
+                && n % 128 == 0
                 && let Some(fp16) = self.fp16.as_mut()
             {
                 fp16.project_qwen3_attention_weights(
-                    t, &self.work.attended, &mut self.work.projected, 2048,
+                    t, &self.work.attended, &mut self.work.projected, 2048, n,
                 )?
             } else {
                 false
@@ -1192,9 +1193,9 @@ impl CudaBackend {
             #[cfg(feature = "cuda-llama-ffn-mmq-research")]
             let projected_gate_up = if let Some(mmq) = self.ffn_mmq.as_mut().filter(|_| use_mmq) {
                 if cfg!(feature = "cuda-llama-prefill-fp16-gate-up-research")
-                    && (n == 512
-                        || (n == 46 && cfg!(feature = "cuda-llama-prefill-fp16-gate-up-46-research"))
-                        || (n == 256 && cfg!(feature = "cuda-llama-prefill-fp16-gate-up-256-research")))
+                    && (n >= 384
+                        || (n >= 128 && cfg!(feature = "cuda-llama-prefill-fp16-gate-up-256-research"))
+                        || (n >= 32 && cfg!(feature = "cuda-llama-prefill-fp16-gate-up-46-research")))
                 {
                     #[cfg(feature = "cuda-llama-prefill-fp16-gate-up-research")]
                     self.fp16

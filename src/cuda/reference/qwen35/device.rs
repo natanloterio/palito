@@ -82,7 +82,7 @@ impl Drop for Hybrid {
 }
 
 #[cfg(feature = "cuda-qwen35-recurrent-gdn-512-research")]
-type GdnLaunch = unsafe extern "C" fn(sys::CUstream, u64, u64, u64, u64, u64, u64, u64, u64) -> i32;
+type GdnLaunch = unsafe extern "C" fn(sys::CUstream, u64, u64, u64, u64, u64, u64, u64, u64, i32) -> i32;
 
 #[cfg(feature = "cuda-qwen35-recurrent-gdn-512-research")]
 struct Gdn512 {
@@ -112,7 +112,7 @@ impl Gdn512 {
     fn open(stream: &Arc<CudaStream>) -> Result<Self> {
         let library = unsafe { libloading::Library::new("libli_qwen35_gdn_research.so") }
             .map_err(failure)?;
-        let launch = unsafe { *library.get::<GdnLaunch>(b"li_qwen35_gdn_512\0").map_err(failure)? };
+        let launch = unsafe { *library.get::<GdnLaunch>(b"li_qwen35_gdn_chunk\0").map_err(failure)? };
         Ok(Self {
             _library: library,
             stream: stream.clone(),
@@ -123,7 +123,7 @@ impl Gdn512 {
         })
     }
 
-    fn run(&mut self, work: &mut Work, state: &mut CudaSlice<f32>) -> Result<()> {
+    fn run(&mut self, work: &mut Work, state: &mut CudaSlice<f32>, n: i32) -> Result<()> {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         let stream = &self.stream;
         stream.context().bind_to_thread().map_err(failure)?;
@@ -136,7 +136,7 @@ impl Gdn512 {
         let (state_in, _in) = self.state_in.device_ptr_mut(stream);
         let (state_out, _state_out) = self.state_out.device_ptr_mut(stream);
         let status = unsafe {
-            (self.launch)(stream.cu_stream(), qkv, decay, beta, state, out, logs, state_in, state_out)
+            (self.launch)(stream.cu_stream(), qkv, decay, beta, state, out, logs, state_in, state_out, n)
         };
         if status != 0 {
             return Err(failure(format!("Qwen3.5 GDN launch: CUDA status {status}")));
@@ -1670,8 +1670,8 @@ impl Hybrid {
                     launch!(self, "qwen35_delta_gates", (n as u32, 1, 1); GROUPS as u32,
                         &mut self.work.alpha, &mut self.work.beta, &dt.bytes, &decay.bytes);
                     #[cfg(feature = "cuda-qwen35-recurrent-gdn-512-research")]
-                    let gdn_used = if let Some(gdn) = self.gdn.as_mut().filter(|_| n == 512) {
-                        gdn.run(&mut self.work, state)?;
+                    let gdn_used = if let Some(gdn) = self.gdn.as_mut().filter(|_| (128..=512).contains(&n)) {
+                        gdn.run(&mut self.work, state, n)?;
                         true
                     } else {
                         false

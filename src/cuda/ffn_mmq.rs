@@ -164,7 +164,11 @@ impl ReplayKernel {
         let valid_shape = matches!(
             (weight.kind, weight.width, weight.rows),
             (8, 2048, 8192) | (8, 8192, 2048)
-        ) || (n >= 256 && supports_attention(weight, weight.rows));
+        ) || (supports_attention(weight, weight.rows)
+            && (n >= 256
+                || (cfg!(feature = "cuda-llama-short-qo-mmq-research")
+                    && (32..128).contains(&n)
+                    && weight.rows == 2048)));
         if !valid_shape
             || weight.bytes.len() < (weight.width * weight.rows / 32 * 34) as usize
             || !supports_chunk(n)

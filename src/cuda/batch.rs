@@ -377,7 +377,17 @@ impl CudaBackend {
             #[cfg(not(feature = "cuda-llama-attn-mmq-joined-research"))]
             let mmq_qkv = false;
             #[cfg(feature = "cuda-llama-attn-mmq-joined-research")]
-            if let Some(mmq) = self.ffn_mmq.as_mut().filter(|_| mmq_qkv) {
+            let short_qo_mmq = cfg!(feature = "cuda-llama-short-qo-mmq-research")
+                && position == 0
+                && (32..128).contains(&n);
+            #[cfg(feature = "cuda-llama-attn-mmq-joined-research")]
+            let short_q_mmq = short_qo_mmq
+                && self.ffn_mmq.is_some()
+                && ffn_mmq::supports_attention(&l.q, 2048);
+            #[cfg(not(feature = "cuda-llama-attn-mmq-joined-research"))]
+            let short_q_mmq = false;
+            #[cfg(feature = "cuda-llama-attn-mmq-joined-research")]
+            if let Some(mmq) = self.ffn_mmq.as_mut().filter(|_| mmq_qkv || short_q_mmq) {
                 mmq.pack(&self.stream, &self.work.normalized, l.q.width, n)?;
             }
             if !mmq_qkv
@@ -396,8 +406,10 @@ impl CudaBackend {
             .enumerate()
             {
                 let (projection, row_tile, token_tile) = dense_projection(tensor);
-                let mmq_component = mmq_qkv
-                    && !(component == 0 && cfg!(feature = "cuda-llama-prefill-qo-single-term-research"));
+                let mmq_component = (short_q_mmq && component == 0)
+                    || (mmq_qkv
+                        && !(component == 0
+                            && cfg!(feature = "cuda-llama-prefill-qo-single-term-research")));
                 #[cfg(feature = "cuda-llama-attn-mmq-joined-research")]
                 if let Some(mmq) = self.ffn_mmq.as_mut().filter(|_| mmq_component) {
                     mmq.project(&self.stream, tensor, &mut *output, n)?;
@@ -871,8 +883,10 @@ impl CudaBackend {
             let mmq_output = if let Some(mmq) = self
                 .ffn_mmq
                 .as_mut()
-                .filter(|_| !cfg!(feature = "cuda-llama-prefill-qo-single-term-research")
-                    && position == 0 && (384..=512).contains(&n) && ffn_mmq::supports_attention(t, 2048))
+                .filter(|_| (short_qo_mmq
+                    || (!cfg!(feature = "cuda-llama-prefill-qo-single-term-research")
+                        && position == 0 && (384..=512).contains(&n)))
+                    && ffn_mmq::supports_attention(t, 2048))
             {
                 mmq.pack(&self.stream, &self.work.attended, t.width, n)?;
                 mmq.project(&self.stream, t, &mut self.work.projected, n)?;

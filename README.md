@@ -1046,6 +1046,9 @@ bytes. Use the same local CUDA research bridge built with joined support.
 Q/K/V and attention output on initial chunks of 384–512 tokens of the same
 Llama fixture. Q/K/V share their activation pack. This uses the existing
 Joined-N scratch and does not change attention, KV cache, or decode.
+`cuda-llama-short-qo-mmq-research` uses the same corrected two-plane
+projection for Q and attention output on compatible initial 32–127-token
+chunks. K/V stay on their existing paths in that range.
 `cuda-llama-prefill-last-ffn-research` runs the final layer's FFN for only
 the last token of an initial 512-token chunk that emits logits. It still
 writes every attention KV entry and uses the existing corrected Q8_0

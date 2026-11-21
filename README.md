@@ -1274,7 +1274,8 @@ path for short chunks of 32–127 tokens.
 `cuda-qwen35-qkv-single-term-short-research` enables it for chunks of
 32–127 tokens without changing FFN down.
 `cuda-qwen3-fp16-down-single-term-research` uses the leading FP16 weight term
-for the dense Qwen3 3072-to-1024 weight-only FFN down path at 512 tokens.
+for the dense Qwen3 3072-to-1024 weight-only FFN down path on complete
+128-token tiles.
 `cuda-llama-batched-attention-256-research` extends the Llama batched attention
 path to the initial 256-token chunk. It uses TF32 only for the value product
 and retains F32 KV storage and pedantic F32 scores.

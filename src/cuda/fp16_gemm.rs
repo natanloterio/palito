@@ -340,7 +340,7 @@ impl Prefill {
                     && cfg!(feature = "cuda-qwen3-prefill-gate-up-single-term-research")
                     && qwen3_weight_only
                     && (t.kind, t.width, t.rows) == (12, 1024, 3072))
-                || (n >= 384 && n % 128 == 0
+                || (n >= 128 && n % 128 == 0
                     && cfg!(feature = "cuda-qwen3-fp16-down-single-term-research")
                     && qwen3_weight_only
                     && matches!((t.kind, t.width, t.rows), (12 | 14, 3072, 1024)))

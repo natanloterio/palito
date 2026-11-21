@@ -164,6 +164,34 @@ impl Prefill {
         Ok(())
     }
 
+    #[cfg(feature = "cuda-llama-short-kv-fp16-research")]
+    pub(super) fn project_q8_kv(
+        &mut self,
+        x: &CudaSlice<f32>,
+        k: &DeviceTensor,
+        v: &DeviceTensor,
+        k_out: &mut CudaSlice<f32>,
+        v_out: &mut CudaSlice<f32>,
+        n: i32,
+    ) -> Result<bool> {
+        let (Some([kh, kl]), Some([vh, vl])) = (k.fp16.as_ref(), v.fp16.as_ref()) else {
+            return Ok(false);
+        };
+        if [(k.kind, k.width, k.rows), (v.kind, v.width, v.rows)] != [(8, 2048, 512); 2] {
+            return Ok(false);
+        }
+        let count = k.width * n;
+        if x.len() < count as usize {
+            return Err(invalid("invalid FP16 Q8 K/V activation size"));
+        }
+        expand(&self.gemm.stream, &self.expand, x, 0, &mut self.x[0], count, false)?;
+        for (high, low, out) in [(kh, kl, k_out), (vh, vl, v_out)] {
+            self.gemm.project(high, &self.x[0], out, k.width, k.rows, n, 1.0, 0.0)?;
+            self.gemm.project(low, &self.x[0], out, k.width, k.rows, n, 1.0 / 1024.0, 1.0)?;
+        }
+        Ok(true)
+    }
+
     #[cfg(feature = "cuda-qwen35-ffn-weight-only-research")]
     pub(super) fn with_hybrid_ffn_weight_only(mut self) -> Self {
         self.hybrid_ffn_weight_only = true;

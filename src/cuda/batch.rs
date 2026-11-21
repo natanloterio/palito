@@ -390,6 +390,16 @@ impl CudaBackend {
             if let Some(mmq) = self.ffn_mmq.as_mut().filter(|_| mmq_qkv || short_q_mmq) {
                 mmq.pack(&self.stream, &self.work.normalized, l.q.width, n)?;
             }
+            #[cfg(feature = "cuda-llama-short-kv-fp16-research")]
+            let short_kv_fp16 = if short_q_mmq && let Some(fp16) = self.fp16.as_mut() {
+                fp16.project_q8_kv(
+                    &self.work.normalized, &l.k, &l.v, &mut self.work.k, &mut self.work.v, n,
+                )?
+            } else {
+                false
+            };
+            #[cfg(not(feature = "cuda-llama-short-kv-fp16-research"))]
+            let short_kv_fp16 = false;
             if !mmq_qkv
                 && [&l.q, &l.k, &l.v]
                     .iter()
@@ -433,7 +443,7 @@ impl CudaBackend {
                 };
                 #[cfg(not(feature = "cuda-qwen3-prefill-kv-weight-only-research"))]
                 let qkv_weight_only = false;
-                if mmq_component || qkv_weight_only
+                if mmq_component || (short_kv_fp16 && component != 0) || qkv_weight_only
                     || try_corrected_fp16!(self, tensor, normalized, &mut *output, n)
                 {
                 } else if residual_projection(matmul, tensor, n, packed_llama) {

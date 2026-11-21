@@ -1052,9 +1052,9 @@ Joined-N scratch and does not change attention, KV cache, or decode.
 projection for Q and attention output on compatible initial 32–127-token
 chunks. K/V stay on their existing paths in that range.
 `cuda-llama-prefill-last-ffn-research` runs the final layer's FFN for only
-the last token of an initial 512-token chunk that emits logits. It still
+the last token of an initial chunk of at least 32 tokens that emits logits. It still
 writes every attention KV entry and uses the existing corrected Q8_0
-matvecs for that final row. Diagnostic captures, shorter chunks, and decode
+matvecs for that final row. Diagnostic captures, smaller chunks, and decode
 keep their existing paths.
 `cuda-llama-prefill-fp16-gate-up-research` replaces Joined-N only for the
 batched Q8_0 gate and up projections of initial Llama chunks of 384–512 tokens.

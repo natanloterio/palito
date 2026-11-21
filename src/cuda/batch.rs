@@ -978,7 +978,7 @@ impl CudaBackend {
             #[cfg(feature = "cuda-llama-prefill-last-ffn-research")]
             if output_logits
                 && position == 0
-                && n == 512
+                && n >= 32
                 && index + 1 == self.weights.layers.len()
                 && self.diagnostic.is_none()
                 && s.info.architecture == "llama"

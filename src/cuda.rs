@@ -950,7 +950,11 @@ impl CudaBackend {
                 include_str!("cuda/residual_tile.cu")
             ),
             CudaMatmul::ResidualMma3Research | CudaMatmul::Int8Prefill => format!(
-                "{source}\n{}\n{}\n{}\n{}\n{}",
+                // Expert C3 MMQ, Qwen3-30B 2.9k prompt: NVRTC 12.8 PTX is fastest with
+                // 2 blocks/SM (348 ms TTFT; 1 block 374 ms), NVRTC 13.3 spills 3.7x
+                // more at 128 registers (420 ms) and is fastest with 1 block (352 ms).
+                "#define MMQ_C3_GROUPED_BLOCKS {}\n{source}\n{}\n{}\n{}\n{}\n{}",
+                if cache::nvrtc_version()?.0 >= 13 { 1 } else { 2 },
                 include_str!("cuda/residual.cu"),
                 include_str!("cuda/residual_precise.cu"),
                 include_str!("cuda/residual_mma.cu"),

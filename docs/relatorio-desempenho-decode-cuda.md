@@ -312,3 +312,5 @@ Prompt de 2.863 tokens, Qwen3-30B-A3B Q4_K_M, RTX 5090. O llama.cpp faz 0,18 s.
 Validação: mesmos 32 tokens do F32 nos prompts curto e longo; texto real de 256 tokens com max_abs 0,092 e cos 0,9999981; MoE long600 com chunks 64/512/600 com max_abs ≤ 0,055; 15 testes CUDA; `f32` e `f32-tiled` inalterados; decode ~373 tok/s.
 
 Descartado: KS 128 nos tiles de 64 tokens, KS 64/256 nos experts, attention pré-convertida com 4 warps.
+
+**0.2.4 — NVRTC 13.** O pacote Linux leva o NVRTC 13.3, e com ele o TTFT era 0,42 s: o kernel dos experts (`mmq_c3_grouped`) fazia 3,7 vezes mais spill de registradores com o limite de 128 registros de 2 blocos por SM. As medições acima usaram o NVRTC 12.8 do sistema, carregado pelo nome `libnvrtc.so`. Agora esse kernel usa 1 bloco por SM quando o NVRTC é 13 ou maior: 0,35 s com as duas versões, mesmos tokens e mesmos gates.

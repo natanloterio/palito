@@ -285,7 +285,10 @@ impl Prefill {
         let hybrid_down = false;
         let hybrid_output = cfg!(feature = "cuda-qwen35-output-weight-only-research")
             && self.hybrid_ffn_weight_only
-            && (n >= 384 || (n >= 128 && cfg!(feature = "cuda-qwen35-output-single-term-256-research")))
+            && (n >= 384
+                || (n >= 128 && cfg!(feature = "cuda-qwen35-output-single-term-256-research"))
+                || ((32..128).contains(&n)
+                    && cfg!(feature = "cuda-qwen35-output-single-term-short-research")))
             && matches!((t.kind, t.width, t.rows), (12..=14, 2048, 1024));
         if qwen3_weight_only
             || hybrid_ffn

@@ -1265,6 +1265,8 @@ projections, also only at 512 tokens.
 `cuda-qwen35-output-single-term-research` further uses just the leading FP16
 weight term for those same mixer outputs at 512 tokens.
 `cuda-qwen35-output-single-term-256-research` also applies it at 256 tokens.
+`cuda-qwen35-output-single-term-short-research` adds the same mixer-output
+path for short chunks of 32–127 tokens.
 `cuda-qwen35-qkv-single-term-research` uses one FP16 weight term for the
 1024-to-6144 recurrent mixer QKV projection at 512 tokens.
 `cuda-qwen35-qkv-single-term-256-research` also applies it at 256 tokens.

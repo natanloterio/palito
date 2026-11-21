@@ -82,6 +82,7 @@ cuda-qwen35-ffn-down-single-term-research = ["cuda-qwen35-down-weight-only-resea
 cuda-qwen35-output-weight-only-research = ["cuda-qwen35-ffn-weight-only-research"]
 cuda-qwen35-output-single-term-research = ["cuda-qwen35-output-weight-only-research"]
 cuda-qwen35-output-single-term-256-research = ["cuda-qwen35-output-single-term-research"]
+cuda-qwen35-output-single-term-short-research = ["cuda-qwen35-output-single-term-research"]
 cuda-qwen35-qkv-single-term-research = ["cuda-qwen35-qkv-weight-only-research"]
 cuda-qwen35-qkv-single-term-256-research = ["cuda-qwen35-qkv-single-term-research", "cuda-qwen35-qkv-down-weight-only-256-research"]
 cuda-qwen35-ffn-down-single-term-256-research = ["cuda-qwen35-ffn-down-single-term-research", "cuda-qwen35-qkv-down-weight-only-256-research"]

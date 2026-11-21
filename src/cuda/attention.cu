@@ -630,6 +630,145 @@ extern "C" __global__ void attention_split_group_decode(const float *q, const fl
     attention_split_group_impl(q, keys, values, partial, dim, heads, kv_heads, control[1] + 1);
 }
 
+// Causal prefill attention (flash style) for dim == 128 and GQA groups <= 8:
+// grid = (kv_heads, ceil(tokens / PREFILL_TOKENS)), block = 32 * PREFILL_TOKENS.
+// Warp w owns token blockIdx.y * PREFILL_TOKENS + w and all `group` query heads of
+// the block's KV head, so every K/V tile staged in shared memory serves
+// PREFILL_TOKENS * group query rows. Scores: lane j scores key j of a 32-key tile
+// for all rows; online softmax per row; values: lane l owns dims 4l..4l+3. Token t
+// sees count + t keys, matching attention_fused.
+#define PREFILL_TOKENS 4
+#define PREFILL_KEYS 32
+#define PREFILL_STRIDE 132
+
+// Warps = PREFILL_TOKENS * Split: Split warps share a token, each owning
+// ceil(group / Split) of its query rows (fewer rows per warp, more warps per SM).
+template<int Split>
+__device__ __forceinline__ void attention_prefill_flash_impl(
+    const float *q, const float *keys, const float *values, float *output, int heads,
+    int kv_heads, int tokens, int count) {
+    constexpr int ROWS = ATTENTION_GROUP_MAX / Split;
+    __shared__ __align__(16) float tile[PREFILL_KEYS * PREFILL_STRIDE];
+    __shared__ __align__(16) float query[PREFILL_TOKENS][ATTENTION_GROUP_MAX][ATTENTION_KV_DIM];
+    __shared__ float probability[PREFILL_TOKENS][ATTENTION_GROUP_MAX][PREFILL_KEYS];
+    const int dim = ATTENTION_KV_DIM;
+    int kv_head = blockIdx.x, group = heads / kv_heads;
+    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    int local = warp / Split, part = warp % Split;
+    int per = (group + Split - 1) / Split, row0 = part * per;
+    int first = blockIdx.y * PREFILL_TOKENS, token = first + local;
+    bool active = token < tokens;
+    int limit = active ? count + token : 0;
+    int last = min(tokens - 1, first + PREFILL_TOKENS - 1);
+    int span = count + last;
+    for (int i = threadIdx.x; i < PREFILL_TOKENS * group * (dim / 4); i += blockDim.x) {
+        int t = i / (group * (dim / 4)), rest = i % (group * (dim / 4));
+        int r = rest / (dim / 4), c = rest % (dim / 4);
+        float4 v = first + t < tokens
+            ? *(const float4 *)(q + ((u64)(first + t) * heads + kv_head * group + r) * dim + 4 * c)
+            : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        *(float4 *)&query[t][r][4 * c] = v;
+    }
+    float maximum[ROWS], total[ROWS];
+    float4 acc[ROWS];
+    #pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        maximum[r] = -__int_as_float(0x7f800000);
+        total[r] = 0.0f;
+        acc[r] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    float scale = sqrtf((float)dim);
+    for (int base = 0; base < span; base += PREFILL_KEYS) {
+        int n = min(PREFILL_KEYS, span - base);
+        __syncthreads();
+        for (int i = threadIdx.x; i < PREFILL_KEYS * dim / 4; i += blockDim.x) {
+            int key = i / (dim / 4), c = i % (dim / 4);
+            float4 v = key < n ? *(const float4 *)(keys + ((u64)(base + key) * kv_heads + kv_head)
+                                                   * dim + 4 * c)
+                               : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            *(float4 *)&tile[key * PREFILL_STRIDE + 4 * c] = v;
+        }
+        __syncthreads();
+        if (base < limit) {
+            float score[ROWS];
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) score[r] = 0.0f;
+            for (int d = 0; d < dim; d += 4) {
+                float4 k = *(const float4 *)&tile[lane * PREFILL_STRIDE + d];
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) {
+                    if (r < per && row0 + r < group) {
+                        float4 x = *(const float4 *)&query[local][row0 + r][d];
+                        score[r] += x.x * k.x + x.y * k.y + x.z * k.z + x.w * k.w;
+                    }
+                }
+            }
+            bool valid = base + lane < limit;
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                if (r < per && row0 + r < group) {
+                    float s = valid ? score[r] / scale : -__int_as_float(0x7f800000);
+                    float step = s;
+                    #pragma unroll
+                    for (int offset = 16; offset > 0; offset /= 2)
+                        step = fmaxf(step, __shfl_xor_sync(0xffffffff, step, offset));
+                    float updated = fmaxf(maximum[r], step);
+                    float rescale = expf(maximum[r] - updated);
+                    float p = valid ? expf(s - updated) : 0.0f;
+                    total[r] = total[r] * rescale + warp_sum(p);
+                    maximum[r] = updated;
+                    acc[r].x *= rescale;
+                    acc[r].y *= rescale;
+                    acc[r].z *= rescale;
+                    acc[r].w *= rescale;
+                    probability[local][row0 + r][lane] = p;
+                }
+            }
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < PREFILL_KEYS * dim / 4; i += blockDim.x) {
+            int key = i / (dim / 4), c = i % (dim / 4);
+            float4 v = key < n ? *(const float4 *)(values + ((u64)(base + key) * kv_heads + kv_head)
+                                                   * dim + 4 * c)
+                               : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            *(float4 *)&tile[key * PREFILL_STRIDE + 4 * c] = v;
+        }
+        __syncthreads();
+        if (base < limit) {
+            int keys_here = min(n, limit - base);
+            for (int j = 0; j < keys_here; j++) {
+                float4 v = *(const float4 *)&tile[j * PREFILL_STRIDE + 4 * lane];
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) {
+                    if (r < per && row0 + r < group) {
+                        float p = probability[local][row0 + r][j];
+                        acc[r].x += p * v.x;
+                        acc[r].y += p * v.y;
+                        acc[r].z += p * v.z;
+                        acc[r].w += p * v.w;
+                    }
+                }
+            }
+        }
+    }
+    if (!active) return;
+    #pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        if (r < per && row0 + r < group) {
+            float4 v = make_float4(acc[r].x / total[r], acc[r].y / total[r], acc[r].z / total[r],
+                                   acc[r].w / total[r]);
+            *(float4 *)(output + ((u64)token * heads + kv_head * group + row0 + r) * dim
+                        + 4 * lane) = v;
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128 * PREFILL_TOKENS)
+attention_prefill_flash4(const float *q, const float *keys, const float *values, float *output,
+                         int heads, int kv_heads, int tokens, int count) {
+    attention_prefill_flash_impl<4>(q, keys, values, output, heads, kv_heads, tokens, count);
+}
+
 // Combine for the chunked split passes, parallel over chunks: grid=(heads),
 // block=256, dim % 4 == 0 and dim <= 128. Warp w accumulates chunks w, w + 8, ...
 // with float4 loads; partials are reduced in shared memory.

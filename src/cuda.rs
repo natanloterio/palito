@@ -906,7 +906,8 @@ impl CudaBackend {
         };
         let source = if options.matmul.f32_tiled() {
             format!(
-                "#define CUDA_PACKED_DECODE 1\n#define CUDA_REGISTER_PREFILL 1\n#define CUDA_NATIVE_HALF 1\n{source}"
+                "#define CUDA_PACKED_DECODE 1\n#define CUDA_REGISTER_PREFILL 1\n#define CUDA_NATIVE_HALF 1\n{source}\n{}",
+                include_str!("cuda/gemm.cu")
             )
         } else {
             source
@@ -1025,6 +1026,10 @@ impl CudaBackend {
                 "attention_split_head_decode",
                 "attention_split_group",
                 "attention_split_group_decode",
+                "attention_prefill_flash4",
+                "gemm_packed_dense",
+                "gemm_packed_grouped",
+                "group_experts_fast32",
                 "attention_combine_group",
                 "attention_combine_group_decode",
                 "attention_combine_wide",

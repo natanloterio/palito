@@ -44,9 +44,10 @@ struct Session {
     max_tokens: u32,
 }
 
-pub(crate) fn run(args: ChatArgs) -> Result<()> {
+pub(crate) fn run(mut args: ChatArgs) -> Result<()> {
     let start = Instant::now();
-    let mut session = Session::open(&args)?;
+    args.runtime.use_fast_cuda_defaults();
+    let mut session = Session::open(&mut args)?;
     let interactive = std::io::stdin().is_terminal();
     if interactive {
         eprintln!(
@@ -86,13 +87,13 @@ pub(crate) fn run(args: ChatArgs) -> Result<()> {
 }
 
 impl Session {
-    fn open(args: &ChatArgs) -> Result<Self> {
-        let runtime = &args.runtime;
+    fn open(args: &mut ChatArgs) -> Result<Self> {
         let override_source = match &args.chat_template_file {
             Some(path) => Some(fs::read_to_string(path)?),
             None => None,
         };
-        let backend = runtime.open()?;
+        let backend = open_backend(&mut args.runtime)?;
+        let runtime = &args.runtime;
         let tokenizer_adds_bos = !backend.tokenize("")?.is_empty();
         let template = ChatTemplate::from_model(
             &runtime.model,
@@ -140,6 +141,20 @@ impl Session {
     fn prompt_tokens(&self, messages: &[Message]) -> Result<Vec<i32>> {
         self.executor
             .tokenize(&self.template.render(messages, true)?)
+    }
+}
+
+/// Opens the backend; if only the implicit decode graph fails (unsupported
+/// architecture or shape), retries without it instead of refusing to chat.
+fn open_backend(runtime: &mut RuntimeArgs) -> Result<Box<dyn Backend>> {
+    match runtime.open() {
+        #[cfg(feature = "cuda")]
+        Err(error) if runtime.implicit_decode_graph() => {
+            eprintln!("(decode graph unavailable: {error}; continuing without it)");
+            runtime.disable_implicit_decode_graph();
+            runtime.open()
+        }
+        result => result,
     }
 }
 

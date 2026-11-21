@@ -219,3 +219,34 @@ Tudo continua no perfil opt-in `--cuda-matmul f32-tiled`, com aritmética F32 e 
 
 - **Prefill de prompts longos** (TTFT): o caminho de prefill de attention (`attention_scores`/`attention_values`) é muito lento em ~3k tokens. É o próximo alvo.
 - O `chat` ainda usa o perfil `f32` por padrão. O `f32-tiled` com grafo precisa de flag.
+
+## 10. Prefill (TTFT) de prompts longos
+
+Prompt de 2.863 tokens no Qwen3-30B-A3B, RTX 5090, perfil `f32-tiled`, tempo até o primeiro token:
+
+| Etapa | TTFT |
+|---|---|
+| início (chunk 64, attention `attention_scores`/`attention_values`) | 14,0 s |
+| attention de prefill estilo flash (`attention_prefill_flash4`) | 7,2 s |
+| chunks de 512 tokens (padrão do `chat` em CUDA `f32-tiled`) | 2,8 s |
+| GEMM empacotada com blocagem em registradores (`gemm.cu`) | 1,24 s |
+| GEMM com K=16 e double buffering, agrupamento de experts paralelo | **~1,06 s** |
+| llama.cpp (MMQ int8 em tensor cores) | 0,18 s |
+
+O que entrou:
+
+- **Attention de prefill causal estilo flash.** Um bloco cobre um head KV e 4 tokens, com tiles K/V de 32 chaves em shared memory, que servem os 4 tokens × 8 heads de query. São 4 warps por token, com softmax online.
+- **GEMM F32 para Q4_K/Q6_K.** Tiles de 64×64 (denso) e 64×32 (experts), com 4×4 acumuladores por thread e K=16. Os bytes do tile seguinte são lidos para registradores enquanto o tile atual é calculado. A decodificação usa a mesma aritmética de `projection_weights`, e cada saída soma K em ordem crescente, então os experts dão resultado bit a bit igual ao kernel anterior.
+- **Agrupamento de experts paralelo** (`group_experts_fast32`): `__match_any_sync` mais prefixos por warp. São 52 ms a menos e o layout dos descritores é idêntico.
+- **`chat` em CUDA:** usa por padrão `f32-tiled` com o grafo de decode e chunks de 512 tokens. Para voltar ao comportamento antigo, use `--cuda-matmul f32`, `--no-cuda-decode-graph`, `--prefill-chunk` e `--batch`.
+
+Tentado e descartado: tiles maiores (128×64 e 128×128 no denso, 128×32 e 64×32 com 8×4 nos experts) e K de 8, 32 ou 64. Todos foram mais lentos.
+
+Validação:
+
+- gate de logits nos 20 casos;
+- gate novo de 600 tokens com chunks de 64 e 512, max_abs ≤ 0,00003;
+- IDs gerados idênticos no prompt longo;
+- 15 testes de integração CUDA passam.
+
+**Limite físico em F32.** O prefill desse prompt precisa de ~19 TFLOP nas projeções e ~3,2 TFLOP na attention. Com `fmad` desligado, a 5090 faz ~52 TFLOP/s em F32 nos CUDA cores, o que dá um piso teórico de ~0,45 s. Chegar aos 0,18 s do llama.cpp exige tensor cores, seja com ativações int8 (q8_1), seja com TF32 em três produtos. Isso é uma decisão de precisão.

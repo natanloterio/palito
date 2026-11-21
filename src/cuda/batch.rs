@@ -13,6 +13,15 @@ fn reference_dense_shape(
         && matches!((width, rows), (2048, 4096) | (4096, 2048) | (2048, 512))
 }
 
+/// Register-blocked packed GEMM (gemm.cu): tiled profile, K-quant rows, enough
+/// tokens to fill 64-token tiles.
+fn packed_gemm_shape(matmul: CudaMatmul, tensor: &DeviceTensor, tokens: i32) -> bool {
+    matmul.f32_tiled()
+        && tokens >= 64
+        && matches!(tensor.kind, 12 | 14)
+        && tensor.width % 256 == 0
+}
+
 fn residual_projection(matmul: CudaMatmul, tensor: &DeviceTensor, tokens: i32) -> bool {
     matmul.residual_components() > 0
         && tokens >= matmul.residual_min_tokens() as i32
@@ -194,7 +203,9 @@ impl CudaBackend {
         };
         let matmul = self.matmul;
         let dense_projection = |t: &DeviceTensor| {
-            if reference_dense_shape(matmul, t.kind, t.width, t.rows, n) {
+            if packed_gemm_shape(matmul, t, n) {
+                ("gemm_packed_dense", 64, 64)
+            } else if reference_dense_shape(matmul, t.kind, t.width, t.rows, n) {
                 ("prefill_matmul_ref2x16", 2, 16)
             } else {
                 (projection, row_tile, token_tile)
@@ -289,7 +300,9 @@ impl CudaBackend {
                         .all(|t| matches!(t.kind, 12 | 14))
                 });
             let (grouped_projection, group_row_tile, group_tile, group_threads) =
-                if register_groups || integer_groups {
+                if register_groups {
+                    ("gemm_packed_grouped", 64, 32, 128)
+                } else if register_groups || integer_groups {
                     ("grouped_matmul_unroll8", 32, 32, 128)
                 } else {
                     (grouped_projection, group_row_tile, matmul.group_tile(), 256)
@@ -502,6 +515,29 @@ impl CudaBackend {
                     &mut self.work.attended,
                     &heads,
                     &kv_heads,
+                    &count
+                );
+            } else if self.matmul.f32_tiled()
+                && dim == 128
+                && kv_heads > 0
+                && heads % kv_heads == 0
+                && heads / kv_heads <= 8
+            {
+                // Tiled profile: flash-style prefill attention, K/V tiles shared by
+                // 4 tokens x the GQA group (PREFILL_TOKENS in attention.cu).
+                // 4 warps per token (2 query rows each) measured fastest: 369 -> 260 ms
+                // of attention at 2.9k tokens with 512-token chunks.
+                launch!(
+                    self,
+                    "attention_prefill_flash4",
+                    (kv_heads as u32, (n as u32).div_ceil(4), 1); 512,
+                    &self.work.q,
+                    &self.keys[index],
+                    &self.values[index],
+                    &mut self.work.attended,
+                    &heads,
+                    &kv_heads,
+                    &n,
                     &count
                 );
             } else if fused_attention_supported(s) {
@@ -764,14 +800,17 @@ impl CudaBackend {
                     launch!(self, "group_parallel_emit32", (experts as u32 + 1, 1, 1);32,
                         &self.work.ids, &*counts, &mut *groups, &assignments, &experts, &slots);
                 } else {
+                    // GROUP_FAST_EXPERTS in gemm.cu bounds the parallel grouping.
+                    let (name, threads) = match group_tile {
+                        32 if experts <= 256 => ("group_experts_fast32", 1024),
+                        32 => ("group_experts_reg32", 256),
+                        8 => ("group_experts_tiled", 256),
+                        _ => ("group_experts", 256),
+                    };
                     launch!(
                         self,
-                        match group_tile {
-                            32 => "group_experts_reg32",
-                            8 => "group_experts_tiled",
-                            _ => "group_experts",
-                        },
-                        (1, 1, 1),
+                        name,
+                        (1, 1, 1); threads,
                         &self.work.ids,
                         &mut *groups,
                         &experts,

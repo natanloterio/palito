@@ -1712,11 +1712,9 @@ impl Hybrid {
                     if gdn_used {
                         // The bridge wrote attended output and restored the persistent F32 layout.
                     } else if cfg!(feature = "cuda-qwen35-recurrent-warp-research")
-                        && n >= if cfg!(feature = "cuda-qwen35-short-warp-recurrence-research") {
-                            32
-                        } else {
-                            256
-                        }
+                        && (n >= 256
+                            || (n >= 32 && cfg!(feature = "cuda-qwen35-short-warp-recurrence-research"))
+                            || (n == 1 && cfg!(feature = "cuda-qwen35-decode-warp-recurrence-research")))
                     {
                         let columns =
                             if cfg!(feature = "cuda-qwen35-recurrent-eight-segments-research") {

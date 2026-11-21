@@ -1177,6 +1177,8 @@ products into four warp-reduced partials for chunks of at least 256 tokens.
 It changes the FP32 summation order without changing state layout or decode.
 `cuda-qwen35-short-warp-recurrence-research` lowers the crossover to 32
 tokens. The MMA recurrence, when enabled and eligible, still takes priority.
+`cuda-qwen35-decode-warp-recurrence-research` uses the sharded kernel for
+single-token updates in both eager and graph mode.
 `cuda-qwen35-recurrent-direct-qk-research` reads Q/K directly on that warp
 path instead of staging them in shared memory. It removes the staging
 barriers without changing the warp path's FP32 arithmetic or decode.

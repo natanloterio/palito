@@ -45,26 +45,39 @@ pub enum CudaMatmul {
     /// Research-only three-component integer MMA prefill; no production promotion.
     #[serde(rename = "residual-mma3-research")]
     ResidualMma3Research,
+    /// f32-tiled decode with approximate tensor-core prefill: INT8 MMA projections on
+    /// three-component residual activations and FP16 hi/lo attention. Relaxed gate:
+    /// same argmax, cos >= 0.99999, max_abs <= 0.15 against F32 logits.
+    #[serde(rename = "int8-prefill")]
+    Int8Prefill,
 }
 
 impl CudaMatmul {
     fn f32_tiled(self) -> bool {
         matches!(
             self,
-            Self::F32Tiled | Self::ResidualInt8Research | Self::ResidualMma3Research
+            Self::F32Tiled
+                | Self::ResidualInt8Research
+                | Self::ResidualMma3Research
+                | Self::Int8Prefill
         )
+    }
+
+    /// Prefill through three-component residual INT8 activations and integer MMA.
+    fn integer_mma(self) -> bool {
+        matches!(self, Self::ResidualMma3Research | Self::Int8Prefill)
     }
 
     fn residual_components(self) -> usize {
         match self {
             Self::ResidualInt8Research => 2,
-            Self::ResidualMma3Research => 3,
+            Self::ResidualMma3Research | Self::Int8Prefill => 3,
             _ => 0,
         }
     }
 
     fn residual_min_tokens(self) -> usize {
-        if self == Self::ResidualMma3Research {
+        if self.integer_mma() {
             32
         } else {
             256
@@ -237,7 +250,7 @@ fn residual_workspace_elements(spec: &Spec, matmul: CudaMatmul) -> Result<usize>
         .map(|n| n / 32 * 32)
         .filter(|&n| {
             n <= i32::MAX as usize
-                / if matmul == CudaMatmul::ResidualMma3Research {
+                / if matmul.integer_mma() {
                     3
                 } else {
                     1
@@ -455,7 +468,7 @@ impl Workspace {
             },
             residual_mma3: {
                 let count = residual_workspace_elements(spec, matmul)?;
-                if count == 0 || matmul != CudaMatmul::ResidualMma3Research {
+                if count == 0 || !matmul.integer_mma() {
                     None
                 } else {
                     Some(PreciseWorkspace {
@@ -831,7 +844,7 @@ impl CudaBackend {
                 "residual INT8 research requires compute capability >=6.1",
             ));
         }
-        if options.matmul == CudaMatmul::ResidualMma3Research && major < 8 {
+        if options.matmul.integer_mma() && major < 8 {
             return Err(invalid(
                 "residual MMA3 research requires compute capability >=8.0",
             ));
@@ -889,11 +902,13 @@ impl CudaBackend {
                 include_str!("cuda/residual.cu"),
                 include_str!("cuda/residual_tile.cu")
             ),
-            CudaMatmul::ResidualMma3Research => format!(
-                "{source}\n{}\n{}\n{}",
+            CudaMatmul::ResidualMma3Research | CudaMatmul::Int8Prefill => format!(
+                "{source}\n{}\n{}\n{}\n{}\n{}",
                 include_str!("cuda/residual.cu"),
                 include_str!("cuda/residual_precise.cu"),
-                include_str!("cuda/residual_mma.cu")
+                include_str!("cuda/residual_mma.cu"),
+                include_str!("cuda/mmq.cu"),
+                include_str!("cuda/attention_mma.cu")
             ),
             _ => source,
         };
@@ -1045,6 +1060,17 @@ impl CudaBackend {
             }
             if options.matmul == CudaMatmul::ResidualInt8Research {
                 for name in ["residual_quantize32", "residual_matmul32"] {
+                    functions.insert(name, module.load_function(name).map_err(failure)?);
+                }
+            }
+            if options.matmul == CudaMatmul::Int8Prefill {
+                for name in [
+                    "residual_quantize32_precise3",
+                    "residual_matmul_mmq",
+                    "residual_matmul_mmq16",
+                    "residual_matmul_mmq_grouped",
+                    "attention_prefill_mma",
+                ] {
                     functions.insert(name, module.load_function(name).map_err(failure)?);
                 }
             }

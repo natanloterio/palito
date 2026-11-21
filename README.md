@@ -1474,3 +1474,5 @@ local-inference chat --model /path/to/model.gguf --context 4096
 ```
 
 `LOCAL_INFERENCE_BACKEND`, `LOCAL_INFERENCE_MODEL` and `LOCAL_INFERENCE_CUDA_KERNEL_CACHE` set the defaults, and flags take precedence.
+
+`chat` on CUDA defaults to `--cuda-matmul int8-prefill`: prefill runs on tensor cores (INT8 MMA projections over three-component residual activations, FP16 hi/lo attention) and decode is the `f32-tiled` path. Its logits pass a relaxed gate against the F32 oracle (same argmax, cos >= 0.99999, max_abs <= 0.15; 0.09 on a 256-token real-text prompt). GPUs below sm_80 fall back to `f32-tiled`. Pass `--cuda-matmul f32-tiled` for F32 prefill.

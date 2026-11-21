@@ -50,7 +50,7 @@ fn dense_mma3_splits(width: i32, rows: i32, tokens: i32, scratch_floats: usize) 
 macro_rules! prepare_residual {
     ($backend:ident,$input:expr,$count:expr) => {{
         let count: i32 = $count;
-        if $backend.matmul == CudaMatmul::ResidualMma3Research {
+        if $backend.matmul.integer_mma() {
             let work = $backend
                 .work
                 .residual_mma3
@@ -58,7 +58,7 @@ macro_rules! prepare_residual {
                 .ok_or_else(|| failure("residual MMA3 workspace missing"))?;
             launch!(
                 $backend,
-                "residual_quantize32_precise3",
+"residual_quantize32_precise3",
                 ((count as u32).div_ceil(256), 1, 1),
                 $input,
                 &mut work.values,
@@ -109,7 +109,7 @@ macro_rules! project_residual {
             launch!($backend,"projection_fp16_packed",grid;128,
                 &tensor.bytes,&tensor.kind,$input,$output,&tensor.width,&tensor.rows,
                 &tokens,groups,&used,&grouped,&major,&mut $backend.work.status);
-        } else if $backend.matmul == CudaMatmul::ResidualMma3Research {
+        } else if $backend.matmul.integer_mma() {
             let work = $backend.work.residual_mma3.as_ref()
                 .ok_or_else(||failure("residual MMA3 workspace missing"))?;
             let splits = if cfg!(feature = "cuda-mma3-splitk-research") && grouped == 0 {
@@ -135,7 +135,17 @@ macro_rules! project_residual {
                 launch!($backend,"residual_splitk_reduce",((count as u32).div_ceil(256), 1, 1);256,
                     &*partials,$output,&count_i32,&splits_i32,&mut $backend.work.status);
             } else {
-                let (kernel, grid, threads) = if cfg!(feature = "cuda-mma3-wide-rows-research")
+                let (kernel, grid, threads) = if $backend.matmul == CudaMatmul::Int8Prefill {
+                    let row_tiles = (tensor.rows as u32).div_ceil(128);
+                    let (name, columns) = if grouped != 0 {
+                        ("residual_matmul_mmq_grouped", $slots)
+                    } else if row_tiles * (tokens as u32).div_ceil(64) >= 256 {
+                        ("residual_matmul_mmq", (tokens as u32).div_ceil(64))
+                    } else {
+                        ("residual_matmul_mmq16", (tokens as u32).div_ceil(16))
+                    };
+                    (name, (row_tiles, columns, 1), 256)
+                } else if cfg!(feature = "cuda-mma3-wide-rows-research")
                     && tokens == 512
                     && (grouped != 0 || cfg!(feature = "cuda-mma3-dense-wide-rows-research"))
                 {
@@ -196,7 +206,8 @@ impl CudaBackend {
             ),
             CudaMatmul::F32Tiled
             | CudaMatmul::ResidualInt8Research
-            | CudaMatmul::ResidualMma3Research => {
+            | CudaMatmul::ResidualMma3Research
+            | CudaMatmul::Int8Prefill => {
                 ("prefill_matmul", "grouped_matmul_tiled", 1, 4, 32)
             }
             CudaMatmul::Tf32x3Tiled => ("prefill_matmul", "grouped_matmul_tf32x3_tiled", 1, 4, 128),
@@ -527,10 +538,18 @@ impl CudaBackend {
                 // 4 tokens x the GQA group (PREFILL_TOKENS in attention.cu).
                 // 4 warps per token (2 query rows each) measured fastest: 369 -> 260 ms
                 // of attention at 2.9k tokens with 512-token chunks.
+                // FP16 hi/lo tensor-core attention (int8-prefill) needs GQA group 8.
+                let (name, grid_y, threads) = if self.matmul == CudaMatmul::Int8Prefill
+                    && heads == 8 * kv_heads
+                {
+                    ("attention_prefill_mma", (n as u32).div_ceil(8), 128)
+                } else {
+                    ("attention_prefill_flash4", (n as u32).div_ceil(4), 512)
+                };
                 launch!(
                     self,
-                    "attention_prefill_flash4",
-                    (kv_heads as u32, (n as u32).div_ceil(4), 1); 512,
+                    name,
+                    (kv_heads as u32, grid_y, 1); threads,
                     &self.work.q,
                     &self.keys[index],
                     &self.values[index],

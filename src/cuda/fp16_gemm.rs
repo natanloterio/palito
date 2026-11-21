@@ -258,6 +258,9 @@ impl Prefill {
                     && (t.kind, t.width, t.rows) == (12, 1024, 3072)));
         #[cfg(not(feature = "cuda-qwen3-fp16-down-weight-only-research"))]
         let qwen3_weight_only = false;
+        let short_qwen3_gate_up = cfg!(feature = "cuda-qwen3-short-gate-up-single-term-research")
+            && (32..128).contains(&n)
+            && (t.kind, t.width, t.rows) == (12, 1024, 3072);
         let hybrid_gate_up_short =
             (32..128).contains(&n) && cfg!(feature = "cuda-qwen35-ffn-gate-up-single-term-46-research");
         #[cfg(feature = "cuda-qwen35-ffn-weight-only-research")]
@@ -293,6 +296,7 @@ impl Prefill {
                     && cfg!(feature = "cuda-qwen35-output-single-term-short-research")))
             && matches!((t.kind, t.width, t.rows), (12..=14, 2048, 1024));
         if qwen3_weight_only
+            || short_qwen3_gate_up
             || hybrid_ffn
             || hybrid_qkv
             || hybrid_down
@@ -321,7 +325,8 @@ impl Prefill {
                         || (n >= 128
                             && cfg!(feature = "cuda-qwen35-ffn-gate-up-single-term-256-research"))
                         || hybrid_gate_up_short);
-            if hybrid_gate_up_single_term
+            if short_qwen3_gate_up
+                || hybrid_gate_up_single_term
                 || (cfg!(feature = "cuda-llama-prefill-qo-single-term-research")
                     && n >= 384
                     && (t.kind, t.width, t.rows) == (8, 2048, 2048))

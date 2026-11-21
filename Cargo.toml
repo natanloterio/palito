@@ -117,6 +117,7 @@ cuda-qwen3-prefill-kv-weight-only-research = ["cuda-qwen3-fp16-down-weight-only-
 cuda-qwen3-prefill-q-weight-only-research = ["cuda-qwen3-prefill-kv-weight-only-research"]
 cuda-qwen3-prefill-output-weight-only-research = ["cuda-qwen3-fp16-down-weight-only-research"]
 cuda-qwen3-prefill-gate-up-single-term-research = ["cuda-qwen3-fp16-gate-up-weight-only-research"]
+cuda-qwen3-short-gate-up-single-term-research = ["cuda-qwen3-prefill-gate-up-single-term-research"]
 cuda-llama-prefill-qo-single-term-research = ["cuda-llama-attn-mmq-joined-research", "cuda-llama-attention-projection-weight-only-research"]
 cuda-llama-prefill-fp16-gate-up-256-research = ["cuda-llama-prefill-fp16-gate-up-research", "cuda-llama-ffn-mmq-joined-research"]
 cuda-llama-prefill-fp16-gate-up-46-research = ["cuda-llama-prefill-fp16-gate-up-research"]

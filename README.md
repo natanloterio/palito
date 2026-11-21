@@ -1100,6 +1100,8 @@ same tile-aligned Qwen3 chunks.
 weight term per gate/up projection for complete 128-token tiles, with FP32
 accumulation.
 The low weight term is omitted only for these gate/up projections.
+`cuda-qwen3-short-gate-up-single-term-research` also enables this gate/up
+path for short chunks of 32–127 tokens.
 `cuda-llama-prefill-qo-single-term-research` uses the leading FP16 terms
 and FP32 accumulation for Llama Q and attention output at 512 tokens.
 The initial K/V projections retain both Joined-N planes and F32 cache.

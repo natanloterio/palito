@@ -259,53 +259,66 @@ __device__ __forceinline__ float packed_sum_block(float value) {
 // One warp owns a complete 256-value block, with eight independent K chains.
 // Q4_K blocks are 16-byte aligned; Q6_K's 210-byte stride permits only u16
 // loads. Metadata stays local to the lane, without warp-wide broadcasts.
+// Exact float of an integer in [0, 2^23): avoids the low-throughput I2F conversion.
+__device__ __forceinline__ float small_uint_float(unsigned int value) {
+    return __int_as_float(0x4b000000 | value) - 8388608.0f;
+}
+
+// Accumulates one packed 256-value block (Q4_K or Q6_K) of a row into this lane's
+// eight partial sums; `x` points at the block's first input value.
 template<int Kind>
-__device__ __forceinline__ float packed_lane_span(const u8 *w, const float *x, u64 offset,
-                                                  int width, int lane, int start, int step) {
-    float parts[8] = {};
-    for (int first = start; first < width; first += step) {
-        const u8 *p = w + ((offset + first) / 256) * (Kind == 12 ? 144 : 210);
-        float d = half_value(p + (Kind == 12 ? 0 : 208));
-        if (Kind == 12) {
-            int g = (lane / 8) * 2, col = (lane & 7) * 4;
-            unsigned int q = *(const unsigned int *)(p + 16 + (g / 2) * 32 + col);
-            float dm = half_value(p + 2);
-            const u8 *s = p + 4;
+__device__ __forceinline__ void packed_block_accumulate(const u8 *p, const float *x, int lane,
+                                                        float *parts) {
+    if (Kind == 12) {
+        // 144-byte blocks are 16-byte aligned: wide loads for d/dmin, the 12 scale
+        // bytes and the input; arithmetic and its order match the scalar decode.
+        int g = (lane / 8) * 2, col = (lane & 7) * 4;
+        unsigned int q = *(const unsigned int *)(p + 16 + (g / 2) * 32 + col);
+        unsigned int dd = *(const unsigned int *)p;
+        float d = half_value_bits(dd & 0xffff), dm = half_value_bits(dd >> 16);
+        const unsigned int *sw = (const unsigned int *)(p + 4);
+        unsigned int s0 = sw[0], s1 = sw[1], s2 = sw[2];
+        #pragma unroll
+        for (int half = 0; half < 2; half++) {
+            int group = g + half, shift = 8 * (group & 3);
+            // Bytes s[group & 3], s[(group & 3) + 4] and s[(group & 3) + 8] of the scales.
+            unsigned int lo = (s0 >> shift) & 255, mid = (s1 >> shift) & 255;
+            unsigned int hi = (s2 >> shift) & 255;
+            int scale = group < 4 ? lo & 63 : (hi & 15) | ((lo >> 6) << 4);
+            int minimum = group < 4 ? mid & 63 : (hi >> 4) | ((mid >> 6) << 4);
+            float ds = d * (float)scale, ms = dm * (float)minimum;
+            float4 xv = *(const float4 *)(x + group * 32 + col);
+            float xs[4] = {xv.x, xv.y, xv.z, xv.w};
             #pragma unroll
-            for (int half = 0; half < 2; half++) {
-                int group = g + half;
-                int scale = group < 4 ? s[group] & 63
-                    : (s[group + 4] & 15) | ((s[group - 4] >> 6) << 4);
-                int minimum = group < 4 ? s[group + 4] & 63
-                    : (s[group + 4] >> 4) | ((s[group] >> 6) << 4);
-                float ds = d * (float)scale, ms = dm * (float)minimum;
-                #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    float decoded = ds * (float)((q >> (j * 8 + half * 4)) & 15) - ms;
-                    parts[half * 4 + j] += decoded * x[first + group * 32 + col + j];
-                }
+            for (int j = 0; j < 4; j++) {
+                float decoded = ds * small_uint_float((q >> (j * 8 + half * 4)) & 15) - ms;
+                parts[half * 4 + j] += decoded * xs[j];
             }
-        } else {
-            int h = lane / 16, col = (lane & 15) * 2;
-            unsigned int lo0 = *(const unsigned short *)(p + h * 64 + col);
-            unsigned int lo1 = *(const unsigned short *)(p + h * 64 + 32 + col);
-            unsigned int hi = *(const unsigned short *)(p + 128 + h * 32 + col);
+        }
+    } else {
+        float d = half_value(p + 208);
+        int h = lane / 16, col = (lane & 15) * 2;
+        unsigned int lo0 = *(const unsigned short *)(p + h * 64 + col);
+        unsigned int lo1 = *(const unsigned short *)(p + h * 64 + 32 + col);
+        unsigned int hi = *(const unsigned short *)(p + 128 + h * 32 + col);
+        #pragma unroll
+        for (int quarter = 0; quarter < 4; quarter++) {
+            unsigned int low = (quarter & 1) ? lo1 : lo0;
+            int group = h * 8 + quarter * 2 + col / 16;
+            float ds = d * (float)((const signed char *)p)[192 + group];
             #pragma unroll
-            for (int quarter = 0; quarter < 4; quarter++) {
-                unsigned int low = (quarter & 1) ? lo1 : lo0;
-                int group = h * 8 + quarter * 2 + col / 16;
-                float ds = d * (float)((const signed char *)p)[192 + group];
-                #pragma unroll
-                for (int j = 0; j < 2; j++) {
-                    int ql = (low >> (j * 8 + (quarter / 2) * 4)) & 15;
-                    int qh = (hi >> (j * 8 + quarter * 2)) & 3;
-                    float decoded = ds * (float)((ql | (qh << 4)) - 32);
-                    parts[quarter * 2 + j] += decoded
-                        * x[first + h * 128 + quarter * 32 + col + j];
-                }
+            for (int j = 0; j < 2; j++) {
+                int ql = (low >> (j * 8 + (quarter / 2) * 4)) & 15;
+                int qh = (hi >> (j * 8 + quarter * 2)) & 3;
+                float decoded = ds * (small_uint_float(ql | (qh << 4)) - 32.0f);
+                parts[quarter * 2 + j] += decoded
+                    * x[h * 128 + quarter * 32 + col + j];
             }
         }
     }
+}
+
+__device__ __forceinline__ float fold_parts(float *parts) {
     parts[0] += parts[4];
     parts[1] += parts[5];
     parts[2] += parts[6];
@@ -316,9 +329,14 @@ __device__ __forceinline__ float packed_lane_span(const u8 *w, const float *x, u
 }
 
 template<int Kind>
-__device__ __forceinline__ float packed_matrix_lane(const u8 *w, const float *x,
-                                                    u64 offset, int width, int tid) {
-    return packed_lane_span<Kind>(w, x, offset, width, tid & 31, (tid / 32) * 256, 2048);
+__device__ __forceinline__ float packed_lane_span(const u8 *w, const float *x, u64 offset,
+                                                  int width, int lane, int start, int step) {
+    float parts[8] = {};
+    for (int first = start; first < width; first += step) {
+        const u8 *p = w + ((offset + first) / 256) * (Kind == 12 ? 144 : 210);
+        packed_block_accumulate<Kind>(p, x + first, lane, parts);
+    }
+    return fold_parts(parts);
 }
 
 __device__ __forceinline__ float warp_sum(float value) {
@@ -328,11 +346,64 @@ __device__ __forceinline__ float warp_sum(float value) {
     return value;
 }
 
+// Q4_K with 8 lanes per 256-value block: each lane issues one 16-byte load of
+// quantized values (32 values), so a warp covers 4 blocks per step. More bytes in
+// flight per lane than packed_lane_span; F32 arithmetic, different summation order.
+__device__ __forceinline__ void q4k_wide_block(const u8 *p, const float *x, int sub,
+                                               float *parts) {
+    uint4 qv = *(const uint4 *)(p + 16 + sub * 16);
+    unsigned int dd = *(const unsigned int *)p;
+    float d = half_value_bits(dd & 0xffff), dm = half_value_bits(dd >> 16);
+    const unsigned int *sw = (const unsigned int *)(p + 4);
+    unsigned int s0 = sw[0], s1 = sw[1], s2 = sw[2];
+    unsigned int qw[4] = {qv.x, qv.y, qv.z, qv.w};
+    int pair = sub >> 1;
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        // Bytes 16*(sub&1)..+15 of 32-byte chunk `pair`: low nibbles belong to group
+        // 2*pair, high nibbles to group 2*pair+1.
+        int group = 2 * pair + half, shift = 8 * (group & 3);
+        unsigned int lo = (s0 >> shift) & 255, mid = (s1 >> shift) & 255;
+        unsigned int hi = (s2 >> shift) & 255;
+        int scale = group < 4 ? lo & 63 : (hi & 15) | ((lo >> 6) << 4);
+        int minimum = group < 4 ? mid & 63 : (hi >> 4) | ((mid >> 6) << 4);
+        float ds = d * (float)scale, ms = dm * (float)minimum;
+        const float *xb = x + 32 * group + (sub & 1) * 16;
+        #pragma unroll
+        for (int word = 0; word < 4; word++) {
+            float4 xv = *(const float4 *)(xb + 4 * word);
+            float xs[4] = {xv.x, xv.y, xv.z, xv.w};
+            #pragma unroll
+            for (int b = 0; b < 4; b++) {
+                float decoded = ds * small_uint_float((qw[word] >> (8 * b + 4 * half)) & 15) - ms;
+                parts[half * 4 + b] += decoded * xs[b];
+            }
+        }
+    }
+}
+
+// One warp's share (`part` of `warps`) of a Q4_K row, already warp-reduced.
+__device__ __forceinline__ float q4k_wide_row_part(const u8 *w, const float *x, u64 offset,
+                                                   int width, int lane, int part, int warps) {
+    float parts[8] = {};
+    for (int first = (part * 4 + (lane >> 3)) * 256; first < width; first += warps * 1024)
+        q4k_wide_block(w + ((offset + first) / 256) * 144, x + first, lane & 7, parts);
+    return warp_sum(fold_parts(parts));
+}
+
 template<int Kind>
-__device__ __forceinline__ float warp_scalar_row(const u8 *w, const float *x,
-                                                 u64 offset, int width, int lane) {
+__device__ __forceinline__ float packed_matrix_lane(const u8 *w, const float *x,
+                                                    u64 offset, int width, int tid) {
+    return packed_lane_span<Kind>(w, x, offset, width, tid & 31, (tid / 32) * 256, 2048);
+}
+
+template<int Kind>
+__device__ __forceinline__ float warp_scalar_row(const u8 *w, const float *x, u64 offset,
+                                                 int width, int lane, int part = 0,
+                                                 int warps = 1) {
     float sum = 0.0f;
-    for (int i = lane; i < width; i += 32) sum += weight(w, Kind, offset + i) * x[i];
+    for (int i = part * 32 + lane; i < width; i += warps * 32)
+        sum += weight(w, Kind, offset + i) * x[i];
     return warp_sum(sum);
 }
 
@@ -340,8 +411,19 @@ __device__ __forceinline__ float warp_scalar_row(const u8 *w, const float *x,
 // (no barrier); few-row shapes split a row's 256-value blocks across up to 8
 // warps so the grid still fills the GPU. Mirrors `matvec_warps_per_row` in
 // cuda.rs, which sizes the grid: grid=(ceil(rows * warps / 8), selections, 1).
-__device__ __forceinline__ int matvec_warps_per_row(int rows, int selections, int width) {
+// Block-aligned Q4_K rows use the wide layout, where one warp step covers 4 blocks.
+__device__ __forceinline__ bool q4k_wide(int kind, int width) {
+    return kind == 12 && width % 256 == 0;
+}
+
+__device__ __forceinline__ int matvec_warps_per_row(int kind, int rows, int selections,
+                                                    int width) {
     int blocks = width / 256 > 0 ? width / 256 : 1, warps = 1;
+    if (q4k_wide(kind, width)) {
+        warps = blocks / 8 > 8 ? 8 : (blocks / 8 > 1 ? blocks / 8 : 1);
+        while (warps < 8 && warps * 4 < blocks && rows * selections * warps < 2048) warps *= 2;
+        return warps;
+    }
     while (warps < 8 && warps < blocks && rows * selections * warps < 16384) warps *= 2;
     return warps;
 }
@@ -352,27 +434,29 @@ extern "C" __global__ void matvec_packed_rows(const u8 *w, int kind, const float
                                              int moe, int batched) {
     __shared__ float partial[8];
     int lane = threadIdx.x & 31, warp = threadIdx.x / 32, selected = blockIdx.y;
-    int warps = matvec_warps_per_row(rows, gridDim.y, width);
+    int warps = matvec_warps_per_row(kind, rows, gridDim.y, width);
     int part = warp % warps, row = blockIdx.x * (8 / warps) + warp / warps;
     float sum = 0.0f;
     if (row < rows) {
         int expert = moe ? ids[selected] : 0;
         u64 offset = ((u64)expert * rows + row) * width;
         const float *input = x + (batched ? (u64)selected * width : 0);
-        if ((kind == 12 || kind == 14) && width % 256 == 0) {
+        if (q4k_wide(kind, width)) {
+            sum = q4k_wide_row_part(w, input, offset, width, lane, part, warps);
+        } else if (kind == 14 && width % 256 == 0) {
             int start = part * 256, step = warps * 256;
-            sum = warp_sum(kind == 12
-                ? packed_lane_span<12>(w, input, offset, width, lane, start, step)
-                : packed_lane_span<14>(w, input, offset, width, lane, start, step));
-        } else if (part == 0) {
+            sum = warp_sum(packed_lane_span<14>(w, input, offset, width, lane, start, step));
+        } else {
             switch (kind) {
-                case 0: sum = warp_scalar_row<0>(w, input, offset, width, lane); break;
-                case 1: sum = warp_scalar_row<1>(w, input, offset, width, lane); break;
-                case 6: sum = warp_scalar_row<6>(w, input, offset, width, lane); break;
-                case 8: sum = warp_scalar_row<8>(w, input, offset, width, lane); break;
-                case 12: sum = warp_scalar_row<12>(w, input, offset, width, lane); break;
-                case 13: sum = warp_scalar_row<13>(w, input, offset, width, lane); break;
-                case 14: sum = warp_scalar_row<14>(w, input, offset, width, lane); break;
+#define SCALAR_ROW(K) warp_scalar_row<K>(w, input, offset, width, lane, part, warps)
+                case 0: sum = SCALAR_ROW(0); break;
+                case 1: sum = SCALAR_ROW(1); break;
+                case 6: sum = SCALAR_ROW(6); break;
+                case 8: sum = SCALAR_ROW(8); break;
+                case 12: sum = SCALAR_ROW(12); break;
+                case 13: sum = SCALAR_ROW(13); break;
+                case 14: sum = SCALAR_ROW(14); break;
+#undef SCALAR_ROW
                 default: sum = __int_as_float(0x7fffffff); break;
             }
         }
@@ -407,6 +491,7 @@ extern "C" __global__ void normalize_warp(const float *x, const u8 *w, float *y,
 template<int Kind>
 __device__ __forceinline__ float packed_row_part(const u8 *w, const float *x, u64 offset,
                                                  int width, int lane, int part, int warps) {
+    if (Kind == 12) return q4k_wide_row_part(w, x, offset, width, lane, part, warps);
     return warp_sum(packed_lane_span<Kind>(w, x, offset, width, lane, part * 256, warps * 256));
 }
 
@@ -421,7 +506,7 @@ extern "C" __global__ void matvec_packed_qkv_rows(
     __shared__ float partial[8];
     int total = q_rows + k_rows + v_rows;
     int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
-    int warps = matvec_warps_per_row(total, 1, width);
+    int warps = matvec_warps_per_row(q_kind, total, 1, width);
     int part = warp % warps, row = blockIdx.x * (8 / warps) + warp / warps;
     const u8 *w = wq;
     int kind = q_kind, local = row;
@@ -454,7 +539,7 @@ extern "C" __global__ void matvec_packed_gate_up_rows(
     int width, int rows, const int *ids) {
     __shared__ float partial[2][8];
     int lane = threadIdx.x & 31, warp = threadIdx.x / 32, selected = blockIdx.y;
-    int warps = matvec_warps_per_row(rows, gridDim.y, width);
+    int warps = matvec_warps_per_row(gate_kind, rows, gridDim.y, width);
     int part = warp % warps, row = blockIdx.x * (8 / warps) + warp / warps;
     float g = 0.0f, u = 0.0f;
     if (row < rows) {
@@ -1135,6 +1220,68 @@ extern "C" __global__ void residual_normalize(float *x, const float *projected,
     float inverse = 1.0f / sqrtf(sum_block(sum) / (float)n + epsilon);
     for (int i = threadIdx.x; i < n; i += blockDim.x)
         y[i] = x[i] * inverse * ((const float *)w)[i];
+}
+#endif
+
+#if defined(CUDA_PACKED_DECODE)
+#define NORM_ITEMS 4
+// Single-block RMSNorm tail: v holds this thread's updated values (element
+// threadIdx.x + k * blockDim.x) and nw the matching norm weights, both loaded up
+// front so global latency overlaps. y = v * inverse * w, as normalize_warp.
+__device__ __forceinline__ void block_rmsnorm(const float *v, const float *nw, float *y,
+                                              int n, float epsilon) {
+    __shared__ float partial[32];
+    float sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < NORM_ITEMS; k++)
+        if (threadIdx.x + k * blockDim.x < n) sum += v[k] * v[k];
+    sum = warp_sum(sum);
+    if ((threadIdx.x & 31) == 0) partial[threadIdx.x / 32] = sum;
+    __syncthreads();
+    float total = 0.0f;
+    for (int i = 0; i < (int)blockDim.x / 32; i++) total += partial[i];
+    float inverse = 1.0f / sqrtf(total / (float)n + epsilon);
+    #pragma unroll
+    for (int k = 0; k < NORM_ITEMS; k++) {
+        int i = threadIdx.x + k * blockDim.x;
+        if (i < n) y[i] = v[k] * inverse * nw[k];
+    }
+}
+
+// x += projected, then y = RMSNorm(x) * w. grid=1, block=1024, n <= 4 * 1024.
+extern "C" __global__ void residual_rmsnorm(float *x, const float *projected, const u8 *w,
+                                            float *y, int n, float epsilon) {
+    float v[NORM_ITEMS], nw[NORM_ITEMS];
+    #pragma unroll
+    for (int k = 0; k < NORM_ITEMS; k++) {
+        int i = threadIdx.x + k * blockDim.x;
+        if (i < n) {
+            v[k] = x[i] + projected[i];
+            nw[k] = ((const float *)w)[i];
+            x[i] = v[k];
+        }
+    }
+    block_rmsnorm(v, nw, y, n, epsilon);
+}
+
+// MoE combine (x += sum_s weights[s] * experts[s]) fused with the next RMSNorm.
+// grid=1, block=1024, n <= 4 * 1024.
+extern "C" __global__ void combine_rmsnorm(float *x, const float *experts,
+                                           const float *weights, int n, int used,
+                                           const u8 *w, float *y, float epsilon) {
+    float v[NORM_ITEMS], nw[NORM_ITEMS];
+    #pragma unroll
+    for (int k = 0; k < NORM_ITEMS; k++) {
+        int i = threadIdx.x + k * blockDim.x;
+        if (i < n) {
+            float combined = 0.0f;
+            for (int s = 0; s < used; s++) combined += weights[s] * experts[(u64)s * n + i];
+            v[k] = x[i] + combined;
+            nw[k] = ((const float *)w)[i];
+            x[i] = v[k];
+        }
+    }
+    block_rmsnorm(v, nw, y, n, epsilon);
 }
 #endif
 

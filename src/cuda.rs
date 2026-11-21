@@ -266,16 +266,28 @@ fn fused_attention_supported(spec: &Spec) -> bool {
 }
 
 /// Keys per split in `attention_split` (ATTENTION_SPLIT in attention.cu).
-const ATTENTION_SPLIT: usize = 64;
+const ATTENTION_SPLIT: usize = 16;
 
 /// Split-K decode attention: `f32-tiled` profile, any context, head dim <= 256.
 fn split_attention_supported(spec: &Spec, matmul: CudaMatmul) -> bool {
     matmul.f32_tiled() && spec.dim <= 256
 }
 
+/// Grid height of the chunked split passes (capped by the 16-key split count, which
+/// sizes the partial buffer): 128 chunks measured best on Qwen3-30B at 0.1k-3k keys,
+/// and never fewer than keep a full-context chunk within ATTENTION_TILE_MAX (128)
+/// keys for the one-head-per-block pass.
+fn attention_chunks(spec: &Spec) -> usize {
+    (spec.info.context_tokens as usize).div_ceil(128).max(128)
+}
+
 fn attention_splits(spec: &Spec) -> usize {
     (spec.info.context_tokens as usize).div_ceil(ATTENTION_SPLIT)
 }
+
+/// Widths the single-block fused residual/combine + RMSNorm kernels accept
+/// (1024 threads, NORM_ITEMS = 4 values each).
+const FUSED_NORM_MAX_WIDTH: usize = 4 * 1024;
 
 /// F32 elements of the split-K partials: per head and split, o[dim], max and sum.
 fn attention_partial_elements(spec: &Spec, matmul: CudaMatmul) -> usize {
@@ -731,8 +743,16 @@ pub struct CudaBackend {
 
 /// Warps sharing one output row in `matvec_packed_rows` (mirrors the device
 /// function of the same name in kernels.cu; both must agree to size the grid).
-fn matvec_warps_per_row(rows: u32, selections: u32, width: u32) -> u32 {
+/// Block-aligned Q4_K rows use the wide layout (one warp step covers 4 blocks).
+fn matvec_warps_per_row(kind: i32, rows: u32, selections: u32, width: u32) -> u32 {
     let blocks = (width / 256).max(1);
+    if kind == 12 && width % 256 == 0 {
+        let mut warps = (blocks / 8).clamp(1, 8);
+        while warps < 8 && warps * 4 < blocks && rows * selections * warps < 2048 {
+            warps *= 2;
+        }
+        return warps;
+    }
     let mut warps = 1;
     while warps < 8 && warps < blocks && rows * selections * warps < 16384 {
         warps *= 2;
@@ -743,12 +763,18 @@ fn matvec_warps_per_row(rows: u32, selections: u32, width: u32) -> u32 {
 /// Grid for a 256-thread `matvec` launch. The `f32-tiled` profile dispatches
 /// `matvec_packed_rows` (8 warps per block, 1-8 warps per row); `f32` keeps one
 /// block per row. Tensor shapes are validated positive when the model is uploaded.
-fn matvec_grid(matmul: CudaMatmul, rows: i32, selections: u32, width: i32) -> (u32, u32, u32) {
+fn matvec_grid(
+    matmul: CudaMatmul,
+    kind: i32,
+    rows: i32,
+    selections: u32,
+    width: i32,
+) -> (u32, u32, u32) {
     let rows = rows as u32;
     if !matmul.f32_tiled() {
         return (rows, selections, 1);
     }
-    let warps = matvec_warps_per_row(rows, selections, width as u32);
+    let warps = matvec_warps_per_row(kind, rows, selections, width as u32);
     ((rows * warps).div_ceil(8), selections, 1)
 }
 
@@ -992,9 +1018,23 @@ impl CudaBackend {
                 "attention_split_decode",
                 "attention_combine",
                 "attention_combine_decode",
+                "attention_split_gqa",
+                "attention_split_gqa_decode",
+                "attention_combine_chunks",
+                "attention_split_head",
+                "attention_split_head_decode",
+                "attention_split_group",
+                "attention_split_group_decode",
+                "attention_combine_group",
+                "attention_combine_group_decode",
+                "attention_combine_wide",
+                "attention_combine_wide_decode",
+                "attention_combine_chunks_decode",
                 "qkv_head_norm_rope_cache",
                 "qkv_head_norm_rope_cache_decode",
                 "matvec_packed_qkv_rows",
+                "residual_rmsnorm",
+                "combine_rmsnorm",
             ] {
                 functions.insert(name, module.load_function(name).map_err(failure)?);
             }
@@ -1326,13 +1366,17 @@ impl CudaBackend {
                 &scale
             );
         }
+        // Set when the previous layer's fused combine already wrote this layer's
+        // attention RMSNorm into work.normalized.
+        let mut attention_normalized = false;
         for (index, l) in self.weights.layers.iter().enumerate() {
             let gemma_attention = gemma.map(|g| g.attention(s, index));
             let rope_base = gemma_attention.map_or(s.rope_base, |(_, base, _)| base);
             let affine = l.affine.as_ref();
             let olmo2 = s.info.architecture == "olmo2";
             let olmoe = s.info.architecture == "olmoe";
-            if olmo2 {
+            if std::mem::take(&mut attention_normalized) {
+            } else if olmo2 {
                 self.stream
                     .memcpy_dtod(
                         &self.work.x.slice(..s.width),
@@ -1390,7 +1434,7 @@ impl CudaBackend {
                 launch!(
                     self,
                     "matvec_packed_qkv_rows",
-                    matvec_grid(self.matmul, l.q.rows + l.k.rows + l.v.rows, 1, l.q.width),
+                    matvec_grid(self.matmul, l.q.kind, l.q.rows + l.k.rows + l.v.rows, 1, l.q.width),
                     &l.q.bytes,
                     &l.q.kind,
                     &l.q.rows,
@@ -1415,7 +1459,7 @@ impl CudaBackend {
                     launch!(
                         self,
                         "matvec",
-                        matvec_grid(self.matmul, tensor.rows, 1, tensor.width),
+                        matvec_grid(self.matmul, tensor.kind, tensor.rows, 1, tensor.width),
                         &tensor.bytes,
                         &tensor.kind,
                         &self.work.normalized,
@@ -1577,25 +1621,69 @@ impl CudaBackend {
                     _ if device_state => return Err(failure("decode control missing")),
                     _ => None,
                 };
-                let grid = (heads as u32, splits as u32, 1);
-                if let Some(control) = control {
-                    launch!(
-                        self, "attention_split_decode", grid, &self.work.q, &self.keys[index],
-                        &self.values[index], &mut *partials, &dim, &heads, &kv_heads, control
-                    );
-                    launch!(
-                        self, "attention_combine_decode", (heads as u32, 1, 1), &*partials,
-                        &mut self.work.attended, &dim, &splits, control
-                    );
+                // Chunked passes size each block's key range on the device from the live
+                // count. dim <= 128: grouped warp-per-head pass for GQA, otherwise the
+                // vectorized one-head-per-block pass. dim <= 256: one block per query
+                // head through the head-group pass. Otherwise fixed 16-key splits.
+                let chunks = splits.min(attention_chunks(s) as i32);
+                let decode = control.is_some();
+                let pick = |device: &'static str, host: &'static str| if decode { device } else { host };
+                let group = (heads / kv_heads) as u32;
+                let vector = dim <= 128 && dim % 4 == 0 && chunks <= 1024;
+                let mut threads = 256;
+                let (split, combine, grid, blocks) = if vector && (2..=8).contains(&group) {
+                    // Grouped-query attention: one block per KV head and chunk, one warp
+                    // per query head, so the group shares each key/value row through L1.
+                    threads = 32 * group;
+                    (
+                        pick("attention_split_group_decode", "attention_split_group"),
+                        pick("attention_combine_group_decode", "attention_combine_group"),
+                        (kv_heads as u32, chunks as u32, 1),
+                        chunks,
+                    )
+                } else if vector {
+                    (
+                        pick("attention_split_head_decode", "attention_split_head"),
+                        pick("attention_combine_wide_decode", "attention_combine_wide"),
+                        (heads as u32, chunks as u32, 1),
+                        chunks,
+                    )
+                } else if dim <= 256 && 256 % dim == 0 {
+                    (
+                        pick("attention_split_gqa_decode", "attention_split_gqa"),
+                        pick("attention_combine_chunks_decode", "attention_combine_chunks"),
+                        (heads as u32, chunks as u32, 1),
+                        chunks,
+                    )
                 } else {
-                    launch!(
-                        self, "attention_split", grid, &self.work.q, &self.keys[index],
+                    (
+                        pick("attention_split_decode", "attention_split"),
+                        pick("attention_combine_decode", "attention_combine"),
+                        (heads as u32, splits as u32, 1),
+                        splits,
+                    )
+                };
+                // Both split kernels take (q, keys, values, partial, dim, heads, kv_heads,
+                // count | control); both combines take (partial, out, dim, blocks, ...).
+                match control {
+                    Some(control) => launch!(
+                        self, split, grid; threads, &self.work.q, &self.keys[index],
+                        &self.values[index], &mut *partials, &dim, &heads, &kv_heads, control
+                    ),
+                    None => launch!(
+                        self, split, grid; threads, &self.work.q, &self.keys[index],
                         &self.values[index], &mut *partials, &dim, &heads, &kv_heads, &count
-                    );
-                    launch!(
-                        self, "attention_combine", (heads as u32, 1, 1), &*partials,
-                        &mut self.work.attended, &dim, &splits, &count
-                    );
+                    ),
+                }
+                match control {
+                    Some(control) => launch!(
+                        self, combine, (heads as u32, 1, 1), &*partials,
+                        &mut self.work.attended, &dim, &blocks, control
+                    ),
+                    None => launch!(
+                        self, combine, (heads as u32, 1, 1), &*partials,
+                        &mut self.work.attended, &dim, &blocks, &count
+                    ),
                 }
             } else if device_state {
                 let control = &self
@@ -1648,7 +1736,7 @@ impl CudaBackend {
             launch!(
                 self,
                 "matvec",
-                matvec_grid(self.matmul, t.rows, 1, t.width),
+                matvec_grid(self.matmul, t.kind, t.rows, 1, t.width),
                 &t.bytes,
                 &t.kind,
                 &self.work.attended,
@@ -1669,7 +1757,32 @@ impl CudaBackend {
                     &w
                 );
             }
-            if let Some([post_attn, _]) = &l.post_norms {
+            let fused_norm = self.matmul.f32_tiled() && s.width <= FUSED_NORM_MAX_WIDTH;
+            let fused_ffn_norm = match &l.ffn_norm {
+                Some(norm)
+                    if fused_norm
+                        && l.post_norms.is_none()
+                        && !s.parallel_residual
+                        && !olmo2
+                        && affine.is_none() =>
+                {
+                    launch!(
+                        self,
+                        "residual_rmsnorm",
+                        (1, 1, 1); 1024,
+                        &mut self.work.x,
+                        &self.work.projected,
+                        &norm.bytes,
+                        &mut self.work.normalized,
+                        &w,
+                        &s.epsilon
+                    );
+                    true
+                }
+                _ => false,
+            };
+            if fused_ffn_norm {
+            } else if let Some([post_attn, _]) = &l.post_norms {
                 gemma_post_norm!(self, projected, post_attn, 1, w, s.epsilon);
             } else if !s.parallel_residual {
                 launch!(
@@ -1681,7 +1794,8 @@ impl CudaBackend {
                     &w
                 );
             }
-            if olmo2 {
+            if fused_ffn_norm {
+            } else if olmo2 {
                 self.stream
                     .memcpy_dtod(
                         &self.work.x.slice(..s.width),
@@ -1707,7 +1821,7 @@ impl CudaBackend {
                 launch!(
                     self,
                     "matvec",
-                    matvec_grid(self.matmul, t.rows, 1, t.width),
+                    matvec_grid(self.matmul, t.kind, t.rows, 1, t.width),
                     &t.bytes,
                     &t.kind,
                     &self.work.normalized,
@@ -1786,7 +1900,7 @@ impl CudaBackend {
                 launch!(
                     self,
                     "matvec_packed_gate_up_rows",
-                    matvec_grid(self.matmul, gate.rows, used as u32, gate.width),
+                    matvec_grid(self.matmul, gate.kind, gate.rows, used as u32, gate.width),
                     &gate.bytes,
                     &gate.kind,
                     &l.up.bytes,
@@ -1802,7 +1916,7 @@ impl CudaBackend {
                     launch!(
                         self,
                         "matvec",
-                        matvec_grid(self.matmul, t.rows, used as u32, t.width),
+                        matvec_grid(self.matmul, t.kind, t.rows, used as u32, t.width),
                         &t.bytes,
                         &t.kind,
                         &self.work.normalized,
@@ -1850,7 +1964,7 @@ impl CudaBackend {
                 launch!(
                     self,
                     "matvec",
-                    matvec_grid(self.matmul, t.rows, used as u32, t.width),
+                    matvec_grid(self.matmul, t.kind, t.rows, used as u32, t.width),
                     &t.bytes,
                     &t.kind,
                     &self.work.gate,
@@ -1862,8 +1976,29 @@ impl CudaBackend {
                     &1i32
                 );
             }
+            let next_norm = self
+                .weights
+                .layers
+                .get(index + 1)
+                .filter(|next| next.affine.is_none() && !olmo2)
+                .and_then(|next| next.norm.as_ref());
             if let Some([_, post_ffn]) = &l.post_norms {
                 gemma_post_norm!(self, down, post_ffn, 1, w, s.epsilon);
+            } else if let Some(norm) = next_norm.filter(|_| fused_norm) {
+                launch!(
+                    self,
+                    "combine_rmsnorm",
+                    (1, 1, 1); 1024,
+                    &mut self.work.x,
+                    &self.work.down,
+                    &self.work.probabilities,
+                    &w,
+                    &used,
+                    &norm.bytes,
+                    &mut self.work.normalized,
+                    &s.epsilon
+                );
+                attention_normalized = true;
             } else {
                 launch!(
                     self,
@@ -1913,7 +2048,7 @@ impl CudaBackend {
         launch!(
             self,
             "matvec",
-            matvec_grid(self.matmul, t.rows, 1, t.width),
+            matvec_grid(self.matmul, t.kind, t.rows, 1, t.width),
             &t.bytes,
             &t.kind,
             &self.work.normalized,
@@ -2353,16 +2488,25 @@ mod tests {
 
     #[test]
     fn matvec_warps_per_row_fills_the_gpu_without_exceeding_row_blocks() {
-        assert_eq!(matvec_warps_per_row(151_936, 1, 2048), 1);
-        assert_eq!(matvec_warps_per_row(2048, 8, 768), 1);
-        assert_eq!(matvec_warps_per_row(768, 8, 2048), 4);
-        assert_eq!(matvec_warps_per_row(512, 1, 2048), 8);
-        assert_eq!(matvec_warps_per_row(3, 1, 512), 2);
-        assert_eq!(matvec_warps_per_row(3, 1, 256), 1);
-        assert_eq!(matvec_grid(CudaMatmul::F32, 512, 1, 2048), (512, 1, 1));
-        assert_eq!(matvec_grid(CudaMatmul::F32Tiled, 512, 1, 2048), (512, 1, 1));
-        assert_eq!(matvec_grid(CudaMatmul::F32Tiled, 2048, 8, 768), (256, 8, 1));
-        assert_eq!(matvec_grid(CudaMatmul::F32Tiled, 3, 1, 256), (1, 1, 1));
+        // Q6_K and other kinds: one 256-value block per warp step.
+        assert_eq!(matvec_warps_per_row(14, 151_936, 1, 2048), 1);
+        assert_eq!(matvec_warps_per_row(14, 2048, 8, 768), 1);
+        assert_eq!(matvec_warps_per_row(14, 768, 8, 2048), 4);
+        assert_eq!(matvec_warps_per_row(14, 512, 1, 2048), 8);
+        assert_eq!(matvec_warps_per_row(0, 3, 1, 512), 2);
+        assert_eq!(matvec_warps_per_row(14, 3, 1, 256), 1);
+        // Q4_K wide layout: one warp step covers four blocks.
+        assert_eq!(matvec_warps_per_row(12, 768, 8, 2048), 1);
+        assert_eq!(matvec_warps_per_row(12, 2048, 8, 768), 1);
+        assert_eq!(matvec_warps_per_row(12, 2048, 1, 4096), 2);
+        assert_eq!(matvec_warps_per_row(12, 512, 1, 2048), 2);
+        assert_eq!(matvec_warps_per_row(12, 3, 1, 8192), 8);
+        assert_eq!(matvec_warps_per_row(12, 3, 1, 256), 1);
+        assert_eq!(matvec_grid(CudaMatmul::F32, 12, 512, 1, 2048), (512, 1, 1));
+        assert_eq!(matvec_grid(CudaMatmul::F32Tiled, 14, 512, 1, 2048), (512, 1, 1));
+        assert_eq!(matvec_grid(CudaMatmul::F32Tiled, 12, 512, 1, 2048), (128, 1, 1));
+        assert_eq!(matvec_grid(CudaMatmul::F32Tiled, 14, 2048, 8, 768), (256, 8, 1));
+        assert_eq!(matvec_grid(CudaMatmul::F32Tiled, 14, 3, 1, 256), (1, 1, 1));
     }
 
     #[test]
@@ -2448,7 +2592,7 @@ mod tests {
                 launch!(
                     harness,
                     "matvec",
-                    matvec_grid(CudaMatmul::F32Tiled, t.rows, 2, t.width),
+                    matvec_grid(CudaMatmul::F32Tiled, t.kind, t.rows, 2, t.width),
                     &t.bytes,
                     &t.kind,
                     &x,

@@ -1270,6 +1270,8 @@ path for short chunks of 32–127 tokens.
 `cuda-qwen35-qkv-single-term-research` uses one FP16 weight term for the
 1024-to-6144 recurrent mixer QKV projection at 512 tokens.
 `cuda-qwen35-qkv-single-term-256-research` also applies it at 256 tokens.
+`cuda-qwen35-qkv-single-term-short-research` enables it for chunks of
+32–127 tokens without changing FFN down.
 `cuda-qwen3-fp16-down-single-term-research` uses the leading FP16 weight term
 for the dense Qwen3 3072-to-1024 weight-only FFN down path at 512 tokens.
 `cuda-llama-batched-attention-256-research` extends the Llama batched attention

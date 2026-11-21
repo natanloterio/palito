@@ -328,7 +328,7 @@ impl Prefill {
             if short_qwen3_gate_up
                 || hybrid_gate_up_single_term
                 || (cfg!(feature = "cuda-llama-prefill-qo-single-term-research")
-                    && n >= 384
+                    && n >= 128
                     && (t.kind, t.width, t.rows) == (8, 2048, 2048))
                 || (cfg!(feature = "cuda-qwen35-ffn-down-single-term-research")
                     && hybrid_down

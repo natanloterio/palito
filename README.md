@@ -1103,8 +1103,10 @@ The low weight term is omitted only for these gate/up projections.
 `cuda-qwen3-short-gate-up-single-term-research` also enables this gate/up
 path for short chunks of 32–127 tokens.
 `cuda-llama-prefill-qo-single-term-research` uses the leading FP16 terms
-and FP32 accumulation for Llama Q and attention output at 512 tokens.
-The initial K/V projections retain both Joined-N planes and F32 cache.
+and FP32 accumulation for compatible Q8_0 Llama Q and attention output.
+It applies from 384 tokens, or from 128 when the mid-batch
+`cuda-llama-attention-projection-weight-only-256-research` opt-in is also
+enabled. K/V dispatch and the F32 cache are unchanged.
 `cuda-llama-prefill-fp16-gate-up-256-research` extends the shared
 activation pack and leading FP16 gate/up schedule to the initial
 256-token Llama chunk. Down stays on the corrected Joined-N path.

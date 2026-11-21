@@ -181,6 +181,12 @@ pub(in crate::cuda) fn open(
     Ok(Box::new(open_hybrid(path, config, options, false)?))
 }
 
+const SPLIT_DECODE_TILE: usize = if cfg!(feature = "cuda-qwen35-split-decode-tile64-research") {
+    64
+} else {
+    128
+};
+
 fn open_hybrid(
     path: &Path,
     config: &Config,
@@ -285,7 +291,7 @@ fn open_hybrid(
         0
     };
     let scores = HEADS * if cfg!(feature = "cuda-qwen35-split-decode-attention-research") && context > 512 {
-        context.max(context.div_ceil(128) * (HEAD_DIM + 2))
+        context.max(context.div_ceil(SPLIT_DECODE_TILE) * (HEAD_DIM + 2))
     } else {
         context
     };
@@ -1496,7 +1502,7 @@ impl Hybrid {
                     if n == 1 && bucket > 512
                         && self.functions.contains_key("qwen35_split_decode_partials")
                     {
-                        let tile = 128u32;
+                        let tile = SPLIT_DECODE_TILE as u32;
                         let tiles = bucket.div_ceil(tile);
                         macro_rules! split_attention {
                             ($position:expr) => {

@@ -419,6 +419,8 @@ and CUDA 13 NVRTC libraries on `LD_LIBRARY_PATH`.
   into 128-token tiles for Qwen3.5 single-token decode. Eager decode uses it
   above 512 live tokens; graph decode selects it for grid buckets above 512.
   Persistent F32 KV and recurrent state are unchanged.
+  `cuda-qwen35-split-decode-tile64-research` uses 64-token tiles in that
+  same regime and reserves additional workspace for their partial results.
   `cuda-llama-split-decode-attention-research` uses 128-token F32 tiles
   for Llama eager decode with 32 query heads, eight KV heads, 64 dimensions,
   and at least 128 live tokens. A single tile writes the output directly.

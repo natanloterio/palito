@@ -56,6 +56,7 @@ cuda-qwen35-recurrent-gdn-512-research = ["cuda-qwen35-recurrent-four-chains-res
 cuda-qwen35-decode-graph-research = ["cuda"]
 cuda-device-greedy-research = ["cuda"]
 cuda-qwen35-split-decode-attention-research = ["cuda"]
+cuda-qwen35-split-decode-tile64-research = ["cuda-qwen35-split-decode-attention-research"]
 cuda-llama-split-decode-attention-research = ["cuda"]
 cuda-llama-factored-rope-cache-research = ["cuda"]
 cuda-llama-grouped-prefill-256-research = ["cuda-llama-grouped-prefill-attention-research", "cuda-llama-batched-attention-256-research"]

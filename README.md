@@ -1055,7 +1055,10 @@ projection for Q and attention output on compatible initial 32–127-token
 chunks. K/V stay on their existing paths in that range.
 With `cuda-llama-short-kv-fp16-research`, compatible Q8_0 K/V projections in
 that range share a leading FP16 activation conversion and retain both FP16
-weight terms with FP32 accumulation. The KV cache remains F32.
+weight terms with FP32 accumulation. With
+`cuda-llama-attention-projection-weight-only-256-research` also enabled, the
+same K/V path covers compatible initial chunks of 128–383 tokens. Larger
+chunks keep their existing K/V dispatch, and the KV cache remains F32.
 `cuda-llama-prefill-last-ffn-research` runs the final layer's FFN for only
 the last token of an initial chunk of at least 32 tokens that emits logits. It still
 writes every attention KV entry and uses the existing corrected Q8_0

@@ -48,6 +48,7 @@ cuda-qwen35-matvec-ffn-width-research = ["cuda-qwen35-matvec-fixed-width-researc
 cuda-qwen35-fused-ffn-decode-research = ["cuda-qwen35-matvec-cache-research"]
 cuda-qwen35-fused-ffn-fixed-width-research = ["cuda-qwen35-fused-ffn-decode-research"]
 cuda-qwen35-value-columns-research = ["cuda-decode-score-reuse-research"]
+cuda-qwen35-value-time-warps-research = ["cuda-qwen35-value-columns-research", "cuda-qwen35-decode-graph-research"]
 cuda-qwen35-recurrent-direct-qk-research = ["cuda-qwen35-recurrent-warp-research"]
 cuda-qwen35-recurrent-eight-segments-research = ["cuda-qwen35-recurrent-direct-qk-research"]
 cuda-qwen35-recurrent-four-chains-research = ["cuda-qwen35-recurrent-eight-segments-research", "cuda-qwen35-recurrent-fma-research"]

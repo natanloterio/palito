@@ -1004,6 +1004,41 @@ extern "C" __global__ void qwen35_attention_value_columns_graph(const float *sco
     qwen35_attention_value_columns_impl(scores, values, output, heads, kv_heads, context, control[1] + 1);
 }
 #endif
+
+#ifdef CUDA_QWEN35_VALUE_TIME_WARPS
+__device__ __forceinline__ void qwen35_attention_value_time_warps_impl(const float *scores,
+    const float *values, float *output, int heads, int kv_heads, int context, int count) {
+    constexpr int dim = 256;
+    constexpr int warps = 4;
+    __shared__ float partial[warps][32];
+    const int head = blockIdx.x;
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int col = blockIdx.y * 32 + lane;
+    const int kv_head = head / (heads / kv_heads);
+    const float *score = scores + (u64)head * context;
+    const float *value = values + kv_head * dim + col;
+    float sum = 0.0f;
+    for (int t = warp; t < count; t += warps)
+        sum += score[t] * value[(u64)t * kv_heads * dim];
+    partial[warp][lane] = sum;
+    __syncthreads();
+    if (warp == 0)
+        output[head * dim + col] = (partial[0][lane] + partial[1][lane])
+                                 + (partial[2][lane] + partial[3][lane]);
+}
+
+extern "C" __global__ void qwen35_attention_value_time_warps(const float *scores,
+    const float *values, float *output, int heads, int kv_heads, int context, int count) {
+    qwen35_attention_value_time_warps_impl(scores, values, output, heads, kv_heads, context, count);
+}
+
+#ifdef CUDA_QWEN35_DECODE_GRAPH
+extern "C" __global__ void qwen35_attention_value_time_warps_graph(const float *scores,
+    const float *values, float *output, int heads, int kv_heads, int context, const int *control) {
+    qwen35_attention_value_time_warps_impl(scores, values, output, heads, kv_heads, context, control[1] + 1);
+}
+#endif
+#endif
 #endif
 
 #ifdef CUDA_LLAMA_DECODE_VALUE_SPLIT

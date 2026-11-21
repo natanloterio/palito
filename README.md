@@ -1130,6 +1130,10 @@ value reduction without changing its partitions or F32 accumulation order.
 `cuda-qwen35-value-columns-research` splits the fallback 256-wide attention
 value reduction across column tiles at contexts of at least 128 tokens.
 It preserves the softmax and per-column F32 accumulation order.
+`cuda-qwen35-value-time-warps-research` also splits each column tile across
+four warps for single-token decode at 128–512 live tokens, using the same
+F32 reduction in eager and graph modes. It leaves the softmax, F32 KV
+storage and longer-context split-attention path unchanged.
 
 `cuda-qwen35-dp4a-head-research` and `cuda-qwen3-dp4a-head-research` use
 packed K-format dot products with three-component activation quantization

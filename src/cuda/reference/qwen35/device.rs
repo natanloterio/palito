@@ -441,6 +441,9 @@ fn open_hybrid(
                 if cfg!(feature = "cuda-qwen35-value-columns-research") {
                     options.push("-DCUDA_QWEN35_VALUE_COLUMNS=1".into());
                 }
+                if cfg!(feature = "cuda-qwen35-value-time-warps-research") {
+                    options.push("-DCUDA_QWEN35_VALUE_TIME_WARPS=1".into());
+                }
                 if cfg!(feature = "cuda-qwen35-recurrent-fma-research") {
                     options.push("-DCUDA_QWEN35_RECURRENT_FMA=1".into());
                 }
@@ -513,6 +516,10 @@ fn open_hybrid(
             functions.insert(name, module.load_function(name).map_err(failure)?);
         }
     }
+    if cfg!(feature = "cuda-qwen35-value-time-warps-research") {
+        let name = "qwen35_attention_value_time_warps";
+        functions.insert(name, module.load_function(name).map_err(failure)?);
+    }
     if cfg!(feature = "cuda-qwen35-conv-tile-research") {
         for name in ["qwen35_conv_save", "qwen35_conv_tile"] {
             functions.insert(name, module.load_function(name).map_err(failure)?);
@@ -551,6 +558,10 @@ fn open_hybrid(
         }
         if functions.contains_key("qwen35_attention_normalize") {
             for name in ["qwen35_attention_normalize_graph", "qwen35_attention_value_columns_graph"] {
+                functions.insert(name, module.load_function(name).map_err(failure)?);
+            }
+            if cfg!(feature = "cuda-qwen35-value-time-warps-research") {
+                let name = "qwen35_attention_value_time_warps_graph";
                 functions.insert(name, module.load_function(name).map_err(failure)?);
             }
         }
@@ -1508,7 +1519,14 @@ impl Hybrid {
                         if split {
                             launch!(self, "qwen35_attention_normalize_graph", (HEADS as u32, 1, 1),
                                 &mut self.work.scores, &heads, &kv_heads, &context, control);
-                            launch!(self, "qwen35_attention_value_columns_graph", (HEADS as u32, 8, 1); 32,
+                            let (kernel, threads) = if (128..=512).contains(&bucket)
+                                && self.functions.contains_key("qwen35_attention_value_time_warps_graph")
+                            {
+                                ("qwen35_attention_value_time_warps_graph", 128)
+                            } else {
+                                ("qwen35_attention_value_columns_graph", 32)
+                            };
+                            launch!(self, kernel, (HEADS as u32, 8, 1); threads,
                                 &self.work.scores, &*values, &mut self.work.attended, &heads, &kv_heads, &context, control);
                         } else {
                             launch!(self, "qwen35_attention_values_graph", (HEADS as u32, 1, 1),
@@ -1580,7 +1598,14 @@ impl Hybrid {
                                     &context,
                                     &count
                                 );
-                                launch!(self, "qwen35_attention_value_columns", (HEADS as u32, 8, 1); 32,
+                                let (kernel, threads) = if n == 1 && count <= 512
+                                    && self.functions.contains_key("qwen35_attention_value_time_warps")
+                                {
+                                    ("qwen35_attention_value_time_warps", 128)
+                                } else {
+                                    ("qwen35_attention_value_columns", 32)
+                                };
+                                launch!(self, kernel, (HEADS as u32, 8, 1); threads,
                                     &self.work.scores, &*values, &mut out_row, &heads, &kv_heads, &context, &count);
                                 continue;
                             }

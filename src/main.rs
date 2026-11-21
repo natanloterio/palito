@@ -102,6 +102,9 @@ impl std::ops::Deref for ModelArgs {
 /// Read only by the CUDA backend, so a global setting never breaks CPU runs.
 #[cfg(feature = "cuda")]
 const KERNEL_CACHE_ENV: &str = "LOCAL_INFERENCE_CUDA_KERNEL_CACHE";
+const DEFAULT_GENERATED_TOKENS: u32 = 32;
+/// Long enough for Qwen3-style reasoning before the answer.
+const CHAT_REPLY_TOKENS: u32 = 2048;
 const DEFAULT_BATCH_TOKENS: u32 = 128;
 const DEFAULT_PREFILL_CHUNK: u32 = 64;
 /// CUDA prefill capacity is bounded at 512 tokens (prefill_capacity in cuda.rs).
@@ -126,8 +129,10 @@ pub(crate) struct RuntimeArgs {
     prefill_chunk: Option<u32>,
     #[arg(long, default_value_t = 4)]
     threads: u32,
-    #[arg(long, default_value_t = 32)]
-    pub(crate) tokens: u32,
+    /// Maximum generated tokens [default: 32; chat: 2048 per reply, capped at half
+    /// of --context].
+    #[arg(long)]
+    tokens: Option<u32>,
     /// Expand weights for differential validation rather than retaining packed GGUF blocks.
     #[arg(long)]
     f32_weights: bool,
@@ -382,6 +387,16 @@ impl RuntimeArgs {
         false
     }
 
+    pub(crate) fn tokens(&self) -> u32 {
+        self.tokens.unwrap_or(DEFAULT_GENERATED_TOKENS)
+    }
+
+    /// Reply budget for chat: room to finish, without starving the history.
+    pub(crate) fn chat_tokens(&self) -> u32 {
+        self.tokens
+            .unwrap_or(CHAT_REPLY_TOKENS.min((self.context / 2).max(1)))
+    }
+
     fn batch(&self) -> u32 {
         self.batch.unwrap_or(if self.fast_prefill() {
             FAST_PREFILL_TOKENS.min(self.context)
@@ -491,7 +506,7 @@ fn execute() -> Result<()> {
             let mut executor = Executor::new(backend, config)?;
             // Check text support before any numerical execution, including ID inputs.
             executor.detokenize(&[])?;
-            let sample = executor.generate(&input, model.tokens, GenerationMode::UntilEog)?;
+            let sample = executor.generate(&input, model.tokens(), GenerationMode::UntilEog)?;
             println!(
                 "{}",
                 serde_json::to_string(&json!({
@@ -516,13 +531,13 @@ fn execute() -> Result<()> {
             let input = model.input(backend.as_ref())?;
             let mut executor = Executor::new(backend, config.clone())?;
             for _ in 0..warmups {
-                executor.generate(&input, model.tokens, GenerationMode::FixedLength)?;
+                executor.generate(&input, model.tokens(), GenerationMode::FixedLength)?;
             }
             let mut samples = Vec::new();
             for _ in 0..repetitions {
                 samples.push(executor.generate(
                     &input,
-                    model.tokens,
+                    model.tokens(),
                     GenerationMode::FixedLength,
                 )?);
             }

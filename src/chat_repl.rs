@@ -110,7 +110,7 @@ impl Session {
             history: initial.clone(),
             initial,
             context: runtime.context as usize,
-            max_tokens: runtime.tokens,
+            max_tokens: runtime.chat_tokens(),
         })
     }
 

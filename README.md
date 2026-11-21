@@ -1463,3 +1463,14 @@ implied by the CPU results or by the KT HTTP adapter.
 See the [literature review](../literature_review/review.md) for the evidence and
 limitations behind this order. A successful smoke benchmark establishes a
 baseline; it does not establish a speedup or generalize to larger models.
+
+## Linux CLI bundle
+
+`scripts/package-linux.sh` builds `target/dist/local-inference-<version>-linux-x86_64.tar.gz`: the CUDA binary, bundled NVRTC 13 and a wrapper that defaults to `--backend cuda` with a kernel cache in `~/.cache/local-inference/kernels`. With `--install`, the script also links the wrapper as `~/.local/bin/local-inference`. The host needs an NVIDIA driver with CUDA 13 support.
+
+```sh
+scripts/package-linux.sh --install
+local-inference chat --model /path/to/model.gguf --context 4096
+```
+
+`LOCAL_INFERENCE_BACKEND`, `LOCAL_INFERENCE_MODEL` and `LOCAL_INFERENCE_CUDA_KERNEL_CACHE` set the defaults, and flags take precedence.

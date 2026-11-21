@@ -1,6 +1,6 @@
 [package]
 name = "local-inference"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Independent Rust GGUF inference engine with external-reference benchmarks"
@@ -49,7 +49,7 @@ path = "examples/cuda_capture.rs"
 required-features = ["cuda"]
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

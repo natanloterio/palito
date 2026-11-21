@@ -99,6 +99,9 @@ impl std::ops::Deref for ModelArgs {
     }
 }
 
+/// Read only by the CUDA backend, so a global setting never breaks CPU runs.
+#[cfg(feature = "cuda")]
+const KERNEL_CACHE_ENV: &str = "LOCAL_INFERENCE_CUDA_KERNEL_CACHE";
 const DEFAULT_BATCH_TOKENS: u32 = 128;
 const DEFAULT_PREFILL_CHUNK: u32 = 64;
 /// CUDA prefill capacity is bounded at 512 tokens (prefill_capacity in cuda.rs).
@@ -107,9 +110,9 @@ const FAST_PREFILL_TOKENS: u32 = 512;
 /// Backend, model and execution-plan options shared by every local model command.
 #[derive(Args)]
 pub(crate) struct RuntimeArgs {
-    #[arg(long, value_enum, default_value_t = LocalBackend::Cpu)]
+    #[arg(long, value_enum, env = "LOCAL_INFERENCE_BACKEND", default_value_t = LocalBackend::Cpu)]
     backend: LocalBackend,
-    #[arg(long)]
+    #[arg(long, env = "LOCAL_INFERENCE_MODEL")]
     pub(crate) model: PathBuf,
     #[arg(long, default_value_t = 512)]
     pub(crate) context: u32,
@@ -150,7 +153,8 @@ pub(crate) struct RuntimeArgs {
     #[cfg(feature = "cuda")]
     #[arg(long)]
     gpu_memory_limit_bytes: Option<u64>,
-    /// Opt-in private directory for persistent CUDA kernel compilation cache.
+    /// Opt-in private directory for persistent CUDA kernel compilation cache
+    /// [fallback when omitted with --backend cuda: $LOCAL_INFERENCE_CUDA_KERNEL_CACHE].
     #[cfg(feature = "cuda")]
     #[arg(long)]
     cuda_kernel_cache: Option<PathBuf>,
@@ -335,7 +339,11 @@ impl RuntimeArgs {
         if let Some(limit) = self.gpu_memory_limit_bytes {
             options.memory_limit_bytes = limit;
         }
-        options.kernel_cache_dir = self.cuda_kernel_cache.clone();
+        options.kernel_cache_dir = self.cuda_kernel_cache.clone().or_else(|| {
+            std::env::var_os(KERNEL_CACHE_ENV)
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from)
+        });
         options.matmul = self.cuda_matmul();
         options.decode_graph = self.cuda_decode_graph || self.implicit_decode_graph();
         options

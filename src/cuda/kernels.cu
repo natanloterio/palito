@@ -260,11 +260,10 @@ __device__ __forceinline__ float packed_sum_block(float value) {
 // Q4_K blocks are 16-byte aligned; Q6_K's 210-byte stride permits only u16
 // loads. Metadata stays local to the lane, without warp-wide broadcasts.
 template<int Kind>
-__device__ __forceinline__ float packed_matrix_lane(const u8 *w, const float *x,
-                                                    u64 offset, int width, int tid) {
+__device__ __forceinline__ float packed_lane_span(const u8 *w, const float *x, u64 offset,
+                                                  int width, int lane, int start, int step) {
     float parts[8] = {};
-    int lane = tid & 31;
-    for (int first = (tid / 32) * 256; first < width; first += 2048) {
+    for (int first = start; first < width; first += step) {
         const u8 *p = w + ((offset + first) / 256) * (Kind == 12 ? 144 : 210);
         float d = half_value(p + (Kind == 12 ? 0 : 208));
         if (Kind == 12) {
@@ -314,6 +313,170 @@ __device__ __forceinline__ float packed_matrix_lane(const u8 *w, const float *x,
     parts[0] += parts[2];
     parts[1] += parts[3];
     return parts[0] + parts[1];
+}
+
+template<int Kind>
+__device__ __forceinline__ float packed_matrix_lane(const u8 *w, const float *x,
+                                                    u64 offset, int width, int tid) {
+    return packed_lane_span<Kind>(w, x, offset, width, tid & 31, (tid / 32) * 256, 2048);
+}
+
+__device__ __forceinline__ float warp_sum(float value) {
+    #pragma unroll
+    for (int stride = 16; stride > 0; stride /= 2)
+        value += __shfl_xor_sync(0xffffffff, value, stride);
+    return value;
+}
+
+template<int Kind>
+__device__ __forceinline__ float warp_scalar_row(const u8 *w, const float *x,
+                                                 u64 offset, int width, int lane) {
+    float sum = 0.0f;
+    for (int i = lane; i < width; i += 32) sum += weight(w, Kind, offset + i) * x[i];
+    return warp_sum(sum);
+}
+
+// Warps cooperating on one output row. Narrow-row shapes keep one warp per row
+// (no barrier); few-row shapes split a row's 256-value blocks across up to 8
+// warps so the grid still fills the GPU. Mirrors `matvec_warps_per_row` in
+// cuda.rs, which sizes the grid: grid=(ceil(rows * warps / 8), selections, 1).
+__device__ __forceinline__ int matvec_warps_per_row(int rows, int selections, int width) {
+    int blocks = width / 256 > 0 ? width / 256 : 1, warps = 1;
+    while (warps < 8 && warps < blocks && rows * selections * warps < 16384) warps *= 2;
+    return warps;
+}
+
+// block=(256, 1, 1). F32 arithmetic; only the reduction order differs from matvec.
+extern "C" __global__ void matvec_packed_rows(const u8 *w, int kind, const float *x, float *y,
+                                             int width, int rows, const int *ids,
+                                             int moe, int batched) {
+    __shared__ float partial[8];
+    int lane = threadIdx.x & 31, warp = threadIdx.x / 32, selected = blockIdx.y;
+    int warps = matvec_warps_per_row(rows, gridDim.y, width);
+    int part = warp % warps, row = blockIdx.x * (8 / warps) + warp / warps;
+    float sum = 0.0f;
+    if (row < rows) {
+        int expert = moe ? ids[selected] : 0;
+        u64 offset = ((u64)expert * rows + row) * width;
+        const float *input = x + (batched ? (u64)selected * width : 0);
+        if ((kind == 12 || kind == 14) && width % 256 == 0) {
+            int start = part * 256, step = warps * 256;
+            sum = warp_sum(kind == 12
+                ? packed_lane_span<12>(w, input, offset, width, lane, start, step)
+                : packed_lane_span<14>(w, input, offset, width, lane, start, step));
+        } else if (part == 0) {
+            switch (kind) {
+                case 0: sum = warp_scalar_row<0>(w, input, offset, width, lane); break;
+                case 1: sum = warp_scalar_row<1>(w, input, offset, width, lane); break;
+                case 6: sum = warp_scalar_row<6>(w, input, offset, width, lane); break;
+                case 8: sum = warp_scalar_row<8>(w, input, offset, width, lane); break;
+                case 12: sum = warp_scalar_row<12>(w, input, offset, width, lane); break;
+                case 13: sum = warp_scalar_row<13>(w, input, offset, width, lane); break;
+                case 14: sum = warp_scalar_row<14>(w, input, offset, width, lane); break;
+                default: sum = __int_as_float(0x7fffffff); break;
+            }
+        }
+    }
+    if (warps > 1) {
+        if (lane == 0) partial[warp] = sum;
+        __syncthreads();
+        if (part != 0) return;
+        for (int i = 1; i < warps; i++) sum += partial[warp + i];
+    }
+    if (lane == 0 && row < rows) y[(u64)selected * rows + row] = sum;
+}
+
+// Drop-in RMSNorm (grid=rows, block=32..1024 threads, multiple of 32): warp shuffles
+// plus one barrier instead of the shared-memory tree. F32; only the reduction order differs.
+extern "C" __global__ void normalize_warp(const float *x, const u8 *w, float *y, int n,
+                                          float epsilon) {
+    __shared__ float partial[32];
+    x += (u64)blockIdx.x * n;
+    y += (u64)blockIdx.x * n;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) sum += x[i] * x[i];
+    sum = warp_sum(sum);
+    if ((threadIdx.x & 31) == 0) partial[threadIdx.x / 32] = sum;
+    __syncthreads();
+    float total = 0.0f;
+    for (int i = 0; i < (int)blockDim.x / 32; i++) total += partial[i];
+    float inverse = 1.0f / sqrtf(total / (float)n + epsilon);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = x[i] * inverse * ((const float *)w)[i];
+}
+
+template<int Kind>
+__device__ __forceinline__ float packed_row_part(const u8 *w, const float *x, u64 offset,
+                                                 int width, int lane, int part, int warps) {
+    return warp_sum(packed_lane_span<Kind>(w, x, offset, width, lane, part * 256, warps * 256));
+}
+
+// Q, K and V projections of one input in a single launch: rows [0, q) go to yq,
+// [q, q + k) to yk and the rest to yv. All three must be block-aligned packed
+// Q4_K/Q6_K with the same width. Grid as matvec_packed_rows over q + k + v rows.
+extern "C" __global__ void matvec_packed_qkv_rows(
+    const u8 *wq, int q_kind, int q_rows, float *yq,
+    const u8 *wk, int k_kind, int k_rows, float *yk,
+    const u8 *wv, int v_kind, int v_rows, float *yv,
+    const float *x, int width) {
+    __shared__ float partial[8];
+    int total = q_rows + k_rows + v_rows;
+    int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    int warps = matvec_warps_per_row(total, 1, width);
+    int part = warp % warps, row = blockIdx.x * (8 / warps) + warp / warps;
+    const u8 *w = wq;
+    int kind = q_kind, local = row;
+    float *y = yq;
+    if (row >= q_rows + k_rows) {
+        w = wv; kind = v_kind; y = yv; local = row - q_rows - k_rows;
+    } else if (row >= q_rows) {
+        w = wk; kind = k_kind; y = yk; local = row - q_rows;
+    }
+    float sum = 0.0f;
+    if (row < total) {
+        u64 offset = (u64)local * width;
+        sum = kind == 12 ? packed_row_part<12>(w, x, offset, width, lane, part, warps)
+                         : packed_row_part<14>(w, x, offset, width, lane, part, warps);
+    }
+    if (warps > 1) {
+        if (lane == 0) partial[warp] = sum;
+        __syncthreads();
+        if (part != 0) return;
+        for (int i = 1; i < warps; i++) sum += partial[warp + i];
+    }
+    if (lane == 0 && row < total) y[local] = sum;
+}
+
+// Fused MoE gate/up projections plus SwiGLU for packed Q4_K/Q6_K experts with
+// block-aligned rows. Same grid as matvec_packed_rows; reads x once per row pair
+// and drops the separate swiglu launch. y = silu(gate . x) * (up . x).
+extern "C" __global__ void matvec_packed_gate_up_rows(
+    const u8 *gate, int gate_kind, const u8 *up, int up_kind, const float *x, float *y,
+    int width, int rows, const int *ids) {
+    __shared__ float partial[2][8];
+    int lane = threadIdx.x & 31, warp = threadIdx.x / 32, selected = blockIdx.y;
+    int warps = matvec_warps_per_row(rows, gridDim.y, width);
+    int part = warp % warps, row = blockIdx.x * (8 / warps) + warp / warps;
+    float g = 0.0f, u = 0.0f;
+    if (row < rows) {
+        u64 offset = ((u64)ids[selected] * rows + row) * width;
+        g = gate_kind == 12 ? packed_row_part<12>(gate, x, offset, width, lane, part, warps)
+                            : packed_row_part<14>(gate, x, offset, width, lane, part, warps);
+        u = up_kind == 12 ? packed_row_part<12>(up, x, offset, width, lane, part, warps)
+                          : packed_row_part<14>(up, x, offset, width, lane, part, warps);
+    }
+    if (warps > 1) {
+        if (lane == 0) {
+            partial[0][warp] = g;
+            partial[1][warp] = u;
+        }
+        __syncthreads();
+        if (part != 0) return;
+        for (int i = 1; i < warps; i++) {
+            g += partial[0][warp + i];
+            u += partial[1][warp + i];
+        }
+    }
+    if (lane == 0 && row < rows) y[(u64)selected * rows + row] = g / (1.0f + expf(-g)) * u;
 }
 
 template<int Kind>
@@ -828,6 +991,10 @@ extern "C" __global__ void router_full_softmax(const float *scores, int count, i
     router_impl<true>(scores, count, used, ids, weights, status);
 }
 #if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_DECODE_FUSION_RESEARCH)
+#define CUDA_ROUTER_WARP128 1
+#endif
+#if defined(CUDA_ROUTER_WARP128) || defined(CUDA_PACKED_DECODE)
+// Same selection, tie-breaking and weight summation order as router(); one warp.
 extern "C" __global__ void router_warp128(const float *scores, int used,
                                           int *ids, float *weights, int *status) {
     scores += (u64)blockIdx.x * 128;
@@ -891,7 +1058,11 @@ extern "C" __global__ void router_warp128(const float *scores, int used,
     }
     if (lane < used) weights[lane] = my_weight / total;
 }
+#endif
 
+#if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_DECODE_FUSION_RESEARCH) || defined(CUDA_PACKED_DECODE)
+// Equals head_norm (256-lane tree) + rotary + cache_kv for dim-128 heads with
+// full, unscaled RoPE; grid=(heads + kv_heads), block=256.
 __device__ __forceinline__ void qkv_head_norm_rope_cache_impl(
     float *q, const u8 *q_norm, int heads,
     float *k, const u8 *k_norm, const float *v,

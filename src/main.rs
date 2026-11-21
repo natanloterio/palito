@@ -107,8 +107,10 @@ const DEFAULT_GENERATED_TOKENS: u32 = 32;
 const CHAT_REPLY_TOKENS: u32 = 2048;
 const DEFAULT_BATCH_TOKENS: u32 = 128;
 const DEFAULT_PREFILL_CHUNK: u32 = 64;
-/// CUDA prefill capacity is bounded at 512 tokens (prefill_capacity in cuda.rs).
-const FAST_PREFILL_TOKENS: u32 = 512;
+/// Chat prefill batch/chunk on CUDA (PREFILL_CAPACITY_MAX in cuda.rs), capped by
+/// --context: one chunk covers a 4k prompt (Qwen3-30B 2.9k prompt, int8-prefill:
+/// TTFT 0.40 s with 512-token chunks, 0.30 s in one chunk, ~0.7 GB more workspace).
+const FAST_PREFILL_TOKENS: u32 = 4096;
 
 /// Backend, model and execution-plan options shared by every local model command.
 #[derive(Args)]
@@ -119,11 +121,11 @@ pub(crate) struct RuntimeArgs {
     pub(crate) model: PathBuf,
     #[arg(long, default_value_t = 512)]
     pub(crate) context: u32,
-    /// Prefill batch capacity [default: 128; chat on CUDA: 512, capped by
+    /// Prefill batch capacity [default: 128; chat on CUDA: 4096, capped by
     /// --context].
     #[arg(long)]
     batch: Option<u32>,
-    /// Tokens per prefill call [default: 64; chat on CUDA: 512, capped by
+    /// Tokens per prefill call [default: 64; chat on CUDA: 4096, capped by
     /// --context and --batch].
     #[arg(long)]
     prefill_chunk: Option<u32>,
@@ -468,7 +470,7 @@ impl RuntimeArgs {
                     "backend": "cuda", "options": self.cuda_options(),
                     "expert_residency": "all weights GPU-resident",
                     "prefill": if self.batch() > 1 {
-                        "layer-wise batched (internal capacity <=512)"
+                        "layer-wise batched (internal capacity <=4096)"
                     } else { "sequential token steps" },
                     "kv_precision": "f32",
                 });

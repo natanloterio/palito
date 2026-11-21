@@ -293,3 +293,22 @@ Tempo de GPU no prompt longo (nsys), 534 ms no total:
 
 As projeções MMQ e a attention são os próximos alvos.
 
+## 12. Prefill `int8-prefill` na 0.2.3: 0,54 s → 0,35 s
+
+Prompt de 2.863 tokens, Qwen3-30B-A3B Q4_K_M, RTX 5090. O llama.cpp faz 0,18 s.
+
+| Mudança | TTFT |
+|---|---|
+| 0.2.2 | 0,54 s |
+| par residual com fator inteiro nas projeções de atenção | 0,45 s |
+| K/V convertidos uma vez por camada para FP16 alto/baixo, attention com 8 warps | 0,426 s |
+| tile de 32 tokens nas projeções com poucas linhas (K/V, saída da attention) | 0,40 s |
+| capacidade de prefill de 512 para 4096 (prompt inteiro num chunk) | 0,35 s |
+
+- **Par residual** (`quantize32_residual_pair`): x ≈ d·(K·q1 + q2), com K inteiro entre 1 e 32768 por bloco de 32 valores. O kernel combina os dois MMAs em inteiro (K·dot1 + dot2 cabe em 32 bits) e usa 2 MMAs em vez de 3. Um fator potência de dois dava max_abs 0,19 e um split int16 uniforme dava 1,05.
+- **FFN e experts continuam com três componentes.** Com o par também nelas o TTFT cai para 0,30 s, mas o max_abs no prompt longo vai a 0,73 e o primeiro token muda: o erro troca experts do roteamento MoE, e nesse prompt os dois primeiros tokens estão a 0,022 de logit.
+- **Capacidade 4096:** o buffer de scores por token só é reservado para attention não-flash (BLOOM, Gemma). O custo é ~0,7 GB a mais de workspace no chat com contexto 4096.
+
+Validação: mesmos 32 tokens do F32 nos prompts curto e longo; texto real de 256 tokens com max_abs 0,092 e cos 0,9999981; MoE long600 com chunks 64/512/600 com max_abs ≤ 0,055; 15 testes CUDA; `f32` e `f32-tiled` inalterados; decode ~373 tok/s.
+
+Descartado: KS 128 nos tiles de 64 tokens, KS 64/256 nos experts, attention pré-convertida com 4 warps.

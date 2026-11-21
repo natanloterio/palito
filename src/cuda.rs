@@ -224,6 +224,8 @@ struct Workspace {
     residual_int8: Option<ResidualWorkspace>,
     residual_mma3: Option<PreciseWorkspace>,
     attention_partials: Option<CudaSlice<f32>>,
+    /// FP16 hi/lo K/V planes for attention_prefill_mma_half (int8-prefill).
+    attention_half: Option<CudaSlice<u16>>,
 }
 
 struct ResidualWorkspace {
@@ -237,13 +239,16 @@ struct PreciseWorkspace {
     values: CudaSlice<i8>,
     scales: CudaSlice<f32>,
     sums: CudaSlice<i32>,
+    /// Current contents are the S16 pair (quantize32_residual_pair) rather than
+    /// three residual components; set by prepare_residual, read by the MMQ launch.
+    pair: bool,
 }
 
 fn residual_workspace_elements(spec: &Spec, matmul: CudaMatmul) -> Result<usize> {
     if matmul.residual_components() == 0 || prefill_capacity(spec) < matmul.residual_min_tokens() {
         return Ok(0);
     }
-    let sizes = workspace_sizes(spec)?;
+    let sizes = workspace_sizes(spec, matmul)?;
     let largest = sizes[0].max(sizes[2]).max(sizes[7]);
     largest
         .checked_add(31)
@@ -268,8 +273,25 @@ fn residual_workspace_bytes(spec: &Spec, matmul: CudaMatmul) -> Result<u64> {
         .ok_or_else(|| invalid("residual INT8 workspace byte overflow"))
 }
 
+/// Largest prefill batch the CUDA workspaces are sized for. Above 512 tokens only
+/// pays off with flash prefill attention (no per-token score rows): Qwen3-30B 2.9k
+/// prompt, int8-prefill TTFT 0.40 s at 512 -> 0.30 s in one 3k chunk.
+const PREFILL_CAPACITY_MAX: usize = 4096;
+
 fn prefill_capacity(spec: &Spec) -> usize {
-    (spec.info.batch_tokens as usize).min(512)
+    (spec.info.batch_tokens as usize).min(PREFILL_CAPACITY_MAX)
+}
+
+/// Batched prefill attention is the flash kernel (attention_prefill_flash4 or
+/// attention_prefill_mma_half) and needs no heads x context score row per token.
+/// Must match the branch order in batched_prefill (ALiBi/BLOOM and Gemma first).
+fn flash_prefill_attention(spec: &Spec, matmul: CudaMatmul) -> bool {
+    matmul.f32_tiled()
+        && spec.dim == 128
+        && spec.kv_heads > 0
+        && spec.heads % spec.kv_heads == 0
+        && spec.heads / spec.kv_heads <= 8
+        && !matches!(spec.info.architecture.as_str(), "bloom" | "gemma2" | "gemma3")
 }
 
 fn fused_attention_supported(spec: &Spec) -> bool {
@@ -303,6 +325,25 @@ fn attention_splits(spec: &Spec) -> usize {
 const FUSED_NORM_MAX_WIDTH: usize = 4 * 1024;
 
 /// F32 elements of the split-K partials: per head and split, o[dim], max and sum.
+/// Positions per plane of the int8-prefill FP16 K/V buffer (multiple of 64).
+fn attention_half_stride(spec: &Spec) -> usize {
+    (spec.info.context_tokens as usize).div_ceil(64) * 64
+}
+
+/// u16 elements of the int8-prefill FP16 hi/lo K/V buffer (4 planes), or 0.
+fn attention_half_elements(spec: &Spec, matmul: CudaMatmul) -> usize {
+    if matmul == CudaMatmul::Int8Prefill
+        && spec.dim == 128
+        && spec.kv_heads > 0
+        && spec.heads == 8 * spec.kv_heads
+        && prefill_capacity(spec) > 1
+    {
+        4 * attention_half_stride(spec) * spec.kv_heads * spec.dim
+    } else {
+        0
+    }
+}
+
 fn attention_partial_elements(spec: &Spec, matmul: CudaMatmul) -> usize {
     if split_attention_supported(spec, matmul) {
         spec.heads * attention_splits(spec) * (spec.dim + 2)
@@ -361,7 +402,7 @@ fn group_workspace_elements(spec: &Spec, matmul: CudaMatmul) -> Result<usize> {
     }
 }
 
-fn workspace_sizes(spec: &Spec) -> Result<[usize; 12]> {
+fn workspace_sizes(spec: &Spec, matmul: CudaMatmul) -> Result<[usize; 12]> {
     let product = |a: usize, b: usize| {
         a.checked_mul(b)
             .ok_or_else(|| invalid("workspace overflow"))
@@ -383,7 +424,7 @@ fn workspace_sizes(spec: &Spec) -> Result<[usize; 12]> {
     for size in &mut sizes[..10] {
         *size = product(*size, prefill_capacity(spec))?;
     }
-    if !fused_attention_supported(spec) {
+    if !fused_attention_supported(spec) && !flash_prefill_attention(spec, matmul) {
         sizes[10] = product(sizes[10], prefill_capacity(spec))?;
     }
     if spec.experts > 0 {
@@ -408,7 +449,7 @@ fn parallel_group_count_elements(spec: &Spec, matmul: CudaMatmul) -> usize {
 
 impl Workspace {
     fn new(spec: &Spec, stream: &Arc<CudaStream>, matmul: CudaMatmul) -> Result<Self> {
-        let [w, _, qw, kw, _, _, _, gates, _, down, scores, router] = workspace_sizes(spec)?;
+        let [w, _, qw, kw, _, _, _, gates, _, down, scores, router] = workspace_sizes(spec, matmul)?;
         let alloc = |n| stream.alloc_zeros::<f32>(n).map_err(failure);
         Ok(Self {
             x: alloc(w)?,
@@ -475,12 +516,18 @@ impl Workspace {
                         values: stream.alloc_zeros(count * 3).map_err(failure)?,
                         scales: alloc(count / 32 * 3)?,
                         sums: stream.alloc_zeros(count / 32 * 3).map_err(failure)?,
+                        pair: false,
                     })
                 }
             },
             attention_partials: match attention_partial_elements(spec, matmul) {
                 0 => None,
                 n => Some(alloc(n)?),
+            },
+            // Zeroed: tiles may read finite V rows past the converted positions.
+            attention_half: match attention_half_elements(spec, matmul) {
+                0 => None,
+                n => Some(stream.alloc_zeros(n).map_err(failure)?),
             },
         })
     }
@@ -1065,11 +1112,17 @@ impl CudaBackend {
             }
             if options.matmul == CudaMatmul::Int8Prefill {
                 for name in [
+                    "quantize32_residual_pair",
                     "residual_quantize32_precise3",
-                    "residual_matmul_mmq",
-                    "residual_matmul_mmq16",
-                    "residual_matmul_mmq_grouped",
+                    "mmq_c3",
+                    "mmq_c3_rows32",
+                    "mmq_c3_grouped",
+                    "mmq_s16",
+                    "mmq_s16_rows32",
+                    "mmq_s16_grouped",
                     "attention_prefill_mma",
+                    "attention_half_kv",
+                    "attention_prefill_mma_half",
                 ] {
                     functions.insert(name, module.load_function(name).map_err(failure)?);
                 }
@@ -1225,7 +1278,7 @@ impl CudaBackend {
             .ok_or_else(|| invalid("KV byte overflow"))?;
         let routing = routing_elements(s)? as u64;
         let groups = group_workspace_elements(s, options.matmul)? as u64;
-        let workspace_bytes = workspace_sizes(s)?
+        let workspace_bytes = workspace_sizes(s, options.matmul)?
             .into_iter()
             .try_fold(0u64, |sum, n| sum.checked_add(n as u64))
             .and_then(|n| n.checked_add(routing * 2 + groups + 1))
@@ -1242,6 +1295,7 @@ impl CudaBackend {
             .ok_or_else(|| invalid("workspace byte overflow"))?;
         let workspace_bytes = workspace_bytes
             .checked_add(residual_workspace_bytes(s, options.matmul)?)
+            .and_then(|n| n.checked_add(attention_half_elements(s, options.matmul) as u64 * 2))
             .ok_or_else(|| invalid("workspace byte overflow"))?;
         let logits_bytes = u64::from(s.info.vocab_tokens) * 4;
         let reservation = weight_bytes

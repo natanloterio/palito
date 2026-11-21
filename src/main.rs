@@ -8,6 +8,8 @@ use local_inference::{
 use serde_json::json;
 use std::{fs, path::PathBuf, time::Instant};
 
+mod chat_repl;
+
 #[derive(Parser)]
 #[command(
     version,
@@ -25,6 +27,11 @@ enum Command {
     Remote {
         #[command(flatten)]
         args: RemoteArgs,
+    },
+    /// Interactive multi-turn chat using the model's GGUF chat template (greedy).
+    Chat {
+        #[command(flatten)]
+        args: chat_repl::ChatArgs,
     },
     /// Greedy completion, stopping at EOG. No chat template is applied.
     Generate {
@@ -75,18 +82,32 @@ enum LocalBackend {
 #[command(group(ArgGroup::new("input").required(true).multiple(false)
     .args(["input_tokens_file", "prompt", "prompt_file"])))]
 struct ModelArgs {
-    #[arg(long, value_enum, default_value_t = LocalBackend::Cpu)]
-    backend: LocalBackend,
-    #[arg(long)]
-    model: PathBuf,
+    #[command(flatten)]
+    runtime: RuntimeArgs,
     #[arg(long)]
     input_tokens_file: Option<PathBuf>,
     #[arg(long, allow_hyphen_values = true)]
     prompt: Option<String>,
     #[arg(long)]
     prompt_file: Option<PathBuf>,
+}
+
+impl std::ops::Deref for ModelArgs {
+    type Target = RuntimeArgs;
+    fn deref(&self) -> &RuntimeArgs {
+        &self.runtime
+    }
+}
+
+/// Backend, model and execution-plan options shared by every local model command.
+#[derive(Args)]
+pub(crate) struct RuntimeArgs {
+    #[arg(long, value_enum, default_value_t = LocalBackend::Cpu)]
+    backend: LocalBackend,
+    #[arg(long)]
+    pub(crate) model: PathBuf,
     #[arg(long, default_value_t = 512)]
-    context: u32,
+    pub(crate) context: u32,
     #[arg(long, default_value_t = 128)]
     batch: u32,
     #[arg(long, default_value_t = 64)]
@@ -94,7 +115,7 @@ struct ModelArgs {
     #[arg(long, default_value_t = 4)]
     threads: u32,
     #[arg(long, default_value_t = 32)]
-    tokens: u32,
+    pub(crate) tokens: u32,
     /// Expand weights for differential validation rather than retaining packed GGUF blocks.
     #[arg(long)]
     f32_weights: bool,
@@ -219,7 +240,7 @@ fn text_input(prompt: &Option<String>, file: &Option<PathBuf>) -> Result<String>
     }
 }
 
-impl ModelArgs {
+impl RuntimeArgs {
     fn options(&self) -> CpuOptions {
         CpuOptions {
             expand_weights: self.f32_weights,
@@ -231,7 +252,7 @@ impl ModelArgs {
         }
     }
 
-    fn open(&self) -> Result<Box<dyn Backend>> {
+    pub(crate) fn open(&self) -> Result<Box<dyn Backend>> {
         #[cfg(feature = "cuda")]
         {
             if self.backend != LocalBackend::Cuda
@@ -319,7 +340,7 @@ impl ModelArgs {
         json!(self.options())
     }
 
-    fn config(&self) -> Config {
+    pub(crate) fn config(&self) -> Config {
         Config {
             context_tokens: self.context,
             batch_tokens: self.batch,
@@ -327,7 +348,9 @@ impl ModelArgs {
             threads: self.threads,
         }
     }
+}
 
+impl ModelArgs {
     fn input(&self, backend: &dyn Backend) -> Result<Vec<i32>> {
         match &self.input_tokens_file {
             Some(path) => Ok(serde_json::from_slice(&fs::read(path)?)?),
@@ -340,6 +363,7 @@ fn execute() -> Result<()> {
     match Cli::parse().command {
         #[cfg(feature = "ktransformers")]
         Command::Remote { args } => remote(args)?,
+        Command::Chat { args } => chat_repl::run(args)?,
         Command::Tokenize { model, text } => {
             let tokenizer = Tokenizer::open(&model)?;
             let input = text_input(&text.prompt, &text.prompt_file)?;

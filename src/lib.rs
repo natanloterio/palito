@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod chat;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;

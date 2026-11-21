@@ -47,7 +47,7 @@ __device__ __forceinline__ void fa_mma(float c[4], const unsigned int a[4], unsi
 template<int Warps, bool Split, bool SplitV>
 __device__ __forceinline__ void attention_prefill_mma_impl(
     const float *q, const float *keys, const float *values, float *output, int heads,
-    int kv_heads, int tokens, int count) {
+    int kv_heads, int tokens, int count, const uint4 *halves = nullptr, int stride = 0) {
     constexpr int THREADS = 32 * Warps, GROUP = 8;
     __shared__ __align__(16) unsigned short ks[FA_KEYS * FA_K_STRIDE];
     __shared__ __align__(16) unsigned short kl[Split ? FA_KEYS * FA_K_STRIDE : 2];
@@ -94,6 +94,24 @@ __device__ __forceinline__ void attention_prefill_mma_impl(
     for (int base = 0; base < span; base += FA_KEYS) {
         int n = min(FA_KEYS, span - base);
         __syncthreads();
+        if (halves) {
+            // Pre-split tiles (attention_half_kv): plain 16-byte copies. Keys past
+            // the span are masked; their V rows are finite (zeroed or older data).
+            const uint4 *khi = halves, *klo = halves + (u64)stride * kv_heads * (FA_DIM / 8);
+            const uint4 *vhi = klo + (u64)stride * kv_heads * (FA_DIM / 8);
+            const uint4 *vlo = vhi + (u64)stride * kv_heads * (FA_DIM / 8);
+            for (int i = tid; i < FA_KEYS * FA_DIM / 8; i += THREADS) {
+                int key = i / (FA_DIM / 8), c = i % (FA_DIM / 8);
+                u64 at = ((u64)(base + key) * kv_heads + kv_head) * (FA_DIM / 8) + c;
+                uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+                *(uint4 *)&ks[key * FA_K_STRIDE + 8 * c] = key < n ? khi[at] : zero;
+                *(uint4 *)&kl[key * FA_K_STRIDE + 8 * c] = key < n ? klo[at] : zero;
+                int d = i / (FA_KEYS / 8), part = i % (FA_KEYS / 8);
+                u64 row = ((u64)kv_head * FA_DIM + d) * (stride / 8) + base / 8 + part;
+                *(uint4 *)&vt[d * FA_V_STRIDE + 8 * part] = vhi[row];
+                *(uint4 *)&vl[d * FA_V_STRIDE + 8 * part] = vlo[row];
+            }
+        } else {
         for (int i = tid; i < FA_KEYS * FA_DIM / 4; i += THREADS) {
             int key = i / (FA_DIM / 4), c = 4 * (i % (FA_DIM / 4));
             float4 v = key < n
@@ -128,6 +146,7 @@ __device__ __forceinline__ void attention_prefill_mma_impl(
                         fa_pack(pairs[e][0] - h.x, pairs[e][1] - h.y);
                 }
             }
+        }
         }
         __syncthreads();
         if (base >= warp_limit) continue;
@@ -232,3 +251,54 @@ attention_prefill_mma(const float *q, const float *keys, const float *values, fl
     attention_prefill_mma_impl<4, true, true>(q, keys, values, output, heads, kv_heads, tokens, count);
 #endif
 }
+
+// Pre-split K/V for attention_prefill_mma_half: four planes of `stride` positions,
+// K hi, K lo as [position][kv_head][128] and V hi, V lo transposed as
+// [kv_head][128][stride] (FP16 bits). grid = (ceil(positions / 32), kv_heads),
+// 256 threads; stride % 64 == 0 and positions <= stride.
+extern "C" __global__ void __launch_bounds__(256)
+attention_half_kv(const float *keys, const float *values, unsigned short *halves,
+                  int kv_heads, int positions, int stride) {
+#if __CUDA_ARCH__ >= 800
+    __shared__ float tile[FA_DIM][33];
+    int kv_head = blockIdx.y, first = blockIdx.x * 32, tid = threadIdx.x;
+    u64 plane = (u64)stride * kv_heads * FA_DIM;
+    unsigned short *khi = halves, *klo = halves + plane, *vhi = klo + plane, *vlo = vhi + plane;
+    for (int i = tid; i < 32 * FA_DIM / 2; i += 256) {
+        int p = i / (FA_DIM / 2), d = 2 * (i % (FA_DIM / 2)), pos = first + p;
+        float2 k = make_float2(0.0f, 0.0f), v = make_float2(0.0f, 0.0f);
+        if (pos < positions) {
+            u64 at = ((u64)pos * kv_heads + kv_head) * FA_DIM + d;
+            k = *(const float2 *)(keys + at);
+            v = *(const float2 *)(values + at);
+            unsigned int high = fa_pack(k.x, k.y);
+            float2 h = fa_unpack(high);
+            *(unsigned int *)(khi + at) = high;
+            *(unsigned int *)(klo + at) = fa_pack(k.x - h.x, k.y - h.y);
+        }
+        tile[d][p] = v.x;
+        tile[d + 1][p] = v.y;
+    }
+    __syncthreads();
+    for (int i = tid; i < FA_DIM * 16; i += 256) {
+        int d = i / 16, pair = 2 * (i % 16), pos = first + pair;
+        if (pos >= positions) continue;
+        float a = tile[d][pair], b = tile[d][pair + 1];
+        unsigned int high = fa_pack(a, b);
+        float2 h = fa_unpack(high);
+        u64 at = ((u64)kv_head * FA_DIM + d) * stride + pos;
+        *(unsigned int *)(vhi + at) = high;
+        *(unsigned int *)(vlo + at) = fa_pack(a - h.x, b - h.y);
+    }
+#endif
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+attention_prefill_mma_half(const float *q, const unsigned short *halves, float *output,
+                           int heads, int kv_heads, int tokens, int count, int stride) {
+#if __CUDA_ARCH__ >= 800
+    attention_prefill_mma_impl<8, true, true>(q, nullptr, nullptr, output, heads, kv_heads,
+                                              tokens, count, (const uint4 *)halves, stride);
+#endif
+}
+

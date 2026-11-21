@@ -1,6 +1,10 @@
-// Integer tensor-core prefill projection for packed Q4_K / Q6_K weights and
-// residual INT8 activations (residual_quantize32_precise<C>): same ABI as
-// residual_matmul_mma3. Each block stages a 128-row x KS weight tile and a
+// Integer tensor-core prefill projection for packed Q4_K / Q6_K weights and INT8
+// activation planes: same ABI as residual_matmul_mma3. Activations are either C
+// residual components (residual_quantize32_precise<C>, one scale/sum per component)
+// or, with S16, two residual planes whose scales differ by an integer factor
+// (quantize32_residual_pair: x ~ d * (K * q1 + q2), K in [1, 32768] per 32 values);
+// S16 combines the two MMAs in the integer accumulator (dot = K * dot1 + dot2,
+// bounded by 65024 * 32768 + 65024 < 2^31). Each block stages a 128-row x KS weight tile and a
 // BN-token activation tile per component; 8 warps (4 along rows x 2 along
 // tokens) issue s8 MMAs whose integer dot products are exact per 32-value (Q4_K)
 // or 16-value (Q6_K) scale group. Each output accumulates in F32
@@ -8,25 +12,29 @@
 #define MMQ_ROWS 128
 
 // Declared once per kernel and shared by both Kind instantiations.
-template<int C, int BN, int KS>
+template<int C, int BN, int KS, int SC>
 struct MmqShared {
     static constexpr int PACKS = KS / 4, STRIDE = KS / 4 + 4, GROUPS = KS / 32;
     unsigned int wq[MMQ_ROWS][STRIDE];
     unsigned int xq[C][BN][STRIDE];
     float coefficient[MMQ_ROWS][2 * GROUPS], minimum[MMQ_ROWS][GROUPS];
-    float xs[BN][GROUPS][C];
+    float xs[BN][GROUPS][SC];
     // Q4_K minimum term per token: sum over components of activation_sum * scale.
     float msum[BN][GROUPS];
+    int factor[BN][GROUPS];
     int destination[BN], source[BN];
 };
 
 #if __CUDA_ARCH__ >= 800
-template<int Kind, int C, int BN, int KS>
+template<int Kind, int C, int BN, int KS, bool S16>
 __device__ void mmq_tile(const u8 *weights, const signed char *values, const float *scales,
                          const int *sums, float *output, int width, int rows, int tokens,
                          const int *groups, int used, int grouped, int assignment_major,
-                         int *status, MmqShared<C, BN, KS> &sh) {
-    using Shared = MmqShared<C, BN, KS>;
+                         int *status, MmqShared<C, BN, KS, S16 ? 2 : C> &sh) {
+    // S16 metadata per 32 values: scales {d, unused}, sums {sum of codes, factor K}.
+    constexpr int SC = S16 ? 2 : C;
+    static_assert(!S16 || C == 2, "split16 uses two planes");
+    using Shared = MmqShared<C, BN, KS, SC>;
     constexpr int THREADS = 256, NT = BN / 16, PACKS = Shared::PACKS, GROUPS = Shared::GROUPS;
     static_assert(BN % 16 == 0 && KS % 32 == 0, "tile shape");
     int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
@@ -64,8 +72,8 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
     constexpr int S_ITEMS = (BN * GROUPS + THREADS - 1) / THREADS;
     constexpr int W_WORDS = Kind == 12 ? 1 : 2;
     unsigned int wraw[W_ITEMS][W_WORDS], praw[P_ITEMS][4], xraw[X_ITEMS];
-    float sraw[S_ITEMS][C];
-    int mraw[S_ITEMS][C];
+    float sraw[S_ITEMS][SC];
+    int mraw[S_ITEMS][SC];
     auto block_of = [&](int row, int k) {
         return weights + (((u64)expert * rows + first_row + row) * width + k) / 256
             * (Kind == 12 ? 144 : 210);
@@ -123,9 +131,9 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
         for (int j = 0; j < S_ITEMS; j++) {
             int index = tid + j * THREADS, t = index / GROUPS, g = index % GROUPS;
             int s = index < BN * GROUPS ? sh.source[t] : -1;
-            u64 offset = ((u64)(s < 0 ? 0 : s) * width + k) / 32 * C + g * C;
+            u64 offset = ((u64)(s < 0 ? 0 : s) * width + k) / 32 * SC + g * SC;
             #pragma unroll
-            for (int c = 0; c < C; c++) {
+            for (int c = 0; c < SC; c++) {
                 sraw[j][c] = s >= 0 ? scales[offset + c] : 0.0f;
                 mraw[j][c] = s >= 0 ? sums[offset + c] : 0;
             }
@@ -185,12 +193,18 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
             int index = tid + j * THREADS, t = index / GROUPS, g = index % GROUPS;
             if (index >= BN * GROUPS) continue;
             float m = 0.0f;
-            #pragma unroll
-            for (int c = 0; c < C; c++) {
-                sh.xs[t][g][c] = sraw[j][c];
-                if (Kind == 12) m += (float)mraw[j][c] * sraw[j][c];
+            if (S16) {
+                sh.xs[t][g][0] = sraw[j][0];
+                sh.factor[t][g] = mraw[j][1];
+                m = (float)mraw[j][0] * sraw[j][0];
+            } else {
+                #pragma unroll
+                for (int c = 0; c < SC; c++) {
+                    sh.xs[t][g][c] = sraw[j][c];
+                    if (Kind == 12) m += (float)mraw[j][c] * sraw[j][c];
+                }
             }
-            sh.msum[t][g] = m;
+            sh.msum[t][g] = Kind == 12 ? m : 0.0f;
         }
     };
     fetch(0);
@@ -227,11 +241,33 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
                     for (int m = 0; m < 2; m++)
                         #pragma unroll
                         for (int i = 0; i < 4; i++) combined[m][i] = 0.0f;
+                    if (S16) {
+                        unsigned int h0 = sh.xq[0][tb + group][pack];
+                        unsigned int h1 = Kind == 12 ? sh.xq[0][tb + group][pack + 4] : 0u;
+                        unsigned int l0 = sh.xq[1][tb + group][pack];
+                        unsigned int l1 = Kind == 12 ? sh.xq[1][tb + group][pack + 4] : 0u;
+                        float s0 = sh.xs[t0][g][0], s1 = sh.xs[t0 + 1][g][0];
+                        int e0 = sh.factor[t0][g], e1 = sh.factor[t0 + 1][g];
+                        #pragma unroll
+                        for (int m = 0; m < 2; m++) {
+                            int dot[4] = {0, 0, 0, 0};
+                            residual_mma_group<Kind>(a[m][0], a[m][1], a[m][2], a[m][3], h0, h1, dot);
+                            dot[0] *= e0;
+                            dot[1] *= e1;
+                            dot[2] *= e0;
+                            dot[3] *= e1;
+                            residual_mma_group<Kind>(a[m][0], a[m][1], a[m][2], a[m][3], l0, l1, dot);
+                            combined[m][0] = (float)dot[0] * s0;
+                            combined[m][1] = (float)dot[1] * s1;
+                            combined[m][2] = (float)dot[2] * s0;
+                            combined[m][3] = (float)dot[3] * s1;
+                        }
+                    }
                     #pragma unroll
-                    for (int c = 0; c < C; c++) {
+                    for (int c = 0; c < (S16 ? 0 : C); c++) {
                         unsigned int b0 = sh.xq[c][tb + group][pack];
                         unsigned int b1 = Kind == 12 ? sh.xq[c][tb + group][pack + 4] : 0u;
-                        float s0 = sh.xs[t0][g][c], s1 = sh.xs[t0 + 1][g][c];
+                        float s0 = sh.xs[t0][g][S16 ? 0 : c], s1 = sh.xs[t0 + 1][g][S16 ? 0 : c];
                         #pragma unroll
                         for (int m = 0; m < 2; m++) {
                             int dot[4] = {0, 0, 0, 0};
@@ -282,26 +318,78 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
 #endif
 
 // 256 threads; grid = (ceil(rows / 128), grouped ? slots : ceil(tokens / BN)).
-// The activation components C must match residual_quantize32_precise<C>.
+// The activation layout must match the quantizer: C = 3 residual components
+// (residual_quantize32_precise3) or the S16 pair (quantize32_residual_pair).
 #if __CUDA_ARCH__ >= 800
-#define MMQ_BODY(C, BN, KS) \
-    __shared__ MmqShared<C, BN, KS> sh; \
-    if (kind == 12) mmq_tile<12, C, BN, KS>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, sh); \
-    if (kind == 14) mmq_tile<14, C, BN, KS>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, sh); \
+#define MMQ_BODY(C, BN, KS, S16) \
+    __shared__ MmqShared<C, BN, KS, S16 ? 2 : C> sh; \
+    if (kind == 12) mmq_tile<12, C, BN, KS, S16>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, sh); \
+    if (kind == 14) mmq_tile<14, C, BN, KS, S16>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, sh); \
     if (kind != 12 && kind != 14 && threadIdx.x == 0) atomicOr(status, 8);
 #else
-#define MMQ_BODY(C, BN, KS) if (threadIdx.x == 0) atomicOr(status, 16);
+#define MMQ_BODY(C, BN, KS, S16) if (threadIdx.x == 0) atomicOr(status, 16);
 #endif
-#define MMQ_KERNEL(Name, C, BN, KS) \
+#define MMQ_KERNEL(Name, C, BN, KS, S16) \
 extern "C" __global__ void __launch_bounds__(256, 2) \
 Name(const u8 *weights, int kind, const signed char *values, const float *scales, \
      const int *sums, float *output, int width, int rows, int tokens, const int *groups, \
      int used, int grouped, int assignment_major, int *status) { \
-    MMQ_BODY(C, BN, KS) \
+    MMQ_BODY(C, BN, KS, S16) \
 }
-// Dense projections with many token tiles.
-MMQ_KERNEL(residual_matmul_mmq, 3, 64, 64)
-// Dense projections with few rows (K/V): more, smaller token tiles.
-MMQ_KERNEL(residual_matmul_mmq16, 3, 16, 128)
-// Expert slots of 32-assignment descriptors (group_experts_fast32).
-MMQ_KERNEL(residual_matmul_mmq_grouped, 3, 32, 128)
+// int8-prefill (S16 activations, quantize32_residual_pair). Tiles measured on
+// Qwen3-30B: KS 128 for 64-token tiles was slower, 32-token tiles beat 16 and 64
+// for few-row projections, and expert slots preferred KS 128 over 64 or 256.
+MMQ_KERNEL(mmq_s16, 2, 64, 64, true)
+MMQ_KERNEL(mmq_s16_rows32, 2, 32, 128, true)
+MMQ_KERNEL(mmq_s16_grouped, 2, 32, 128, true)
+// Three residual components (residual_quantize32_precise3) for FFN inputs.
+MMQ_KERNEL(mmq_c3, 3, 64, 64, false)
+MMQ_KERNEL(mmq_c3_rows32, 3, 32, 128, false)
+MMQ_KERNEL(mmq_c3_grouped, 3, 32, 128, false)
+
+// Two residual s8 planes per 32-value warp block with integer-related scales:
+// d1 = max|x| / 127, q1 = round(x / d1), r = x - d1 * q1, K = floor(127 * d1 / max|r|)
+// clamped to [1, 32768] (so |q2| <= 127), d = d1 / K, q2 = round(r / d).
+// x ~ d * (K * q1 + q2): within K / (K + 1) of the adaptive two-component residual,
+// which matters for blocks with large outliers (a uniform int16 code measured
+// max_abs 1.05 on real text, a power-of-two factor 0.19).
+// q[i] = q1, q[count + i] = q2; scales[2b] = d; sums[2b] = sum of K * q1 + q2,
+// sums[2b + 1] = K for block b = i / 32. count % 32 == 0.
+#define MMQ_PAIR_FACTOR_MAX 32768
+extern "C" __global__ void quantize32_residual_pair(const float *x, signed char *q,
+                                                    float *scales, int *sums, int count,
+                                                    int *status) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x, lane = threadIdx.x % 32;
+    if (i >= count) return;
+    float value = x[i];
+    if (__any_sync(0xffffffff, !isfinite(value))) {
+        if (lane == 0) atomicOr(status, 1);
+        return;
+    }
+    float maximum = fabsf(value);
+    for (int stride = 16; stride > 0; stride /= 2)
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, stride));
+    float d1 = maximum == 0.0f ? 0.0f : fmaxf(__fdiv_rn(maximum, 127.0f), __uint_as_float(1));
+    int q1 = d1 == 0.0f ? 0 : max(-127, min(127, __float2int_rn(__fdiv_rn(value, d1))));
+    float r = fmaf(-d1, (float)q1, value);
+    float rmax = fabsf(r);
+    for (int stride = 16; stride > 0; stride /= 2)
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffff, rmax, stride));
+    int factor = MMQ_PAIR_FACTOR_MAX;
+    if (rmax > 0.0f) {
+        float ratio = __fdiv_rn(127.0f * d1, rmax);
+        factor = ratio >= (float)MMQ_PAIR_FACTOR_MAX ? MMQ_PAIR_FACTOR_MAX : max(1, (int)ratio);
+    }
+    float d = __fdiv_rn(d1, (float)factor);
+    int q2 = d == 0.0f ? 0 : max(-127, min(127, __float2int_rn(__fdiv_rn(r, d))));
+    q[i] = (signed char)q1;
+    q[count + i] = (signed char)q2;
+    int code = q1 * factor + q2;
+    for (int stride = 16; stride > 0; stride /= 2) code += __shfl_down_sync(0xffffffff, code, stride);
+    if (lane == 0) {
+        scales[2 * (i / 32)] = d;
+        scales[2 * (i / 32) + 1] = 0.0f;
+        sums[2 * (i / 32)] = code;
+        sums[2 * (i / 32) + 1] = factor;
+    }
+}

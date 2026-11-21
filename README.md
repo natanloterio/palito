@@ -375,7 +375,8 @@ and CUDA 13 NVRTC libraries on `LD_LIBRARY_PATH`.
   CUDA's report excludes host tokenizer/model-loading copies and host logits.
 - Dense `llama`, dense Qwen3 and Qwen3-MoE prefill are layer-wise batched: packed projections
   reuse weights across prompt tokens, and each query sees only its causal KV prefix.
-  Internal chunks contain at most 512 tokens; larger public batches are split.
+  Internal chunks contain at most 4096 tokens (512 before 0.2.3); larger public batches
+  are split. Per-token score rows are only reserved for non-flash attention (BLOOM, Gemma).
   Default MoE assignments are grouped by expert in four-assignment tiles, then
   scattered back and combined in the original top-k order. Explicit
   `--cuda-matmul f32-tiled` uses 32-assignment register expert tiles for chunks
@@ -1475,4 +1476,4 @@ local-inference chat --model /path/to/model.gguf --context 4096
 
 `LOCAL_INFERENCE_BACKEND`, `LOCAL_INFERENCE_MODEL` and `LOCAL_INFERENCE_CUDA_KERNEL_CACHE` set the defaults, and flags take precedence.
 
-`chat` on CUDA defaults to `--cuda-matmul int8-prefill`: prefill runs on tensor cores (INT8 MMA projections over three-component residual activations, FP16 hi/lo attention) and decode is the `f32-tiled` path. Its logits pass a relaxed gate against the F32 oracle (same argmax, cos >= 0.99999, max_abs <= 0.15; 0.09 on a 256-token real-text prompt). GPUs below sm_80 fall back to `f32-tiled`. Pass `--cuda-matmul f32-tiled` for F32 prefill.
+`chat` on CUDA defaults to `--cuda-matmul int8-prefill`: prefill runs on tensor cores (INT8 MMA projections, FP16 hi/lo attention over K/V converted once per layer; attention projections use a two-plane residual pair with an integer factor, FFN/expert projections three residual components) and decode is the `f32-tiled` path. Its logits pass a relaxed gate against the F32 oracle (same argmax, cos >= 0.99999, max_abs <= 0.15; 0.09 on a 256-token real-text prompt). Chat prefills up to 4096 tokens per chunk (Qwen3-30B-A3B 2.9k prompt on an RTX 5090: 0.35 s to the first token). GPUs below sm_80 fall back to `f32-tiled`. Pass `--cuda-matmul f32-tiled` for F32 prefill.

@@ -47,18 +47,31 @@ fn dense_mma3_splits(width: i32, rows: i32, tokens: i32, scratch_floats: usize) 
     splits
 }
 
+// int8-prefill quantizes attention-projection inputs as the S16 pair and FFN
+// inputs (expert gate/up/down) as three components: the pair's ~16-bit
+// activations flip Qwen3-30B expert routing on a 2.9k prompt (logit max_abs 0.73,
+// first token changed), three components on the FFN keep F32 tokens.
 macro_rules! prepare_residual {
-    ($backend:ident,$input:expr,$count:expr) => {{
+    ($backend:ident,$input:expr,$count:expr) => {
+        prepare_residual!($backend, $input, $count, false)
+    };
+    ($backend:ident,$input:expr,$count:expr,$pair:expr) => {{
         let count: i32 = $count;
         if $backend.matmul.integer_mma() {
+            let pair = $pair && $backend.matmul == CudaMatmul::Int8Prefill;
             let work = $backend
                 .work
                 .residual_mma3
                 .as_mut()
                 .ok_or_else(|| failure("residual MMA3 workspace missing"))?;
+            work.pair = pair;
             launch!(
                 $backend,
-"residual_quantize32_precise3",
+                if pair {
+                    "quantize32_residual_pair"
+                } else {
+                    "residual_quantize32_precise3"
+                },
                 ((count as u32).div_ceil(256), 1, 1),
                 $input,
                 &mut work.values,
@@ -137,12 +150,23 @@ macro_rules! project_residual {
             } else {
                 let (kernel, grid, threads) = if $backend.matmul == CudaMatmul::Int8Prefill {
                     let row_tiles = (tensor.rows as u32).div_ceil(128);
-                    let (name, columns) = if grouped != 0 {
-                        ("residual_matmul_mmq_grouped", $slots)
+                    // Measured on Qwen3-30B (2.9k prompt): 64-token tiles for wide
+                    // projections, 32 for few-row ones (K/V, attention output).
+                    let pair = $backend.work.residual_mma3.as_ref().is_some_and(|w| w.pair);
+                    let (shape, columns) = if grouped != 0 {
+                        (0, $slots)
                     } else if row_tiles * (tokens as u32).div_ceil(64) >= 256 {
-                        ("residual_matmul_mmq", (tokens as u32).div_ceil(64))
+                        (1, (tokens as u32).div_ceil(64))
                     } else {
-                        ("residual_matmul_mmq16", (tokens as u32).div_ceil(16))
+                        (2, (tokens as u32).div_ceil(32))
+                    };
+                    let name = match (pair, shape) {
+                        (true, 0) => "mmq_s16_grouped",
+                        (true, 1) => "mmq_s16",
+                        (true, _) => "mmq_s16_rows32",
+                        (false, 0) => "mmq_c3_grouped",
+                        (false, 1) => "mmq_c3",
+                        (false, _) => "mmq_c3_rows32",
                     };
                     (name, (row_tiles, columns, 1), 256)
                 } else if cfg!(feature = "cuda-mma3-wide-rows-research")
@@ -356,7 +380,7 @@ impl CudaBackend {
                 .iter()
                 .any(|t| residual_projection(matmul, t, n))
             {
-                prepare_residual!(self, &self.work.normalized, n * w);
+                prepare_residual!(self, &self.work.normalized, n * w, true);
             }
             for (component, (tensor, output, stage)) in [
                 (&l.q, &mut self.work.q, "Qproj"),
@@ -490,6 +514,13 @@ impl CudaBackend {
                 &kw,
                 &pos
             );
+            // Score rows exist per prefill token only without flash attention
+            // (flash_prefill_attention sizes the workspace).
+            if (embedding_norm.is_some() || gemma_attention.is_some())
+                && self.work.scores.len() < heads as usize * context as usize * n as usize
+            {
+                return Err(invalid("prefill score workspace too small for this chunk"));
+            }
             // Future KV rows are already written; each query can only see its prefix.
             if embedding_norm.is_some() {
                 alibi_attention!(self, index, heads, kv_heads, dim, context, count, n);
@@ -527,6 +558,41 @@ impl CudaBackend {
                     &heads,
                     &kv_heads,
                     &count
+                );
+            } else if let (Some(halves), true) = (
+                self.work.attention_half.as_mut(),
+                self.matmul == CudaMatmul::Int8Prefill
+                    && dim == 128
+                    && heads == 8 * kv_heads,
+            ) {
+                // int8-prefill: split K/V into FP16 hi/lo planes once per layer, then
+                // FP16 tensor-core attention, 16 tokens x 8 heads per block.
+                let positions = count + n;
+                let stride = attention_half_stride(s) as i32;
+                launch!(
+                    self,
+                    "attention_half_kv",
+                    ((positions as u32).div_ceil(32), kv_heads as u32, 1); 256,
+                    &self.keys[index],
+                    &self.values[index],
+                    &mut *halves,
+                    &kv_heads,
+                    &positions,
+                    &stride
+                );
+                // 8 warps (16 tokens) per block: 4 warps measured equal, 2 slower.
+                launch!(
+                    self,
+                    "attention_prefill_mma_half",
+                    (kv_heads as u32, (n as u32).div_ceil(16), 1); 256,
+                    &self.work.q,
+                    &*halves,
+                    &mut self.work.attended,
+                    &heads,
+                    &kv_heads,
+                    &n,
+                    &count,
+                    &stride
                 );
             } else if self.matmul.f32_tiled()
                 && dim == 128
@@ -613,7 +679,7 @@ impl CudaBackend {
                 t.width as usize
             );
             if residual_projection(matmul, t, n) {
-                prepare_residual!(self, &self.work.attended, n * t.width);
+                prepare_residual!(self, &self.work.attended, n * t.width, true);
                 project_residual!(
                     self,
                     t,
@@ -1075,3 +1141,4 @@ mod tests {
         }
     }
 }
+

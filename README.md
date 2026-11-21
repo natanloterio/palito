@@ -1097,7 +1097,8 @@ same tile-aligned Qwen3 chunks.
 `cuda-qwen3-prefill-q-weight-only-research` uses that schedule for the
 1024-to-2048 query projection of the same initial chunk.
 `cuda-qwen3-prefill-gate-up-single-term-research` uses one leading FP16
-weight term per gate/up projection in the same aligned regime, with FP32 accumulation.
+weight term per gate/up projection for complete 128-token tiles, with FP32
+accumulation.
 The low weight term is omitted only for these gate/up projections.
 `cuda-llama-prefill-qo-single-term-research` uses the leading FP16 terms
 and FP32 accumulation for Llama Q and attention output at 512 tokens.

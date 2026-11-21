@@ -336,7 +336,7 @@ impl Prefill {
                     && (n >= 384
                         || (n >= 128 && cfg!(feature = "cuda-qwen35-qkv-single-term-256-research"))
                         || hybrid_qkv_short))
-                || (n >= 384 && n % 128 == 0
+                || (n >= 128 && n % 128 == 0
                     && cfg!(feature = "cuda-qwen3-prefill-gate-up-single-term-research")
                     && qwen3_weight_only
                     && (t.kind, t.width, t.rows) == (12, 1024, 3072))

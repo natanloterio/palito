@@ -175,3 +175,47 @@ Todas as mudanças estão no perfil opt-in `--cuda-matmul f32-tiled`. O perfil p
 - PDL (programmatic dependent launch).
 - Usar `f32-tiled` por padrão no `chat`.
 - Fase 2: depende da decisão sobre a política de precisão.
+
+## 9. Paridade com o llama.cpp (2026-11-21, segunda rodada)
+
+Tudo continua no perfil opt-in `--cuda-matmul f32-tiled`, com aritmética F32 e `fmad` desligado. O perfil padrão `f32` não mudou: ~94 tok/s, com os mesmos IDs gerados. Os números de llama.cpp foram medidos na mesma sessão e nas mesmas condições térmicas.
+
+| Cenário (Qwen3-30B-A3B, RTX 5090, greedy) | Nosso (`f32-tiled` + `--cuda-decode-graph`) | llama.cpp | Diferença |
+|---|---|---|---|
+| chat com raciocínio, 2 turnos (167 e 232 tokens) | 373–377 tok/s | 359–363 tok/s | **+3–4%** |
+| chat `--no-thinking` (11 tokens) | 375–377 tok/s | 344–346 tok/s | **+9%** |
+| prompt cru curto (10 tokens), 128 tokens gerados | 375–376 tok/s | 358–363 tok/s | **+3–4%** |
+| prompt cru longo (~2.860 tokens), 128 tokens gerados | 315–317 tok/s | 307–312 tok/s | **+1–3%** |
+
+### O que mudou nesta rodada
+
+| # | Mudança | Arquivos | Efeito medido |
+|---|---|---|---|
+| 1 | **Q4_K "wide"**: 8 lanes por bloco, uma carga de 16 bytes por lane, 4 blocos por passo de warp | `kernels.cu` (`q4k_wide_*`, `matvec_warps_per_row` por tipo) | gate 10,8→8,0 µs, Q 6,2→4,3 µs, O 6,2→4,5 µs (microbench); 288→311 tok/s |
+| 2 | Conversão exata de inteiro pequeno para float por bit-trick em vez de I2F | `kernels.cu` (`small_uint_float`) | neutro; bit-idêntico |
+| 3 | **residual + RMSNorm** e **combine MoE + RMSNorm** num único bloco de 1024 threads, com entradas pré-carregadas em registradores | `kernels.cu`, `cuda.rs` | −2 lançamentos por camada; 331→342 tok/s |
+| 4 | **Attention de decode em chunks** dimensionados no device pela contagem viva (grafo continua válido), mais combine paralelo por chunk com cargas vetoriais | `attention.cu` | contexto longo 135→294 tok/s |
+| 5 | **Attention GQA com um warp por head de query**: um bloco por (head KV, chunk), os 8 warps leem as mesmas linhas K/V (L1 absorve o reúso), softmax online local ao warp e nenhuma barreira | `attention.cu` (`attention_split_group`) | contexto longo 294→316 tok/s; curto 372→376 tok/s |
+| 6 | **Replay do grafo em pipeline**: até 2 passos em voo; cada token é copiado para um anel em memória pinned e o host para no primeiro EOG. Acaba a sincronização a cada 8 tokens e o desperdício de até 7 passos especulativos | `decode.rs` | chat sem raciocínio 233→375 tok/s |
+
+### Tentado e descartado (medido)
+
+- **`fmad` ligado:** neutro (281 contra 284 tok/s), portanto o gargalo não é FP.
+- **Cargas de gate e up intercaladas** num único laço: pior.
+- **Q4_K com cargas vetorizadas** mas escalas em vetor local: muito pior (206 tok/s), por spill.
+- **Última-bloco-termina** (atomic + fence) para o RMSNorm fundido: 4,7 µs, mais lento que os 2 kernels originais.
+- **PDL** (programmatic dependent launch): microbench mostra só −0,15 µs por kernel (~3% no total); não compensou o encanamento no cudarc.
+- **Q6_K wide** (16 lanes por bloco): só ajuda a matriz de saída (180→159 µs); `down` e `V` pioram.
+- **Prefetch de V junto com K** na attention: +1% no curto e −2,5% no longo.
+
+### Validação
+
+- Gate de logits completos contra o oráculo independente, nos 20 casos: max_abs ≤ 0,00033, cosseno 1,0 e argmax idêntico.
+- IDs gerados idênticos em todos os perfis e modos, incluindo o prompt longo.
+- 15 testes de integração CUDA passam, entre eles `captured_decode_*` (grafo, EOG e `kv_live_bytes`).
+- Testes de kernel e os 41 testes de CPU passam.
+
+### O que ainda falta
+
+- **Prefill de prompts longos** (TTFT): o caminho de prefill de attention (`attention_scores`/`attention_values`) é muito lento em ~3k tokens. É o próximo alvo.
+- O `chat` ainda usa o perfil `f32` por padrão. O `f32-tiled` com grafo precisa de flag.

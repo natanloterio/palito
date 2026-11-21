@@ -1,5 +1,5 @@
 use super::*;
-use cudarc::driver::CudaGraph;
+use cudarc::driver::{CudaGraph, PinnedHostSlice};
 
 pub(super) struct DecodeState {
     graph: Option<CudaGraph>,
@@ -7,8 +7,14 @@ pub(super) struct DecodeState {
     scores: CudaSlice<f32>,
     ids: CudaSlice<i32>,
     tokens: CudaSlice<i32>,
+    /// Pinned copies of `tokens` taken after each pipelined replay (see
+    /// `sample_decode_tokens`); one more slot than replays allowed in flight.
+    ring: Vec<PinnedHostSlice<i32>>,
     pub sampled: Option<i32>,
 }
+
+/// Replays the host lets run ahead of the tokens it has read back.
+const REPLAYS_IN_FLIGHT: usize = 2;
 
 impl DecodeState {
     pub fn bytes(vocabulary: usize) -> u64 {
@@ -26,6 +32,12 @@ impl DecodeState {
                 .alloc_zeros(vocabulary.div_ceil(256))
                 .map_err(failure)?,
             tokens: stream.alloc_zeros(9).map_err(failure)?,
+            ring: (0..=REPLAYS_IN_FLIGHT)
+                .map(|_| {
+                    // Safety: every slot is written by a device copy before it is read.
+                    unsafe { stream.context().alloc_pinned::<i32>(9) }.map_err(failure)
+                })
+                .collect::<Result<_>>()?,
             sampled: None,
         })
     }
@@ -150,11 +162,11 @@ impl CudaBackend {
             return Err(invalid("sample maximum must be positive"));
         }
         let first = self.sample_greedy()?;
-        if self.decode.is_none() || mode == crate::GenerationMode::UntilEog {
+        let until_eog = mode == crate::GenerationMode::UntilEog;
+        if self.decode.is_none() || (until_eog && self.is_eog(first)) {
             return Ok(vec![first]);
         }
         let count = maximum
-            .min(8)
             .min(self.weights.spec.info.context_tokens as usize - self.state.position + 1);
         if count == 1 {
             return Ok(vec![first]);
@@ -166,12 +178,56 @@ impl CudaBackend {
         self.stream
             .memcpy_htod(&[first], &mut decode.tokens.slice_mut(..1))
             .map_err(failure)?;
-        for _ in 1..count {
-            self.launch_decode()?;
+        // Replay i writes its token to tokens[i % 8] (the slot counter is rewound every
+        // 8 replays) and is followed by a copy of `tokens` into ring[i % ring.len()].
+        // The host keeps at most REPLAYS_IN_FLIGHT replays unread, so the GPU never
+        // waits on a full-stream sync, and stops issuing at the first end-of-generation
+        // token: at most REPLAYS_IN_FLIGHT speculative steps are discarded.
+        let mut tokens = vec![first];
+        let mut launched = 1;
+        while tokens.len() < count {
+            if launched < count && launched - tokens.len() < REPLAYS_IN_FLIGHT {
+                let decode = self.decode.as_mut().unwrap();
+                if launched % 8 == 0 {
+                    self.stream
+                        .memcpy_htod(&[0], &mut decode.control.slice_mut(2..3))
+                        .map_err(failure)?;
+                }
+                self.launch_decode()?;
+                let decode = self.decode.as_mut().unwrap();
+                let slot = launched % decode.ring.len();
+                self.stream
+                    .memcpy_dtoh(&decode.tokens, &mut decode.ring[slot])
+                    .map_err(failure)?;
+                launched += 1;
+                continue;
+            }
+            let index = tokens.len();
+            let decode = self.decode.as_ref().unwrap();
+            let copy = decode.ring[index % decode.ring.len()]
+                .as_slice()
+                .map_err(failure)?;
+            let token = copy[index % 8];
+            if copy[8] != 0 || token < 0 || token as u32 >= self.weights.spec.info.vocab_tokens {
+                return Err(failure(
+                    "nonfinite router scores/logits or invalid device sample; request poisoned",
+                ));
+            }
+            tokens.push(token);
+            if until_eog && self.is_eog(token) {
+                break;
+            }
         }
-        let tokens = self.read_decode_tokens(count)?;
-        self.decode.as_mut().unwrap().sampled = tokens.last().copied();
-        self.state.finish(count - 1);
+        // Only the kept steps count as live context; replays issued past an
+        // end-of-generation token leave no usable next-token state.
+        self.state.finish(tokens.len() - 1);
+        let decode = self.decode.as_mut().unwrap();
+        if launched > tokens.len() {
+            self.state.valid = false;
+            decode.sampled = None;
+        } else {
+            decode.sampled = tokens.last().copied();
+        }
         Ok(tokens)
     }
 }

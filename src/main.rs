@@ -119,11 +119,11 @@ pub(crate) struct RuntimeArgs {
     pub(crate) model: PathBuf,
     #[arg(long, default_value_t = 512)]
     pub(crate) context: u32,
-    /// Prefill batch capacity [default: 128; chat on CUDA f32-tiled: 512, capped by
+    /// Prefill batch capacity [default: 128; chat on CUDA: 512, capped by
     /// --context].
     #[arg(long)]
     batch: Option<u32>,
-    /// Tokens per prefill call [default: 64; chat on CUDA f32-tiled: 512, capped by
+    /// Tokens per prefill call [default: 64; chat on CUDA: 512, capped by
     /// --context and --batch].
     #[arg(long)]
     prefill_chunk: Option<u32>,
@@ -163,15 +163,17 @@ pub(crate) struct RuntimeArgs {
     #[cfg(feature = "cuda")]
     #[arg(long)]
     cuda_kernel_cache: Option<PathBuf>,
-    /// CUDA matrix profile [default: f32; chat: f32-tiled]. f32 keeps its existing
+    /// CUDA matrix profile [default: f32; chat: int8-prefill, f32-tiled below sm_80]. f32 keeps its existing
     /// kernels and arithmetic. f32-tiled selects measured F32 prefill/decode kernels
-    /// without activation quantization. residual-int8-research is opt-in approximate
-    /// prefill, not quality-admitted.
+    /// without activation quantization. int8-prefill keeps f32-tiled decode and runs
+    /// prefill on tensor cores (INT8 projections, FP16 hi/lo attention): faster long
+    /// prompts, approximate logits (same top token on the quality gates).
+    /// residual-int8-research is opt-in approximate prefill, not quality-admitted.
     #[cfg(feature = "cuda")]
     #[arg(long, value_enum)]
     cuda_matmul: Option<local_inference::cuda::CudaMatmul>,
     /// Captured decode with token-only greedy output (f32: context <= 1024). On by
-    /// default for chat with f32-tiled.
+    /// default for chat with f32-tiled and int8-prefill.
     #[cfg(feature = "cuda")]
     #[arg(long)]
     cuda_decode_graph: bool,
@@ -183,6 +185,10 @@ pub(crate) struct RuntimeArgs {
     #[cfg(feature = "cuda")]
     #[arg(skip)]
     fast_cuda_defaults: bool,
+    /// Fast defaults fall back from int8-prefill to f32-tiled (backend open failed).
+    #[cfg(feature = "cuda")]
+    #[arg(skip)]
+    f32_fallback: bool,
 }
 
 #[derive(Args)]
@@ -357,8 +363,11 @@ impl RuntimeArgs {
     #[cfg(feature = "cuda")]
     fn cuda_matmul(&self) -> local_inference::cuda::CudaMatmul {
         use local_inference::cuda::CudaMatmul;
-        self.cuda_matmul.unwrap_or(if self.fast_cuda_defaults {
+        self.cuda_matmul.unwrap_or(if self.fast_cuda_defaults && self.f32_fallback {
             CudaMatmul::F32Tiled
+        } else if self.fast_cuda_defaults {
+            // Tensor-core prefill; relaxed logit gate (same top token), F32 decode.
+            CudaMatmul::Int8Prefill
         } else {
             CudaMatmul::F32
         })
@@ -371,7 +380,17 @@ impl RuntimeArgs {
             && self.backend == LocalBackend::Cuda
             && !self.cuda_decode_graph
             && !self.no_cuda_decode_graph
-            && self.cuda_matmul() == local_inference::cuda::CudaMatmul::F32Tiled
+            && self.fast_cuda_matmul()
+    }
+
+    /// Profiles whose decode is f32-tiled (graph, packed matvec, large prefill chunks).
+    #[cfg(feature = "cuda")]
+    fn fast_cuda_matmul(&self) -> bool {
+        use local_inference::cuda::CudaMatmul;
+        matches!(
+            self.cuda_matmul(),
+            CudaMatmul::F32Tiled | CudaMatmul::Int8Prefill
+        )
     }
 
     /// Large prefill chunks only pay off with the tiled CUDA kernels (measured
@@ -381,7 +400,7 @@ impl RuntimeArgs {
         {
             self.fast_cuda_defaults
                 && self.backend == LocalBackend::Cuda
-                && self.cuda_matmul() == local_inference::cuda::CudaMatmul::F32Tiled
+                && self.fast_cuda_matmul()
         }
         #[cfg(not(feature = "cuda"))]
         false
@@ -413,12 +432,24 @@ impl RuntimeArgs {
         })
     }
 
-    /// Opts into f32-tiled plus the decode graph unless the user chose otherwise.
+    /// Opts into int8-prefill (f32-tiled decode) plus the decode graph unless the user
+    /// chose otherwise.
     pub(crate) fn use_fast_cuda_defaults(&mut self) {
         #[cfg(feature = "cuda")]
         {
             self.fast_cuda_defaults = true;
         }
+    }
+
+    /// Replaces an implicit int8-prefill (needs sm_80+) with f32-tiled; true if changed.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn fall_back_from_implicit_int8(&mut self) -> bool {
+        let implicit = self.fast_cuda_defaults
+            && self.backend == LocalBackend::Cuda
+            && self.cuda_matmul.is_none()
+            && !self.f32_fallback;
+        self.f32_fallback |= implicit;
+        implicit
     }
 
     /// Drops an implicit decode graph (after its capture failed); explicit flags stay.

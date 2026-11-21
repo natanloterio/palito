@@ -250,3 +250,46 @@ Validação:
 - 15 testes de integração CUDA passam.
 
 **Limite físico em F32.** O prefill desse prompt precisa de ~19 TFLOP nas projeções e ~3,2 TFLOP na attention. Com `fmad` desligado, a 5090 faz ~52 TFLOP/s em F32 nos CUDA cores, o que dá um piso teórico de ~0,45 s. Chegar aos 0,18 s do llama.cpp exige tensor cores, seja com ativações int8 (q8_1), seja com TF32 em três produtos. Isso é uma decisão de precisão.
+
+## 11. Prefill com tensor cores: perfil `int8-prefill`
+
+Com o critério de qualidade relaxado, o prefill passou a usar tensor cores. O decode continua sendo o do `f32-tiled`. O perfil é `--cuda-matmul int8-prefill`, e o `chat` em CUDA passa a usá-lo por padrão. GPUs abaixo de sm_80 caem para `f32-tiled`.
+
+Prompt de 2.863 tokens, Qwen3-30B-A3B, RTX 5090, tempo até o primeiro token:
+
+| Perfil | TTFT |
+|---|---|
+| `f32` | 15,4 s |
+| `f32-tiled` | 1,06 s |
+| `int8-prefill` | **0,54 s** |
+| llama.cpp | 0,18 s |
+
+O que entrou:
+
+- **Projeções em INT8 MMA** (`mmq.cu`). Os pesos Q4_K/Q6_K são desempacotados para s8. As ativações são quantizadas em 3 componentes int8 por bloco de 32 valores (`residual_quantize32_precise<3>`). Tiles de 128 linhas × 64 tokens (denso), × 16 tokens (K/V, poucas linhas) ou × 32 atribuições (experts). Os bytes do passo K seguinte são lidos para registradores durante o cálculo do atual.
+- **Attention de prefill em FP16 MMA** (`attention_mma.cu`). Q, K, V e as probabilidades são divididos em parte alta e baixa em FP16, com acumulação e softmax em F32. Com FP16 simples, o erro passava de 1,0 nos logits. Só com P em FP16, os gates MoE longos ficavam com cos 0,999988.
+
+Critério relaxado: mesmo argmax, cos ≥ 0,99999 e max_abs ≤ 0,15 contra o oráculo.
+
+| Caso | max_abs | cos |
+|---|---|---|
+| texto real de 256 tokens | 0,092 | 0,9999981 |
+| MoE long600, chunks 64/512 | 0,00003 | 1,0 |
+| 20 casos curtos e long150 | ≤ 0,0008 | 1,0 |
+
+Os 32 primeiros tokens gerados são idênticos aos do F32 no prompt curto e no longo. O decode fica em ~377 tok/s, igual ao `f32-tiled`. Os 15 testes de integração CUDA passam. Os perfis `f32` e `f32-tiled` não mudaram.
+
+Tentado e descartado: blocos de 64 atribuições por expert (0,75 s contra 0,65 s, porque com chunks de 512 cada expert recebe em média 32 atribuições) e 1 ou 2 componentes nas ativações (1 componente dá max_abs 0,98).
+
+Tempo de GPU no prompt longo (nsys), 534 ms no total:
+
+| Kernel | Tempo |
+|---|---|
+| projeções dos experts (`residual_matmul_mmq_grouped`) | 218 ms |
+| attention (`attention_prefill_mma`) | 107 ms |
+| projeções densas com poucas linhas, K/V (`residual_matmul_mmq16`) | 107 ms |
+| projeções densas (`residual_matmul_mmq`) | 43 ms |
+| restante (router, quantização, normas) | ~60 ms |
+
+As projeções MMQ e a attention são os próximos alvos.
+

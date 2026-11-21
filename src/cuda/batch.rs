@@ -499,7 +499,7 @@ impl CudaBackend {
                 }
             }
             let fused_head_rope = if cfg!(feature = "cuda-qwen3-prefill-fused-head-rope-research")
-                && n >= 384
+                && (n >= 384 || (n >= 32 && s.info.architecture == "qwen3"))
                 && position == 0
                 && dim == 128
                 && s.rotary_dim == 128

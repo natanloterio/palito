@@ -1084,7 +1084,7 @@ to even initial dense Qwen3 chunks of 384–512 tokens (16 query heads, 128 dime
 two query heads per KV head), with unchanged score and value math modes.
 `cuda-qwen3-prefill-fused-head-rope-research` also fuses Q/K head
 normalization, RoPE, and F32 K/V cache writes for initial
-Qwen3 chunks from 384 tokens. Partial and factored RoPE, shorter chunks,
+Qwen3 chunks from 32 tokens. Partial and factored RoPE, shorter chunks,
 continuation, and decode keep their existing paths.
 `cuda-qwen3-prefill-kv-weight-only-research` uses two FP32-accumulating
 GEMMs for each K/V projection in initial Qwen3 chunks of 384–512 tokens

@@ -65,7 +65,8 @@ Defaults set by the wrapper (override with flags or by exporting them):
   LOCAL_INFERENCE_MODEL      (unset; export it to skip --model)
 
 chat on CUDA uses the int8-prefill profile (tensor-core prefill, F32 decode; falls
-back to f32-tiled below sm_80), the decode graph and 512-token prefill chunks.
+back to f32-tiled below sm_80), the decode graph and prefill chunks of up to 4096
+tokens (capped by --context).
 Use --cuda-matmul f32-tiled for F32 prefill or --cuda-matmul f32 for the
 reference profile.
 README

@@ -184,3 +184,110 @@ extern "C" __global__ void attention_fused_query_pair(const float *q, const floa
     }
 }
 #endif
+
+// Split-K (flash-decoding) attention for one decode query, any context length.
+// Pass 1: grid=(heads, splits), block=256. Split j covers keys
+// [j * ATTENTION_SPLIT, (j + 1) * ATTENTION_SPLIT) and writes, per head/split,
+// unnormalized o[dim], its max m and its exp-sum l into
+// partial[(head * splits + j) * (dim + 2)]. Splits past `count` exit, so one
+// captured grid serves every decode position. F32; requires dim <= 256.
+#define ATTENTION_SPLIT 64
+__device__ __forceinline__ void attention_split_impl(const float *q, const float *keys,
+                                                    const float *values, float *partial,
+                                                    int dim, int heads, int kv_heads, int count) {
+    __shared__ float scores[ATTENTION_SPLIT];
+    __shared__ float stats[2];
+    int head = blockIdx.x, split = blockIdx.y, splits = gridDim.y, thread = threadIdx.x;
+    int lane = thread % 32, warp = thread / 32, kv_head = head / (heads / kv_heads);
+    int first = split * ATTENTION_SPLIT;
+    if (first >= count) return;
+    int tile = min(ATTENTION_SPLIT, count - first);
+    q += (u64)head * dim;
+    for (int t = warp; t < tile; t += 8) {
+        const float *key = keys + ((u64)(first + t) * kv_heads + kv_head) * dim;
+        float sum = 0.0f;
+        for (int i = lane; i < dim; i += 32) sum += q[i] * key[i];
+        #pragma unroll
+        for (int stride = 16; stride > 0; stride /= 2)
+            sum += __shfl_xor_sync(0xffffffff, sum, stride);
+        if (lane == 0) scores[t] = sum / sqrtf((float)dim);
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float maximum = -__int_as_float(0x7f800000);
+        for (int t = lane; t < tile; t += 32) maximum = fmaxf(maximum, scores[t]);
+        #pragma unroll
+        for (int stride = 16; stride > 0; stride /= 2)
+            maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, stride));
+        float total = 0.0f;
+        for (int t = lane; t < tile; t += 32) {
+            float p = expf(scores[t] - maximum);
+            scores[t] = p;
+            total += p;
+        }
+        #pragma unroll
+        for (int stride = 16; stride > 0; stride /= 2)
+            total += __shfl_xor_sync(0xffffffff, total, stride);
+        if (lane == 0) {
+            stats[0] = maximum;
+            stats[1] = total;
+        }
+    }
+    __syncthreads();
+    float *out = partial + ((u64)head * splits + split) * (dim + 2);
+    for (int i = thread; i < dim; i += 256) {
+        float value = 0.0f;
+        for (int t = 0; t < tile; t++)
+            value += scores[t] * values[((u64)(first + t) * kv_heads + kv_head) * dim + i];
+        out[i] = value;
+    }
+    if (thread == 0) {
+        out[dim] = stats[0];
+        out[dim + 1] = stats[1];
+    }
+}
+
+extern "C" __global__ void attention_split(const float *q, const float *keys,
+                                          const float *values, float *partial,
+                                          int dim, int heads, int kv_heads, int count) {
+    attention_split_impl(q, keys, values, partial, dim, heads, kv_heads, count);
+}
+
+extern "C" __global__ void attention_split_decode(const float *q, const float *keys,
+                                                 const float *values, float *partial,
+                                                 int dim, int heads, int kv_heads,
+                                                 const int *control) {
+    attention_split_impl(q, keys, values, partial, dim, heads, kv_heads, control[1] + 1);
+}
+
+// Pass 2: grid=(heads), block=256. Rescales every active split to the global max.
+__device__ __forceinline__ void attention_combine_impl(const float *partial, float *output,
+                                                      int dim, int splits, int count) {
+    int head = blockIdx.x, active = (count + ATTENTION_SPLIT - 1) / ATTENTION_SPLIT;
+    const float *base = partial + (u64)head * splits * (dim + 2);
+    float maximum = -__int_as_float(0x7f800000);
+    for (int j = 0; j < active; j++) maximum = fmaxf(maximum, base[(u64)j * (dim + 2) + dim]);
+    float total = 0.0f;
+    for (int j = 0; j < active; j++) {
+        const float *stats = base + (u64)j * (dim + 2) + dim;
+        total += expf(stats[0] - maximum) * stats[1];
+    }
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float value = 0.0f;
+        for (int j = 0; j < active; j++) {
+            const float *split = base + (u64)j * (dim + 2);
+            value += expf(split[dim] - maximum) * split[i];
+        }
+        output[(u64)head * dim + i] = value / total;
+    }
+}
+
+extern "C" __global__ void attention_combine(const float *partial, float *output,
+                                            int dim, int splits, int count) {
+    attention_combine_impl(partial, output, dim, splits, count);
+}
+
+extern "C" __global__ void attention_combine_decode(const float *partial, float *output,
+                                                   int dim, int splits, const int *control) {
+    attention_combine_impl(partial, output, dim, splits, control[1] + 1);
+}

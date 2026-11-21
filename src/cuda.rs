@@ -210,6 +210,7 @@ struct Workspace {
     group_counts: Option<CudaSlice<i32>>,
     residual_int8: Option<ResidualWorkspace>,
     residual_mma3: Option<PreciseWorkspace>,
+    attention_partials: Option<CudaSlice<f32>>,
 }
 
 struct ResidualWorkspace {
@@ -262,6 +263,27 @@ fn fused_attention_supported(spec: &Spec) -> bool {
     spec.dim <= 256
         && spec.info.context_tokens <= 1024
         && !matches!(spec.info.architecture.as_str(), "gemma2" | "gemma3")
+}
+
+/// Keys per split in `attention_split` (ATTENTION_SPLIT in attention.cu).
+const ATTENTION_SPLIT: usize = 64;
+
+/// Split-K decode attention: `f32-tiled` profile, any context, head dim <= 256.
+fn split_attention_supported(spec: &Spec, matmul: CudaMatmul) -> bool {
+    matmul.f32_tiled() && spec.dim <= 256
+}
+
+fn attention_splits(spec: &Spec) -> usize {
+    (spec.info.context_tokens as usize).div_ceil(ATTENTION_SPLIT)
+}
+
+/// F32 elements of the split-K partials: per head and split, o[dim], max and sum.
+fn attention_partial_elements(spec: &Spec, matmul: CudaMatmul) -> usize {
+    if split_attention_supported(spec, matmul) {
+        spec.heads * attention_splits(spec) * (spec.dim + 2)
+    } else {
+        0
+    }
 }
 
 fn routing_elements(spec: &Spec) -> Result<usize> {
@@ -431,6 +453,10 @@ impl Workspace {
                     })
                 }
             },
+            attention_partials: match attention_partial_elements(spec, matmul) {
+                0 => None,
+                n => Some(alloc(n)?),
+            },
         })
     }
 }
@@ -572,10 +598,12 @@ macro_rules! transformer_norm {
                 &$eps
             );
         } else if let Some(weight) = $weight {
+            // normalize_warp (f32-tiled) accepts any multiple of 32 threads up to 1024.
+            let threads = if $backend.matmul.f32_tiled() { 1024 } else { 256 };
             launch!(
                 $backend,
                 "normalize",
-                grid,
+                grid; threads,
                 $input,
                 &weight.bytes,
                 &mut $backend.work.normalized,
@@ -699,6 +727,29 @@ pub struct CudaBackend {
     memory: MemoryUsage,
     matmul: CudaMatmul,
     diagnostic: Option<diagnostics::Capture>,
+}
+
+/// Warps sharing one output row in `matvec_packed_rows` (mirrors the device
+/// function of the same name in kernels.cu; both must agree to size the grid).
+fn matvec_warps_per_row(rows: u32, selections: u32, width: u32) -> u32 {
+    let blocks = (width / 256).max(1);
+    let mut warps = 1;
+    while warps < 8 && warps < blocks && rows * selections * warps < 16384 {
+        warps *= 2;
+    }
+    warps
+}
+
+/// Grid for a 256-thread `matvec` launch. The `f32-tiled` profile dispatches
+/// `matvec_packed_rows` (8 warps per block, 1-8 warps per row); `f32` keeps one
+/// block per row. Tensor shapes are validated positive when the model is uploaded.
+fn matvec_grid(matmul: CudaMatmul, rows: i32, selections: u32, width: i32) -> (u32, u32, u32) {
+    let rows = rows as u32;
+    if !matmul.f32_tiled() {
+        return (rows, selections, 1);
+    }
+    let warps = matvec_warps_per_row(rows, selections, width as u32);
+    ((rows * warps).div_ceil(8), selections, 1)
 }
 
 /// Open the native CUDA backend for the model's architecture.
@@ -920,10 +971,10 @@ impl CudaBackend {
             "group_experts_tiled",
             "grouped_matmul_tiled",
         ] {
-            let entry = if name == "matvec" && options.matmul.f32_tiled() {
-                "matvec_packed_f32"
-            } else {
-                name
+            let entry = match name {
+                "matvec" if options.matmul.f32_tiled() => "matvec_packed_rows",
+                "normalize" if options.matmul.f32_tiled() => "normalize_warp",
+                _ => name,
             };
             functions.insert(name, module.load_function(entry).map_err(failure)?);
         }
@@ -935,6 +986,15 @@ impl CudaBackend {
                 "grouped_matmul_coalesced_k32",
                 "grouped_matmul_unroll8",
                 "prefill_matmul_ref2x16",
+                "matvec_packed_gate_up_rows",
+                "router_warp128",
+                "attention_split",
+                "attention_split_decode",
+                "attention_combine",
+                "attention_combine_decode",
+                "qkv_head_norm_rope_cache",
+                "qkv_head_norm_rope_cache_decode",
+                "matvec_packed_qkv_rows",
             ] {
                 functions.insert(name, module.load_function(name).map_err(failure)?);
             }
@@ -966,12 +1026,7 @@ impl CudaBackend {
                     functions.insert(name, module.load_function(name).map_err(failure)?);
                 }
                 if cfg!(feature = "cuda-decode-fusion-research") {
-                    for name in [
-                        "matvec_packed_qkv",
-                        "router_warp128",
-                        "qkv_head_norm_rope_cache",
-                        "qkv_head_norm_rope_cache_decode",
-                    ] {
+                    for name in ["matvec_packed_qkv", "router_warp128"] {
                         functions.insert(name, module.load_function(name).map_err(failure)?);
                     }
                 }
@@ -1072,9 +1127,13 @@ impl CudaBackend {
                 "Gemma CUDA requires f32 matmul without a decode graph",
             ));
         }
-        if options.decode_graph && !fused_attention_supported(s) {
+        if options.decode_graph
+            && !fused_attention_supported(s)
+            && !split_attention_supported(s, options.matmul)
+        {
             return Err(invalid(
-                "decode graph requires head dimension <=256 and context <=1024",
+                "decode graph requires head dimension <=256 and context <=1024 \
+                 (any context with --cuda-matmul f32-tiled)",
             ));
         }
         if s.used > 65535
@@ -1100,6 +1159,7 @@ impl CudaBackend {
             .try_fold(0u64, |sum, n| sum.checked_add(n as u64))
             .and_then(|n| n.checked_add(routing * 2 + groups + 1))
             .and_then(|n| n.checked_add(parallel_group_count_elements(s, options.matmul) as u64))
+            .and_then(|n| n.checked_add(attention_partial_elements(s, options.matmul) as u64))
             .and_then(|n| {
                 n.checked_add(if prefill_capacity(s) > 1 {
                     prefill_capacity(s) as u64
@@ -1319,6 +1379,33 @@ impl CudaBackend {
                     &self.work.normalized,
                     &l.q.width
                 );
+            } else if self.matmul.f32_tiled()
+                && l.q.width == l.k.width
+                && l.k.width == l.v.width
+                && l.q.width % 256 == 0
+                && matches!(l.q.kind, 12 | 14)
+                && matches!(l.k.kind, 12 | 14)
+                && matches!(l.v.kind, 12 | 14)
+            {
+                launch!(
+                    self,
+                    "matvec_packed_qkv_rows",
+                    matvec_grid(self.matmul, l.q.rows + l.k.rows + l.v.rows, 1, l.q.width),
+                    &l.q.bytes,
+                    &l.q.kind,
+                    &l.q.rows,
+                    &mut self.work.q,
+                    &l.k.bytes,
+                    &l.k.kind,
+                    &l.k.rows,
+                    &mut self.work.k,
+                    &l.v.bytes,
+                    &l.v.kind,
+                    &l.v.rows,
+                    &mut self.work.v,
+                    &self.work.normalized,
+                    &l.q.width
+                );
             } else {
                 for (tensor, output) in [
                     (&l.q, &mut self.work.q),
@@ -1328,7 +1415,7 @@ impl CudaBackend {
                     launch!(
                         self,
                         "matvec",
-                        (tensor.rows as u32, 1, 1),
+                        matvec_grid(self.matmul, tensor.rows, 1, tensor.width),
                         &tensor.bytes,
                         &tensor.kind,
                         &self.work.normalized,
@@ -1356,8 +1443,19 @@ impl CudaBackend {
                     );
                 }
             }
-            if cfg!(feature = "cuda-decode-fusion-research")
-                && self.matmul == CudaMatmul::ResidualMma3Research
+            let fusion_research = cfg!(feature = "cuda-decode-fusion-research")
+                && self.matmul == CudaMatmul::ResidualMma3Research;
+            // The fused kernel equals head_norm + rotary + cache_kv only for per-head
+            // norms with full, unscaled RoPE (e.g. Qwen3); other layouts keep the chain.
+            let fused_qk_chain = self.matmul.f32_tiled()
+                && !olmo2
+                && !olmoe
+                && position_embedding.is_none()
+                && embedding_norm.is_none()
+                && s.rotary_dim == s.dim
+                && self.weights.rope_factors.is_none()
+                && rope_base == s.rope_base;
+            if (fusion_research || fused_qk_chain)
                 && dim == 128
                 && qw == heads * 128
                 && kw == kv_heads * 128
@@ -1472,6 +1570,33 @@ impl CudaBackend {
                     scale,
                     gemma.unwrap().attention_softcap
                 );
+            } else if let Some(partials) = &mut self.work.attention_partials {
+                let splits = attention_splits(s) as i32;
+                let control = match &self.decode {
+                    Some(decode) if device_state => Some(&decode.control),
+                    _ if device_state => return Err(failure("decode control missing")),
+                    _ => None,
+                };
+                let grid = (heads as u32, splits as u32, 1);
+                if let Some(control) = control {
+                    launch!(
+                        self, "attention_split_decode", grid, &self.work.q, &self.keys[index],
+                        &self.values[index], &mut *partials, &dim, &heads, &kv_heads, control
+                    );
+                    launch!(
+                        self, "attention_combine_decode", (heads as u32, 1, 1), &*partials,
+                        &mut self.work.attended, &dim, &splits, control
+                    );
+                } else {
+                    launch!(
+                        self, "attention_split", grid, &self.work.q, &self.keys[index],
+                        &self.values[index], &mut *partials, &dim, &heads, &kv_heads, &count
+                    );
+                    launch!(
+                        self, "attention_combine", (heads as u32, 1, 1), &*partials,
+                        &mut self.work.attended, &dim, &splits, &count
+                    );
+                }
             } else if device_state {
                 let control = &self
                     .decode
@@ -1523,7 +1648,7 @@ impl CudaBackend {
             launch!(
                 self,
                 "matvec",
-                (t.rows as u32, 1, 1),
+                matvec_grid(self.matmul, t.rows, 1, t.width),
                 &t.bytes,
                 &t.kind,
                 &self.work.attended,
@@ -1582,7 +1707,7 @@ impl CudaBackend {
                 launch!(
                     self,
                     "matvec",
-                    (t.rows as u32, 1, 1),
+                    matvec_grid(self.matmul, t.rows, 1, t.width),
                     &t.bytes,
                     &t.kind,
                     &self.work.normalized,
@@ -1593,11 +1718,10 @@ impl CudaBackend {
                     &0i32,
                     &0i32
                 );
-                if cfg!(feature = "cuda-decode-fusion-research")
-                    && self.matmul == CudaMatmul::ResidualMma3Research
-                    && experts == 128
-                    && used <= 32
-                {
+                let warp_router = self.matmul.f32_tiled() && !olmoe
+                    || cfg!(feature = "cuda-decode-fusion-research")
+                        && self.matmul == CudaMatmul::ResidualMma3Research;
+                if warp_router && experts == 128 && used <= 32 {
                     launch!(
                         self,
                         "router_warp128",
@@ -1650,12 +1774,35 @@ impl CudaBackend {
                     &gate.rows,
                     &self.work.ids
                 );
+            } else if self.matmul.f32_tiled()
+                && moe != 0
+                && gemma.is_none()
+                && gate.width == l.up.width
+                && gate.rows == l.up.rows
+                && gate.width % 256 == 0
+                && matches!(gate.kind, 12 | 14)
+                && matches!(l.up.kind, 12 | 14)
+            {
+                launch!(
+                    self,
+                    "matvec_packed_gate_up_rows",
+                    matvec_grid(self.matmul, gate.rows, used as u32, gate.width),
+                    &gate.bytes,
+                    &gate.kind,
+                    &l.up.bytes,
+                    &l.up.kind,
+                    &self.work.normalized,
+                    &mut self.work.gate,
+                    &gate.width,
+                    &gate.rows,
+                    &self.work.ids
+                );
             } else {
                 for (t, out) in [(gate, &mut self.work.gate), (&l.up, &mut self.work.up)] {
                     launch!(
                         self,
                         "matvec",
-                        (t.rows as u32, used as u32, 1),
+                        matvec_grid(self.matmul, t.rows, used as u32, t.width),
                         &t.bytes,
                         &t.kind,
                         &self.work.normalized,
@@ -1703,7 +1850,7 @@ impl CudaBackend {
                 launch!(
                     self,
                     "matvec",
-                    (t.rows as u32, used as u32, 1),
+                    matvec_grid(self.matmul, t.rows, used as u32, t.width),
                     &t.bytes,
                     &t.kind,
                     &self.work.gate,
@@ -1766,7 +1913,7 @@ impl CudaBackend {
         launch!(
             self,
             "matvec",
-            (t.rows as u32, 1, 1),
+            matvec_grid(self.matmul, t.rows, 1, t.width),
             &t.bytes,
             &t.kind,
             &self.work.normalized,
@@ -2202,6 +2349,127 @@ mod tests {
                 assert!((actual - input * factor / (DIM as f32).sqrt()).abs() < 1e-7);
             }
         }
+    }
+
+    #[test]
+    fn matvec_warps_per_row_fills_the_gpu_without_exceeding_row_blocks() {
+        assert_eq!(matvec_warps_per_row(151_936, 1, 2048), 1);
+        assert_eq!(matvec_warps_per_row(2048, 8, 768), 1);
+        assert_eq!(matvec_warps_per_row(768, 8, 2048), 4);
+        assert_eq!(matvec_warps_per_row(512, 1, 2048), 8);
+        assert_eq!(matvec_warps_per_row(3, 1, 512), 2);
+        assert_eq!(matvec_warps_per_row(3, 1, 256), 1);
+        assert_eq!(matvec_grid(CudaMatmul::F32, 512, 1, 2048), (512, 1, 1));
+        assert_eq!(matvec_grid(CudaMatmul::F32Tiled, 512, 1, 2048), (512, 1, 1));
+        assert_eq!(matvec_grid(CudaMatmul::F32Tiled, 2048, 8, 768), (256, 8, 1));
+        assert_eq!(matvec_grid(CudaMatmul::F32Tiled, 3, 1, 256), (1, 1, 1));
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA 13 NVRTC/driver and a free GPU; run serially in release mode"]
+    fn packed_row_matvec_matches_cpu_for_every_warp_split() -> Result<()> {
+        use crate::gguf::layout;
+        let context = CudaContext::new(0).unwrap();
+        let source = format!(
+            "#define CUDA_PACKED_DECODE 1\n#define CUDA_NATIVE_HALF 1\n{}",
+            include_str!("cuda/kernels.cu")
+        );
+        let ptx = compile_ptx_with_opts(
+            source,
+            CompileOptions {
+                fmad: Some(false),
+                arch: Some("compute_75"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let module = context.load_module(ptx).unwrap();
+        struct Harness {
+            stream: Arc<CudaStream>,
+            functions: HashMap<&'static str, CudaFunction>,
+        }
+        let harness = Harness {
+            stream: context.default_stream(),
+            functions: HashMap::from([("matvec", module.load_function("matvec_packed_rows").unwrap())]),
+        };
+        let small = [0u32, 1, 6, 8, 12, 14].into_iter().flat_map(|kind| {
+            let block = layout(kind).unwrap().0;
+            [(block, 3), (768, 3), (2048, 3), (4096, 5)].map(|(w, r)| (kind, w, r))
+        });
+        // Large row counts reach the 1-, 2- and 4-warp splits for packed K-quants.
+        let large = [12u32, 14]
+            .into_iter()
+            .flat_map(|kind| [(2048, 1500), (2048, 5000), (768, 9000)].map(|(w, r)| (kind, w, r)));
+        for (kind, width, rows) in small.chain(large) {
+            let tensor = packed_fixture(kind, width, rows, 3);
+            let input: Vec<f32> = (0..width * 2)
+                .map(|i| (i % 23) as f32 / 23.0 - 0.5)
+                .collect();
+            // Sum of |w * x| per output: the scale of F32 reordering error.
+            let magnitude = |expert: usize, row: usize, x: &[f32]| -> f32 {
+                let mut w = vec![0.0f32; width];
+                let first = (expert * rows + row) * width;
+                match &tensor.storage {
+                    Storage::F32(values) => w.copy_from_slice(&values[first..first + width]),
+                    Storage::Packed { kind, bytes } => {
+                        let (block, size, _) = layout(*kind).unwrap();
+                        let start = first / block * size;
+                        for (b, chunk) in bytes[start..start + width / block * size]
+                            .chunks_exact(size)
+                            .enumerate()
+                        {
+                            crate::gguf::decode(*kind, chunk, &mut w[b * block..(b + 1) * block]);
+                        }
+                    }
+                }
+                w.iter().zip(x).map(|(a, b)| (a * b).abs()).sum()
+            };
+            let expected: Vec<Vec<(f32, f32)>> = (0..=1)
+                .map(|batched| {
+                    let mut out = vec![0.0; rows * 2];
+                    let mut scale = vec![0.0; rows * 2];
+                    for (slot, expert) in [2, 0].into_iter().enumerate() {
+                        let start = if batched == 1 { slot * width } else { 0 };
+                        let x = &input[start..start + width];
+                        tensor.multiply_expert(expert, x, &mut out[slot * rows..(slot + 1) * rows]);
+                        for row in 0..rows {
+                            scale[slot * rows + row] = magnitude(expert, row, x);
+                        }
+                    }
+                    out.into_iter().zip(scale).collect()
+                })
+                .collect();
+            let t = DeviceTensor::upload(tensor, &harness.stream).unwrap();
+            let x = harness.stream.clone_htod(&input).unwrap();
+            let ids = harness.stream.clone_htod(&[2i32, 0]).unwrap();
+            for (batched, expected) in expected.iter().enumerate() {
+                let batched = batched as i32;
+                let mut out = harness.stream.clone_htod(&vec![12345.0f32; rows * 2]).unwrap();
+                launch!(
+                    harness,
+                    "matvec",
+                    matvec_grid(CudaMatmul::F32Tiled, t.rows, 2, t.width),
+                    &t.bytes,
+                    &t.kind,
+                    &x,
+                    &mut out,
+                    &t.width,
+                    &t.rows,
+                    &ids,
+                    &1i32,
+                    &batched
+                );
+                let actual = harness.stream.clone_dtoh(&out).unwrap();
+                for (a, (e, scale)) in actual.iter().zip(expected) {
+                    // A lost or duplicated 256-value block would err by ~scale / blocks.
+                    assert!(
+                        (a - e).abs() < 0.0001 + scale * 1e-6,
+                        "kind={kind}, width={width}, rows={rows}, batched={batched}: {a} != {e}"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

@@ -99,6 +99,11 @@ impl std::ops::Deref for ModelArgs {
     }
 }
 
+const DEFAULT_BATCH_TOKENS: u32 = 128;
+const DEFAULT_PREFILL_CHUNK: u32 = 64;
+/// CUDA prefill capacity is bounded at 512 tokens (prefill_capacity in cuda.rs).
+const FAST_PREFILL_TOKENS: u32 = 512;
+
 /// Backend, model and execution-plan options shared by every local model command.
 #[derive(Args)]
 pub(crate) struct RuntimeArgs {
@@ -108,10 +113,14 @@ pub(crate) struct RuntimeArgs {
     pub(crate) model: PathBuf,
     #[arg(long, default_value_t = 512)]
     pub(crate) context: u32,
-    #[arg(long, default_value_t = 128)]
-    batch: u32,
-    #[arg(long, default_value_t = 64)]
-    prefill_chunk: u32,
+    /// Prefill batch capacity [default: 128; chat on CUDA f32-tiled: 512, capped by
+    /// --context].
+    #[arg(long)]
+    batch: Option<u32>,
+    /// Tokens per prefill call [default: 64; chat on CUDA f32-tiled: 512, capped by
+    /// --context and --batch].
+    #[arg(long)]
+    prefill_chunk: Option<u32>,
     #[arg(long, default_value_t = 4)]
     threads: u32,
     #[arg(long, default_value_t = 32)]
@@ -145,16 +154,26 @@ pub(crate) struct RuntimeArgs {
     #[cfg(feature = "cuda")]
     #[arg(long)]
     cuda_kernel_cache: Option<PathBuf>,
-    /// CUDA matrix profile; default f32 keeps its existing kernels and arithmetic.
-    /// f32-tiled selects measured F32 prefill/decode kernels without activation quantization.
-    /// residual-int8-research is opt-in approximate prefill, not quality-admitted.
+    /// CUDA matrix profile [default: f32; chat: f32-tiled]. f32 keeps its existing
+    /// kernels and arithmetic. f32-tiled selects measured F32 prefill/decode kernels
+    /// without activation quantization. residual-int8-research is opt-in approximate
+    /// prefill, not quality-admitted.
     #[cfg(feature = "cuda")]
-    #[arg(long, value_enum, default_value_t = local_inference::cuda::CudaMatmul::F32)]
-    cuda_matmul: local_inference::cuda::CudaMatmul,
-    /// Opt-in captured decode with token-only greedy output; context <=1024.
+    #[arg(long, value_enum)]
+    cuda_matmul: Option<local_inference::cuda::CudaMatmul>,
+    /// Captured decode with token-only greedy output (f32: context <= 1024). On by
+    /// default for chat with f32-tiled.
     #[cfg(feature = "cuda")]
     #[arg(long)]
     cuda_decode_graph: bool,
+    /// Disable the decode graph chat enables by default.
+    #[cfg(feature = "cuda")]
+    #[arg(long, conflicts_with = "cuda_decode_graph")]
+    no_cuda_decode_graph: bool,
+    /// Set by commands that default to the fastest quality-admitted CUDA settings.
+    #[cfg(feature = "cuda")]
+    #[arg(skip)]
+    fast_cuda_defaults: bool,
 }
 
 #[derive(Args)]
@@ -259,8 +278,11 @@ impl RuntimeArgs {
                 && (self.cuda_device.is_some()
                     || self.gpu_memory_limit_bytes.is_some()
                     || self.cuda_kernel_cache.is_some()
-                    || self.cuda_matmul != local_inference::cuda::CudaMatmul::F32
-                    || self.cuda_decode_graph)
+                    || self
+                        .cuda_matmul
+                        .is_some_and(|m| m != local_inference::cuda::CudaMatmul::F32)
+                    || self.cuda_decode_graph
+                    || self.no_cuda_decode_graph)
             {
                 return Err(local_inference::Error::Invalid(
                     "CUDA options require --backend cuda".into(),
@@ -314,9 +336,74 @@ impl RuntimeArgs {
             options.memory_limit_bytes = limit;
         }
         options.kernel_cache_dir = self.cuda_kernel_cache.clone();
-        options.matmul = self.cuda_matmul;
-        options.decode_graph = self.cuda_decode_graph;
+        options.matmul = self.cuda_matmul();
+        options.decode_graph = self.cuda_decode_graph || self.implicit_decode_graph();
         options
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_matmul(&self) -> local_inference::cuda::CudaMatmul {
+        use local_inference::cuda::CudaMatmul;
+        self.cuda_matmul.unwrap_or(if self.fast_cuda_defaults {
+            CudaMatmul::F32Tiled
+        } else {
+            CudaMatmul::F32
+        })
+    }
+
+    /// Decode graph enabled by fast defaults rather than requested by the user.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn implicit_decode_graph(&self) -> bool {
+        self.fast_cuda_defaults
+            && self.backend == LocalBackend::Cuda
+            && !self.cuda_decode_graph
+            && !self.no_cuda_decode_graph
+            && self.cuda_matmul() == local_inference::cuda::CudaMatmul::F32Tiled
+    }
+
+    /// Large prefill chunks only pay off with the tiled CUDA kernels (measured
+    /// 7.2 s -> 2.8 s TTFT at 2.9k tokens on Qwen3-30B, 64 -> 512).
+    fn fast_prefill(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.fast_cuda_defaults
+                && self.backend == LocalBackend::Cuda
+                && self.cuda_matmul() == local_inference::cuda::CudaMatmul::F32Tiled
+        }
+        #[cfg(not(feature = "cuda"))]
+        false
+    }
+
+    fn batch(&self) -> u32 {
+        self.batch.unwrap_or(if self.fast_prefill() {
+            FAST_PREFILL_TOKENS.min(self.context)
+        } else {
+            DEFAULT_BATCH_TOKENS
+        })
+    }
+
+    fn prefill_chunk(&self) -> u32 {
+        self.prefill_chunk.unwrap_or(if self.fast_prefill() {
+            FAST_PREFILL_TOKENS.min(self.batch())
+        } else {
+            DEFAULT_PREFILL_CHUNK
+        })
+    }
+
+    /// Opts into f32-tiled plus the decode graph unless the user chose otherwise.
+    pub(crate) fn use_fast_cuda_defaults(&mut self) {
+        #[cfg(feature = "cuda")]
+        {
+            self.fast_cuda_defaults = true;
+        }
+    }
+
+    /// Drops an implicit decode graph (after its capture failed); explicit flags stay.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn disable_implicit_decode_graph(&mut self) {
+        if self.implicit_decode_graph() {
+            self.no_cuda_decode_graph = true;
+        }
     }
 
     fn execution(&self, _info: &local_inference::backend::ModelInfo) -> serde_json::Value {
@@ -326,7 +413,7 @@ impl RuntimeArgs {
                 return json!({
                     "backend": "cuda", "options": self.cuda_options(),
                     "expert_residency": "all weights GPU-resident",
-                    "prefill": if self.batch > 1 {
+                    "prefill": if self.batch() > 1 {
                         "layer-wise batched (internal capacity <=512)"
                     } else { "sequential token steps" },
                     "kv_precision": "f32",
@@ -343,8 +430,8 @@ impl RuntimeArgs {
     pub(crate) fn config(&self) -> Config {
         Config {
             context_tokens: self.context,
-            batch_tokens: self.batch,
-            prefill_chunk: self.prefill_chunk,
+            batch_tokens: self.batch(),
+            prefill_chunk: self.prefill_chunk(),
             threads: self.threads,
         }
     }

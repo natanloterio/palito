@@ -38,17 +38,22 @@ pub(super) fn compile(
     let Some(directory) = directory else {
         return compile_ptx_with_opts(source, options).map_err(failure);
     };
-    let (mut major, mut minor) = (0i32, 0i32);
-    // Both pointers address initialized, writable integers for the duration of the call.
-    unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor) }
-        .result()
-        .map_err(failure)?;
-    let key = key(source, &options, (major, minor));
+    let key = key(source, &options, nvrtc_version()?);
     cached(directory, &key, || {
         compile_ptx_with_opts(source, options)
             .map(|ptx| ptx.to_src())
             .map_err(failure)
     })
+}
+
+/// Version of the NVRTC library that compiles the kernels (not the cudarc headers).
+pub(super) fn nvrtc_version() -> Result<(i32, i32)> {
+    let (mut major, mut minor) = (0i32, 0i32);
+    // Both pointers address initialized, writable integers for the duration of the call.
+    unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor) }
+        .result()
+        .map_err(failure)?;
+    Ok((major, minor))
 }
 
 fn cached(directory: &Path, key: &str, compile: impl FnOnce() -> Result<String>) -> Result<Ptx> {

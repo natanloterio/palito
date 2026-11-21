@@ -329,8 +329,9 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
 #else
 #define MMQ_BODY(C, BN, KS, S16) if (threadIdx.x == 0) atomicOr(status, 16);
 #endif
-#define MMQ_KERNEL(Name, C, BN, KS, S16) \
-extern "C" __global__ void __launch_bounds__(256, 2) \
+#define MMQ_KERNEL(Name, C, BN, KS, S16) MMQ_KERNEL_BLOCKS(Name, C, BN, KS, S16, 2)
+#define MMQ_KERNEL_BLOCKS(Name, C, BN, KS, S16, Blocks) \
+extern "C" __global__ void __launch_bounds__(256, Blocks) \
 Name(const u8 *weights, int kind, const signed char *values, const float *scales, \
      const int *sums, float *output, int width, int rows, int tokens, const int *groups, \
      int used, int grouped, int assignment_major, int *status) { \
@@ -345,7 +346,10 @@ MMQ_KERNEL(mmq_s16_grouped, 2, 32, 128, true)
 // Three residual components (residual_quantize32_precise3) for FFN inputs.
 MMQ_KERNEL(mmq_c3, 3, 64, 64, false)
 MMQ_KERNEL(mmq_c3_rows32, 3, 32, 128, false)
-MMQ_KERNEL(mmq_c3_grouped, 3, 32, 128, false)
+#ifndef MMQ_C3_GROUPED_BLOCKS
+#define MMQ_C3_GROUPED_BLOCKS 2
+#endif
+MMQ_KERNEL_BLOCKS(mmq_c3_grouped, 3, 32, 128, false, MMQ_C3_GROUPED_BLOCKS)
 
 // Two residual s8 planes per 32-value warp block with integer-related scales:
 // d1 = max|x| / 127, q1 = round(x / d1), r = x - d1 * q1, K = floor(127 * d1 / max|r|)

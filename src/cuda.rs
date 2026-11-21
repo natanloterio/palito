@@ -2068,13 +2068,19 @@ impl CudaBackend {
                     );
                 }
             } else if (dim, heads, kv_heads) == (64, 32, 8)
-                && count >= 128
+                && count
+                    >= if cfg!(feature = "cuda-llama-direct-short-decode-research") {
+                        32
+                    } else {
+                        128
+                    }
                 && self.functions.contains_key("llama_split_decode_partials")
             {
                 const TILE: u32 = 128;
                 let tiles = (count as u32).div_ceil(TILE);
-                // At least 128 live tokens leave room for 66 floats per tile.
-                debug_assert!(heads as usize * tiles as usize * 66 <= self.work.scores.len());
+                debug_assert!(
+                    tiles == 1 || heads as usize * tiles as usize * 66 <= self.work.scores.len()
+                );
                 launch!(self, "llama_split_decode_partials", (heads as u32, tiles, 1),
                     &self.work.q, &self.keys[index], &self.values[index],
                     &mut self.work.attended, &mut self.work.scores, &heads,

@@ -424,7 +424,9 @@ and CUDA 13 NVRTC libraries on `LD_LIBRARY_PATH`.
   `cuda-llama-split-decode-attention-research` uses 128-token F32 tiles
   for Llama eager decode with 32 query heads, eight KV heads, 64 dimensions,
   and at least 128 live tokens. A single tile writes the output directly.
-  The path preserves F32 KV.
+  `cuda-llama-direct-short-decode-research` extends direct output down to
+  32 live tokens, bypassing separate score and value launches whenever the
+  live KV fits in one tile. Both paths preserve F32 KV.
 - `--cuda-matmul tf32x3-tiled` is a separate approximate expert-only experiment.
   It **fails** the strict real-model MoE logit gate (0.08683 maximum error versus
   the 0.01 limit), despite matching bounded generated IDs. Do not treat it as

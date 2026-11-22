@@ -25,6 +25,15 @@ fn cpu() -> EngineOptions {
     }
 }
 
+/// Serializes the tests that load a model on the GPU: the test harness runs
+/// tests in parallel threads, and two Qwen3-30B-A3B engines do not fit in GPU
+/// memory at once. Poison-tolerant so one failing test does not fail the rest.
+#[cfg(feature = "cuda")]
+fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPU.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn capped(max_tokens: u32) -> GenerationOptions {
     GenerationOptions {
         max_tokens: Some(max_tokens),
@@ -197,6 +206,7 @@ fn c_api_reports_errors_without_a_model() {
 #[test]
 #[ignore = "requires CUDA 13 and models/SmolLM2-135M-Instruct-Q4_K_M.gguf"]
 fn cuda_engine_uses_the_trained_context_and_matches_cpu_text() {
+    let _gpu = gpu_lock();
     let mut gpu = Engine::open(
         &smollm(),
         &EngineOptions {
@@ -341,4 +351,199 @@ fn c_abi_layout_matches_the_bindings() {
     assert_eq!(offset_of!(PalitoResult, generated_tokens), 16);
     assert_eq!(offset_of!(PalitoResult, ttft_ms), 24);
     assert_eq!(offset_of!(PalitoResult, tokens_per_second), 32);
+}
+
+#[cfg(feature = "cuda")]
+fn qwen3(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("models")
+        .join(name)
+}
+
+/// (text, prompt tokens, cached tokens) for each prompt of a scripted chat:
+/// three turns, then the second turn asked differently, then a new system
+/// prompt. Replies are appended as the model gave them.
+#[cfg(feature = "cuda")]
+fn scripted_chat(engine: &mut Engine) -> Vec<(String, usize, usize)> {
+    let options = GenerationOptions {
+        max_tokens: Some(24),
+        enable_thinking: false,
+        ..GenerationOptions::default()
+    };
+    let mut results = Vec::new();
+    let mut ask = |engine: &mut Engine, messages: &[Message]| {
+        let completion = engine.chat(messages, &options, |_| true).unwrap();
+        results.push((
+            completion.text.clone(),
+            completion.prompt_tokens,
+            completion.cached_tokens,
+        ));
+        Message::new("assistant", completion.text)
+    };
+    let system = Message::system("You are a terse assistant. Answer in one short sentence.");
+    let mut messages = vec![system, Message::user("Name a primary color.")];
+    for question in ["Name another one.", "Which of the two is warmer?"] {
+        let reply = ask(engine, &messages);
+        messages.push(reply);
+        messages.push(Message::user(question));
+    }
+    ask(engine, &messages);
+    messages.truncate(3);
+    messages.push(Message::user("Name a fruit of that color instead."));
+    ask(engine, &messages);
+    ask(
+        engine,
+        &[
+            Message::system("Reply in French."),
+            Message::user("Name a color."),
+        ],
+    );
+    results
+}
+
+#[cfg(feature = "cuda")]
+fn assert_prefix_cache_is_exact(model: &str, profiles: &[(palito::cuda::CudaMatmul, bool)]) {
+    for &(matmul, graph) in profiles {
+        let open = |prefix_cache| {
+            Engine::open(
+                &qwen3(model),
+                &EngineOptions {
+                    device: Device::Cuda,
+                    context_tokens: Some(1024),
+                    batch_tokens: Some(64),
+                    prefill_chunk: Some(16),
+                    cuda_matmul: Some(matmul),
+                    decode_graph: Some(graph),
+                    prefix_cache,
+                    ..EngineOptions::default()
+                },
+            )
+            .unwrap()
+        };
+        let uncached = scripted_chat(&mut open(false));
+        let cached = scripted_chat(&mut open(true));
+        let label = format!("{matmul:?} graph={graph}");
+        for ((text, prompt, hit), (expected, expected_prompt, miss)) in cached.iter().zip(&uncached)
+        {
+            assert_eq!(text, expected, "{label}: cached reply differs");
+            assert_eq!(
+                prompt, expected_prompt,
+                "{label}: prompt_tokens must be the full prompt"
+            );
+            assert_eq!(*miss, 0, "{label}: disabled cache reused tokens");
+            assert!(hit % 16 == 0 && hit < prompt, "{label}: {hit} of {prompt}");
+        }
+        let hits: Vec<usize> = cached.iter().map(|r| r.2).collect();
+        assert_eq!(hits[0], 0, "{label}: first prompt");
+        assert!(hits[1] > 0 && hits[2] > hits[1], "{label}: turns {hits:?}");
+        assert!(
+            hits[3] > 0 && hits[3] < hits[2],
+            "{label}: diverging prompt {hits:?}"
+        );
+        assert_eq!(hits[4], 0, "{label}: unrelated prompt {hits:?}");
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CUDA 13 and models/compat-qwen3/Qwen3-0.6B-Q4_K_M.gguf"]
+fn cuda_prefix_cache_hit_partial_and_miss_keep_greedy_output() {
+    let _gpu = gpu_lock();
+    use palito::cuda::CudaMatmul;
+    assert_prefix_cache_is_exact(
+        "compat-qwen3/Qwen3-0.6B-Q4_K_M.gguf",
+        &[
+            (CudaMatmul::Int8Fast, true),
+            (CudaMatmul::Int8Fast, false),
+            (CudaMatmul::F32Tiled, true),
+            (CudaMatmul::F32, false),
+            (CudaMatmul::F32, true),
+        ],
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CUDA 13, ~20 GB of GPU memory and Qwen3-30B-A3B-Q4_K_M"]
+fn cuda_prefix_cache_keeps_qwen3_30b_greedy_output() {
+    let _gpu = gpu_lock();
+    assert_prefix_cache_is_exact(
+        "benchmark-qwen3/gguf/Qwen3-30B-A3B-Q4_K_M.gguf",
+        &[(palito::cuda::CudaMatmul::Int8Fast, true)],
+    );
+}
+
+/// Time to first token of the second and third turns of a chat with ~10k tokens
+/// of history, with and without the prefix cache (Palito's chat defaults).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "benchmark: requires CUDA 13, ~20 GB of GPU memory and Qwen3-30B-A3B-Q4_K_M"]
+fn cuda_prefix_cache_speeds_up_long_conversations() {
+    let _gpu = gpu_lock();
+    let document: String = (0..480)
+        .map(|i| {
+            format!(
+                "Record {i}: sensor {} read {} at site {}.\n",
+                i * 7 % 113,
+                i * 31 % 997,
+                i % 17
+            )
+        })
+        .collect();
+    let options = GenerationOptions {
+        max_tokens: Some(16),
+        enable_thinking: false,
+        ..GenerationOptions::default()
+    };
+    let run = |prefix_cache| {
+        let mut engine = Engine::open(
+            &qwen3("benchmark-qwen3/gguf/Qwen3-30B-A3B-Q4_K_M.gguf"),
+            &EngineOptions {
+                device: Device::Cuda,
+                context_tokens: Some(16384),
+                prefix_cache,
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+        let mut messages = vec![Message::user(format!(
+            "{document}\nWhich site appears most?"
+        ))];
+        let mut turns = Vec::new();
+        for question in [
+            "Which sensor read the highest value?",
+            "Summarize in five words.",
+            "Thanks.",
+        ] {
+            let completion = engine.chat(&messages, &options, |_| true).unwrap();
+            turns.push((
+                completion.prompt_tokens,
+                completion.cached_tokens,
+                completion.ttft_ns,
+                completion.text.clone(),
+            ));
+            messages.push(Message::new("assistant", completion.text));
+            messages.push(Message::user(question));
+        }
+        turns
+    };
+    let cold = run(false);
+    let warm = run(true);
+    for (index, (cold, warm)) in cold.iter().zip(&warm).enumerate() {
+        eprintln!(
+            "turn {}: prompt {} tokens, cached {}, ttft {:.1} ms -> {:.1} ms ({:.2}x)",
+            index + 1,
+            warm.0,
+            warm.1,
+            cold.2 as f64 / 1e6,
+            warm.2 as f64 / 1e6,
+            cold.2 as f64 / warm.2 as f64
+        );
+        assert_eq!(cold.3, warm.3, "turn {} text differs", index + 1);
+    }
+    for turn in &warm[1..] {
+        assert!(turn.0 > 9000, "history too short: {}", turn.0);
+    }
+    let speedup = cold[1].2 as f64 / warm[1].2 as f64;
+    assert!(speedup >= 3.0, "second-turn speedup {speedup:.2}x");
 }

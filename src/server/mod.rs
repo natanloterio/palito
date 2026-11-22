@@ -67,6 +67,10 @@ pub(crate) struct ServeArgs {
     /// Require `Authorization: Bearer <key>` on /v1 routes.
     #[arg(long, env = "PALITO_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
+    /// Re-evaluate every prompt in full instead of reusing the previous
+    /// request's KV cache for a shared prompt start (CUDA).
+    #[arg(long)]
+    no_prefix_cache: bool,
     /// Requests allowed to wait while one is running; more get 503.
     #[arg(long, default_value_t = 16)]
     queue: usize,
@@ -100,6 +104,7 @@ pub(crate) fn run(args: ServeArgs) -> palito::Result<()> {
         gpu_device: args.gpu_device,
         gpu_memory_limit_bytes: args.gpu_memory_limit_bytes,
         kernel_cache_dir: args.cuda_kernel_cache.clone(),
+        prefix_cache: !args.no_prefix_cache,
         ..EngineOptions::default()
     };
     let sampling = args.sampling.sampling();

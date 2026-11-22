@@ -125,6 +125,10 @@ pub struct CudaOptions {
     /// Shrink the requested context to the largest one whose device buffers fit
     /// (ModelInfo::context_tokens reports it) instead of refusing to open.
     pub fit_context: bool,
+    /// Opt-in: keep the last prompt's K/V on the device and resume the next
+    /// prompt sharing its start at the latest prefill-chunk boundary before the
+    /// divergence (greedy output unchanged; see `prefix`).
+    pub prefix_cache: bool,
 }
 
 impl Default for CudaOptions {
@@ -136,6 +140,7 @@ impl Default for CudaOptions {
             matmul: CudaMatmul::F32,
             decode_graph: false,
             fit_context: false,
+            prefix_cache: false,
         }
     }
 }
@@ -844,6 +849,7 @@ mod model_replay;
 mod packed_decode;
 #[cfg(test)]
 mod prefill;
+mod prefix;
 pub mod reference;
 #[cfg(test)]
 mod residual;
@@ -864,6 +870,8 @@ pub struct CudaBackend {
     memory: MemoryUsage,
     matmul: CudaMatmul,
     diagnostic: Option<diagnostics::Capture>,
+    /// None: prefix cache disabled.
+    prefix: Option<prefix::PrefixCache>,
 }
 
 /// Warps sharing one output row in `matvec_packed_rows` (mirrors the device
@@ -1433,6 +1441,7 @@ impl CudaBackend {
             memory,
             matmul: options.matmul,
             diagnostic: None,
+            prefix: options.prefix_cache.then(prefix::PrefixCache::default),
         };
         if options.decode_graph {
             backend.capture_decode_graph()?;
@@ -2426,12 +2435,32 @@ impl Backend for CudaBackend {
             * 8;
         Some(usage)
     }
+    fn restore_prefix(&mut self, prompt: &[i32]) -> Result<usize> {
+        let Some(prefix) = &mut self.prefix else {
+            return Ok(0);
+        };
+        if self.state.position != 0 || self.state.valid || self.state.failed {
+            return Err(invalid("prefix restoration requires a reset backend"));
+        }
+        let restored = prefix.restore(prompt);
+        self.state.position = restored;
+        Ok(restored)
+    }
+    fn store_prefix(&mut self, prompt: &[i32]) -> Result<()> {
+        if let Some(prefix) = &mut self.prefix {
+            prefix.store(prompt);
+        }
+        Ok(())
+    }
 }
 
 impl CudaBackend {
     fn evaluate_inner(&mut self, tokens: &[i32], position: u32, host_logits: bool) -> Result<()> {
         self.state
             .begin(tokens, position, &self.weights.spec.info)?;
+        if let Some(prefix) = &mut self.prefix {
+            prefix.overwrite(position as usize);
+        }
         if let Some(capture) = &self.diagnostic {
             capture.validate_batch(tokens.len(), prefill_capacity(&self.weights.spec))?;
         }
@@ -2462,6 +2491,9 @@ impl CudaBackend {
             self.decode.as_mut().unwrap().sampled = Some(sampled);
         }
         self.state.finish(tokens.len());
+        if let Some(prefix) = &mut self.prefix {
+            prefix.evaluated(tokens, position as usize);
+        }
         Ok(())
     }
 }

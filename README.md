@@ -80,6 +80,7 @@ Useful options:
 | `--temperature T` | Samples instead of always picking the most likely token (default 0: greedy, the same reply every time) |
 | `--top-p P`, `--top-k K`, `--seed S` | Narrow the sampling to the most likely tokens; a seed makes it repeatable |
 | `--stop TEXT` | Ends the reply at TEXT, which is not printed (repeat for several) |
+| `--no-prefix-cache` | Re-reads the whole conversation every turn instead of reusing the previous turn's work (GPU) |
 
 For Qwen3, its authors suggest `--temperature 0.6 --top-p 0.95 --top-k 20` with reasoning on, and `--temperature 0.7 --top-p 0.8 --top-k 20` with `--no-thinking`. Greedy decoding works well for short answers, but long reasoning can start repeating itself.
 
@@ -148,6 +149,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 - **Not supported:** `n` > 1 is rejected.
 - **One request at a time:** the model runs one request at a time, and others wait in a queue (`--queue`, default 16; beyond that the server returns 503). If a client disconnects, its generation stops.
 - **Local by default:** the server only accepts connections from this machine. To serve your network, use `--host 0.0.0.0 --api-key YOUR_KEY` (or set `PALITO_API_KEY`). Clients then send `Authorization: Bearer YOUR_KEY`.
+- **Conversations are cheap to continue:** on the GPU, a request that starts with the previous request's prompt (a chat resent with one more turn) skips most of the shared part. Replies are the same as without it. `--no-prefix-cache` turns it off.
 - **Other options:** `--port`, `--context`, `--backend cpu`, `--gpu-memory-limit-bytes`, `--model-name`.
 
 ## Use Palito from your own program
@@ -213,6 +215,8 @@ Qwen3-30B-A3B Q4_K_M on an RTX 5090:
 | 2.9k tokens | 0.16 s | ~300 tok/s |
 | 10k tokens | 0.75 s | 211 tok/s |
 | 40k tokens | 6.4 s | 103 tok/s |
+
+Continuing a conversation is faster: with ~9.7k tokens of history, the next turn's first token comes after 0.18 s instead of 0.77 s, because the history is not read again.
 
 ## Troubleshooting
 

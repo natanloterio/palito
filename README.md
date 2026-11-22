@@ -6,7 +6,7 @@ Fast local LLM inference for GGUF models, written in Rust, with its own CUDA ker
 
 - **Fast:** on an RTX 5090 with Qwen3-30B-A3B (Q4_K_M), the first token of a 2.9k-token prompt arrives in ~0.16 s (llama.cpp: 0.18 s), and decoding runs at ~300–350 tok/s.
 - **Uses the model's full context:** `chat` opens with the model's trained context (Qwen3-30B-A3B: 40,960 tokens) and replies run until the model finishes.
-- **One binary:** no Python, no server, no llama.cpp. The Linux bundle ships the CUDA compiler it needs.
+- **One binary:** chat in the terminal, an OpenAI-compatible server (`palito serve`), or a C library for your own program. No Python and no llama.cpp; the Linux bundle ships the CUDA compiler it needs.
 
 ## Requirements
 
@@ -111,6 +111,37 @@ palito generate --model models/SmolLM2-135M-Instruct-Q4_K_M.gguf \
 ```sh
 palito chat --backend cpu --model models/SmolLM2-135M-Instruct-Q4_K_M.gguf --tokens 300
 ```
+
+## Run as a server (OpenAI-compatible API)
+
+```sh
+palito serve --model models/Qwen3-30B-A3B-Q4_K_M.gguf
+# Serving the OpenAI API at http://127.0.0.1:8080/v1
+```
+
+Any OpenAI client works: point it at `http://127.0.0.1:8080/v1`. That includes the official SDKs, Open WebUI and editor plugins. The API key can be any text unless you set one.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
+for chunk in client.chat.completions.create(
+        model="palito", stream=True,
+        messages=[{"role": "user", "content": "Hello!"}]):
+    print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+- **Endpoints:** `POST /v1/chat/completions`, `POST /v1/completions` (both support `"stream": true`), `GET /v1/models`, `GET /health`.
+- **Qwen3 reasoning:** send `"chat_template_kwargs": {"enable_thinking": false}` to turn it off.
+- **Decoding is greedy:** `temperature` and `top_p` are accepted but ignored. `n` > 1 and `stop` sequences are rejected.
+- **One request at a time:** the model runs one request at a time, and others wait in a queue (`--queue`, default 16; beyond that the server returns 503). If a client disconnects, its generation stops.
+- **Local by default:** the server only accepts connections from this machine. To serve your network, use `--host 0.0.0.0 --api-key YOUR_KEY` (or set `PALITO_API_KEY`). Clients then send `Authorization: Bearer YOUR_KEY`.
+- **Other options:** `--port`, `--context`, `--backend cpu`, `--gpu-memory-limit-bytes`, `--model-name`.
 
 ## Use Palito from your own program
 

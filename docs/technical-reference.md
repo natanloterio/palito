@@ -1465,6 +1465,10 @@ See the [literature review](../../literature_review/review.md) for the evidence 
 limitations behind this order. A successful smoke benchmark establishes a
 baseline; it does not establish a speedup or generalize to larger models.
 
+## HTTP server
+
+`palito serve` (`src/server/`) is an OpenAI-compatible server on axum/tokio. The `Engine` is opened on a dedicated worker thread and serves one request at a time. HTTP handlers queue jobs into a bounded channel (`--queue`; full → 503 with `Retry-After`) and receive text over an unbounded channel. When the client disconnects, that channel closes and the engine cancels generation at the next token. Streaming follows the OpenAI chunk format (role chunk, content deltas, a finish chunk, an optional `stream_options.include_usage` chunk, `[DONE]`). Responses add a `timings` object (`ttft_ms`, `tokens_per_second`). `/v1` routes require `Authorization: Bearer` when `--api-key`/`PALITO_API_KEY` is set (constant-time comparison). Bodies are limited to 16 MiB. Tests: `cargo test --release --test serve -- --include-ignored` (SmolLM2 fixture, CPU). Checked with the official OpenAI Python SDK (models, chat, streaming, completions) against Qwen3-30B-A3B: about 360 tok/s per request, same as the CLI.
+
 ## Embedding API
 
 `palito::engine::Engine` opens a model with the `chat` defaults: the GGUF context, capped at 65,535 and fitted to free device memory on CUDA. It then tries the CUDA profiles in this order and uses the first that opens: `int8-fast` with the decode graph, `f32-tiled` with and then without the graph, then `f32`. It runs chat (the model's template, `enable_thinking` per call) or plain completion with streamed text and a finish reason (stop, length, context full, cancelled). `src/ffi.rs` wraps it as the C API declared in `include/palito.h`, built as `target/release/libpalito.so` (`crate-type = ["rlib", "cdylib"]`). Panics are caught at the boundary. Strings returned by the library are freed by the library. Tests: `cargo test --release --test engine -- --include-ignored` (needs the SmolLM2 fixture; the CUDA case needs `--features cuda`).

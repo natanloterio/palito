@@ -1139,6 +1139,26 @@ Replacement evicts the old entry before allocating a new one. Reports expose
 Snapshot creation/restoration is included in prefill time. Warm-cache latency is
 not a cold-inference speedup or a fair comparison with an uncached reference.
 
+### CUDA prompt prefix cache
+
+`CudaOptions::prefix_cache` (on by default in `EngineOptions`, so for `palito chat --backend cuda` and `palito serve`; `--no-prefix-cache` or `EngineOptions::prefix_cache = false` turns it off) keeps one cached prompt. Nothing is copied. The K/V buffers already hold the previous prompt's rows. `restore_prefix` moves the start position forward and the executor evaluates only the rest (`src/cuda/prefix.rs`).
+
+Exactness comes from how the restore point is chosen, not from batch-invariant kernels. A request resumes only at the start of one of the previous prompt's prefill chunks, at or before the first differing token. It also keeps at least the last prompt token, whose logits are not stored. Every chunk before that point holds the same tokens, at the same positions and in the same batch, as an uncached prefill of the new prompt. Every chunk after it is batched exactly as it would be without the cache. So no kernel sees a batch shape the uncached run would not.
+
+Rows written by decode are never reused. Decode evaluates one token at a time, unlike prefill. Any evaluation below the cached length, from any caller, drops the rows it overwrites. A failed prefill keeps only the chunks that completed. `Completion::prompt_tokens` and server `usage` still count the full prompt; `Completion::cached_tokens` (and `Sample::cached_prompt_tokens`) report the reuse. The cache adds no device memory (`prefix_capacity_bytes` stays 0). Qwen3.5 (`qwen35`, recurrent delta-net state) opens a separate backend that keeps the default no-op and never reuses.
+
+The granularity is the prefill chunk: 4096 tokens with the chat defaults, 64 on the f32 profile. Reuse is up to the last chunk start at or before the shared prefix, so prompts shorter than one chunk get no reuse. `tests/engine.rs::cuda_prefix_cache_hit_partial_and_miss_keep_greedy_output` runs a three-turn chat, a prompt that diverges mid-way, and an unrelated prompt on Qwen3-0.6B, with 16-token chunks. It covers int8-fast with and without the graph, f32-tiled, and f32 with and without the graph. The test checks that every reply matches the uncached run and checks the hit/partial/miss counts. `cuda_prefix_cache_keeps_qwen3_30b_greedy_output` runs the same chat on Qwen3-30B-A3B. Changing the restore to ignore token equality makes the first test fail.
+
+`cuda_prefix_cache_speeds_up_long_conversations` measures Qwen3-30B-A3B Q4_K_M on an RTX 5090 with chat defaults (int8-fast, graph, 4096-token chunks, 16k context, 16-token replies). Replies are identical:
+
+| Turn | Prompt | Reused | TTFT uncached | TTFT cached | Speedup |
+|---|---|---|---|---|---|
+| 2 | 9,693 | 8,192 | 768 ms | 178 ms | 4.3x |
+| 3 | 9,726 | 8,192 | 780 ms | 180 ms | 4.3x |
+| 2 (longer history) | 12,536 | 12,288 | 1,105 ms | 72 ms | 15.3x |
+
+The gain depends on where the history ends relative to a 4096 boundary. Just past one, almost everything is reused. Just before one, up to 4095 tokens are evaluated again.
+
 `CpuBackend` exposes single-use append transactions with commit/rollback. Nested,
 foreign, and reset-invalidated handles are rejected. Rollback restores the prior
 logits/history/visible position; stale rejected KV cannot affect later attention.

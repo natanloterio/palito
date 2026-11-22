@@ -56,6 +56,9 @@ pub struct EngineOptions {
     pub decode_graph: Option<bool>,
     /// Jinja source replacing the GGUF `tokenizer.chat_template`.
     pub chat_template: Option<String>,
+    /// CUDA: reuse the previous prompt's K/V when the next prompt starts with it
+    /// (a chat resent with one more turn). Greedy output is unchanged.
+    pub prefix_cache: bool,
 }
 
 impl Default for EngineOptions {
@@ -78,6 +81,7 @@ impl Default for EngineOptions {
             #[cfg(feature = "cuda")]
             decode_graph: None,
             chat_template: None,
+            prefix_cache: true,
         }
     }
 }
@@ -124,6 +128,8 @@ pub struct Completion {
     pub text: String,
     pub finish_reason: FinishReason,
     pub prompt_tokens: usize,
+    /// Prompt tokens whose evaluation was reused from the previous request.
+    pub cached_tokens: usize,
     pub generated_tokens: usize,
     /// Prompt evaluation plus the first token, in nanoseconds.
     pub ttft_ns: u64,
@@ -314,6 +320,7 @@ impl Engine {
         } else {
             FinishReason::ContextFull
         };
+        let cached_tokens = sample.as_ref().map_or(0, |s| s.cached_prompt_tokens);
         let (ttft_ns, tokens_per_second) = match &sample {
             Some(sample) => (sample.ttft_ns, decode_rate(sample)),
             None => clock.stats(),
@@ -322,6 +329,7 @@ impl Engine {
             text,
             finish_reason,
             prompt_tokens: tokens.len(),
+            cached_tokens,
             generated_tokens: generated.len(),
             ttft_ns,
             tokens_per_second,

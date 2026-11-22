@@ -1,5 +1,7 @@
 pub mod backend;
 pub mod chat;
+pub mod engine;
+pub mod ffi;
 pub mod stream;
 pub mod cpu;
 #[cfg(feature = "cuda")]
@@ -27,6 +29,9 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// A streaming callback asked to stop generation.
+    #[error("generation cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

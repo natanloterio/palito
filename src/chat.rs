@@ -108,6 +108,16 @@ impl ChatTemplate {
     }
 
     pub fn render(&self, messages: &[Message], add_generation_prompt: bool) -> Result<String> {
+        self.render_thinking(messages, add_generation_prompt, self.enable_thinking)
+    }
+
+    /// `render` with an explicit `enable_thinking` for this call.
+    pub fn render_thinking(
+        &self,
+        messages: &[Message],
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+    ) -> Result<String> {
         self.env
             .get_template(TEMPLATE_NAME)
             .and_then(|template| {
@@ -119,7 +129,7 @@ impl ChatTemplate {
                     add_generation_prompt => add_generation_prompt,
                     bos_token => &self.bos_token,
                     eos_token => &self.eos_token,
-                    enable_thinking => self.enable_thinking,
+                    enable_thinking => enable_thinking,
                 })
             })
             .map_err(template_error)

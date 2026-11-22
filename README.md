@@ -112,6 +112,52 @@ palito generate --model models/SmolLM2-135M-Instruct-Q4_K_M.gguf \
 palito chat --backend cpu --model models/SmolLM2-135M-Instruct-Q4_K_M.gguf --tokens 300
 ```
 
+## Use Palito from your own program
+
+Palito is also a library, `libpalito.so`, with a C API in [`include/palito.h`](include/palito.h). Your program loads it and calls it directly, in the same process: no server, no subprocess. Any language that can call C can use it.
+
+The release bundle contains `lib/libpalito.so`, `include/palito.h` and two examples. Keep the bundle's `lib/` on the library path, since the GPU kernel compiler loads from there.
+
+**C** ([`examples/c/chat.c`](examples/c/chat.c)):
+
+```c
+palito_engine *engine = palito_open("model.gguf", NULL, &error);   // NULL: default options
+palito_message messages[] = {{"user", "Hello!"}};
+palito_result result;
+palito_chat(engine, messages, 1, NULL, print_text, NULL, &result, &error);
+// print_text(text, length, user_data) receives the reply as it is generated;
+// result.text holds the full reply, result.tokens_per_second the speed.
+palito_result_free(&result);
+palito_close(engine);
+```
+
+```sh
+cc examples/c/chat.c -Iinclude -Llib -lpalito -o chat
+LD_LIBRARY_PATH=lib ./chat models/Qwen3-30B-A3B-Q4_K_M.gguf "Hello!"
+```
+
+**Python** ([`examples/python/palito.py`](examples/python/palito.py), standard library only):
+
+```python
+from palito import Palito
+
+with Palito("models/Qwen3-30B-A3B-Q4_K_M.gguf") as llm:
+    reply = llm.chat([{"role": "user", "content": "Hello!"}],
+                     on_text=lambda text: print(text, end="", flush=True))
+    print(reply["finish_reason"], reply["tokens_per_second"])
+```
+
+Run it with `LD_LIBRARY_PATH=lib PALITO_LIBRARY=lib/libpalito.so`.
+
+How it works:
+- Open a model once, then call `palito_chat` or `palito_complete` as many times as you like. The defaults are the same as `palito chat`: full context, fastest GPU profile.
+- Each call is stateless: pass the whole conversation every time.
+- The callback gets the text as it is generated; return nonzero to stop.
+- Errors come back as `-1` plus a message.
+- Use one engine per thread, or guard it with a lock.
+
+Rust programs can use the crate directly: `palito::engine::Engine`.
+
 ## Supported models
 
 Tested on the GPU with the fast path: **Qwen3** (dense and MoE, e.g. Qwen3-0.6B and Qwen3-30B-A3B), **SmolLM2 / Llama**, **Gemma 3**.

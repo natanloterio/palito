@@ -339,3 +339,5 @@ Qualidade (`int8-fast`, informada, sem gate): texto real de 256 tokens com max_a
 | 40,7k | 6,39 s | 103 tok/s |
 
 Agulha num palheiro de 39,7k tokens (5%, 50%, 95%): achada com `int8-fast` (6,2 s de prefill) e `int8-prefill` (15,3 s). Contexto inteiro gerado (40.940 tokens) a 152 tok/s em média. Conto de 3.000 palavras: 5.080 tokens, terminou no fim do turno.
+
+**0.3.0 — Palito.** O projeto passa a se chamar Palito (binário `palito`, variáveis `PALITO_*`, pacote `palito-<versão>-linux-x86_64`). O `chat` usa `int8-fast` por padrão (com fallback para `f32-tiled` e, para pesos Q5_K como o Phi-3-128k, `f32`) e mostra a resposta token a token. Com o grafo de decode, os tokens são lidos enquanto os passos seguintes já rodam na GPU, então o streaming não custa velocidade: resposta de 1.014 tokens no Qwen3-30B-A3B a 338–341 tok/s com streaming e 337–338 tok/s sem. O texto é idêntico com e sem streaming (Qwen3, SmolLM2 e Phi-3, com acentos, emoji e japonês).

@@ -234,8 +234,9 @@ struct Workspace {
     logits: CudaSlice<f32>,
     tokens: Option<CudaSlice<i32>>,
     groups: Option<CudaSlice<i32>>,
-    /// Assignments per descriptor in `groups` for the integer MMQ path (32 or 64).
-    group_tile: usize,
+    /// int8-fast mixed expert tiles: (slots, element offset) of the 128-, 64- and
+    /// 32-assignment descriptor regions in `groups` (group_experts_mixed).
+    group_mix: Option<[(u32, usize); 3]>,
     group_counts: Option<CudaSlice<i32>>,
     residual_int8: Option<ResidualWorkspace>,
     residual_mma3: Option<PreciseWorkspace>,
@@ -403,6 +404,31 @@ fn group_elements_with(spec: &Spec, tile: usize) -> Result<usize> {
         .ok_or_else(|| invalid("group workspace overflow"))
 }
 
+/// Slot bounds of group_experts_mixed for `assignments` routed to `experts`: a
+/// 128-tile holds more than `large` assignments, a 64-tile more than `small`, and an
+/// expert has at most one 64- and one 32-tile. Returns ([(slots, offset); 3], elements).
+pub(super) fn mixed_group_regions(
+    assignments: usize,
+    experts: usize,
+    small: usize,
+    large: usize,
+) -> ([(u32, usize); 3], usize) {
+    let slots128 = assignments / (large + 1);
+    let slots64 = experts.min(assignments / (small + 1));
+    let slots32 = experts.min(assignments);
+    let offset64 = slots128 * 129;
+    let offset32 = offset64 + slots64 * 65;
+    let elements = offset32 + slots32 * 33;
+    (
+        [
+            (slots128 as u32, 0),
+            (slots64 as u32, offset64),
+            (slots32 as u32, offset32),
+        ],
+        elements,
+    )
+}
+
 fn register_group_shape(spec: &Spec, matmul: CudaMatmul, tokens: usize) -> bool {
     matmul.f32_tiled()
         && tokens >= 256
@@ -423,8 +449,10 @@ fn group_workspace_elements(spec: &Spec, matmul: CudaMatmul) -> Result<usize> {
             && prefill_capacity(spec) >= matmul.residual_min_tokens())
     {
         let base = base.max(group_elements_with(spec, 32)?);
-        if matmul == CudaMatmul::Int8Fast {
-            Ok(base.max(group_elements_with(spec, 64)?).max(group_elements_with(spec, 128)?))
+        if matmul == CudaMatmul::Int8Fast && base > 0 {
+            let assignments = routing_elements(spec)?;
+            let mixed = mixed_group_regions(assignments, spec.experts, 0, 64).1;
+            Ok(base.max(mixed))
         } else {
             Ok(base)
         }
@@ -512,7 +540,7 @@ impl Workspace {
             } else {
                 None
             },
-            group_tile: 32,
+            group_mix: None,
             groups: if group_workspace_elements(spec, matmul)? > 0 {
                 Some(
                     stream
@@ -1152,16 +1180,14 @@ impl CudaBackend {
                     "swiglu_quantize32_q8",
                     "head_norm_rotary",
                     "prefill_matmul_tf32",
-                    "mmq_c1_rows32",
-                    "mmq_c1_rows32_splitk",
-                    "mmq_c1_tokens128_splitk",
                     "mmq_splitk_reduce",
-                    "mmq_c1_tokens128",
-                    "mmq_c1_grouped",
-                    "mmq_c1_grouped64",
-                    "mmq_c1_grouped128",
-                    "group_experts_fast64",
-                    "group_experts_fast128",
+                    "mmq_c1_pipe128",
+                    "mmq_c1_pipe128_splitk",
+                    "mmq_c1_pipe64",
+                    "mmq_c1_pipe32",
+                    "mmq_c1_pipe32_splitk",
+                    "router_tf32_tiled",
+                    "group_experts_mixed",
                     "attention_prefill_mma_fast",
                     "attention_half_kv",
                     "attention_prefill_mma_half_fast",
@@ -2396,6 +2422,58 @@ mod tests {
             accelerated: false,
             block_elements: block,
         }
+    }
+
+    #[test]
+    fn int8_fast_mixed_groups_fit_workspace_and_skip_dense() {
+        let mut spec = Spec {
+            info: ModelInfo {
+                backend: "test".into(),
+                revision: "test".into(),
+                architecture: "qwen3moe".into(),
+                tensor_types: vec![],
+                weight_bytes: 0,
+                parameters: 0,
+                context_tokens: 1024,
+                batch_tokens: 512,
+                vocab_tokens: 3,
+                capabilities: crate::backend::Capabilities {
+                    token_step: true,
+                    chunked_prefill: true,
+                },
+            },
+            width: 2048,
+            heads: 32,
+            kv_heads: 4,
+            dim: 128,
+            rotary_dim: 128,
+            parallel_residual: false,
+            hidden: 768,
+            experts: 128,
+            used: 8,
+            epsilon: 1e-6,
+            rope_base: 1_000_000.0,
+            rope_attn_factor: 1.0,
+            neox: true,
+            eog: vec![],
+            tokenizer: Err(invalid("tokenizer unused by workspace sizing")),
+        };
+        for capacity in [64u32, 600, 1433, 4096] {
+            spec.info.batch_tokens = capacity;
+            let reserved = group_workspace_elements(&spec, CudaMatmul::Int8Fast).unwrap();
+            let assignments = routing_elements(&spec).unwrap();
+            for chunk in [16usize, 64, 553, capacity as usize] {
+                let used = chunk.min(capacity as usize) * spec.used;
+                let (regions, elements) = mixed_group_regions(used, spec.experts, 32, 96);
+                assert!(elements <= reserved, "capacity {capacity} chunk {chunk}");
+                assert!(regions[1].1 == regions[0].0 as usize * 129);
+                assert!(regions[2].1 == regions[1].1 + regions[1].0 as usize * 65);
+            }
+            assert!(mixed_group_regions(assignments, spec.experts, 0, 64).1 <= reserved);
+        }
+        spec.experts = 0;
+        spec.used = 0;
+        assert_eq!(group_workspace_elements(&spec, CudaMatmul::Int8Fast).unwrap(), 0);
     }
 
     #[test]

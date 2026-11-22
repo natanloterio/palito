@@ -276,13 +276,83 @@ group_experts_fast32(const int *ids, int *groups, int experts, int used, int tok
     group_experts_fast<32>(ids, groups, experts, used, tokens, slots);
 }
 
+// int8-fast mixed expert tiles: each expert's c assignments fill c / 128 tiles of 128,
+// and the remainder r = c % 128 one 32-tile (r <= small), one 64-tile (r <= 64), a
+// 64- and a 32-tile (r <= large) or another 128-tile. Three descriptor regions in
+// order (128, 64, 32 assignments; stride TILE + 1) of slots128, slots64, slots32 slots;
+// unused slots keep expert -1. Assignments stay ascending within an expert.
 extern "C" __global__ void __launch_bounds__(1024)
-group_experts_fast128(const int *ids, int *groups, int experts, int used, int tokens, int slots) {
-    group_experts_fast<128>(ids, groups, experts, used, tokens, slots);
-}
-
-// 64-assignment tiles for int8-fast expert MMQ (mmq_c1_grouped64).
-extern "C" __global__ void __launch_bounds__(1024)
-group_experts_fast64(const int *ids, int *groups, int experts, int used, int tokens, int slots) {
-    group_experts_fast<64>(ids, groups, experts, used, tokens, slots);
+group_experts_mixed(const int *ids, int *groups, int experts, int used, int tokens,
+                    int slots128, int slots64, int slots32, int small, int large) {
+    constexpr int WARPS = 32;
+    __shared__ int counts[GROUP_FAST_EXPERTS], running[GROUP_FAST_EXPERTS];
+    __shared__ int offset128[GROUP_FAST_EXPERTS], offset64[GROUP_FAST_EXPERTS];
+    __shared__ int offset32[GROUP_FAST_EXPERTS], whole[GROUP_FAST_EXPERTS];
+    __shared__ int warp_counts[WARPS][GROUP_FAST_EXPERTS];
+    int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    int assignments = tokens * used;
+    int *region64 = groups + slots128 * 129, *region32 = region64 + slots64 * 65;
+    int total = slots128 * 129 + slots64 * 65 + slots32 * 33;
+    for (int i = tid; i < total; i += 1024) groups[i] = -1;
+    for (int e = tid; e < experts; e += 1024) {
+        counts[e] = 0;
+        running[e] = 0;
+    }
+    __syncthreads();
+    for (int i = tid; i < assignments; i += 1024) {
+        int e = ids[i];
+        if (e >= 0 && e < experts) atomicAdd(&counts[e], 1);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int a = 0, b = 0, c = 0;
+        for (int e = 0; e < experts; e++) {
+            int r = counts[e] % 128, full = counts[e] / 128 + (r > large ? 1 : 0);
+            bool has64 = r > small && r <= large, has32 = (r > 0 && r <= small) || r > 64 && r <= large;
+            whole[e] = full;
+            offset128[e] = a;
+            offset64[e] = has64 ? b : -1;
+            offset32[e] = has32 ? c : -1;
+            a += full;
+            b += has64;
+            c += has32;
+        }
+    }
+    for (int first = 0; first < assignments; first += 1024) {
+        for (int i = tid; i < WARPS * experts; i += 1024) warp_counts[i / experts][i % experts] = 0;
+        __syncthreads();
+        int i = first + tid;
+        int e = i < assignments ? ids[i] : -1;
+        bool valid = e >= 0 && e < experts;
+        unsigned int same = __match_any_sync(0xffffffff, valid ? e : -1);
+        int rank = __popc(same & ((1u << lane) - 1));
+        if (valid && rank == 0) warp_counts[warp][e] = __popc(same);
+        __syncthreads();
+        for (int x = tid; x < experts; x += 1024) {
+            int sum = running[x];
+            for (int w = 0; w < WARPS; w++) {
+                int count = warp_counts[w][x];
+                warp_counts[w][x] = sum;
+                sum += count;
+            }
+            running[x] = sum;
+        }
+        __syncthreads();
+        if (valid) {
+            int selected = warp_counts[warp][e] + rank, rest = selected - whole[e] * 128;
+            int *slot;
+            if (rest < 0) {
+                slot = groups + (offset128[e] + selected / 128) * 129;
+                slot[1 + selected % 128] = i;
+            } else if (offset64[e] >= 0 && rest < 64) {
+                slot = region64 + offset64[e] * 65;
+                slot[1 + rest] = i;
+            } else {
+                slot = region32 + offset32[e] * 33;
+                slot[1 + rest - (offset64[e] >= 0 ? 64 : 0)] = i;
+            }
+            slot[0] = e;
+        }
+        __syncthreads();
+    }
 }

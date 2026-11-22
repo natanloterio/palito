@@ -126,6 +126,23 @@ macro_rules! project_residual {
             launch!($backend,"projection_fp16_packed",grid;128,
                 &tensor.bytes,&tensor.kind,$input,$output,&tensor.width,&tensor.rows,
                 &tokens,groups,&used,&grouped,&major,&mut $backend.work.status);
+        } else if let (true, Some(mix)) = (grouped != 0, $backend.work.group_mix) {
+            // int8-fast mixed expert tiles: one MMQ per descriptor region.
+            let work = $backend.work.residual_mma3.as_ref()
+                .ok_or_else(||failure("residual MMA3 workspace missing"))?;
+            let row_tiles = (tensor.rows as u32).div_ceil(128);
+            for (kernel, (slots, offset)) in
+                ["mmq_c1_pipe128", "mmq_c1_pipe64", "mmq_c1_pipe32"].into_iter().zip(mix)
+            {
+                if slots == 0 {
+                    continue;
+                }
+                let region = groups.slice(offset..);
+                launch!($backend,kernel,(row_tiles, slots, 1);256,
+                    &tensor.bytes,&tensor.kind,&work.values,&work.scales,&work.sums,
+                    $output,&tensor.width,&tensor.rows,&tokens,&region,&used,&grouped,&major,
+                    &mut $backend.work.status);
+            }
         } else if $backend.matmul.integer_mma() {
             let work = $backend.work.residual_mma3.as_ref()
                 .ok_or_else(||failure("residual MMA3 workspace missing"))?;
@@ -162,22 +179,15 @@ macro_rules! project_residual {
                     let tiles = |bn: u32| (tokens as u32).div_ceil(bn);
                     // Measured on Qwen3-30B (2.9k prompt). int8-prefill: 64-token tiles
                     // for wide projections, 32 for few-row ones (K/V, attention output).
-                    // int8-fast: 128-token tiles without register prefetch once there
-                    // are >= 100 64-token blocks (Q/K/V/O 48 -> 38 ms), expert tiles
-                    // as grouped (group_tile 32/64/128).
+                    // int8-fast (cp.async-pipelined Q4_K tiles): 128-token tiles once
+                    // there are >= 100 64-token blocks (Q/K/V/O 48 -> 38 ms), else 32;
+                    // experts in 32-assignment tiles unless group_mix is set.
                     let (name, columns) = match format {
-                        ResidualFormat::Single if grouped != 0 => (
-                            match $backend.work.group_tile {
-                                128 => "mmq_c1_grouped128",
-                                64 => "mmq_c1_grouped64",
-                                _ => "mmq_c1_grouped",
-                            },
-                            $slots,
-                        ),
+                        ResidualFormat::Single if grouped != 0 => ("mmq_c1_pipe32", $slots),
                         ResidualFormat::Single if row_tiles * tiles(64) >= 100 => {
-                            ("mmq_c1_tokens128", tiles(128))
+                            ("mmq_c1_pipe128", tiles(128))
                         }
-                        ResidualFormat::Single => ("mmq_c1_rows32", tiles(32)),
+                        ResidualFormat::Single => ("mmq_c1_pipe32", tiles(32)),
                         ResidualFormat::Pair if grouped != 0 => ("mmq_s16_grouped", $slots),
                         ResidualFormat::Three if grouped != 0 => ("mmq_c3_grouped", $slots),
                         ResidualFormat::Pair if row_tiles * tiles(64) >= 256 => ("mmq_s16", tiles(64)),
@@ -196,14 +206,14 @@ macro_rules! project_residual {
                 };
                 let scratch_floats = scratch.as_ref().map_or(0, |buf| buf.len());
                 let splits = match kernel {
-                    "mmq_c1_rows32" => fast_splits(
+                    "mmq_c1_pipe32" if grouped == 0 => fast_splits(
                         tensor.width,
                         tensor.rows,
                         tokens,
                         grid.0 * grid.1,
                         scratch_floats,
                     ),
-                    "mmq_c1_tokens128" => wave_splits(
+                    "mmq_c1_pipe128" if grouped == 0 => wave_splits(
                         tensor.width,
                         tensor.rows,
                         tokens,
@@ -212,10 +222,10 @@ macro_rules! project_residual {
                     ),
                     _ => 1,
                 };
-                let split_kernel = if kernel == "mmq_c1_tokens128" {
-                    "mmq_c1_tokens128_splitk"
+                let split_kernel = if kernel == "mmq_c1_pipe128" {
+                    "mmq_c1_pipe128_splitk"
                 } else {
-                    "mmq_c1_rows32_splitk"
+                    "mmq_c1_pipe32_splitk"
                 };
                 if splits > 1 {
                     let partials = scratch.as_deref_mut()
@@ -390,17 +400,16 @@ impl CudaBackend {
                         .all(|t| matches!(t.kind, 12 | 14))
                 });
             let (grouped_projection, group_row_tile, group_tile, group_threads) =
-                if let (true, Some(tile)) =
-                    (integer_groups && matmul == CudaMatmul::Int8Fast, fast_group_tile(s, n))
-                {
-                    ("grouped_matmul_unroll8", 32, tile, 128)
-                } else if register_groups {
+                if register_groups {
                     ("gemm_packed_grouped", 64, 32, 128)
                 } else if register_groups || integer_groups {
                     ("grouped_matmul_unroll8", 32, 32, 128)
                 } else {
                     (grouped_projection, group_row_tile, matmul.group_tile(), 256)
                 };
+            // int8-fast: mixed 128/64/32 expert tiles (group_experts_mixed).
+            let group_mix = (integer_groups && matmul == CudaMatmul::Int8Fast && mixed_expert_tiles(s, n))
+                .then(|| super::mixed_group_regions(assignments, s.experts, MIX_SMALL, MIX_LARGE).0);
             let group_slots = if s.experts > 0 {
                 assignments.min(assignments.div_ceil(group_tile) + s.experts - 1) as u32
             } else {
@@ -884,10 +893,14 @@ impl CudaBackend {
             }
             let gate = gate.expect("gated CUDA layer");
             if let Some(t) = &l.router {
-                // int8-fast routes in TF32 tensor cores as llama.cpp (cuBLAS TF32), one
-                // warp (16 rows) per block: Qwen3-30B 2.9k prompt 17 -> ~4 ms. F32 stays
-                // faster up to ~550 tokens.
-                let (name, grid, threads) = if self.matmul == CudaMatmul::Int8Fast && n >= 1024 {
+                // int8-fast routes in TF32 tensor cores as llama.cpp (cuBLAS TF32).
+                // F32 router weights: 64x16 cp.async tiles, Qwen3-30B per prefill 1.4k
+                // 5.3 -> ~0.5 ms, 0.55k (F32 before) 3.5 -> ~0.3 ms; F32 is faster
+                // below ~64 tokens. Other kinds: one warp (16 rows) per block.
+                let tiled = t.kind == 0 && t.width % 32 == 0;
+                let (name, grid, threads) = if self.matmul == CudaMatmul::Int8Fast && n >= 64 && tiled {
+                    ("router_tf32_tiled", ((t.rows as u32).div_ceil(64), (n as u32).div_ceil(16), 1), 256)
+                } else if self.matmul == CudaMatmul::Int8Fast && n >= 1024 {
                     ("prefill_matmul_tf32", ((t.rows as u32).div_ceil(16), (n as u32).div_ceil(8), 1), 32)
                 } else {
                     ("prefill_matmul", (t.rows as u32, (n as u32).div_ceil(4), 1), 256)
@@ -970,6 +983,7 @@ impl CudaBackend {
                     .as_mut()
                     .ok_or_else(|| failure("expert group workspace missing"))?;
                 let slots = group_slots as i32;
+                self.work.group_mix = group_mix;
                 if cfg!(feature = "cuda-parallel-grouping-research")
                     && integer_groups
                     && matmul == CudaMatmul::ResidualMma3Research
@@ -984,12 +998,15 @@ impl CudaBackend {
                         &self.work.ids, &mut *counts, &assignments);
                     launch!(self, "group_parallel_emit32", (experts as u32 + 1, 1, 1);32,
                         &self.work.ids, &*counts, &mut *groups, &assignments, &experts, &slots);
+                } else if let Some(mix) = group_mix {
+                    // GROUP_FAST_EXPERTS in gemm.cu bounds the parallel groupings.
+                    let (small, large) = (MIX_SMALL as i32, MIX_LARGE as i32);
+                    let (s128, s64, s32) = (mix[0].0 as i32, mix[1].0 as i32, mix[2].0 as i32);
+                    launch!(self, "group_experts_mixed", (1, 1, 1); 1024,
+                        &self.work.ids, &mut *groups, &experts, &used, &n,
+                        &s128, &s64, &s32, &small, &large);
                 } else {
-                    // GROUP_FAST_EXPERTS in gemm.cu bounds the parallel grouping.
-                    self.work.group_tile = group_tile;
                     let (name, threads) = match group_tile {
-                        64 => ("group_experts_fast64", 1024),
-                        128 => ("group_experts_fast128", 1024),
                         32 if experts <= 256 => ("group_experts_fast32", 1024),
                         32 => ("group_experts_reg32", 256),
                         8 => ("group_experts_tiled", 256),
@@ -1275,18 +1292,18 @@ mod tests {
     }
 }
 
-/// int8-fast expert tile once experts average 16 / 128 assignments (fewer weight
-/// re-reads than 32-assignment tiles): Qwen3-30B 0.55k prompt 53 -> 52 ms, 1.4k
-/// 116 -> 108 ms, 2.9k 243 -> 230 (64) -> 226 ms (128).
-/// GROUP_FAST_EXPERTS bounds group_experts_fast*.
-fn fast_group_tile(s: &Spec, tokens: i32) -> Option<usize> {
-    let average = tokens as usize * s.used / s.experts.max(1);
-    match average {
-        _ if s.experts > 256 => None,
-        128.. => Some(128),
-        16.. => Some(64),
-        _ => None,
-    }
+/// int8-fast expert remainder tiles (group_experts_mixed): after whole 128-tiles, an
+/// expert's last r <= MIX_SMALL assignments take a 32-tile, r <= 64 a 64-tile, r <=
+/// MIX_LARGE a 64- and a 32-tile, more another 128-tile. Qwen3-30B (pipelined MMQ)
+/// within 1 ms for small 16..32, large 80..96; 0.55k / 1.4k / 2.9k prompt 44 / 90 /
+/// 162 ms against 64- or 128-tiles alone 49 / 102 / 178 ms (before pipelining).
+const MIX_SMALL: usize = 32;
+const MIX_LARGE: usize = 96;
+
+/// Mixed expert tiles once experts average 16 assignments; below, 32-tiles.
+/// GROUP_FAST_EXPERTS bounds group_experts_mixed.
+fn mixed_expert_tiles(s: &Spec, tokens: i32) -> bool {
+    s.experts <= 256 && tokens as usize * s.used / s.experts.max(1) >= 16
 }
 
 /// K splits for int8-fast few-block dense MMQ (short prompts): double while the grid

@@ -39,14 +39,100 @@ __device__ __forceinline__ void fa_mma(float c[4], const unsigned int a[4], unsi
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+// Stage one FA_KEYS tile from F32 K/V: K rows as FP16 (hi and, with Split, lo),
+// V transposed as key pairs (hi and, with SplitV, lo). Keys past n are zero.
+template<int THREADS, bool Split, bool SplitV>
+__device__ __forceinline__ void fa_stage(const float *keys, const float *values,
+                                         unsigned short *ks, unsigned short *kl,
+                                         unsigned short *vt, unsigned short *vl, int base, int n,
+                                         int kv_heads, int kv_head, int tid) {
+    for (int i = tid; i < FA_KEYS * FA_DIM / 4; i += THREADS) {
+        int key = i / (FA_DIM / 4), c = 4 * (i % (FA_DIM / 4));
+        float4 v = key < n
+            ? *(const float4 *)(keys + ((u64)(base + key) * kv_heads + kv_head) * FA_DIM + c)
+            : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        unsigned int *dst = (unsigned int *)&ks[key * FA_K_STRIDE + c];
+        dst[0] = fa_pack(v.x, v.y);
+        dst[1] = fa_pack(v.z, v.w);
+        if (Split) {
+            float2 h0 = fa_unpack(dst[0]), h1 = fa_unpack(dst[1]);
+            unsigned int *low = (unsigned int *)&kl[key * FA_K_STRIDE + c];
+            low[0] = fa_pack(v.x - h0.x, v.y - h0.y);
+            low[1] = fa_pack(v.z - h1.x, v.w - h1.y);
+        }
+    }
+    for (int i = tid; i < (FA_KEYS / 2) * (FA_DIM / 4); i += THREADS) {
+        int pair = i / (FA_DIM / 4), c = 4 * (i % (FA_DIM / 4)), key = 2 * pair;
+        float4 a = key < n
+            ? *(const float4 *)(values + ((u64)(base + key) * kv_heads + kv_head) * FA_DIM + c)
+            : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float4 b = key + 1 < n
+            ? *(const float4 *)(values + ((u64)(base + key + 1) * kv_heads + kv_head) * FA_DIM + c)
+            : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float pairs[4][2] = {{a.x, b.x}, {a.y, b.y}, {a.z, b.z}, {a.w, b.w}};
+        #pragma unroll
+        for (int e = 0; e < 4; e++) {
+            unsigned int high = fa_pack(pairs[e][0], pairs[e][1]);
+            *(unsigned int *)&vt[(c + e) * FA_V_STRIDE + key] = high;
+            if (SplitV) {
+                float2 h = fa_unpack(high);
+                *(unsigned int *)&vl[(c + e) * FA_V_STRIDE + key] =
+                    fa_pack(pairs[e][0] - h.x, pairs[e][1] - h.y);
+            }
+        }
+    }
+}
+
+// Stage one FA_KEYS tile from the int8-fast FP16 K/V cache: K and V rows are
+// coalesced 16-byte copies. These are the bits the F32 path's FP16 rounding
+// produced, so the attention output is unchanged.
+template<int THREADS, bool Split, bool SplitV>
+__device__ __forceinline__ void fa_stage(const kv_f16 *keys, const kv_f16 *values,
+                                         unsigned short *ks, unsigned short *kl,
+                                         unsigned short *vt, unsigned short *vl, int base, int n,
+                                         int kv_heads, int kv_head, int tid) {
+    static_assert(!Split && !SplitV, "the FP16 KV cache has no low planes");
+    // V row-major like K, into vt's storage (FA_KEYS x FA_K_STRIDE <= FA_DIM x
+    // FA_V_STRIDE); the P.V MMA reads it with ldmatrix.trans (fa_kv_rows). All
+    // loads of a thread are issued before its stores.
+    constexpr int STEPS = FA_KEYS * FA_DIM / 8 / THREADS;
+    static_assert(STEPS * THREADS == FA_KEYS * FA_DIM / 8, "THREADS must divide the tile");
+    const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+    uint4 k[STEPS], v[STEPS];
+    #pragma unroll
+    for (int s = 0; s < STEPS; s++) {
+        int i = tid + s * THREADS, key = i / (FA_DIM / 8), c = i % (FA_DIM / 8);
+        u64 at = ((u64)(base + key) * kv_heads + kv_head) * FA_DIM + 8 * c;
+        k[s] = key < n ? *(const uint4 *)(keys + at) : zero;
+        v[s] = key < n ? *(const uint4 *)(values + at) : zero;
+    }
+    #pragma unroll
+    for (int s = 0; s < STEPS; s++) {
+        int i = tid + s * THREADS, key = i / (FA_DIM / 8), c = i % (FA_DIM / 8);
+        *(uint4 *)&ks[key * FA_K_STRIDE + 8 * c] = k[s];
+        *(uint4 *)&vt[key * FA_K_STRIDE + 8 * c] = v[s];
+    }
+}
+
+// FP16 caches stage V row-major [key][dim]; F32 ones transposed [dim][key].
+template<typename KV> struct fa_kv_rows { static const bool value = false; };
+template<> struct fa_kv_rows<kv_f16> { static const bool value = true; };
+
+// Four 8x8 FP16 tiles, transposed: lane L addresses row L of tile L / 8.
+__device__ __forceinline__ void fa_ldmatrix_x4_trans(unsigned int r[4], const unsigned short *row) {
+    unsigned int address = (unsigned int)__cvta_generic_to_shared(row);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(address));
+}
+
 // Split: Q and K are carried as FP16 high + low parts and S takes three MMAs
 // (hi*hi + lo*hi + hi*lo). SplitV: V and the probabilities P likewise,
 // O += Phi*Vhi + Phi*Vlo + Plo*Vhi. Plain FP16 S or V measured max_abs ~1.0 on
 // real-text logits; FP16 P alone failed the long MoE gates (cos 0.999988). With all
 // splits the 600-token MoE gate stays within max_abs 0.00004 of the oracle.
-template<int Warps, bool Split, bool SplitV>
+template<int Warps, bool Split, bool SplitV, typename KV = float>
 __device__ __forceinline__ void attention_prefill_mma_impl(
-    const float *q, const float *keys, const float *values, float *output, int heads,
+    const float *q, const KV *keys, const KV *values, float *output, int heads,
     int kv_heads, int tokens, int count, const uint4 *halves = nullptr, int stride = 0) {
     constexpr int THREADS = 32 * Warps, GROUP = 8;
     __shared__ __align__(16) unsigned short ks[FA_KEYS * FA_K_STRIDE];
@@ -112,41 +198,8 @@ __device__ __forceinline__ void attention_prefill_mma_impl(
                 *(uint4 *)&vl[d * FA_V_STRIDE + 8 * part] = vlo[row];
             }
         } else {
-        for (int i = tid; i < FA_KEYS * FA_DIM / 4; i += THREADS) {
-            int key = i / (FA_DIM / 4), c = 4 * (i % (FA_DIM / 4));
-            float4 v = key < n
-                ? *(const float4 *)(keys + ((u64)(base + key) * kv_heads + kv_head) * FA_DIM + c)
-                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            unsigned int *dst = (unsigned int *)&ks[key * FA_K_STRIDE + c];
-            dst[0] = fa_pack(v.x, v.y);
-            dst[1] = fa_pack(v.z, v.w);
-            if (Split) {
-                float2 h0 = fa_unpack(dst[0]), h1 = fa_unpack(dst[1]);
-                unsigned int *low = (unsigned int *)&kl[key * FA_K_STRIDE + c];
-                low[0] = fa_pack(v.x - h0.x, v.y - h0.y);
-                low[1] = fa_pack(v.z - h1.x, v.w - h1.y);
-            }
-        }
-        for (int i = tid; i < (FA_KEYS / 2) * (FA_DIM / 4); i += THREADS) {
-            int pair = i / (FA_DIM / 4), c = 4 * (i % (FA_DIM / 4)), key = 2 * pair;
-            float4 a = key < n
-                ? *(const float4 *)(values + ((u64)(base + key) * kv_heads + kv_head) * FA_DIM + c)
-                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            float4 b = key + 1 < n
-                ? *(const float4 *)(values + ((u64)(base + key + 1) * kv_heads + kv_head) * FA_DIM + c)
-                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            float pairs[4][2] = {{a.x, b.x}, {a.y, b.y}, {a.z, b.z}, {a.w, b.w}};
-            #pragma unroll
-            for (int e = 0; e < 4; e++) {
-                unsigned int high = fa_pack(pairs[e][0], pairs[e][1]);
-                *(unsigned int *)&vt[(c + e) * FA_V_STRIDE + key] = high;
-                if (SplitV) {
-                    float2 h = fa_unpack(high);
-                    *(unsigned int *)&vl[(c + e) * FA_V_STRIDE + key] =
-                        fa_pack(pairs[e][0] - h.x, pairs[e][1] - h.y);
-                }
-            }
-        }
+            fa_stage<THREADS, Split, SplitV>(keys, values, ks, kl, vt, vl, base, n, kv_heads,
+                                             kv_head, tid);
         }
         __syncthreads();
         if (base >= warp_limit) continue;
@@ -212,6 +265,20 @@ __device__ __forceinline__ void attention_prefill_mma_impl(
                 p[e] = fa_pack(pv[e][0], pv[e][1]);
                 float2 h = fa_unpack(p[e]);
                 pl[e] = fa_pack(pv[e][0] - h.x, pv[e][1] - h.y);
+            }
+            if (fa_kv_rows<KV>::value) {
+                // B fragments of keys 16k.. for dims 8j.. and 8(j + 1)..: the same
+                // registers the transposed layout yields, so the same MMAs.
+                const unsigned short *row =
+                    &vt[(16 * k + lane % 16) * FA_K_STRIDE + 8 * (lane / 16)];
+                #pragma unroll
+                for (int j = 0; j < FA_DIM / 8; j += 2) {
+                    unsigned int b[4];
+                    fa_ldmatrix_x4_trans(b, row + 8 * j);
+                    fa_mma(o[j], p, b[0], b[1]);
+                    fa_mma(o[j + 1], p, b[2], b[3]);
+                }
+                continue;
             }
             #pragma unroll
             for (int j = 0; j < FA_DIM / 8; j++) {
@@ -297,27 +364,22 @@ extern "C" __global__ void __launch_bounds__(256)
 attention_prefill_mma_half(const float *q, const unsigned short *halves, float *output,
                            int heads, int kv_heads, int tokens, int count, int stride) {
 #if __CUDA_ARCH__ >= 800
-    attention_prefill_mma_impl<8, true, true>(q, nullptr, nullptr, output, heads, kv_heads,
-                                              tokens, count, (const uint4 *)halves, stride);
+    attention_prefill_mma_impl<8, true, true>(q, (const float *)nullptr, (const float *)nullptr,
+                                              output, heads, kv_heads, tokens, count,
+                                              (const uint4 *)halves, stride);
 #endif
 }
 
-
+#ifdef CUDA_KV_F16
 // int8-fast: single FP16 Q/K/V and P (FP32 accumulation and softmax), as llama.cpp's
-// FP16 flash attention; the lo planes of the pre-split buffer are not read.
-extern "C" __global__ void __launch_bounds__(128)
-attention_prefill_mma_fast(const float *q, const float *keys, const float *values, float *output,
-                           int heads, int kv_heads, int tokens, int count) {
-#if __CUDA_ARCH__ >= 800
-    attention_prefill_mma_impl<4, false, false>(q, keys, values, output, heads, kv_heads, tokens, count);
-#endif
-}
-
+// FP16 flash attention, over the FP16 K/V cache. Tiles are staged straight from the
+// cache (no per-layer conversion); 8 warps (16 tokens) per block.
 extern "C" __global__ void __launch_bounds__(256)
-attention_prefill_mma_half_fast(const float *q, const unsigned short *halves, float *output,
-                                int heads, int kv_heads, int tokens, int count, int stride) {
+attention_prefill_mma_fast_f16(const float *q, const kv_f16 *keys, const kv_f16 *values,
+                               float *output, int heads, int kv_heads, int tokens, int count) {
 #if __CUDA_ARCH__ >= 800
-    attention_prefill_mma_impl<8, false, false>(q, nullptr, nullptr, output, heads, kv_heads,
-                                                tokens, count, (const uint4 *)halves, stride);
+    attention_prefill_mma_impl<8, false, false>(q, keys, values, output, heads, kv_heads, tokens,
+                                                count);
 #endif
 }
+#endif

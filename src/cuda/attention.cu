@@ -1,7 +1,8 @@
 // One block per query/head keeps bounded scores on chip. Match the original
 // 256-lane dot and softmax trees rather than changing numerical precision.
-__device__ __forceinline__ void attention_fused_impl(const float *q, const float *keys,
-                                                    const float *values, float *output,
+template<typename KV>
+__device__ __forceinline__ void attention_fused_impl(const float *q, const KV *keys,
+                                                    const KV *values, float *output,
                                                     int dim, int heads, int kv_heads, int count) {
     __shared__ float scores[1024];
     __shared__ float maxima[256];
@@ -25,9 +26,9 @@ __device__ __forceinline__ void attention_fused_impl(const float *q, const float
             int i = lane + p * 32;
             if (i < dim)
 #ifdef CUDA_ATTENTION_REUSE_RESEARCH
-                parts[p] = query[p] * keys[((u64)time * kv_heads + kv_head) * dim + i];
+                parts[p] = query[p] * kv_load(keys, ((u64)time * kv_heads + kv_head) * dim + i);
 #else
-                parts[p] = q[i] * keys[((u64)time * kv_heads + kv_head) * dim + i];
+                parts[p] = q[i] * kv_load(keys, ((u64)time * kv_heads + kv_head) * dim + i);
 #endif
         }
 
@@ -83,9 +84,10 @@ __device__ __forceinline__ void attention_fused_impl(const float *q, const float
         float value = 0.0f;
         for (int time = 0; time < count; time++)
 #ifdef CUDA_NORMALIZED_ATTENTION
-            value += scores[time] * values[((u64)time * kv_heads + kv_head) * dim + i];
+            value += scores[time] * kv_load(values, ((u64)time * kv_heads + kv_head) * dim + i);
 #else
-            value += scores[time] / total * values[((u64)time * kv_heads + kv_head) * dim + i];
+            value += scores[time] / total
+                * kv_load(values, ((u64)time * kv_heads + kv_head) * dim + i);
 #endif
         output[((u64)token * heads + head) * dim + i] = value;
     }
@@ -103,6 +105,21 @@ extern "C" __global__ void attention_fused_decode(const float *q, const float *k
                                                  const int *control) {
     attention_fused_impl(q, keys, values, output, dim, heads, kv_heads, control[1] + 1);
 }
+
+#ifdef CUDA_KV_F16
+extern "C" __global__ void attention_fused_f16(const float *q, const kv_f16 *keys,
+                                              const kv_f16 *values, float *output,
+                                              int dim, int heads, int kv_heads, int count) {
+    attention_fused_impl(q, keys, values, output, dim, heads, kv_heads, count);
+}
+
+extern "C" __global__ void attention_fused_decode_f16(const float *q, const kv_f16 *keys,
+                                                     const kv_f16 *values, float *output,
+                                                     int dim, int heads, int kv_heads,
+                                                     const int *control) {
+    attention_fused_impl(q, keys, values, output, dim, heads, kv_heads, control[1] + 1);
+}
+#endif
 
 #if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_ATTENTION_QUERY_PAIR_RESEARCH)
 // Launch with even query count, 128-wide heads and 256 threads.
@@ -192,8 +209,9 @@ extern "C" __global__ void attention_fused_query_pair(const float *q, const floa
 // partial[(head * splits + j) * (dim + 2)]. Splits past `count` exit, so one
 // captured grid serves every decode position. F32; requires dim <= 256.
 #define ATTENTION_SPLIT 16
-__device__ __forceinline__ void attention_split_impl(const float *q, const float *keys,
-                                                    const float *values, float *partial,
+template<typename KV>
+__device__ __forceinline__ void attention_split_impl(const float *q, const KV *keys,
+                                                    const KV *values, float *partial,
                                                     int dim, int heads, int kv_heads, int count) {
     __shared__ float scores[ATTENTION_SPLIT];
     __shared__ float stats[2];
@@ -204,9 +222,9 @@ __device__ __forceinline__ void attention_split_impl(const float *q, const float
     int tile = min(ATTENTION_SPLIT, count - first);
     q += (u64)head * dim;
     for (int t = warp; t < tile; t += 8) {
-        const float *key = keys + ((u64)(first + t) * kv_heads + kv_head) * dim;
+        const KV *key = keys + ((u64)(first + t) * kv_heads + kv_head) * dim;
         float sum = 0.0f;
-        for (int i = lane; i < dim; i += 32) sum += q[i] * key[i];
+        for (int i = lane; i < dim; i += 32) sum += q[i] * kv_load(key, i);
         #pragma unroll
         for (int stride = 16; stride > 0; stride /= 2)
             sum += __shfl_xor_sync(0xffffffff, sum, stride);
@@ -238,7 +256,7 @@ __device__ __forceinline__ void attention_split_impl(const float *q, const float
     for (int i = thread; i < dim; i += 256) {
         float value = 0.0f;
         for (int t = 0; t < tile; t++)
-            value += scores[t] * values[((u64)(first + t) * kv_heads + kv_head) * dim + i];
+            value += scores[t] * kv_load(values, ((u64)(first + t) * kv_heads + kv_head) * dim + i);
         out[i] = value;
     }
     if (thread == 0) {
@@ -259,6 +277,21 @@ extern "C" __global__ void attention_split_decode(const float *q, const float *k
                                                  const int *control) {
     attention_split_impl(q, keys, values, partial, dim, heads, kv_heads, control[1] + 1);
 }
+
+#ifdef CUDA_KV_F16
+extern "C" __global__ void attention_split_f16(const float *q, const kv_f16 *keys,
+                                              const kv_f16 *values, float *partial,
+                                              int dim, int heads, int kv_heads, int count) {
+    attention_split_impl(q, keys, values, partial, dim, heads, kv_heads, count);
+}
+
+extern "C" __global__ void attention_split_decode_f16(const float *q, const kv_f16 *keys,
+                                                     const kv_f16 *values, float *partial,
+                                                     int dim, int heads, int kv_heads,
+                                                     const int *control) {
+    attention_split_impl(q, keys, values, partial, dim, heads, kv_heads, control[1] + 1);
+}
+#endif
 
 // Pass 2: grid=(heads), block=256. Rescales every active split to the global max.
 __device__ __forceinline__ void attention_combine_impl(const float *partial, float *output,
@@ -312,8 +345,9 @@ __device__ __forceinline__ int attention_chunk(int count, int chunks,
 // over many blocks.
 #define ATTENTION_GROUP_GRANULE 4
 
+template<typename KV>
 __device__ __forceinline__ void attention_split_gqa_impl(
-    const float *q, const float *keys, const float *values, float *partial, int dim,
+    const float *q, const KV *keys, const KV *values, float *partial, int dim,
     int heads, int kv_heads, int count) {
     __shared__ float scores[ATTENTION_GROUP_MAX][ATTENTION_TILE_MAX];
     __shared__ float stats[ATTENTION_GROUP_MAX][2];
@@ -327,10 +361,10 @@ __device__ __forceinline__ void attention_split_gqa_impl(
     int tile = min(chunk, count - first);
     for (int pair = warp; pair < group * tile; pair += 8) {
         int h = pair / tile, t = pair % tile;
-        const float *key = keys + ((u64)(first + t) * kv_heads + kv_head) * dim;
+        const KV *key = keys + ((u64)(first + t) * kv_heads + kv_head) * dim;
         const float *query = q + (u64)(first_head + h) * dim;
         float sum = 0.0f;
-        for (int j = lane; j < dim; j += 32) sum += query[j] * key[j];
+        for (int j = lane; j < dim; j += 32) sum += query[j] * kv_load(key, j);
         #pragma unroll
         for (int offset = 16; offset > 0; offset /= 2)
             sum += __shfl_xor_sync(0xffffffff, sum, offset);
@@ -362,7 +396,7 @@ __device__ __forceinline__ void attention_split_gqa_impl(
     for (int h = thread / dim; h < group; h += blockDim.x / dim) {
         float value = 0.0f;
         for (int t = 0; t < tile; t++)
-            value += scores[h][t] * values[((u64)(first + t) * kv_heads + kv_head) * dim + i];
+            value += scores[h][t] * kv_load(values, ((u64)(first + t) * kv_heads + kv_head) * dim + i);
         float *out = partial + ((u64)(first_head + h) * chunks + blockIdx.y) * (dim + 2);
         out[i] = value;
         if (i == 0) {
@@ -384,6 +418,21 @@ extern "C" __global__ void attention_split_gqa_decode(const float *q, const floa
                                                      const int *control) {
     attention_split_gqa_impl(q, keys, values, partial, dim, heads, kv_heads, control[1] + 1);
 }
+
+#ifdef CUDA_KV_F16
+extern "C" __global__ void attention_split_gqa_f16(const float *q, const kv_f16 *keys,
+                                                  const kv_f16 *values, float *partial, int dim,
+                                                  int heads, int kv_heads, int count) {
+    attention_split_gqa_impl(q, keys, values, partial, dim, heads, kv_heads, count);
+}
+
+extern "C" __global__ void attention_split_gqa_decode_f16(const float *q, const kv_f16 *keys,
+                                                         const kv_f16 *values, float *partial,
+                                                         int dim, int heads, int kv_heads,
+                                                         const int *control) {
+    attention_split_gqa_impl(q, keys, values, partial, dim, heads, kv_heads, control[1] + 1);
+}
+#endif
 
 // Pass 2 for attention_split_gqa: grid=(heads), block=256, over the active chunks.
 __device__ __forceinline__ void attention_combine_chunks_impl(const float *partial,
@@ -428,8 +477,9 @@ extern "C" __global__ void attention_combine_chunks_decode(const float *partial,
 // scores keys w, w + 8, ... and later accumulates their values; the 8 warp
 // partials are reduced in shared memory. Same partial layout and combine as
 // attention_split_gqa. F32 arithmetic; summation order differs.
+template<typename KV>
 __device__ __forceinline__ void attention_split_head_impl(
-    const float *q, const float *keys, const float *values, float *partial, int dim,
+    const float *q, const KV *keys, const KV *values, float *partial, int dim,
     int heads, int kv_heads, int count) {
     __shared__ float scores[ATTENTION_TILE_MAX];
     __shared__ float reduce[8][ATTENTION_KV_DIM];
@@ -451,8 +501,7 @@ __device__ __forceinline__ void attention_split_head_impl(
         for (int u = 0; u < 4; u++) {
             int t = base + 8 * u;
             k[u] = active && t < tile
-                ? *(const float4 *)(keys + ((u64)(first + t) * kv_heads + kv_head) * dim
-                                    + 4 * lane)
+                ? kv_load4(keys, ((u64)(first + t) * kv_heads + kv_head) * dim + 4 * lane)
                 : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
         #pragma unroll
@@ -491,8 +540,7 @@ __device__ __forceinline__ void attention_split_head_impl(
             for (int u = 0; u < 4; u++) {
                 int t = base + 8 * u;
                 v[u] = t < tile
-                    ? *(const float4 *)(values + ((u64)(first + t) * kv_heads + kv_head) * dim
-                                        + 4 * lane)
+                    ? kv_load4(values, ((u64)(first + t) * kv_heads + kv_head) * dim + 4 * lane)
                     : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
             #pragma unroll
@@ -537,14 +585,30 @@ extern "C" __global__ void attention_split_head_decode(const float *q, const flo
     attention_split_head_impl(q, keys, values, partial, dim, heads, kv_heads, control[1] + 1);
 }
 
+#ifdef CUDA_KV_F16
+extern "C" __global__ void attention_split_head_f16(const float *q, const kv_f16 *keys,
+                                                   const kv_f16 *values, float *partial,
+                                                   int dim, int heads, int kv_heads, int count) {
+    attention_split_head_impl(q, keys, values, partial, dim, heads, kv_heads, count);
+}
+
+extern "C" __global__ void attention_split_head_decode_f16(const float *q, const kv_f16 *keys,
+                                                          const kv_f16 *values, float *partial,
+                                                          int dim, int heads, int kv_heads,
+                                                          const int *control) {
+    attention_split_head_impl(q, keys, values, partial, dim, heads, kv_heads, control[1] + 1);
+}
+#endif
+
 // Grouped split pass, one warp per query head: grid=(kv_heads, chunks), block =
 // 32 * (heads / kv_heads) threads (<= 256), dim % 4 == 0 and dim <= 128 (lane l owns
 // dims 4l..4l+3). Every warp of a block reads the same key/value rows, so L1 serves
 // the group's reuse and L2 sees each row once per block. Warp-local online softmax
 // over 32-key steps; no block barriers. Same partial layout and combine as
 // attention_split_head.
+template<typename KV>
 __device__ __forceinline__ void attention_split_group_impl(
-    const float *q, const float *keys, const float *values, float *partial, int dim,
+    const float *q, const KV *keys, const KV *values, float *partial, int dim,
     int heads, int kv_heads, int count) {
     int kv_head = blockIdx.x, group = heads / kv_heads;
     int lane = threadIdx.x % 32, head = kv_head * group + threadIdx.x / 32;
@@ -564,8 +628,7 @@ __device__ __forceinline__ void attention_split_group_impl(
             #pragma unroll
             for (int j = 0; j < 4; j++)
                 k[j] = active && u + j < n
-                    ? *(const float4 *)(keys + ((u64)(base + u + j) * kv_heads + kv_head) * dim
-                                        + 4 * lane)
+                    ? kv_load4(keys, ((u64)(base + u + j) * kv_heads + kv_head) * dim + 4 * lane)
                     : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             #pragma unroll
             for (int j = 0; j < 4; j++) {
@@ -591,8 +654,7 @@ __device__ __forceinline__ void attention_split_group_impl(
             #pragma unroll
             for (int j = 0; j < 4; j++)
                 v[j] = active && u + j < n
-                    ? *(const float4 *)(values + ((u64)(base + u + j) * kv_heads + kv_head) * dim
-                                        + 4 * lane)
+                    ? kv_load4(values, ((u64)(base + u + j) * kv_heads + kv_head) * dim + 4 * lane)
                     : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             #pragma unroll
             for (int j = 0; j < 4; j++) {
@@ -630,6 +692,21 @@ extern "C" __global__ void attention_split_group_decode(const float *q, const fl
     attention_split_group_impl(q, keys, values, partial, dim, heads, kv_heads, control[1] + 1);
 }
 
+#ifdef CUDA_KV_F16
+extern "C" __global__ void attention_split_group_f16(const float *q, const kv_f16 *keys,
+                                                    const kv_f16 *values, float *partial,
+                                                    int dim, int heads, int kv_heads, int count) {
+    attention_split_group_impl(q, keys, values, partial, dim, heads, kv_heads, count);
+}
+
+extern "C" __global__ void attention_split_group_decode_f16(const float *q, const kv_f16 *keys,
+                                                           const kv_f16 *values, float *partial,
+                                                           int dim, int heads, int kv_heads,
+                                                           const int *control) {
+    attention_split_group_impl(q, keys, values, partial, dim, heads, kv_heads, control[1] + 1);
+}
+#endif
+
 // Causal prefill attention (flash style) for dim == 128 and GQA groups <= 8:
 // grid = (kv_heads, ceil(tokens / PREFILL_TOKENS)), block = 32 * PREFILL_TOKENS.
 // Warp w owns token blockIdx.y * PREFILL_TOKENS + w and all `group` query heads of
@@ -643,9 +720,9 @@ extern "C" __global__ void attention_split_group_decode(const float *q, const fl
 
 // Warps = PREFILL_TOKENS * Split: Split warps share a token, each owning
 // ceil(group / Split) of its query rows (fewer rows per warp, more warps per SM).
-template<int Split>
+template<int Split, typename KV>
 __device__ __forceinline__ void attention_prefill_flash_impl(
-    const float *q, const float *keys, const float *values, float *output, int heads,
+    const float *q, const KV *keys, const KV *values, float *output, int heads,
     int kv_heads, int tokens, int count) {
     constexpr int ROWS = ATTENTION_GROUP_MAX / Split;
     __shared__ __align__(16) float tile[PREFILL_KEYS * PREFILL_STRIDE];
@@ -683,8 +760,8 @@ __device__ __forceinline__ void attention_prefill_flash_impl(
         __syncthreads();
         for (int i = threadIdx.x; i < PREFILL_KEYS * dim / 4; i += blockDim.x) {
             int key = i / (dim / 4), c = i % (dim / 4);
-            float4 v = key < n ? *(const float4 *)(keys + ((u64)(base + key) * kv_heads + kv_head)
-                                                   * dim + 4 * c)
+            float4 v = key < n ? kv_load4(keys, ((u64)(base + key) * kv_heads + kv_head) * dim
+                                                    + 4 * c)
                                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             *(float4 *)&tile[key * PREFILL_STRIDE + 4 * c] = v;
         }
@@ -728,8 +805,8 @@ __device__ __forceinline__ void attention_prefill_flash_impl(
         __syncthreads();
         for (int i = threadIdx.x; i < PREFILL_KEYS * dim / 4; i += blockDim.x) {
             int key = i / (dim / 4), c = i % (dim / 4);
-            float4 v = key < n ? *(const float4 *)(values + ((u64)(base + key) * kv_heads + kv_head)
-                                                   * dim + 4 * c)
+            float4 v = key < n ? kv_load4(values, ((u64)(base + key) * kv_heads + kv_head) * dim
+                                                    + 4 * c)
                                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             *(float4 *)&tile[key * PREFILL_STRIDE + 4 * c] = v;
         }
@@ -768,6 +845,14 @@ attention_prefill_flash4(const float *q, const float *keys, const float *values,
                          int heads, int kv_heads, int tokens, int count) {
     attention_prefill_flash_impl<4>(q, keys, values, output, heads, kv_heads, tokens, count);
 }
+
+#ifdef CUDA_KV_F16
+extern "C" __global__ void __launch_bounds__(128 * PREFILL_TOKENS)
+attention_prefill_flash4_f16(const float *q, const kv_f16 *keys, const kv_f16 *values,
+                             float *output, int heads, int kv_heads, int tokens, int count) {
+    attention_prefill_flash_impl<4>(q, keys, values, output, heads, kv_heads, tokens, count);
+}
+#endif
 
 // Combine for the chunked split passes, parallel over chunks: grid=(heads),
 // block=256, dim % 4 == 0 and dim <= 128. Warp w accumulates chunks w, w + 8, ...
@@ -850,4 +935,169 @@ extern "C" __global__ void attention_combine_group_decode(const float *partial,
     attention_combine_wide_impl(partial, output, dim, chunks, control[1] + 1,
                                 ATTENTION_GROUP_GRANULE);
 }
+#endif
+
+#if defined(CUDA_PACKED_DECODE) && defined(CUDA_KV_F16)
+// Sum G per-lane values across the warp in log2(G) halving steps plus the rest
+// (G - 1 + 5 - log2(G) shuffles instead of 5 G). Returns the full sum of value
+// kv_row_head(lane) of every lane.
+template<int G>
+__device__ __forceinline__ float kv_row_reduce(float v[G], int lane) {
+    #pragma unroll
+    for (int s = 0; (G >> s) > 1; s++) {
+        const int half = G >> (s + 1), offset = 16 >> s;
+        bool upper = lane & offset;
+        #pragma unroll
+        for (int j = 0; j < half; j++) {
+            float send = upper ? v[j] : v[j + half], keep = upper ? v[j + half] : v[j];
+            v[j] = keep + __shfl_xor_sync(0xffffffff, send, offset);
+        }
+    }
+    float sum = v[0];
+    #pragma unroll
+    for (int offset = 16 / G; offset > 0; offset /= 2)
+        sum += __shfl_xor_sync(0xffffffff, sum, offset);
+    return sum;
+}
+
+template<int G>
+__device__ __forceinline__ int kv_row_head(int lane) {
+    int head = 0;
+    #pragma unroll
+    for (int s = 0; (G >> s) > 1; s++)
+        if (lane & (16 >> s)) head += G >> (s + 1);
+    return head;
+}
+
+#define ATTENTION_ROW_UNROLL 8
+
+// GQA decode split pass, warp-parallel over keys: grid = (kv_heads, chunks / 8),
+// block = 256, dim == 128 and group = heads / kv_heads <= G (G in {2, 4, 8}). Warp
+// w of block (x, y) is chunk c = 8 y + w: a contiguous key range (attention_chunk
+// with chunks = 8 gridDim.y, ATTENTION_GROUP_GRANULE) for all `group` query heads of
+// KV head x, so every K/V row is read once per step and the 8 warps of a block keep
+// distinct rows in flight. Lane l owns dims 4l..4l+3; online softmax per 32-key
+// batch. Same partial layout and combine (attention_combine_group) as
+// attention_split_group; F32 accumulation.
+template<int G, typename KV>
+__device__ __forceinline__ void attention_split_rows_impl(
+    const float *q, const KV *keys, const KV *values, float *partial, int heads, int kv_heads,
+    int count) {
+    __shared__ float probability[8][G][32];
+    const int dim = ATTENTION_KV_DIM, per = 32 / G;
+    int kv_head = blockIdx.x, group = heads / kv_heads;
+    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    int chunks = gridDim.y * 8, index = blockIdx.y * 8 + warp;
+    int chunk = attention_chunk(count, chunks, ATTENTION_GROUP_GRANULE);
+    int begin = index * chunk, end = min(count, begin + chunk);
+    if (begin >= end) return;
+    float4 query[G], acc[G];
+    #pragma unroll
+    for (int h = 0; h < G; h++) {
+        query[h] = h < group ? *(const float4 *)(q + (u64)(kv_head * group + h) * dim + 4 * lane)
+                             : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        acc[h] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    // Softmax state of head lane / per, held by its `per` lanes.
+    int mine = lane / per, slot = lane % per, leader = kv_row_head<G>(lane);
+    bool writes = (lane & (16 / G * 2 - 1)) == 0;
+    float scale = sqrtf((float)dim), maximum = -__int_as_float(0x7f800000), total = 0.0f;
+    float (*p)[32] = probability[warp];
+    for (int base = begin; base < end; base += 32) {
+        int n = min(32, end - base);
+        for (int u = 0; u < n; u += ATTENTION_ROW_UNROLL) {
+            float4 k[ATTENTION_ROW_UNROLL];
+            #pragma unroll
+            for (int j = 0; j < ATTENTION_ROW_UNROLL; j++)
+                k[j] = u + j < n
+                    ? kv_load4(keys, ((u64)(base + u + j) * kv_heads + kv_head) * dim + 4 * lane)
+                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            #pragma unroll
+            for (int j = 0; j < ATTENTION_ROW_UNROLL; j++) {
+                float part[G];
+                #pragma unroll
+                for (int h = 0; h < G; h++)
+                    part[h] = query[h].x * k[j].x + query[h].y * k[j].y + query[h].z * k[j].z
+                            + query[h].w * k[j].w;
+                float score = kv_row_reduce<G>(part, lane);
+                if (writes && u + j < n) p[leader][u + j] = score / scale;
+            }
+        }
+        __syncwarp();
+        float step = -__int_as_float(0x7f800000);
+        for (int t = slot; t < n; t += per) step = fmaxf(step, p[mine][t]);
+        #pragma unroll
+        for (int offset = per / 2; offset > 0; offset /= 2)
+            step = fmaxf(step, __shfl_xor_sync(0xffffffff, step, offset));
+        float updated = fmaxf(maximum, step), rescale = expf(maximum - updated), sum = 0.0f;
+        for (int t = slot; t < n; t += per) {
+            float e = expf(p[mine][t] - updated);
+            p[mine][t] = e;
+            sum += e;
+        }
+        #pragma unroll
+        for (int offset = per / 2; offset > 0; offset /= 2)
+            sum += __shfl_xor_sync(0xffffffff, sum, offset);
+        total = total * rescale + sum;
+        maximum = updated;
+        __syncwarp();
+        #pragma unroll
+        for (int h = 0; h < G; h++) {
+            float r = __shfl_sync(0xffffffff, rescale, h * per);
+            acc[h].x *= r;
+            acc[h].y *= r;
+            acc[h].z *= r;
+            acc[h].w *= r;
+        }
+        for (int u = 0; u < n; u += ATTENTION_ROW_UNROLL) {
+            float4 v[ATTENTION_ROW_UNROLL];
+            #pragma unroll
+            for (int j = 0; j < ATTENTION_ROW_UNROLL; j++)
+                v[j] = u + j < n
+                    ? kv_load4(values, ((u64)(base + u + j) * kv_heads + kv_head) * dim + 4 * lane)
+                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            #pragma unroll
+            for (int j = 0; j < ATTENTION_ROW_UNROLL; j++) {
+                if (u + j >= n) continue;
+                #pragma unroll
+                for (int h = 0; h < G; h++) {
+                    float e = p[h][u + j];
+                    acc[h].x += e * v[j].x;
+                    acc[h].y += e * v[j].y;
+                    acc[h].z += e * v[j].z;
+                    acc[h].w += e * v[j].w;
+                }
+            }
+        }
+        __syncwarp();
+    }
+    #pragma unroll
+    for (int h = 0; h < G; h++) {
+        if (h >= group) continue;
+        float *out = partial + ((u64)(kv_head * group + h) * chunks + index) * (dim + 2);
+        // dim + 2 is even: partial rows are 8-byte aligned.
+        *(float2 *)(out + 4 * lane) = make_float2(acc[h].x, acc[h].y);
+        *(float2 *)(out + 4 * lane + 2) = make_float2(acc[h].z, acc[h].w);
+    }
+    if (slot == 0 && mine < group) {
+        float *out = partial + ((u64)(kv_head * group + mine) * chunks + index) * (dim + 2);
+        out[dim] = maximum;
+        out[dim + 1] = total;
+    }
+}
+
+#define ATTENTION_SPLIT_ROWS(G)                                                                    \
+extern "C" __global__ void __launch_bounds__(256) attention_split_rows##G##_f16(                   \
+    const float *q, const kv_f16 *keys, const kv_f16 *values, float *partial, int dim,             \
+    int heads, int kv_heads, int count) {                                                          \
+    attention_split_rows_impl<G>(q, keys, values, partial, heads, kv_heads, count);                \
+}                                                                                                  \
+extern "C" __global__ void __launch_bounds__(256) attention_split_rows##G##_decode_f16(            \
+    const float *q, const kv_f16 *keys, const kv_f16 *values, float *partial, int dim,             \
+    int heads, int kv_heads, const int *control) {                                                 \
+    attention_split_rows_impl<G>(q, keys, values, partial, heads, kv_heads, control[1] + 1);       \
+}
+ATTENTION_SPLIT_ROWS(2)
+ATTENTION_SPLIT_ROWS(4)
+ATTENTION_SPLIT_ROWS(8)
 #endif

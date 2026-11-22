@@ -655,7 +655,7 @@ impl CudaBackend {
                 );
             } else if let (Some(halves), true) = (
                 self.work.attention_half.as_mut(),
-                self.matmul.tensor_prefill() && dim == 128 && heads == 8 * kv_heads,
+                self.matmul == CudaMatmul::Int8Prefill && dim == 128 && heads == 8 * kv_heads,
             ) {
                 // int8-prefill: split K/V into FP16 hi/lo planes once per layer, then
                 // FP16 tensor-core attention, 16 tokens x 8 heads per block.
@@ -675,11 +675,7 @@ impl CudaBackend {
                 // 8 warps (16 tokens) per block: 4 warps measured equal, 2 slower.
                 launch!(
                     self,
-                    if self.matmul == CudaMatmul::Int8Fast {
-                        "attention_prefill_mma_half_fast"
-                    } else {
-                        "attention_prefill_mma_half"
-                    },
+                    "attention_prefill_mma_half",
                     (kv_heads as u32, (n as u32).div_ceil(16), 1); 256,
                     &self.work.q,
                     &*halves,
@@ -701,15 +697,12 @@ impl CudaBackend {
                 // 4 warps per token (2 query rows each) measured fastest: 369 -> 260 ms
                 // of attention at 2.9k tokens with 512-token chunks.
                 // FP16 hi/lo tensor-core attention (int8-prefill) needs GQA group 8.
-                let (name, grid_y, threads) = if self.matmul.tensor_prefill()
-                    && heads == 8 * kv_heads
-                {
-                    let name = if self.matmul == CudaMatmul::Int8Fast {
-                        "attention_prefill_mma_fast"
-                    } else {
-                        "attention_prefill_mma"
-                    };
-                    (name, (n as u32).div_ceil(8), 128)
+                let (name, grid_y, threads) = if self.matmul.kv_f16() && heads == 8 * kv_heads {
+                    // int8-fast: single FP16 attention straight from the FP16 K/V
+                    // cache, 16 tokens x 8 heads per block.
+                    ("attention_prefill_mma_fast_f16", (n as u32).div_ceil(16), 256)
+                } else if self.matmul.tensor_prefill() && heads == 8 * kv_heads {
+                    ("attention_prefill_mma", (n as u32).div_ceil(8), 128)
                 } else {
                     ("attention_prefill_flash4", (n as u32).div_ceil(4), 512)
                 };

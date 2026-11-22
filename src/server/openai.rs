@@ -1,13 +1,14 @@
 //! OpenAI-compatible request and response shapes (the subset Palito serves).
 //!
-//! Supported generation fields: `max_tokens`/`max_completion_tokens`,
-//! `temperature`, `top_p`, `top_k` (llama.cpp extension), `seed`, `stop` and
-//! `response_format` (`text`, `json_object`, `json_schema`).
-//! Omitted sampling fields take the server defaults (greedy unless `palito
-//! serve` was started with `--temperature`). Unsupported behavior (`n` > 1) is
-//! rejected rather than silently ignored; other unknown fields are ignored.
+//! Supported generation fields: `max_tokens`/`max_completion_tokens`, `stop`,
+//! `response_format` (`text`, `json_object`, `json_schema`) and the sampling
+//! fields of `super::sampling`. Omitted sampling fields take the server
+//! defaults (greedy unless `palito serve` was started with `--temperature`).
+//! Unsupported behavior (`n` > 1) is rejected rather than silently ignored;
+//! other unknown fields are ignored.
 
-use palito::{chat::Message, engine::FinishReason, grammar::JsonSchema, sampling::Sampling};
+use super::sampling::SamplingFields;
+use palito::{chat::Message, engine::FinishReason, grammar::JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -47,28 +48,6 @@ pub struct CompletionRequest {
     pub response_format: Option<Value>,
     #[serde(flatten)]
     pub sampling: SamplingFields,
-}
-
-#[derive(Deserialize, Default)]
-pub struct SamplingFields {
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
-    pub top_k: Option<u32>,
-    pub seed: Option<u64>,
-}
-
-impl SamplingFields {
-    /// Request settings over the server defaults, validated.
-    pub fn resolve(&self, defaults: &Sampling) -> Result<Sampling, String> {
-        let sampling = Sampling {
-            temperature: self.temperature.unwrap_or(defaults.temperature),
-            top_p: self.top_p.unwrap_or(defaults.top_p),
-            top_k: self.top_k.unwrap_or(defaults.top_k),
-            seed: self.seed.or(defaults.seed),
-        };
-        sampling.validate().map_err(|error| error.to_string())?;
-        Ok(sampling)
-    }
 }
 
 #[derive(Deserialize)]
@@ -274,6 +253,7 @@ pub fn error_body(message: &str, kind: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use palito::sampling::Sampling;
 
     fn chat(body: Value) -> ChatRequest {
         serde_json::from_value(body).unwrap()
@@ -313,10 +293,10 @@ mod tests {
         assert_eq!(with("stop", json!("END")).stop().unwrap(), vec!["END"]);
         assert!(with("stop", json!([1])).stop().is_err());
         assert!(with("stop", json!(vec!["x"; 17])).stop().is_err());
-        let defaults = Sampling { temperature: 0.6, top_p: 0.95, top_k: 20, seed: None };
-        let custom = with("temperature", json!(0.2)).sampling.resolve(&defaults).unwrap();
+        let defaults = Sampling { temperature: 0.6, top_p: 0.95, top_k: 20, ..Sampling::GREEDY };
+        let custom = with("temperature", json!(0.2)).sampling.resolve(&defaults, 100).unwrap();
         assert_eq!((custom.temperature, custom.top_p, custom.top_k), (0.2, 0.95, 20));
-        assert!(with("top_p", json!(0)).sampling.resolve(&defaults).is_err());
+        assert!(with("top_p", json!(0)).sampling.resolve(&defaults, 100).is_err());
         assert!(with("reasoning_format", json!("none")).split_reasoning() == false);
         assert!(chat(base.clone()).split_reasoning());
         let image = json!([{"type": "image_url", "image_url": {"url": "x"}}]);

@@ -207,7 +207,8 @@ impl<B: Backend> Executor<B> {
     }
 
     /// Generation drawing every token with `sampler` from the host logits (no
-    /// token-only fast path). Same contract as `generate_streaming`.
+    /// token-only fast path). The prompt and generated tokens feed the
+    /// sampler's repetition penalties. Same contract as `generate_streaming`.
     pub fn generate_sampled(
         &mut self,
         prompt: &[i32],
@@ -232,8 +233,10 @@ impl<B: Backend> Executor<B> {
     ) -> Result<Sample> {
         self.check_request(prompt, max_tokens)?;
         let start = Instant::now();
+        sampler.check_vocabulary(self.info().vocab_tokens)?;
         let cached_prompt_tokens = self.prefill(prompt, true)?;
         let prefill_ns = nanos(start);
+        sampler.begin(prompt);
         let first = self.draw(sampler, constraint.as_deref_mut())?;
         let ttft_ns = nanos(start);
         on_token(first)?;
@@ -271,10 +274,12 @@ impl<B: Backend> Executor<B> {
         if logits.len() != self.info().vocab_tokens as usize {
             return Err(Error::Backend("logits do not cover the vocabulary".into()));
         }
-        match constraint {
-            None => sampler.sample(logits),
-            Some(constraint) => constraint.sample(logits, |masked| sampler.sample(masked)),
-        }
+        let token = match constraint {
+            None => sampler.sample(logits)?,
+            Some(constraint) => constraint.sample(logits, |masked| sampler.sample(masked))?,
+        };
+        sampler.accept(token);
+        Ok(token)
     }
 
     fn check_request(&self, prompt: &[i32], max_tokens: u32) -> Result<()> {

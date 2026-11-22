@@ -264,6 +264,7 @@ fn sampling_is_seeded_and_near_zero_temperature_is_greedy() {
                 top_p: 0.95,
                 top_k: 40,
                 seed: Some(seed),
+                ..Sampling::GREEDY
             },
             ..capped(40)
         };
@@ -294,6 +295,45 @@ fn sampling_is_seeded_and_near_zero_temperature_is_greedy() {
 
 #[test]
 #[ignore = "requires models/SmolLM2-135M-Instruct-Q4_K_M.gguf"]
+fn penalties_min_p_and_logit_bias_are_seeded_and_change_the_text() {
+    let mut engine = Engine::open(&smollm(), &cpu()).unwrap();
+    let prompt = "1, 1, 1, 1, 1, 1,";
+    let run = |engine: &mut Engine, sampling: Sampling| {
+        let options = GenerationOptions { sampling, ..capped(12) };
+        engine.complete(prompt, &options, |_| true).unwrap().text
+    };
+    let greedy = run(&mut engine, Sampling::GREEDY);
+    assert!(greedy.starts_with(" 1"), "{greedy:?}");
+    // Neutral new fields leave greedy alone, whatever the window.
+    let neutral = Sampling { repeat_last_n: 0, min_p: 0.3, ..Sampling::GREEDY };
+    assert_eq!(run(&mut engine, neutral), greedy);
+    // The prompt is inside the window: a strong frequency penalty avoids " 1".
+    let penalized = Sampling { frequency_penalty: 2.0, ..Sampling::GREEDY };
+    let text = run(&mut engine, penalized.clone());
+    assert!(!text.starts_with(" 1"), "{text:?}");
+    assert_eq!(run(&mut engine, penalized), text);
+    let one = engine.tokenize(" 1").unwrap();
+    let banned = Sampling {
+        logit_bias: one.iter().map(|&t| (t as u32, f32::NEG_INFINITY)).collect(),
+        ..Sampling::GREEDY
+    };
+    assert!(!run(&mut engine, banned).starts_with(" 1"));
+    let seeded = |seed| Sampling {
+        temperature: 1.0,
+        min_p: 0.05,
+        repeat_penalty: 1.3,
+        presence_penalty: 0.5,
+        seed: Some(seed),
+        ..Sampling::GREEDY
+    };
+    assert_eq!(run(&mut engine, seeded(5)), run(&mut engine, seeded(5)));
+    let out_of_vocabulary = Sampling { logit_bias: vec![(u32::MAX, 1.0)], ..Sampling::GREEDY };
+    let options = GenerationOptions { sampling: out_of_vocabulary, ..capped(4) };
+    assert!(engine.complete(prompt, &options, |_| true).is_err());
+}
+
+#[test]
+#[ignore = "requires models/SmolLM2-135M-Instruct-Q4_K_M.gguf"]
 fn c_api_sampling_and_stop_fields() {
     let path = CString::new(smollm().to_str().unwrap()).unwrap();
     let mut options = std::mem::MaybeUninit::<PalitoOptions>::uninit();
@@ -303,7 +343,7 @@ fn c_api_sampling_and_stop_fields() {
     options.context_tokens = 256;
     let engine = unsafe { palito_open(path.as_ptr(), &options, ptr::null_mut()) };
     assert!(!engine.is_null());
-    let run = |temperature: f32, seed: i64, stops: &[&CStr]| {
+    let run = |temperature: f32, seed: i64, stops: &[&CStr], bias: &[PalitoLogitBias]| {
         let pointers: Vec<*const c_char> = stops.iter().map(|s| s.as_ptr()).collect();
         let mut generation = std::mem::MaybeUninit::<PalitoGeneration>::uninit();
         unsafe { palito_generation_init(generation.as_mut_ptr()) };
@@ -313,6 +353,9 @@ fn c_api_sampling_and_stop_fields() {
         generation.seed = seed;
         generation.stop = pointers.as_ptr();
         generation.stop_count = pointers.len();
+        generation.logit_bias = bias.as_ptr();
+        generation.logit_bias_count = bias.len();
+        assert_eq!((generation.repeat_penalty, generation.repeat_last_n), (1.0, 64));
         let mut result = std::mem::MaybeUninit::<PalitoResult>::uninit();
         let prompt = c"1, 2, 3, 4,";
         let status = unsafe {
@@ -326,10 +369,18 @@ fn c_api_sampling_and_stop_fields() {
         unsafe { palito_result_free(&mut result) };
         (text, finish)
     };
-    let (text, finish) = run(0.0, -1, &[c" 6"]);
+    let (text, finish) = run(0.0, -1, &[c" 6"], &[]);
     assert!(!text.contains(" 6") && text.contains('5'), "{text:?}");
     assert_eq!(finish, PALITO_FINISH_STOP);
-    assert_eq!(run(0.9, 3, &[]), run(0.9, 3, &[]));
+    assert_eq!(run(0.9, 3, &[], &[]), run(0.9, 3, &[], &[]));
+    // Banning the tokens of " 5" moves the greedy reply off it.
+    let five = Engine::open(&smollm(), &cpu()).unwrap().tokenize(" 5").unwrap();
+    let banned: Vec<PalitoLogitBias> = five
+        .iter()
+        .map(|&token| PalitoLogitBias { token, bias: f32::NEG_INFINITY })
+        .collect();
+    let (text, _) = run(0.0, -1, &[], &banned);
+    assert!(!text.starts_with(" 5"), "{text:?}");
     unsafe { palito_close(engine) };
 }
 
@@ -342,11 +393,19 @@ fn c_abi_layout_matches_the_bindings() {
     assert_eq!(offset_of!(PalitoOptions, gpu_memory_limit_bytes), 16);
     assert_eq!(offset_of!(PalitoOptions, kernel_cache_dir), 24);
     assert_eq!(size_of::<PalitoMessage>(), 16);
-    assert_eq!(size_of::<PalitoGeneration>(), 48);
+    assert_eq!(size_of::<PalitoGeneration>(), 88);
     assert_eq!(offset_of!(PalitoGeneration, top_k), 16);
     assert_eq!(offset_of!(PalitoGeneration, seed), 24);
     assert_eq!(offset_of!(PalitoGeneration, stop), 32);
     assert_eq!(offset_of!(PalitoGeneration, stop_count), 40);
+    assert_eq!(offset_of!(PalitoGeneration, min_p), 48);
+    assert_eq!(offset_of!(PalitoGeneration, repeat_penalty), 52);
+    assert_eq!(offset_of!(PalitoGeneration, repeat_last_n), 56);
+    assert_eq!(offset_of!(PalitoGeneration, presence_penalty), 60);
+    assert_eq!(offset_of!(PalitoGeneration, frequency_penalty), 64);
+    assert_eq!(offset_of!(PalitoGeneration, logit_bias), 72);
+    assert_eq!(offset_of!(PalitoGeneration, logit_bias_count), 80);
+    assert_eq!(size_of::<PalitoLogitBias>(), 8);
     assert_eq!(size_of::<PalitoResult>(), 40);
     assert_eq!(offset_of!(PalitoResult, generated_tokens), 16);
     assert_eq!(offset_of!(PalitoResult, ttft_ms), 24);
@@ -629,6 +688,20 @@ fn json_schema_replies_validate_and_the_c_api_takes_a_schema() {
         ..GenerationOptions::default()
     };
     let reply = engine.chat(&[Message::user("Is water wet?")], &options, |_| true).unwrap();
+    assert!(reply.text == r#""yes""# || reply.text == r#""no""#, "{}", reply.text);
+    // Penalties and bias act on the grammar-masked logits; the reply stays valid.
+    let penalized = GenerationOptions {
+        sampling: Sampling {
+            temperature: 0.8,
+            seed: Some(2),
+            min_p: 0.05,
+            repeat_penalty: 1.3,
+            frequency_penalty: 1.0,
+            ..Sampling::GREEDY
+        },
+        ..options.clone()
+    };
+    let reply = engine.chat(&[Message::user("Is water wet?")], &penalized, |_| true).unwrap();
     assert!(reply.text == r#""yes""# || reply.text == r#""no""#, "{}", reply.text);
     drop(engine);
 

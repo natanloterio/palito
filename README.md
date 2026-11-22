@@ -79,10 +79,15 @@ Useful options:
 | `--no-stream` | Prints each reply only once it is complete |
 | `--temperature T` | Samples instead of always picking the most likely token (default 0: greedy, the same reply every time) |
 | `--top-p P`, `--top-k K`, `--seed S` | Narrow the sampling to the most likely tokens; a seed makes it repeatable |
+| `--min-p P` | Drops tokens less likely than P times the most likely one (default 0: off; llama.cpp uses 0.05) |
+| `--repeat-penalty R`, `--repeat-last-n N` | Makes the last N tokens (prompt included, default 64) less likely, as in llama.cpp (default 1: off; 1.1 is a common choice) |
+| `--presence-penalty P`, `--frequency-penalty F` | OpenAI-style penalties over the same window: P once per token already seen, F per occurrence (default 0: off) |
 | `--stop TEXT` | Ends the reply at TEXT, which is not printed (repeat for several) |
 | `--no-prefix-cache` | Re-reads the whole conversation every turn instead of reusing the previous turn's work (GPU) |
 
 For Qwen3, its authors suggest `--temperature 0.6 --top-p 0.95 --top-k 20` with reasoning on, and `--temperature 0.7 --top-p 0.8 --top-k 20` with `--no-thinking`. Greedy decoding works well for short answers, but long reasoning can start repeating itself.
+
+Sampling follows llama.cpp's order: penalties, top-k, top-p, min-p, then temperature. Penalties also work with greedy decoding, but they need the logits on the CPU for every token, so greedy with a penalty runs at sampling speed rather than full greedy speed (see the server notes below).
 
 Set `PALITO_MODEL` once to skip `--model`:
 
@@ -144,7 +149,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 - **Endpoints:** `POST /v1/chat/completions`, `POST /v1/completions` (both support `"stream": true`), `GET /v1/models`, `GET /health`.
 - **Qwen3 reasoning:** the `<think>` part comes back separately as `reasoning_content` (as with llama.cpp and vLLM), and `content` holds only the answer. Send `"reasoning_format": "none"` to keep it inside `content`, or `"chat_template_kwargs": {"enable_thinking": false}` to turn reasoning off.
-- **Sampling:** `temperature`, `top_p`, `top_k` and `seed` work as usual. When a request leaves them out, the server uses its own defaults: greedy, unless you start it with e.g. `--temperature 0.6 --top-p 0.95 --top-k 20`. Greedy runs about 20% faster (~370 vs ~300 tok/s on Qwen3-30B).
+- **Sampling:** `temperature`, `top_p`, `seed`, `presence_penalty`, `frequency_penalty` and `logit_bias` work as in OpenAI's API, plus llama.cpp's `top_k`, `min_p`, `repeat_penalty` and `repeat_last_n`. `logit_bias` takes OpenAI's `{"token id": bias}` or llama.cpp's `[[id, bias]]`, and a bias of `false` bans the token; unknown token ids are rejected. When a request leaves a field out, the server uses its own default, set with the same flags as `palito chat` (e.g. `--temperature 0.6 --top-p 0.95 --top-k 20 --min-p 0.05 --repeat-penalty 1.1`); without flags it is plain greedy. Plain greedy runs about 20% faster (~370 vs ~300 tok/s on Qwen3-30B): any sampling, penalty or bias copies the logits to the CPU every token.
 - **Stop sequences:** `stop` (a string or up to 16 strings) ends the reply; the stop text is not returned. It applies to everything the model writes, reasoning included, so with reasoning on avoid stops like `"\n"`.
 - **JSON output:** `"response_format": {"type": "json_object"}` or `{"type": "json_schema", "json_schema": {"name": "...", "schema": {...}}}` makes the reply JSON that always parses and matches the schema (constrained decoding, also with greedy). Reasoning is turned off for these requests. A schema keyword Palito cannot enforce (e.g. `uniqueItems`, `not`, `if`) returns 400 instead of being ignored. Qwen3-30B decodes at ~327 tok/s greedy (~300 sampled) with a schema.
 - **Not supported:** `n` > 1 is rejected.
@@ -191,8 +196,8 @@ How it works:
 - Open a model once, then call `palito_chat` or `palito_complete` as many times as you like. The defaults are the same as `palito chat`: full context, fastest GPU profile.
 - Each call is stateless: pass the whole conversation every time.
 - The callback gets the text as it is generated; return nonzero to stop.
-- `palito_generation` sets the token cap, reasoning, sampling (`temperature`, `top_p`, `top_k`, `seed`) and stop sequences. Fill it with `palito_generation_init` first.
-- `palito_chat_json` and `palito_complete_json` take an extra JSON Schema string; the output is JSON matching it. The struct layouts never change, so programs built against an older header keep working.
+- `palito_generation` sets the token cap, reasoning, sampling (`temperature`, `top_p`, `top_k`, `min_p`, `seed`), penalties (`repeat_penalty`, `repeat_last_n`, `presence_penalty`, `frequency_penalty`), `logit_bias` and stop sequences. Fill it with `palito_generation_init` first.
+- `palito_chat_json` and `palito_complete_json` take an extra JSON Schema string; the output is JSON matching it. Existing struct fields never move, but `palito_generation` grew after 0.5.0 (penalties, `min_p`, `logit_bias`), so rebuild programs against the current header.
 - `libpalito.so` finds the NVRTC bundled next to it, so `LD_LIBRARY_PATH` is not needed.
 - Errors come back as `-1` plus a message.
 - Use one engine per thread, or guard it with a lock.

@@ -57,6 +57,20 @@ class PalitoTest(unittest.TestCase):
         with self.assertRaisesRegex(palito.PalitoError, "uniqueItems"):
             self.llm.chat(HELLO, json_schema={"type": "array", "uniqueItems": True})
 
+    def test_penalties_and_logit_bias(self):
+        ones = "1, 1, 1, 1, 1, 1,"
+        self.assertTrue(self.llm.complete(ones, max_tokens=4).text.startswith(" 1"))
+        penalized = self.llm.complete(ones, max_tokens=4, frequency_penalty=2.0,
+                                      presence_penalty=0.5, repeat_penalty=1.1)
+        self.assertFalse(penalized.text.startswith(" 1"))
+        a = self.llm.complete(ones, max_tokens=8, temperature=1.0, min_p=0.05, seed=3)
+        b = self.llm.complete(ones, max_tokens=8, temperature=1.0, min_p=0.05, seed=3)
+        self.assertEqual(a.text, b.text)
+        with self.assertRaises(palito.PalitoError):
+            self.llm.complete(ones, max_tokens=2, logit_bias={10**9: 1.0})
+        with self.assertRaises(palito.PalitoError):
+            self.llm.complete(ones, max_tokens=2, min_p=2.0)
+
     def test_errors(self):
         with self.assertRaises(palito.PalitoError):
             palito.Palito("/nonexistent.gguf")

@@ -33,6 +33,20 @@ internal struct NativeGeneration
     public long Seed;
     public IntPtr Stop;
     public nuint StopCount;
+    public float MinP;
+    public float RepeatPenalty;
+    public uint RepeatLastN;
+    public float PresencePenalty;
+    public float FrequencyPenalty;
+    public IntPtr LogitBias;
+    public nuint LogitBiasCount;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct NativeLogitBias
+{
+    public int Token;
+    public float Bias;
 }
 
 [StructLayout(LayoutKind.Sequential)]

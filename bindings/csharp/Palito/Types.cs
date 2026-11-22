@@ -74,6 +74,18 @@ public sealed class GenerationOptions
     public float TopP { get; init; } = 1f;
     /// <summary>0: off.</summary>
     public uint TopK { get; init; }
+    /// <summary>In [0, 1]: drop tokens below MinP times the most likely one's probability; 0: off.</summary>
+    public float MinP { get; init; }
+    /// <summary>llama.cpp repeat penalty (&gt; 0) over the last RepeatLastN tokens, prompt included; 1: off.</summary>
+    public float RepeatPenalty { get; init; } = 1f;
+    /// <summary>Window of the penalties; 0 turns them off.</summary>
+    public uint RepeatLastN { get; init; } = 64;
+    /// <summary>Subtracted once from every token in the window; 0: off.</summary>
+    public float PresencePenalty { get; init; }
+    /// <summary>Subtracted per occurrence in the window; 0: off.</summary>
+    public float FrequencyPenalty { get; init; }
+    /// <summary>Token id to a bias added to its logit; float.NegativeInfinity bans the token.</summary>
+    public IReadOnlyDictionary<int, float> LogitBias { get; init; } = new Dictionary<int, float>();
     /// <summary>null: a different seed each call.</summary>
     public ulong? Seed { get; init; }
     /// <summary>Generation ends at the first of these; it is not part of the text.</summary>

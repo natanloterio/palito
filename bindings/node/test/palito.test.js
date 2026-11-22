@@ -36,6 +36,19 @@ test('stop, seeded sampling, cancel and queueing', { skip: !MODEL }, async () =>
   assert.strictEqual((await llm.complete('Hi', { maxTokens: 2 })).generatedTokens, 2);
 });
 
+test('penalties, min-p and logit bias', { skip: !MODEL }, async () => {
+  const ones = '1, 1, 1, 1, 1, 1,';
+  assert.ok((await llm.complete(ones, { maxTokens: 4 })).text.startsWith(' 1'));
+  const penalized = await llm.complete(ones, {
+    maxTokens: 4, frequencyPenalty: 2, presencePenalty: 0.5, repeatPenalty: 1.1,
+  });
+  assert.ok(!penalized.text.startsWith(' 1'), penalized.text);
+  const seeded = { maxTokens: 8, temperature: 1, minP: 0.05, seed: 3 };
+  assert.strictEqual((await llm.complete(ones, seeded)).text, (await llm.complete(ones, seeded)).text);
+  await assert.rejects(llm.complete(ones, { maxTokens: 2, logitBias: { 1000000000: 1 } }), PalitoError);
+  await assert.rejects(llm.complete(ones, { maxTokens: 2, minP: 2 }), PalitoError);
+});
+
 test('errors', { skip: !MODEL }, async () => {
   await assert.rejects(Palito.open('/nonexistent.gguf'), PalitoError);
   await assert.rejects(llm.chat(HELLO, { temperature: -1 }), PalitoError);

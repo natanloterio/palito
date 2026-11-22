@@ -21,6 +21,16 @@ export interface GenerationOptions {
   temperature?: number;
   topP?: number;
   topK?: number;
+  /** In [0, 1]: drop tokens below minP times the best one's probability. 0 (default): off. */
+  minP?: number;
+  /** > 0; 1 (default): off. Applies to the last repeatLastN tokens, prompt included. */
+  repeatPenalty?: number;
+  /** Default 64; 0 turns the penalties off. */
+  repeatLastN?: number;
+  presencePenalty?: number;
+  frequencyPenalty?: number;
+  /** Token id → bias added to its logit; -Infinity bans the token. */
+  logitBias?: Record<number, number>;
   /** Omitted or negative: a different seed each call. */
   seed?: number;
   /** Generation ends at the first of these; it is not part of the text. */

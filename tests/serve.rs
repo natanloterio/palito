@@ -142,7 +142,8 @@ fn api_key_guards_v1_but_not_health() {
 #[test]
 #[ignore = "requires models/SmolLM2-135M-Instruct-Q4_K_M.gguf"]
 fn stop_sequences_and_seeded_sampling() {
-    let server = start(18095, &["--temperature", "0.9", "--top-k", "40"]);
+    let server = start(18095, &["--temperature", "0.9", "--top-k", "40", "--min-p", "0.05",
+        "--repeat-penalty", "1.1", "--repeat-last-n", "32"]);
     let text = |body: Value| {
         let (status, body) = request(&server, "POST", "/v1/completions", Some(body), None);
         assert_eq!(status, 200, "{body}");
@@ -150,16 +151,32 @@ fn stop_sequences_and_seeded_sampling() {
         let choice = &reply["choices"][0];
         (choice["text"].as_str().unwrap().to_owned(), choice["finish_reason"].clone())
     };
-    let greedy = json!({"prompt": "1, 2, 3, 4,", "max_tokens": 20, "temperature": 0, "stop": [" 7"]});
+    let greedy = json!({"prompt": "1, 2, 3, 4,", "max_tokens": 20, "temperature": 0,
+        "repeat_penalty": 1, "stop": [" 7"]});
     let (cut, finish) = text(greedy);
     assert!(!cut.contains(" 7") && cut.contains('6'), "{cut:?}");
     assert_eq!(finish, "stop");
     // Server defaults (temperature 0.9) with a request seed: reproducible.
     let seeded = json!({"prompt": "Once upon a time", "max_tokens": 20, "seed": 42});
     assert_eq!(text(seeded.clone()).0, text(seeded).0);
-    let (status, _) = request(&server, "POST", "/v1/completions",
-        Some(json!({"prompt": "x", "top_p": 2})), None);
-    assert_eq!(status, 400);
+    // Request penalties: the prompt's repeated " 1" is avoided under greedy.
+    let ones = |extra: Value| {
+        let mut body = json!({"prompt": "1, 1, 1, 1, 1, 1,", "max_tokens": 4, "temperature": 0});
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        text(body).0
+    };
+    assert!(ones(json!({"repeat_penalty": 1.0})).starts_with(" 1"));
+    let penalized = ones(json!({"frequency_penalty": 2.0, "presence_penalty": 0.5}));
+    assert!(!penalized.starts_with(" 1"), "{penalized:?}");
+    for bad in [json!({"top_p": 2}), json!({"min_p": -1}), json!({"repeat_penalty": 0}),
+        json!({"logit_bias": {"99999999": 1}}), json!({"logit_bias": {"x": 1}})] {
+        let mut body = json!({"prompt": "x"});
+        body.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+        let (status, reply) = request(&server, "POST", "/v1/completions", Some(body), None);
+        assert_eq!(status, 400, "{bad}: {reply}");
+    }
+    let streamed = json!({"prompt": "x", "stream": true, "logit_bias": {"99999999": 1}});
+    assert_eq!(request(&server, "POST", "/v1/completions", Some(streamed), None).0, 400);
 }
 
 /// Bounded schemas: a small model always finishes them within the token cap.

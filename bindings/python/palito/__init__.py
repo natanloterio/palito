@@ -30,7 +30,7 @@ import queue
 import shutil
 import sys
 import threading
-from ctypes import (CFUNCTYPE, POINTER, Structure, c_char_p, c_double, c_float,
+from ctypes import (CFUNCTYPE, POINTER, Structure, c_char_p, c_double, c_float, c_int32,
                     c_int, c_int64, c_size_t, c_uint32, c_uint64, c_void_p)
 from dataclasses import dataclass
 
@@ -65,10 +65,17 @@ class _Message(Structure):
     _fields_ = [("role", c_char_p), ("content", c_char_p)]
 
 
+class _LogitBias(Structure):
+    _fields_ = [("token", c_int32), ("bias", c_float)]
+
+
 class _Generation(Structure):
     _fields_ = [("max_tokens", c_uint32), ("enable_thinking", c_int),
                 ("temperature", c_float), ("top_p", c_float), ("top_k", c_uint32),
-                ("seed", c_int64), ("stop", POINTER(c_char_p)), ("stop_count", c_size_t)]
+                ("seed", c_int64), ("stop", POINTER(c_char_p)), ("stop_count", c_size_t),
+                ("min_p", c_float), ("repeat_penalty", c_float), ("repeat_last_n", c_uint32),
+                ("presence_penalty", c_float), ("frequency_penalty", c_float),
+                ("logit_bias", POINTER(_LogitBias)), ("logit_bias_count", c_size_t)]
 
 
 class _Result(Structure):
@@ -193,7 +200,9 @@ class Palito:
 
         on_text(str) receives the reply as it is generated; returning False stops it.
         Generation keywords: max_tokens=0 (no cap), thinking=True, temperature=0.0
-        (greedy), top_p=1.0, top_k=0, seed=None, stop=() (strings), json_schema=None
+        (greedy), top_p=1.0, top_k=0, min_p=0.0, repeat_penalty=1.0, repeat_last_n=64,
+        presence_penalty=0.0, frequency_penalty=0.0, logit_bias=None ({token id: bias},
+        float("-inf") bans a token), seed=None, stop=() (strings), json_schema=None
         (a JSON Schema dict or string: the reply is JSON matching it, reasoning off;
         {"type": "object"} for any object).
         """
@@ -253,7 +262,9 @@ class Palito:
             thread.join()
 
     def _run(self, call, on_text, max_tokens=0, thinking=True, temperature=0.0,
-             top_p=1.0, top_k=0, seed=None, stop=(), json_schema=None):
+             top_p=1.0, top_k=0, min_p=0.0, repeat_penalty=1.0, repeat_last_n=64,
+             presence_penalty=0.0, frequency_penalty=0.0, logit_bias=None, seed=None, stop=(),
+             json_schema=None):
         schema = _schema_bytes(json_schema)
         if schema is not None and not hasattr(self._lib, "palito_chat_json"):
             raise PalitoError("json_schema needs a libpalito newer than 0.5.0")
@@ -264,6 +275,15 @@ class Palito:
         generation.temperature = temperature
         generation.top_p = top_p
         generation.top_k = top_k
+        generation.min_p = min_p
+        generation.repeat_penalty = repeat_penalty
+        generation.repeat_last_n = repeat_last_n
+        generation.presence_penalty = presence_penalty
+        generation.frequency_penalty = frequency_penalty
+        biases = list((logit_bias or {}).items())
+        bias_array = (_LogitBias * len(biases))(*[_LogitBias(t, b) for t, b in biases])
+        generation.logit_bias = bias_array
+        generation.logit_bias_count = len(biases)
         generation.seed = -1 if seed is None else seed
         stops = (c_char_p * len(stop))(*[s.encode() for s in stop])
         generation.stop = stops

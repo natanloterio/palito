@@ -47,6 +47,7 @@ struct Job {
 #[derive(Clone, Debug)]
 pub struct ModelReport {
     pub context_tokens: u32,
+    pub vocab_tokens: u32,
     pub profile: &'static str,
     pub has_chat_template: bool,
 }
@@ -87,6 +88,7 @@ impl Worker {
                 }
                 let _ = ready.send(Ok(ModelReport {
                     context_tokens: engine.context_tokens(),
+                    vocab_tokens: engine.vocab_tokens(),
                     profile: engine.profile(),
                     has_chat_template: engine.has_chat_template(),
                 }));

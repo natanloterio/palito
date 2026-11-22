@@ -15,7 +15,9 @@ All of them accept the same generation settings:
 - `max_tokens`
 - `thinking`
 - `temperature` (0, the default, is greedy)
-- `top_p`, `top_k` and `seed`
+- `top_p`, `top_k`, `min_p` and `seed`
+- `repeat_penalty`, `repeat_last_n`, `presence_penalty` and `frequency_penalty` (llama.cpp semantics; the prompt counts towards the window)
+- `logit_bias` (token id to bias; negative infinity bans the token)
 - `stop` sequences
 
 They also report the same result: text, finish reason, token counts, time to the first token, and tok/s.

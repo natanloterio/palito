@@ -15,7 +15,7 @@ use crate::{
     chat::Message,
     engine::{Completion, Device, Engine, EngineOptions, FinishReason, GenerationOptions},
     grammar::JsonSchema,
-    sampling::Sampling,
+    sampling::{DEFAULT_REPEAT_LAST_N, Sampling},
 };
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},
@@ -71,6 +71,27 @@ pub struct PalitoGeneration {
     /// `stop_count` NUL-terminated stop sequences (may be NULL when 0).
     pub stop: *const *const c_char,
     pub stop_count: usize,
+    /// In [0, 1]; 0: off.
+    pub min_p: f32,
+    /// > 0; 1: off.
+    pub repeat_penalty: f32,
+    /// Tokens (prompt included) the penalties look back at; 0: penalties off.
+    pub repeat_last_n: u32,
+    /// 0: off.
+    pub presence_penalty: f32,
+    /// 0: off.
+    pub frequency_penalty: f32,
+    /// `logit_bias_count` biases (may be NULL when 0).
+    pub logit_bias: *const PalitoLogitBias,
+    pub logit_bias_count: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PalitoLogitBias {
+    pub token: i32,
+    /// Added to the token's logit; -INFINITY bans it.
+    pub bias: f32,
 }
 
 #[repr(C)]
@@ -119,7 +140,8 @@ pub unsafe extern "C" fn palito_options_init(options: *mut PalitoOptions) {
     }
 }
 
-/// Fills `generation` with defaults (no token cap, thinking on, greedy, no stops).
+/// Fills `generation` with defaults (no token cap, thinking on, greedy, no
+/// stops, penalties and biases off, repeat window 64).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn palito_generation_init(generation: *mut PalitoGeneration) {
     if let Some(generation) = unsafe { generation.as_mut() } {
@@ -132,6 +154,13 @@ pub unsafe extern "C" fn palito_generation_init(generation: *mut PalitoGeneratio
             seed: -1,
             stop: ptr::null(),
             stop_count: 0,
+            min_p: 0.0,
+            repeat_penalty: 1.0,
+            repeat_last_n: DEFAULT_REPEAT_LAST_N,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            logit_bias: ptr::null(),
+            logit_bias_count: 0,
         };
     }
 }
@@ -388,6 +417,21 @@ unsafe fn generation_options(
     let stop = (0..generation.stop_count)
         .map(|i| unsafe { text(*generation.stop.add(i), "stop sequence") })
         .collect::<crate::Result<Vec<_>>>()?;
+    if generation.logit_bias.is_null() && generation.logit_bias_count > 0 {
+        return Err(Error::Invalid("logit_bias is NULL".into()));
+    }
+    let logit_bias = if generation.logit_bias_count == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(generation.logit_bias, generation.logit_bias_count) }
+    };
+    let logit_bias = logit_bias
+        .iter()
+        .map(|entry| match u32::try_from(entry.token) {
+            Ok(token) => Ok((token, entry.bias)),
+            Err(_) => Err(Error::Invalid(format!("logit_bias token {} is negative", entry.token))),
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
     Ok(GenerationOptions {
         max_tokens: (generation.max_tokens > 0).then_some(generation.max_tokens),
         enable_thinking: generation.enable_thinking != 0,
@@ -395,6 +439,12 @@ unsafe fn generation_options(
             temperature: generation.temperature,
             top_p: generation.top_p,
             top_k: generation.top_k,
+            min_p: generation.min_p,
+            repeat_penalty: generation.repeat_penalty,
+            repeat_last_n: generation.repeat_last_n,
+            presence_penalty: generation.presence_penalty,
+            frequency_penalty: generation.frequency_penalty,
+            logit_bias,
             seed: u64::try_from(generation.seed).ok(),
         },
         stop,

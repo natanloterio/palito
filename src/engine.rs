@@ -206,6 +206,11 @@ impl Engine {
         self.executor.info().context_tokens
     }
 
+    /// Vocabulary size (token ids are below it).
+    pub fn vocab_tokens(&self) -> u32 {
+        self.executor.info().vocab_tokens
+    }
+
     /// Numerical profile in use: "cpu", or the CUDA matmul profile.
     pub fn profile(&self) -> &'static str {
         self.profile
@@ -282,7 +287,7 @@ impl Engine {
         mut sink: impl TextSink,
     ) -> Result<Completion> {
         stop::validate(&options.stop)?;
-        let mut sampler = Sampler::new(options.sampling)?;
+        let mut sampler = Sampler::new(options.sampling.clone())?;
         let mut constraint = match &options.json_schema {
             Some(schema) => Some(self.json_decoder()?.constraint(schema)?),
             None => None,
@@ -321,7 +326,7 @@ impl Engine {
             Ok(())
         };
         let mode = GenerationMode::UntilEog;
-        let result = if sampler.is_greedy() && constraint.is_none() {
+        let result = if !sampler.needs_host_logits() && constraint.is_none() {
             self.executor
                 .generate_streaming(&tokens, budget, mode, &mut on_token)
         } else {

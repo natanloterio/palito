@@ -6,6 +6,7 @@
 //! other requests wait in a bounded queue (503 when full).
 
 mod openai;
+mod reasoning;
 mod stream;
 mod worker;
 
@@ -18,13 +19,17 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use crate::chat_repl::SamplingArgs;
 use clap::{Args, ValueEnum};
 use openai::{ChatRequest, CompletionRequest, Usage, error_body};
-use palito::engine::{Completion, Device, EngineOptions, GenerationOptions};
+use palito::{
+    engine::{Completion, Device, EngineOptions, GenerationOptions},
+    sampling::Sampling,
+};
 use serde_json::{Value, json};
 use std::{net::IpAddr, path::PathBuf, sync::Arc, time::Instant};
 use stream::Kind;
-use worker::{Event, ModelReport, Prompt, SubmitError, Worker};
+use worker::{Event, ModelReport, Prompt, Reply, SubmitError, Worker};
 
 /// Request bodies above this are refused (a 65k-token prompt is well below it).
 const BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
@@ -68,6 +73,9 @@ pub(crate) struct ServeArgs {
     /// Model id reported by /v1/models [default: the GGUF file name without extension].
     #[arg(long)]
     model_name: Option<String>,
+    /// Defaults for requests that omit temperature, top_p, top_k or seed.
+    #[command(flatten)]
+    sampling: SamplingArgs,
 }
 
 #[derive(Clone)]
@@ -77,6 +85,7 @@ struct AppState {
     report: Arc<ModelReport>,
     api_key: Option<Arc<str>>,
     created: u64,
+    sampling: Sampling,
 }
 
 pub(crate) fn run(args: ServeArgs) -> palito::Result<()> {
@@ -91,7 +100,10 @@ pub(crate) fn run(args: ServeArgs) -> palito::Result<()> {
         gpu_device: args.gpu_device,
         gpu_memory_limit_bytes: args.gpu_memory_limit_bytes,
         kernel_cache_dir: args.cuda_kernel_cache.clone(),
+        ..EngineOptions::default()
     };
+    let sampling = args.sampling.sampling();
+    sampling.validate()?;
     let model = args.model_name.clone().unwrap_or_else(|| {
         args.model
             .file_stem()
@@ -118,6 +130,7 @@ pub(crate) fn run(args: ServeArgs) -> palito::Result<()> {
         report: Arc::new(report),
         api_key: api_key.map(Into::into),
         created: openai::unix_seconds(),
+        sampling,
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -198,16 +211,30 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
     if !state.report.has_chat_template {
         return invalid("this model has no chat template; use /v1/completions");
     }
-    let messages = match request.check_supported().and_then(|()| request.messages()) {
-        Ok(messages) => messages,
+    let parsed = request.check_supported().and_then(|()| {
+        Ok((
+            request.messages()?,
+            request.sampling.resolve(&state.sampling)?,
+            request.stop()?,
+        ))
+    });
+    let (messages, sampling, stop) = match parsed {
+        Ok(parsed) => parsed,
         Err(message) => return invalid(&message),
     };
     let options = GenerationOptions {
         max_tokens: request.max_tokens(),
         enable_thinking: request.enable_thinking(),
+        sampling,
+        stop,
     };
-    let include_usage = request.stream_options.unwrap_or_default().include_usage;
-    respond(state, Kind::Chat, Prompt::Chat(messages), options, request.stream, include_usage).await
+    let reply = Respond {
+        kind: Kind::Chat,
+        stream: request.stream,
+        include_usage: request.stream_options.as_ref().is_some_and(|o| o.include_usage),
+        split_reasoning: request.split_reasoning(),
+    };
+    respond(state, reply, Prompt::Chat(messages), options).await
 }
 
 async fn completions(State(state): State<AppState>, body: Bytes) -> Response {
@@ -215,27 +242,53 @@ async fn completions(State(state): State<AppState>, body: Bytes) -> Response {
         Ok(request) => request,
         Err(response) => return response,
     };
-    let prompt = match request.check_supported().and_then(|()| request.prompt()) {
-        Ok(prompt) => prompt,
+    let parsed = request.check_supported().and_then(|()| {
+        Ok((
+            request.prompt()?,
+            request.sampling.resolve(&state.sampling)?,
+            request.stop()?,
+        ))
+    });
+    let (prompt, sampling, stop) = match parsed {
+        Ok(parsed) => parsed,
         Err(message) => return invalid(&message),
     };
     let options = GenerationOptions {
         max_tokens: Some(request.max_tokens.unwrap_or(openai::COMPLETION_DEFAULT_MAX_TOKENS)),
         enable_thinking: true,
+        sampling,
+        stop,
     };
-    let include_usage = request.stream_options.unwrap_or_default().include_usage;
-    respond(state, Kind::Text, Prompt::Text(prompt), options, request.stream, include_usage).await
+    let reply = Respond {
+        kind: Kind::Text,
+        stream: request.stream,
+        include_usage: request.stream_options.as_ref().is_some_and(|o| o.include_usage),
+        split_reasoning: false,
+    };
+    respond(state, reply, Prompt::Text(prompt), options).await
+}
+
+/// How to answer a request.
+struct Respond {
+    kind: Kind,
+    stream: bool,
+    include_usage: bool,
+    split_reasoning: bool,
 }
 
 async fn respond(
     state: AppState,
-    kind: Kind,
+    reply: Respond,
     prompt: Prompt,
     options: GenerationOptions,
-    stream: bool,
-    include_usage: bool,
 ) -> Response {
-    let mut events = match state.worker.submit(prompt, options) {
+    let Respond {
+        kind,
+        stream,
+        include_usage,
+        split_reasoning,
+    } = reply;
+    let mut events = match state.worker.submit(prompt, options, split_reasoning) {
         Ok(events) => events,
         Err(SubmitError::Busy) => {
             let mut response = failure(
@@ -256,34 +309,41 @@ async fn respond(
     if stream {
         return stream::sse(kind, id, state.model.clone(), events, include_usage);
     }
-    let completion = loop {
+    let reply = loop {
         match events.recv().await {
-            Some(Event::Text(_)) => continue,
+            Some(Event::Text { .. }) => continue,
             Some(Event::Done(result)) => break result,
             None => break Err("engine stopped".into()),
         }
     };
-    match completion {
-        Ok(completion) => {
-            log(kind, &completion);
-            Json(final_body(kind, &id, &state.model, &completion)).into_response()
+    match reply {
+        Ok(reply) => {
+            log(kind, &reply.completion);
+            Json(final_body(kind, &id, &state.model, &reply)).into_response()
         }
         Err(message) => invalid(&message),
     }
 }
 
-fn final_body(kind: Kind, id: &str, model: &str, completion: &Completion) -> Value {
+fn final_body(kind: Kind, id: &str, model: &str, reply: &Reply) -> Value {
+    let completion = &reply.completion;
     let finish = openai::finish_reason(completion.finish_reason);
     let choice = match kind {
-        Kind::Chat => json!({
-            "index": 0,
-            "message": {"role": "assistant", "content": completion.text},
-            "finish_reason": finish,
-            "logprobs": null,
-        }),
+        Kind::Chat => {
+            let mut message = json!({"role": "assistant", "content": reply.content});
+            if let Some(reasoning) = &reply.reasoning {
+                message["reasoning_content"] = json!(reasoning);
+            }
+            json!({
+                "index": 0,
+                "message": message,
+                "finish_reason": finish,
+                "logprobs": null,
+            })
+        }
         Kind::Text => json!({
             "index": 0,
-            "text": completion.text,
+            "text": reply.content,
             "finish_reason": finish,
             "logprobs": null,
         }),

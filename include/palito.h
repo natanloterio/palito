@@ -5,6 +5,8 @@
  * library path at run time (the Linux bundle ships it in lib/).
  *
  * Conventions:
+ *  - Initialize option structs with palito_options_init/palito_generation_init
+ *    before setting fields, so new fields get their defaults.
  *  - Functions returning int return 0 on success and -1 on error. On error,
  *    when `error` is not NULL, *error receives a message to release with
  *    palito_string_free.
@@ -52,8 +54,14 @@ typedef struct {
 } palito_message;
 
 typedef struct {
-    uint32_t max_tokens; /* 0: until end of turn or a full context */
-    int enable_thinking; /* nonzero: reasoning on (Qwen3-style templates) */
+    uint32_t max_tokens;      /* 0: until end of turn or a full context */
+    int enable_thinking;      /* nonzero: reasoning on (Qwen3-style templates) */
+    float temperature;        /* 0: greedy (default) */
+    float top_p;              /* nucleus mass in (0, 1]; 1: off */
+    uint32_t top_k;           /* 0: off */
+    int64_t seed;             /* negative: a different seed every call */
+    const char *const *stop;  /* stop sequences; generation ends at the first, */
+    size_t stop_count;        /* which is not included in the text (max 16) */
 } palito_generation;
 
 typedef struct {

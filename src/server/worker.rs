@@ -7,8 +7,9 @@
 use palito::{
     Error,
     chat::Message,
-    engine::{Completion, Engine, EngineOptions, GenerationOptions},
+    engine::{Completion, Engine, EngineOptions, FinishReason, GenerationOptions},
 };
+use super::reasoning::{self, Part, ReasoningSplitter};
 use std::{
     path::PathBuf,
     sync::mpsc::{SyncSender, TrySendError, sync_channel},
@@ -22,13 +23,23 @@ pub enum Prompt {
 }
 
 pub enum Event {
-    Text(String),
-    Done(Result<Completion, String>),
+    /// Generated text; `reasoning` marks `<think>` content when splitting.
+    Text { reasoning: bool, text: String },
+    Done(Result<Reply, String>),
+}
+
+pub struct Reply {
+    pub completion: Completion,
+    /// Reasoning split from the answer (None when not splitting or empty).
+    pub reasoning: Option<String>,
+    /// The answer (the whole text when not splitting).
+    pub content: String,
 }
 
 struct Job {
     prompt: Prompt,
     options: GenerationOptions,
+    split_reasoning: bool,
     events: UnboundedSender<Event>,
 }
 
@@ -71,6 +82,9 @@ impl Worker {
                         return;
                     }
                 };
+                for notice in engine.notices() {
+                    eprintln!("({notice})");
+                }
                 let _ = ready.send(Ok(ModelReport {
                     context_tokens: engine.context_tokens(),
                     profile: engine.profile(),
@@ -86,15 +100,18 @@ impl Worker {
         Ok((Self { jobs }, report))
     }
 
+    /// `split_reasoning` applies to chat prompts only.
     pub fn submit(
         &self,
         prompt: Prompt,
         options: GenerationOptions,
+        split_reasoning: bool,
     ) -> Result<UnboundedReceiver<Event>, SubmitError> {
         let (events, receiver) = unbounded_channel();
         let job = Job {
             prompt,
             options,
+            split_reasoning,
             events,
         };
         match self.jobs.try_send(job) {
@@ -111,18 +128,54 @@ fn run(engine: &mut Engine, job: Job) {
         return;
     }
     let events = &job.events;
-    let send = |piece: &str| events.send(Event::Text(piece.to_owned())).is_ok();
-    let result = match &job.prompt {
-        Prompt::Chat(messages) => engine.chat(messages, &job.options, send),
-        Prompt::Text(text) => engine.complete(text, &job.options, send),
+    let send = |reasoning: bool, text: String| events.send(Event::Text { reasoning, text }).is_ok();
+    let opened = match (&job.prompt, job.split_reasoning) {
+        (Prompt::Chat(messages), true) => Some(opens_reasoning(engine, messages, &job.options)),
+        _ => None,
     };
-    if let Ok(completion) = &result {
-        if completion.finish_reason == palito::engine::FinishReason::Cancelled {
+    let mut splitter = opened.map(ReasoningSplitter::new);
+    let on_text = |piece: &str| match &mut splitter {
+        None => send(false, piece.to_owned()),
+        Some(splitter) => splitter
+            .push(piece)
+            .into_iter()
+            .all(|(part, text)| send(part == Part::Reasoning, text)),
+    };
+    let result = match &job.prompt {
+        Prompt::Chat(messages) => engine.chat(messages, &job.options, on_text),
+        Prompt::Text(text) => engine.complete(text, &job.options, on_text),
+    };
+    if let Some(splitter) = &mut splitter {
+        for (part, text) in splitter.finish() {
+            send(part == Part::Reasoning, text);
+        }
+    }
+    let reply = result.map_err(|e| e.to_string()).map(|completion| {
+        if completion.finish_reason == FinishReason::Cancelled {
             eprintln!(
                 "request cancelled by the client after {} tokens",
                 completion.generated_tokens
             );
         }
-    }
-    let _ = job.events.send(Event::Done(result.map_err(|e| e.to_string())));
+        let (reasoning, content) = match opened {
+            Some(opened) => {
+                let (reasoning, content) = reasoning::split(&completion.text, opened);
+                ((!reasoning.is_empty()).then_some(reasoning), content)
+            }
+            None => (None, completion.text.clone()),
+        };
+        Reply {
+            completion,
+            reasoning,
+            content,
+        }
+    });
+    let _ = job.events.send(Event::Done(reply));
+}
+
+/// Whether the rendered prompt already opens a `<think>` block.
+fn opens_reasoning(engine: &Engine, messages: &[Message], options: &GenerationOptions) -> bool {
+    engine
+        .render_chat(messages, options.enable_thinking)
+        .is_ok_and(|prompt| prompt.trim_end().ends_with("<think>"))
 }

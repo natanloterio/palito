@@ -1,10 +1,12 @@
 //! OpenAI-compatible request and response shapes (the subset Palito serves).
 //!
-//! Sampling fields such as `temperature` or `top_p` are accepted and ignored:
-//! Palito decodes greedily. Unsupported behavior (`n` > 1, `stop` sequences)
-//! is rejected rather than silently ignored.
+//! Supported generation fields: `max_tokens`/`max_completion_tokens`,
+//! `temperature`, `top_p`, `top_k` (llama.cpp extension), `seed` and `stop`.
+//! Omitted sampling fields take the server defaults (greedy unless `palito
+//! serve` was started with `--temperature`). Unsupported behavior (`n` > 1) is
+//! rejected rather than silently ignored; other unknown fields are ignored.
 
-use palito::{chat::Message, engine::FinishReason};
+use palito::{chat::Message, engine::FinishReason, sampling::Sampling};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -22,8 +24,13 @@ pub struct ChatRequest {
     pub stream_options: Option<StreamOptions>,
     /// llama.cpp/vLLM convention: `{"enable_thinking": false}` for Qwen3.
     pub chat_template_kwargs: Option<TemplateKwargs>,
+    /// llama.cpp convention: "none" keeps `<think>` reasoning inside `content`;
+    /// anything else returns it as `reasoning_content`.
+    pub reasoning_format: Option<String>,
     pub n: Option<u32>,
     pub stop: Option<Value>,
+    #[serde(flatten)]
+    pub sampling: SamplingFields,
 }
 
 #[derive(Deserialize)]
@@ -35,6 +42,30 @@ pub struct CompletionRequest {
     pub stream_options: Option<StreamOptions>,
     pub n: Option<u32>,
     pub stop: Option<Value>,
+    #[serde(flatten)]
+    pub sampling: SamplingFields,
+}
+
+#[derive(Deserialize, Default)]
+pub struct SamplingFields {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub seed: Option<u64>,
+}
+
+impl SamplingFields {
+    /// Request settings over the server defaults, validated.
+    pub fn resolve(&self, defaults: &Sampling) -> Result<Sampling, String> {
+        let sampling = Sampling {
+            temperature: self.temperature.unwrap_or(defaults.temperature),
+            top_p: self.top_p.unwrap_or(defaults.top_p),
+            top_k: self.top_k.unwrap_or(defaults.top_k),
+            seed: self.seed.or(defaults.seed),
+        };
+        sampling.validate().map_err(|error| error.to_string())?;
+        Ok(sampling)
+    }
 }
 
 #[derive(Deserialize)]
@@ -80,7 +111,15 @@ impl ChatRequest {
     }
 
     pub fn check_supported(&self) -> Result<(), String> {
-        check_supported(self.n, self.stop.as_ref())
+        check_supported(self.n)
+    }
+
+    pub fn stop(&self) -> Result<Vec<String>, String> {
+        stop_sequences(self.stop.as_ref())
+    }
+
+    pub fn split_reasoning(&self) -> bool {
+        self.reasoning_format.as_deref() != Some("none")
     }
 }
 
@@ -96,25 +135,36 @@ impl CompletionRequest {
     }
 
     pub fn check_supported(&self) -> Result<(), String> {
-        check_supported(self.n, self.stop.as_ref())
+        check_supported(self.n)
+    }
+
+    pub fn stop(&self) -> Result<Vec<String>, String> {
+        stop_sequences(self.stop.as_ref())
     }
 }
 
-fn check_supported(n: Option<u32>, stop: Option<&Value>) -> Result<(), String> {
+fn check_supported(n: Option<u32>) -> Result<(), String> {
     if n.is_some_and(|n| n != 1) {
         return Err("only n = 1 is supported".into());
     }
-    let empty = match stop {
-        None | Some(Value::Null) => true,
-        Some(Value::String(text)) => text.is_empty(),
-        Some(Value::Array(items)) => items.is_empty(),
-        Some(_) => false,
+    Ok(())
+}
+
+/// `stop`: null, a string, or an array of strings (empty strings are ignored).
+fn stop_sequences(stop: Option<&Value>) -> Result<Vec<String>, String> {
+    let stops = match stop {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(text)) => vec![text.clone()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or("stop must be a string or an array of strings")?,
+        Some(_) => return Err("stop must be a string or an array of strings".into()),
     };
-    if empty {
-        Ok(())
-    } else {
-        Err("stop sequences are not supported".into())
-    }
+    let stops: Vec<String> = stops.into_iter().filter(|s| !s.is_empty()).collect();
+    palito::stop::validate(&stops).map_err(|error| error.to_string())?;
+    Ok(stops)
 }
 
 /// Message content: a string, or text parts `[{"type": "text", "text": ...}]`.
@@ -218,8 +268,16 @@ mod tests {
             chat(body)
         };
         assert!(with("n", json!(2)).check_supported().is_err());
-        assert!(with("stop", json!(["\n"])).check_supported().is_err());
-        assert!(with("stop", json!([])).check_supported().is_ok());
+        assert_eq!(with("stop", json!(["\n", ""])).stop().unwrap(), vec!["\n"]);
+        assert_eq!(with("stop", json!("END")).stop().unwrap(), vec!["END"]);
+        assert!(with("stop", json!([1])).stop().is_err());
+        assert!(with("stop", json!(vec!["x"; 17])).stop().is_err());
+        let defaults = Sampling { temperature: 0.6, top_p: 0.95, top_k: 20, seed: None };
+        let custom = with("temperature", json!(0.2)).sampling.resolve(&defaults).unwrap();
+        assert_eq!((custom.temperature, custom.top_p, custom.top_k), (0.2, 0.95, 20));
+        assert!(with("top_p", json!(0)).sampling.resolve(&defaults).is_err());
+        assert!(with("reasoning_format", json!("none")).split_reasoning() == false);
+        assert!(chat(base.clone()).split_reasoning());
         let image = json!([{"type": "image_url", "image_url": {"url": "x"}}]);
         let mut body = base.clone();
         body["messages"][0]["content"] = image;

@@ -9,6 +9,7 @@ use crate::{
     Error,
     chat::Message,
     engine::{Completion, Device, Engine, EngineOptions, FinishReason, GenerationOptions},
+    sampling::Sampling,
 };
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},
@@ -53,6 +54,17 @@ pub struct PalitoGeneration {
     pub max_tokens: u32,
     /// Nonzero: reasoning on for templates that support it (Qwen3).
     pub enable_thinking: c_int,
+    /// 0: greedy.
+    pub temperature: f32,
+    /// Nucleus mass in (0, 1]; 1: off.
+    pub top_p: f32,
+    /// 0: off.
+    pub top_k: u32,
+    /// Negative: a different seed every call.
+    pub seed: i64,
+    /// `stop_count` NUL-terminated stop sequences (may be NULL when 0).
+    pub stop: *const *const c_char,
+    pub stop_count: usize,
 }
 
 #[repr(C)]
@@ -101,13 +113,19 @@ pub unsafe extern "C" fn palito_options_init(options: *mut PalitoOptions) {
     }
 }
 
-/// Fills `generation` with defaults (no token cap, thinking on).
+/// Fills `generation` with defaults (no token cap, thinking on, greedy, no stops).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn palito_generation_init(generation: *mut PalitoGeneration) {
     if let Some(generation) = unsafe { generation.as_mut() } {
         *generation = PalitoGeneration {
             max_tokens: 0,
             enable_thinking: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            seed: -1,
+            stop: ptr::null(),
+            stop_count: 0,
         };
     }
 }
@@ -194,7 +212,7 @@ pub unsafe extern "C" fn palito_chat(
                 ))
             })
             .collect::<crate::Result<Vec<_>>>()?;
-        let options = unsafe { generation_options(generation) };
+        let options = unsafe { generation_options(generation) }?;
         engine.0.chat(&messages, &options, stream_to(callback, user_data))
     });
     unsafe { finish(outcome, result, error) }
@@ -214,7 +232,7 @@ pub unsafe extern "C" fn palito_complete(
     let outcome = guard(|| {
         let engine = unsafe { engine_mut(engine) }?;
         let prompt = unsafe { text(prompt, "prompt") }?;
-        let options = unsafe { generation_options(generation) };
+        let options = unsafe { generation_options(generation) }?;
         engine.0.complete(&prompt, &options, stream_to(callback, user_data))
     });
     unsafe { finish(outcome, result, error) }
@@ -282,17 +300,33 @@ unsafe fn engine_options(options: &PalitoOptions) -> crate::Result<EngineOptions
         gpu_memory_limit_bytes: (options.gpu_memory_limit_bytes > 0)
             .then_some(options.gpu_memory_limit_bytes),
         kernel_cache_dir,
+        ..defaults
     })
 }
 
-unsafe fn generation_options(generation: *const PalitoGeneration) -> GenerationOptions {
-    match unsafe { generation.as_ref() } {
-        None => GenerationOptions::default(),
-        Some(generation) => GenerationOptions {
-            max_tokens: (generation.max_tokens > 0).then_some(generation.max_tokens),
-            enable_thinking: generation.enable_thinking != 0,
-        },
+unsafe fn generation_options(
+    generation: *const PalitoGeneration,
+) -> crate::Result<GenerationOptions> {
+    let Some(generation) = (unsafe { generation.as_ref() }) else {
+        return Ok(GenerationOptions::default());
+    };
+    if generation.stop.is_null() && generation.stop_count > 0 {
+        return Err(Error::Invalid("stop is NULL".into()));
     }
+    let stop = (0..generation.stop_count)
+        .map(|i| unsafe { text(*generation.stop.add(i), "stop sequence") })
+        .collect::<crate::Result<Vec<_>>>()?;
+    Ok(GenerationOptions {
+        max_tokens: (generation.max_tokens > 0).then_some(generation.max_tokens),
+        enable_thinking: generation.enable_thinking != 0,
+        sampling: Sampling {
+            temperature: generation.temperature,
+            top_p: generation.top_p,
+            top_k: generation.top_k,
+            seed: u64::try_from(generation.seed).ok(),
+        },
+        stop,
+    })
 }
 
 fn stream_to(callback: PalitoTextCallback, user_data: *mut c_void) -> impl FnMut(&str) -> bool {

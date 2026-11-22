@@ -10,7 +10,8 @@ __device__ void tensor_core(const u8 *w, const float *x, float *y,
                            int width, int rows, int tokens, const int *groups,
                            int used, int batched) {
     int lane = threadIdx.x % 32, group = lane / 4, thread = lane % 4;
-    int row = blockIdx.x * 128 + (threadIdx.x / 32) * 16 + group, tile = blockIdx.y;
+    // 16 rows per warp (blockDim.x / 32 warps; 256 threads = 128 rows).
+    int row = blockIdx.x * (blockDim.x / 2) + (threadIdx.x / 32) * 16 + group, tile = blockIdx.y;
     int expert = Grouped ? groups[tile * 5] : 0;
     if (expert < 0) return;
     int assignment = Grouped ? (group < 4 ? groups[tile * 5 + group + 1] : -1)

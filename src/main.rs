@@ -170,7 +170,9 @@ pub(crate) struct RuntimeArgs {
     /// without activation quantization. int8-prefill keeps f32-tiled decode and runs
     /// prefill on tensor cores (INT8 projections, FP16 hi/lo attention): faster long
     /// prompts, approximate logits (same top token on the quality gates).
-    /// residual-int8-research is opt-in approximate prefill, not quality-admitted.
+    /// int8-fast is int8-prefill at llama.cpp precision (one 8-bit plane per 32
+    /// activations, single FP16 attention, TF32 router): fastest prefill, logits about
+    /// 1 off F32 and generated text can differ. residual-int8-research is opt-in approximate prefill, not quality-admitted.
     #[cfg(feature = "cuda")]
     #[arg(long, value_enum)]
     cuda_matmul: Option<local_inference::cuda::CudaMatmul>,
@@ -391,7 +393,7 @@ impl RuntimeArgs {
         use local_inference::cuda::CudaMatmul;
         matches!(
             self.cuda_matmul(),
-            CudaMatmul::F32Tiled | CudaMatmul::Int8Prefill
+            CudaMatmul::F32Tiled | CudaMatmul::Int8Prefill | CudaMatmul::Int8Fast
         )
     }
 

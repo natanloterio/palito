@@ -302,3 +302,22 @@ attention_prefill_mma_half(const float *q, const unsigned short *halves, float *
 #endif
 }
 
+
+// int8-fast: single FP16 Q/K/V and P (FP32 accumulation and softmax), as llama.cpp's
+// FP16 flash attention; the lo planes of the pre-split buffer are not read.
+extern "C" __global__ void __launch_bounds__(128)
+attention_prefill_mma_fast(const float *q, const float *keys, const float *values, float *output,
+                           int heads, int kv_heads, int tokens, int count) {
+#if __CUDA_ARCH__ >= 800
+    attention_prefill_mma_impl<4, false, false>(q, keys, values, output, heads, kv_heads, tokens, count);
+#endif
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+attention_prefill_mma_half_fast(const float *q, const unsigned short *halves, float *output,
+                                int heads, int kv_heads, int tokens, int count, int stride) {
+#if __CUDA_ARCH__ >= 800
+    attention_prefill_mma_impl<8, false, false>(q, nullptr, nullptr, output, heads, kv_heads,
+                                                tokens, count, (const uint4 *)halves, stride);
+#endif
+}

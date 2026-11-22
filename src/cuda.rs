@@ -50,6 +50,10 @@ pub enum CudaMatmul {
     /// same argmax, cos >= 0.99999, max_abs <= 0.15 against F32 logits.
     #[serde(rename = "int8-prefill")]
     Int8Prefill,
+    /// int8-prefill at llama.cpp precision: one s8 plane per 32 activations (q8_1-like)
+    /// for every projection and single FP16 attention. Faster, further from F32.
+    #[serde(rename = "int8-fast")]
+    Int8Fast,
 }
 
 impl CudaMatmul {
@@ -60,24 +64,34 @@ impl CudaMatmul {
                 | Self::ResidualInt8Research
                 | Self::ResidualMma3Research
                 | Self::Int8Prefill
+                | Self::Int8Fast
         )
     }
 
-    /// Prefill through three-component residual INT8 activations and integer MMA.
+    /// Prefill through residual INT8 activations and integer MMA.
     fn integer_mma(self) -> bool {
-        matches!(self, Self::ResidualMma3Research | Self::Int8Prefill)
+        matches!(self, Self::ResidualMma3Research | Self::Int8Prefill | Self::Int8Fast)
+    }
+
+    /// Production tensor-core prefill (mmq.cu projections, attention_mma.cu).
+    fn tensor_prefill(self) -> bool {
+        matches!(self, Self::Int8Prefill | Self::Int8Fast)
     }
 
     fn residual_components(self) -> usize {
         match self {
             Self::ResidualInt8Research => 2,
-            Self::ResidualMma3Research | Self::Int8Prefill => 3,
+            Self::ResidualMma3Research | Self::Int8Prefill | Self::Int8Fast => 3,
             _ => 0,
         }
     }
 
     fn residual_min_tokens(self) -> usize {
-        if self.integer_mma() {
+        if self == Self::Int8Fast {
+            // F32 below 32 tokens: Qwen3-30B 12-token prompt 64 ms, INT8 25 -> 14 ms
+            // with split-K MMQ (fast_splits) and the F32 router.
+            2
+        } else if self.integer_mma() {
             32
         } else {
             256
@@ -220,6 +234,8 @@ struct Workspace {
     logits: CudaSlice<f32>,
     tokens: Option<CudaSlice<i32>>,
     groups: Option<CudaSlice<i32>>,
+    /// Assignments per descriptor in `groups` for the integer MMQ path (32 or 64).
+    group_tile: usize,
     group_counts: Option<CudaSlice<i32>>,
     residual_int8: Option<ResidualWorkspace>,
     residual_mma3: Option<PreciseWorkspace>,
@@ -235,13 +251,23 @@ struct ResidualWorkspace {
     sums: CudaSlice<i32>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResidualFormat {
+    /// residual_quantize32_precise3: three s8 planes.
+    Three,
+    /// quantize32_residual_pair: S16 pair with an integer factor.
+    Pair,
+    /// quantize32_q8: one s8 plane (int8-fast).
+    Single,
+}
+
 struct PreciseWorkspace {
     values: CudaSlice<i8>,
     scales: CudaSlice<f32>,
     sums: CudaSlice<i32>,
-    /// Current contents are the S16 pair (quantize32_residual_pair) rather than
-    /// three residual components; set by prepare_residual, read by the MMQ launch.
-    pair: bool,
+    /// Activation format of the current contents; set by prepare_residual, read by
+    /// the MMQ launch.
+    format: ResidualFormat,
 }
 
 fn residual_workspace_elements(spec: &Spec, matmul: CudaMatmul) -> Result<usize> {
@@ -332,7 +358,7 @@ fn attention_half_stride(spec: &Spec) -> usize {
 
 /// u16 elements of the int8-prefill FP16 hi/lo K/V buffer (4 planes), or 0.
 fn attention_half_elements(spec: &Spec, matmul: CudaMatmul) -> usize {
-    if matmul == CudaMatmul::Int8Prefill
+    if matmul.tensor_prefill()
         && spec.dim == 128
         && spec.kv_heads > 0
         && spec.heads == 8 * spec.kv_heads
@@ -396,7 +422,12 @@ fn group_workspace_elements(spec: &Spec, matmul: CudaMatmul) -> Result<usize> {
         || (matmul.residual_components() > 0
             && prefill_capacity(spec) >= matmul.residual_min_tokens())
     {
-        Ok(base.max(group_elements_with(spec, 32)?))
+        let base = base.max(group_elements_with(spec, 32)?);
+        if matmul == CudaMatmul::Int8Fast {
+            Ok(base.max(group_elements_with(spec, 64)?).max(group_elements_with(spec, 128)?))
+        } else {
+            Ok(base)
+        }
     } else {
         Ok(base)
     }
@@ -481,6 +512,7 @@ impl Workspace {
             } else {
                 None
             },
+            group_tile: 32,
             groups: if group_workspace_elements(spec, matmul)? > 0 {
                 Some(
                     stream
@@ -516,7 +548,7 @@ impl Workspace {
                         values: stream.alloc_zeros(count * 3).map_err(failure)?,
                         scales: alloc(count / 32 * 3)?,
                         sums: stream.alloc_zeros(count / 32 * 3).map_err(failure)?,
-                        pair: false,
+                        format: ResidualFormat::Three,
                     })
                 }
             },
@@ -938,7 +970,7 @@ impl CudaBackend {
         } else {
             base_source.to_owned()
         };
-        let source = if options.matmul.tensor_cores() {
+        let source = if options.matmul.tensor_cores() || options.matmul == CudaMatmul::Int8Fast {
             format!("{base_source}\n{}", include_str!("cuda/tensorcore.cu"))
         } else {
             base_source
@@ -949,7 +981,7 @@ impl CudaBackend {
                 include_str!("cuda/residual.cu"),
                 include_str!("cuda/residual_tile.cu")
             ),
-            CudaMatmul::ResidualMma3Research | CudaMatmul::Int8Prefill => format!(
+            CudaMatmul::ResidualMma3Research | CudaMatmul::Int8Prefill | CudaMatmul::Int8Fast => format!(
                 // Expert C3 MMQ, Qwen3-30B 2.9k prompt: NVRTC 12.8 PTX is fastest with
                 // 2 blocks/SM (348 ms TTFT; 1 block 374 ms), NVRTC 13.3 spills 3.7x
                 // more at 128 registers (420 ms) and is fastest with 1 block (352 ms).
@@ -1111,6 +1143,29 @@ impl CudaBackend {
             }
             if options.matmul == CudaMatmul::ResidualInt8Research {
                 for name in ["residual_quantize32", "residual_matmul32"] {
+                    functions.insert(name, module.load_function(name).map_err(failure)?);
+                }
+            }
+            if options.matmul == CudaMatmul::Int8Fast {
+                for name in [
+                    "quantize32_q8",
+                    "swiglu_quantize32_q8",
+                    "head_norm_rotary",
+                    "prefill_matmul_tf32",
+                    "mmq_c1_rows32",
+                    "mmq_c1_rows32_splitk",
+                    "mmq_c1_tokens128_splitk",
+                    "mmq_splitk_reduce",
+                    "mmq_c1_tokens128",
+                    "mmq_c1_grouped",
+                    "mmq_c1_grouped64",
+                    "mmq_c1_grouped128",
+                    "group_experts_fast64",
+                    "group_experts_fast128",
+                    "attention_prefill_mma_fast",
+                    "attention_half_kv",
+                    "attention_prefill_mma_half_fast",
+                ] {
                     functions.insert(name, module.load_function(name).map_err(failure)?);
                 }
             }

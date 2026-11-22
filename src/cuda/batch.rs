@@ -58,19 +58,23 @@ macro_rules! prepare_residual {
     ($backend:ident,$input:expr,$count:expr,$pair:expr) => {{
         let count: i32 = $count;
         if $backend.matmul.integer_mma() {
-            let pair = $pair && $backend.matmul == CudaMatmul::Int8Prefill;
+            let format = match $backend.matmul {
+                CudaMatmul::Int8Fast => ResidualFormat::Single,
+                CudaMatmul::Int8Prefill if $pair => ResidualFormat::Pair,
+                _ => ResidualFormat::Three,
+            };
             let work = $backend
                 .work
                 .residual_mma3
                 .as_mut()
                 .ok_or_else(|| failure("residual MMA3 workspace missing"))?;
-            work.pair = pair;
+            work.format = format;
             launch!(
                 $backend,
-                if pair {
-                    "quantize32_residual_pair"
-                } else {
-                    "residual_quantize32_precise3"
+                match format {
+                    ResidualFormat::Single => "quantize32_q8",
+                    ResidualFormat::Pair => "quantize32_residual_pair",
+                    ResidualFormat::Three => "residual_quantize32_precise3",
                 },
                 ((count as u32).div_ceil(256), 1, 1),
                 $input,
@@ -148,25 +152,38 @@ macro_rules! project_residual {
                 launch!($backend,"residual_splitk_reduce",((count as u32).div_ceil(256), 1, 1);256,
                     &*partials,$output,&count_i32,&splits_i32,&mut $backend.work.status);
             } else {
-                let (kernel, grid, threads) = if $backend.matmul == CudaMatmul::Int8Prefill {
+                let (kernel, grid, threads) = if $backend.matmul.tensor_prefill() {
                     let row_tiles = (tensor.rows as u32).div_ceil(128);
-                    // Measured on Qwen3-30B (2.9k prompt): 64-token tiles for wide
-                    // projections, 32 for few-row ones (K/V, attention output).
-                    let pair = $backend.work.residual_mma3.as_ref().is_some_and(|w| w.pair);
-                    let (shape, columns) = if grouped != 0 {
-                        (0, $slots)
-                    } else if row_tiles * (tokens as u32).div_ceil(64) >= 256 {
-                        (1, (tokens as u32).div_ceil(64))
-                    } else {
-                        (2, (tokens as u32).div_ceil(32))
-                    };
-                    let name = match (pair, shape) {
-                        (true, 0) => "mmq_s16_grouped",
-                        (true, 1) => "mmq_s16",
-                        (true, _) => "mmq_s16_rows32",
-                        (false, 0) => "mmq_c3_grouped",
-                        (false, 1) => "mmq_c3",
-                        (false, _) => "mmq_c3_rows32",
+                    let format = $backend
+                        .work
+                        .residual_mma3
+                        .as_ref()
+                        .map_or(ResidualFormat::Three, |w| w.format);
+                    let tiles = |bn: u32| (tokens as u32).div_ceil(bn);
+                    // Measured on Qwen3-30B (2.9k prompt). int8-prefill: 64-token tiles
+                    // for wide projections, 32 for few-row ones (K/V, attention output).
+                    // int8-fast: 128-token tiles without register prefetch once there
+                    // are >= 100 64-token blocks (Q/K/V/O 48 -> 38 ms), expert tiles
+                    // as grouped (group_tile 32/64/128).
+                    let (name, columns) = match format {
+                        ResidualFormat::Single if grouped != 0 => (
+                            match $backend.work.group_tile {
+                                128 => "mmq_c1_grouped128",
+                                64 => "mmq_c1_grouped64",
+                                _ => "mmq_c1_grouped",
+                            },
+                            $slots,
+                        ),
+                        ResidualFormat::Single if row_tiles * tiles(64) >= 100 => {
+                            ("mmq_c1_tokens128", tiles(128))
+                        }
+                        ResidualFormat::Single => ("mmq_c1_rows32", tiles(32)),
+                        ResidualFormat::Pair if grouped != 0 => ("mmq_s16_grouped", $slots),
+                        ResidualFormat::Three if grouped != 0 => ("mmq_c3_grouped", $slots),
+                        ResidualFormat::Pair if row_tiles * tiles(64) >= 256 => ("mmq_s16", tiles(64)),
+                        ResidualFormat::Three if row_tiles * tiles(64) >= 256 => ("mmq_c3", tiles(64)),
+                        ResidualFormat::Pair => ("mmq_s16_rows32", tiles(32)),
+                        ResidualFormat::Three => ("mmq_c3_rows32", tiles(32)),
                     };
                     (name, (row_tiles, columns, 1), 256)
                 } else if cfg!(feature = "cuda-mma3-wide-rows-research")
@@ -177,10 +194,47 @@ macro_rules! project_residual {
                 } else {
                     ("residual_matmul_mma3", grid, 128)
                 };
-                launch!($backend,kernel,grid;threads,
-                    &tensor.bytes,&tensor.kind,&work.values,&work.scales,&work.sums,
-                    $output,&tensor.width,&tensor.rows,&tokens,groups,&used,&grouped,&major,
-                    &mut $backend.work.status);
+                let scratch_floats = scratch.as_ref().map_or(0, |buf| buf.len());
+                let splits = match kernel {
+                    "mmq_c1_rows32" => fast_splits(
+                        tensor.width,
+                        tensor.rows,
+                        tokens,
+                        grid.0 * grid.1,
+                        scratch_floats,
+                    ),
+                    "mmq_c1_tokens128" => wave_splits(
+                        tensor.width,
+                        tensor.rows,
+                        tokens,
+                        grid.0 * grid.1,
+                        scratch_floats,
+                    ),
+                    _ => 1,
+                };
+                let split_kernel = if kernel == "mmq_c1_tokens128" {
+                    "mmq_c1_tokens128_splitk"
+                } else {
+                    "mmq_c1_rows32_splitk"
+                };
+                if splits > 1 {
+                    let partials = scratch.as_deref_mut()
+                        .ok_or_else(||failure("MMQ split-k scratch missing"))?;
+                    let splits_i32 = splits as i32;
+                    let count = (tokens as usize) * (tensor.rows as usize);
+                    let count_i32 = count as i32;
+                    launch!($backend,split_kernel,(grid.0, grid.1, splits);threads,
+                        &tensor.bytes,&tensor.kind,&work.values,&work.scales,&work.sums,
+                        &mut *partials,&tensor.width,&tensor.rows,&tokens,groups,&used,&grouped,
+                        &major,&mut $backend.work.status);
+                    launch!($backend,"mmq_splitk_reduce",((count as u32).div_ceil(256), 1, 1);256,
+                        &*partials,$output,&count_i32,&splits_i32,&mut $backend.work.status);
+                } else {
+                    launch!($backend,kernel,grid;threads,
+                        &tensor.bytes,&tensor.kind,&work.values,&work.scales,&work.sums,
+                        $output,&tensor.width,&tensor.rows,&tokens,groups,&used,&grouped,&major,
+                        &mut $backend.work.status);
+                }
             }
         } else {
             let work = $backend.work.residual_int8.as_ref()
@@ -231,7 +285,8 @@ impl CudaBackend {
             CudaMatmul::F32Tiled
             | CudaMatmul::ResidualInt8Research
             | CudaMatmul::ResidualMma3Research
-            | CudaMatmul::Int8Prefill => {
+            | CudaMatmul::Int8Prefill
+            | CudaMatmul::Int8Fast => {
                 ("prefill_matmul", "grouped_matmul_tiled", 1, 4, 32)
             }
             CudaMatmul::Tf32x3Tiled => ("prefill_matmul", "grouped_matmul_tf32x3_tiled", 1, 4, 128),
@@ -335,7 +390,11 @@ impl CudaBackend {
                         .all(|t| matches!(t.kind, 12 | 14))
                 });
             let (grouped_projection, group_row_tile, group_tile, group_threads) =
-                if register_groups {
+                if let (true, Some(tile)) =
+                    (integer_groups && matmul == CudaMatmul::Int8Fast, fast_group_tile(s, n))
+                {
+                    ("grouped_matmul_unroll8", 32, tile, 128)
+                } else if register_groups {
                     ("gemm_packed_grouped", 64, 32, 128)
                 } else if register_groups || integer_groups {
                     ("grouped_matmul_unroll8", 32, 32, 128)
@@ -447,6 +506,32 @@ impl CudaBackend {
                 (&l.q_norm, &mut self.work.q, qw),
                 (&l.k_norm, &mut self.work.k, kw),
             ] {
+                if let (Some(norm), true) = (
+                    norm,
+                    matmul == CudaMatmul::Int8Fast
+                        && !(olmo2 || olmoe)
+                        && position_embedding.is_none()
+                        && embedding_norm.is_none()
+                        && s.rotary_dim == s.dim
+                        && self.weights.rope_factors.is_none()
+                        && dim % 64 == 0
+                        && dim <= 2048,
+                ) {
+                    launch!(
+                        self,
+                        "head_norm_rotary",
+                        ((size / dim * n) as u32, 1, 1); (dim / 2) as u32,
+                        &mut *values,
+                        &norm.bytes,
+                        &dim,
+                        &s.epsilon,
+                        &size,
+                        &pos,
+                        &rope_base,
+                        &neox
+                    );
+                    continue;
+                }
                 if let Some(norm) = norm {
                     let norm_width = if olmo2 || olmoe { size } else { dim };
                     launch!(
@@ -561,9 +646,7 @@ impl CudaBackend {
                 );
             } else if let (Some(halves), true) = (
                 self.work.attention_half.as_mut(),
-                self.matmul == CudaMatmul::Int8Prefill
-                    && dim == 128
-                    && heads == 8 * kv_heads,
+                self.matmul.tensor_prefill() && dim == 128 && heads == 8 * kv_heads,
             ) {
                 // int8-prefill: split K/V into FP16 hi/lo planes once per layer, then
                 // FP16 tensor-core attention, 16 tokens x 8 heads per block.
@@ -583,7 +666,11 @@ impl CudaBackend {
                 // 8 warps (16 tokens) per block: 4 warps measured equal, 2 slower.
                 launch!(
                     self,
-                    "attention_prefill_mma_half",
+                    if self.matmul == CudaMatmul::Int8Fast {
+                        "attention_prefill_mma_half_fast"
+                    } else {
+                        "attention_prefill_mma_half"
+                    },
                     (kv_heads as u32, (n as u32).div_ceil(16), 1); 256,
                     &self.work.q,
                     &*halves,
@@ -605,10 +692,15 @@ impl CudaBackend {
                 // 4 warps per token (2 query rows each) measured fastest: 369 -> 260 ms
                 // of attention at 2.9k tokens with 512-token chunks.
                 // FP16 hi/lo tensor-core attention (int8-prefill) needs GQA group 8.
-                let (name, grid_y, threads) = if self.matmul == CudaMatmul::Int8Prefill
+                let (name, grid_y, threads) = if self.matmul.tensor_prefill()
                     && heads == 8 * kv_heads
                 {
-                    ("attention_prefill_mma", (n as u32).div_ceil(8), 128)
+                    let name = if self.matmul == CudaMatmul::Int8Fast {
+                        "attention_prefill_mma_fast"
+                    } else {
+                        "attention_prefill_mma"
+                    };
+                    (name, (n as u32).div_ceil(8), 128)
                 } else {
                     ("attention_prefill_flash4", (n as u32).div_ceil(4), 512)
                 };
@@ -792,10 +884,18 @@ impl CudaBackend {
             }
             let gate = gate.expect("gated CUDA layer");
             if let Some(t) = &l.router {
+                // int8-fast routes in TF32 tensor cores as llama.cpp (cuBLAS TF32), one
+                // warp (16 rows) per block: Qwen3-30B 2.9k prompt 17 -> ~4 ms. F32 stays
+                // faster up to ~550 tokens.
+                let (name, grid, threads) = if self.matmul == CudaMatmul::Int8Fast && n >= 1024 {
+                    ("prefill_matmul_tf32", ((t.rows as u32).div_ceil(16), (n as u32).div_ceil(8), 1), 32)
+                } else {
+                    ("prefill_matmul", (t.rows as u32, (n as u32).div_ceil(4), 1), 256)
+                };
                 launch!(
                     self,
-                    "prefill_matmul",
-                    (t.rows as u32, (n as u32).div_ceil(4), 1),
+                    name,
+                    grid; threads,
                     &t.bytes,
                     &t.kind,
                     &self.work.normalized,
@@ -886,7 +986,10 @@ impl CudaBackend {
                         &self.work.ids, &*counts, &mut *groups, &assignments, &experts, &slots);
                 } else {
                     // GROUP_FAST_EXPERTS in gemm.cu bounds the parallel grouping.
+                    self.work.group_tile = group_tile;
                     let (name, threads) = match group_tile {
+                        64 => ("group_experts_fast64", 1024),
+                        128 => ("group_experts_fast128", 1024),
                         32 if experts <= 256 => ("group_experts_fast32", 1024),
                         32 => ("group_experts_reg32", 256),
                         8 => ("group_experts_tiled", 256),
@@ -984,6 +1087,34 @@ impl CudaBackend {
                 &self.work.up,
                 s.hidden * s.used
             );
+            let t = &l.down;
+            let quantized_down = integer_groups || (s.experts == 0 && residual_projection(matmul, t, n));
+            // int8-fast: SwiGLU writes the q8 down-projection input directly.
+            let fused_down = quantized_down
+                && matmul == CudaMatmul::Int8Fast
+                && gemma.is_none()
+                && self.diagnostic.is_none()
+                && activated % 32 == 0;
+            if fused_down {
+                let work = self
+                    .work
+                    .residual_mma3
+                    .as_mut()
+                    .ok_or_else(|| failure("residual MMA3 workspace missing"))?;
+                work.format = ResidualFormat::Single;
+                launch!(
+                    self,
+                    "swiglu_quantize32_q8",
+                    vector(activated),
+                    &self.work.gate,
+                    &self.work.up,
+                    &mut work.values,
+                    &mut work.scales,
+                    &mut work.sums,
+                    &activated,
+                    &mut self.work.status
+                );
+            } else {
             launch!(
                 self,
                 if gemma.is_some() {
@@ -1005,13 +1136,15 @@ impl CudaBackend {
                 &self.work.gate,
                 s.hidden * s.used
             );
-            let t = &l.down;
-            if integer_groups || (s.experts == 0 && residual_projection(matmul, t, n)) {
-                prepare_residual!(
-                    self,
-                    &self.work.gate,
-                    n * t.width * if integer_groups { used } else { 1 }
-                );
+            }
+            if quantized_down {
+                if !fused_down {
+                    prepare_residual!(
+                        self,
+                        &self.work.gate,
+                        n * t.width * if integer_groups { used } else { 1 }
+                    );
+                }
                 project_residual!(
                     self,
                     t,
@@ -1140,5 +1273,56 @@ mod tests {
             assert!(!reference_dense_shape(selected, 12, width, rows, 512));
         }
     }
+}
+
+/// int8-fast expert tile once experts average 16 / 128 assignments (fewer weight
+/// re-reads than 32-assignment tiles): Qwen3-30B 0.55k prompt 53 -> 52 ms, 1.4k
+/// 116 -> 108 ms, 2.9k 243 -> 230 (64) -> 226 ms (128).
+/// GROUP_FAST_EXPERTS bounds group_experts_fast*.
+fn fast_group_tile(s: &Spec, tokens: i32) -> Option<usize> {
+    let average = tokens as usize * s.used / s.experts.max(1);
+    match average {
+        _ if s.experts > 256 => None,
+        128.. => Some(128),
+        16.. => Some(64),
+        _ => None,
+    }
+}
+
+/// K splits for int8-fast few-block dense MMQ (short prompts): double while the grid
+/// stays under two waves of 170 SMs, each split keeps whole 256-value Q4_K/Q6_K
+/// blocks, and the partials fit the scratch buffer.
+fn fast_splits(width: i32, rows: i32, tokens: i32, blocks: u32, scratch_floats: usize) -> u32 {
+    let max_blocks: u32 = 340;
+    let mut splits = 1u32;
+    while width > 0
+        && (width as u32) % (splits * 2 * 256) == 0
+        && blocks * splits * 2 <= max_blocks
+        && (splits as usize * 2) * tokens.max(0) as usize * rows.max(0) as usize <= scratch_floats
+    {
+        splits *= 2;
+    }
+    splits
+}
+
+/// K splits that fill the last wave of 1-block/SM 128-token MMQ tiles (RTX 5090:
+/// 170 SMs; the 2.9k-prompt O projection has 368 blocks = 2.2 waves): the split
+/// count minimizing waves / splits, ties to fewer splits, partials in scratch.
+fn wave_splits(width: i32, rows: i32, tokens: i32, blocks: u32, scratch_floats: usize) -> u32 {
+    let sms: u32 = 170;
+    let mut best = (blocks.div_ceil(sms) as f32, 1u32);
+    for splits in [2u32, 4] {
+        if width <= 0
+            || (width as u32) % (splits * 256) != 0
+            || splits as usize * tokens.max(0) as usize * rows.max(0) as usize > scratch_floats
+        {
+            continue;
+        }
+        let cost = (blocks * splits).div_ceil(sms) as f32 / splits as f32 * 1.05;
+        if cost < best.0 {
+            best = (cost, splits);
+        }
+    }
+    best.1
 }
 

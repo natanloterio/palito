@@ -1516,3 +1516,46 @@ palito chat --model /path/to/model.gguf
 `chat` on CUDA defaults to `--cuda-matmul int8-fast` (below) with the decode graph and prefill chunks of up to 4096 tokens; GPUs below sm_80 fall back to `f32-tiled`, and models whose weights only the reference path supports (Q5_K, e.g. Phi-3-mini-128k Q4_K_M) to `f32` without the decode graph, each with a notice. `--cuda-matmul int8-prefill` keeps the more precise tensor-core prefill: INT8 MMA projections, FP16 hi/lo attention over K/V converted once per layer; attention projections use a two-plane residual pair with an integer factor, FFN/expert projections three residual components; decode is the `f32-tiled` path. Its logits pass a relaxed gate against the F32 oracle (same argmax, cos >= 0.99999, max_abs <= 0.15; 0.09 on a 256-token real-text prompt); Qwen3-30B-A3B 2.9k prompt on an RTX 5090: 0.35 s to the first token. Pass `--cuda-matmul f32-tiled` for F32 prefill.
 
 `--cuda-matmul int8-fast` (chat default) runs prefill at llama.cpp's precision: one 8-bit plane per 32 activations (as `q8_1`), single FP16 attention and a TF32 MoE router. Q4_K projections run in cp.async double-buffered INT8 MMA tiles, and each expert's assignments fill whole 128-token tiles plus a 64- and/or 32-token remainder tile. On Qwen3-30B-A3B Q4_K_M (RTX 5090) it reaches the first token of a 2.9k prompt in ~0.16 s (llama.cpp 0.183 s; `int8-prefill` 0.35 s), 1.4k in ~0.086 s (llama.cpp 0.090 s), 0.55k in ~0.043 s (llama.cpp 0.045 s). Its logits are about 1 off F32 (max_abs 0.86-0.97, cos ~0.99966 on a 256-token real-text prompt), so generated text can differ from the F32 profiles.
+
+## Long-context comparison with llama.cpp
+
+`scripts/bench_long_context.py` measures time to first token (TTFT) and decode speed for `palito chat` and `llama-server` with the same message at about 0.5k, 2.9k, 10k and 40k prompt tokens. The message is pinned repository text (four Markdown files at commit `2ded846`, newlines flattened because `chat` reads one message per line), cut to the target with `palito tokenize`. Both engines apply the GGUF chat template (thinking on), decode greedily and generate 256 tokens per request (every sample reached 256). Each engine loads the model once per configuration. One warm-up request per size is discarded, then 3 measured requests follow, and the table shows medians. Every phase holds `/tmp/palito-gpu.lock` (flock), and each engine exits before the lock is released, so the two engines are never loaded at the same time. Raw samples go to `target/bench-long-context/results.json`.
+
+```sh
+python3 scripts/bench_long_context.py            # full run, ~10 min
+python3 -m unittest discover -s scripts -p 'test_bench_long_context.py'
+```
+
+Conditions (2026-11-22): RTX 5090 (driver 615.71.09), i9-14900K, Qwen3-30B-A3B Q4_K_M.
+- **Palito:** 0.5.0 (`~/.local/bin/palito`), `chat --backend cuda --tokens 256 --stats --no-stream`, defaults (`int8-fast`, decode graph, context 40,960, F32 KV), one `/reset` between requests and no prefix cache. TTFT and tok/s come from `--stats`.
+- **llama.cpp:** commit `6b01a4767` (build 12434, `target/benchmark-llama-cuda13`), `llama-server -c 40960 -ngl 99 -np 1 --jinja --reasoning-format none` plus the flags in the column header, requested through `/v1/chat/completions` with `temperature 0`, `top_k 1` and `cache_prompt false`. TTFT is `timings.prompt_ms` and decode is `timings.predicted_per_second`.
+- Prompt tokens are the templated counts that llama.cpp reports. Palito receives the same message text, whose untemplated size `palito tokenize` cut to the target.
+
+| Prompt tokens | Palito TTFT | Palito decode | llama.cpp `-fa off` TTFT | `-fa off` decode | `-fa on` TTFT | `-fa on` decode | `-fa on -ctk q8_0 -ctv q8_0` TTFT | q8_0 KV decode |
+|---|---|---|---|---|---|---|---|---|
+| 507 | 49 ms | 339 tok/s | 39 ms | 305 tok/s | 36 ms | 336 tok/s | 36 ms | 311 tok/s |
+| 2,907 | 169 ms | 291 tok/s | 325 ms | 258 tok/s | 206 ms | 304 tok/s | 218 ms | 272 tok/s |
+| 10,003 | 777 ms | 221 tok/s | 1,772 ms | 186 tok/s | 850 ms | 272 tok/s | 870 ms | 232 tok/s |
+| 40,001 | 6,421 ms | 107 tok/s | 22,268 ms | 76 tok/s | 5,595 ms | 179 tok/s | 5,715 ms | 125 tok/s |
+
+Run-to-run spread was at most 5% for decode (llama.cpp q8_0 KV at 0.5k) and 8% for TTFT (llama.cpp `-fa off` at 2.9k). llama.cpp's default `-fa auto` enables flash attention on this GPU, so the `-fa on` columns show what it does out of the box.
+
+**Reading:**
+- **Prefill:** Palito's TTFT is close to llama.cpp with flash attention: ahead up to 10k, 15% behind at 40k.
+- **Decode against plain llama.cpp:** Palito is ahead of llama.cpp without flash attention at every length (107 against 76 tok/s at 40k).
+- **Decode against llama.cpp's default:** with flash attention, llama.cpp loses much less speed as the context grows: 179 against 107 tok/s at 40k (1.68x) and 272 against 221 at 10k (1.23x).
+
+The context-dependent part of a decode step is the step time minus the near-empty step time:
+
+| | step at 40k | near-empty step | context-dependent part |
+|---|---|---|---|
+| Palito | 9.38 ms | 2.95 ms | 6.4 ms |
+| llama.cpp `-fa on` | 5.58 ms | 2.98 ms | 2.6 ms |
+
+Assuming Qwen3-30B-A3B's attention geometry of 48 layers × 4 KV heads × 128 dimensions for both K and V (an estimate; not re-read from the GGUF for this run), each step reads 7.9 GB of F32 KV at 40k in Palito and 3.9 GB of F16 KV in llama.cpp. That works out to about 1.2 and 1.5 TB/s. So most of the gap is the bytes Palito reads, and a smaller part is the kernel.
+
+**Conclusion:** long-context decode is worth optimizing, and the bytes per KV element are the lever.
+- **F16 KV with a flash-decoding (split-K) attention kernel:** this is the change worth making, and it would only apply to `int8-fast`, whose prefill already uses FP16 attention. It halves the KV traffic, which should bring 40k decode from 107 toward the 150–180 tok/s range (an estimate, not measured).
+- **Not worth it for speed:** q8_0 KV. On this GPU it is slower than F16 KV in llama.cpp (125 against 179 tok/s at 40k), because dequantizing costs more than the saved bandwidth. It is only worth it to fit longer contexts in memory.
+- **`f32` and `f32-tiled`:** F16 KV would change their output, so these profiles must keep F32 KV.
+- **Prefill:** prefill attention needs no change for these lengths.

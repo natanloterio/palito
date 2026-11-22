@@ -622,6 +622,19 @@ macro_rules! launch {
     }};
 }
 
+/// launch! with the kernel's dynamic shared memory (shared::configure), if any.
+macro_rules! launch_shared {
+    ($backend:ident, $name:expr, $grid:expr; $threads:expr, $($arg:expr),+ $(,)?) => {{
+        let name: &str = $name;
+        let shared_mem_bytes = $backend.dynamic_shared.get(name).copied().unwrap_or(0);
+        let cfg = LaunchConfig { grid_dim: $grid, block_dim: ($threads, 1, 1), shared_mem_bytes };
+        let mut args = $backend.stream.launch_builder(&$backend.functions[name]);
+        $(args.arg($arg);)+
+        // As launch!; the size is the kernel's opted-in dynamic shared memory.
+        unsafe { args.launch(cfg) }.map_err(failure)?;
+    }};
+}
+
 macro_rules! launch_position {
     ($backend:ident, $device:expr, $name:literal, $dynamic:literal, $grid:expr,
      [$($before:expr),*], $value:expr, [$($after:expr),*]) => {{
@@ -862,6 +875,7 @@ pub mod reference;
 mod residual;
 #[cfg(test)]
 mod residual_precise;
+mod shared;
 
 pub struct CudaBackend {
     // Destroy captured references before their buffers and modules.
@@ -869,6 +883,8 @@ pub struct CudaBackend {
     weights: Weights<DeviceTensor>,
     stream: Arc<CudaStream>,
     functions: HashMap<&'static str, CudaFunction>,
+    /// Dynamic shared bytes per kernel (shared::configure); absent means none.
+    dynamic_shared: HashMap<&'static str, u32>,
     work: Workspace,
     keys: Vec<kv::KvBuffer>,
     values: Vec<kv::KvBuffer>,
@@ -1111,6 +1127,7 @@ impl CudaBackend {
         )?;
         let module = context.load_module(ptx).map_err(failure)?;
         let mut functions = HashMap::new();
+        let mut dynamic_shared = HashMap::new();
         for name in [
             "embedding",
             "check_finite",
@@ -1212,6 +1229,7 @@ impl CudaBackend {
                     "mmq_c1_pipe32",
                     "mmq_c1_pipe32_splitk",
                     "router_tf32_tiled",
+                    "router_tf32_small",
                     "group_experts_mixed",
                     "attention_prefill_mma_fast_f16",
                     "attention_decode_mma_f16",
@@ -1221,6 +1239,7 @@ impl CudaBackend {
                 ] {
                     functions.insert(name, module.load_function(name).map_err(failure)?);
                 }
+                dynamic_shared = shared::configure(&context, &module, &functions)?;
             }
             if options.matmul == CudaMatmul::Int8Prefill {
                 for name in [
@@ -1454,6 +1473,7 @@ impl CudaBackend {
             weights,
             stream,
             functions,
+            dynamic_shared,
             work,
             keys,
             values,
@@ -1814,7 +1834,10 @@ impl CudaBackend {
                     threads = 32;
                     combine_threads = 1024;
                     (
-                        pick("attention_decode_mma_decode_f16", "attention_decode_mma_f16"),
+                        pick(
+                            "attention_decode_mma_decode_f16",
+                            "attention_decode_mma_f16",
+                        ),
                         pick("attention_combine_rows_decode", "attention_combine_rows"),
                         (kv_heads as u32, row_chunks as u32, 1),
                         row_chunks,

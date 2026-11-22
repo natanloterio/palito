@@ -699,8 +699,13 @@ impl CudaBackend {
                 // FP16 hi/lo tensor-core attention (int8-prefill) needs GQA group 8.
                 let (name, grid_y, threads) = if self.matmul.kv_f16() && heads == 8 * kv_heads {
                     // int8-fast: single FP16 attention straight from the FP16 K/V
-                    // cache, 16 tokens x 8 heads per block.
-                    ("attention_prefill_mma_fast_f16", (n as u32).div_ceil(16), 256)
+                    // cache, 16 tokens x 8 heads per block; 8 tokens while that leaves
+                    // fewer than ATTENTION_FAST_BLOCKS blocks.
+                    if kv_heads as u32 * (n as u32).div_ceil(16) >= ATTENTION_FAST_BLOCKS {
+                        ("attention_prefill_mma_fast_f16", (n as u32).div_ceil(16), 256)
+                    } else {
+                        ("attention_prefill_mma_fast4_f16", (n as u32).div_ceil(8), 128)
+                    }
                 } else if self.matmul.tensor_prefill() && heads == 8 * kv_heads {
                     ("attention_prefill_mma", (n as u32).div_ceil(8), 128)
                 } else {
@@ -891,31 +896,52 @@ impl CudaBackend {
                 // 5.3 -> ~0.5 ms, 0.55k (F32 before) 3.5 -> ~0.3 ms; F32 is faster
                 // below ~64 tokens. Other kinds: one warp (16 rows) per block.
                 let tiled = t.kind == 0 && t.width % 32 == 0;
-                let wide = (t.rows as u32).div_ceil(64) * (n as u32).div_ceil(16);
                 let (name, grid, threads) = if self.matmul == CudaMatmul::Int8Fast && n >= 64 && tiled {
-                    // Few 64x16 tiles leave SMs idle: 32x8 tiles (same per-output order).
-                    if wide >= ROUTER_WIDE_BLOCKS {
-                        ("router_tf32_tiled", ((t.rows as u32).div_ceil(64), (n as u32).div_ceil(16), 1), 256)
-                    } else {
-                        ("router_tf32_small", ((t.rows as u32).div_ceil(32), (n as u32).div_ceil(8), 1), 64)
-                    }
+                    ("router_tf32_tiled", ((t.rows as u32).div_ceil(64), (n as u32).div_ceil(16), 1), 256)
                 } else if self.matmul == CudaMatmul::Int8Fast && n >= 1024 {
                     ("prefill_matmul_tf32", ((t.rows as u32).div_ceil(16), (n as u32).div_ceil(8), 1), 32)
                 } else {
                     ("prefill_matmul", (t.rows as u32, (n as u32).div_ceil(4), 1), 256)
                 };
-                launch!(
-                    self,
-                    name,
-                    grid; threads,
-                    &t.bytes,
-                    &t.kind,
-                    &self.work.normalized,
-                    &mut self.work.router,
-                    &t.width,
-                    &t.rows,
-                    &n
-                );
+                let splits = if name == "router_tf32_tiled" {
+                    router_splits(t.width, t.rows, n, grid.0 * grid.1, self.work.projected.len())
+                } else {
+                    1
+                };
+                if splits > 1 {
+                    // Few tiles: K splits into `projected` (free between the attention
+                    // output and the experts), summed in order.
+                    launch!(
+                        self,
+                        name,
+                        (grid.0, grid.1, splits); threads,
+                        &t.bytes,
+                        &t.kind,
+                        &self.work.normalized,
+                        &mut self.work.projected,
+                        &t.width,
+                        &t.rows,
+                        &n
+                    );
+                    let count = n * t.rows;
+                    let splits = splits as i32;
+                    launch!(self, "mmq_splitk_reduce", ((count as u32).div_ceil(256), 1, 1); 256,
+                        &self.work.projected, &mut self.work.router, &count, &splits,
+                        &mut self.work.status);
+                } else {
+                    launch!(
+                        self,
+                        name,
+                        grid; threads,
+                        &t.bytes,
+                        &t.kind,
+                        &self.work.normalized,
+                        &mut self.work.router,
+                        &t.width,
+                        &t.rows,
+                        &n
+                    );
+                }
                 capture_projection!(
                     self,
                     index,
@@ -1299,8 +1325,27 @@ mod tests {
 const MIX_SMALL: usize = 32;
 const MIX_LARGE: usize = 96;
 
-/// int8-fast router: 64x16-tile blocks below which the 32x8 tiles are used.
-const ROUTER_WIDE_BLOCKS: u32 = 512;
+/// int8-fast prefill attention: 16-token blocks below which 8-token blocks are used
+/// (two waves of 170 SMs).
+const ATTENTION_FAST_BLOCKS: u32 = 340;
+
+/// K splits for the int8-fast router (router_tf32_tiled): double while the grid
+/// stays within ROUTER_SPLIT_BLOCKS, each split keeps whole 32-wide K steps, and
+/// the partials fit `scratch` floats. Qwen3-30B 0.5k: 64 tiles stream 2048 columns
+/// through 64 SMs (33 us); 8 splits take 13 us (with the reduce).
+const ROUTER_SPLIT_BLOCKS: u32 = 512;
+
+fn router_splits(width: i32, rows: i32, tokens: i32, blocks: u32, scratch: usize) -> u32 {
+    let mut splits = 1u32;
+    while width > 0
+        && (width as u32) % (splits * 2 * 32) == 0
+        && blocks * splits * 2 <= ROUTER_SPLIT_BLOCKS
+        && (splits as usize * 2) * tokens.max(0) as usize * rows.max(0) as usize <= scratch
+    {
+        splits *= 2;
+    }
+    splits
+}
 
 /// Mixed expert tiles once experts average MIX_MIN_AVERAGE assignments; below,
 /// 32-tiles (128-wide Q4_K K steps). Qwen3-30B TTFT, 32-tiles / mixed: 0.5k 37 / 44,

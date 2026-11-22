@@ -310,52 +310,53 @@ extern "C" __global__ void grouped_matmul_tf32x3_tiled(const u8 *w, int kind, co
 }
 
 // int8-fast MoE router for F32 weights: prefill_matmul_tf32<0> per warp tile (same
-// m16n8k8 order over K, so identical results) with (16 WR) rows x (8 WT) tokens per
-// (32 WR WT)-thread block and both operands staged by a two-stage cp.async pipeline.
-// grid = (ceil(rows / (16 WR)), ceil(tokens / (8 WT))); width % 32 == 0.
+// m16n8k8 order over K, so identical results) with 64 rows x 16 tokens per
+// 256-thread block and both operands staged by a two-stage cp.async pipeline.
+// grid = (ceil(rows / 64), ceil(tokens / 16), splits); width % (32 splits) == 0.
+// With gridDim.z = splits > 1, block z covers width / splits columns and
+// writes partials to y + z * tokens * rows (mmq_splitk_reduce sums them in order):
+// few tiles otherwise stream all of K through few SMs.
 #if __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void router_copy16(float *dst, const float *src, bool valid) {
     unsigned int d = (unsigned int)__cvta_generic_to_shared(dst);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(valid ? 16 : 0) : "memory");
 }
 
-template<int WR, int WT, int STAGES>
 __device__ __forceinline__ void router_tf32_impl(const float *w, const float *x, float *y,
                                                  int width, int rows, int tokens) {
-    constexpr int KS = 32, STRIDE = KS + 4, R = 16 * WR, T = 8 * WT, THREADS = 32 * WR * WT;
-    __shared__ __align__(16) float a[STAGES][R][STRIDE], b[STAGES][T][STRIDE];
+    constexpr int KS = 32, STRIDE = KS + 4;
+    __shared__ __align__(16) float a[2][64][STRIDE], b[2][16][STRIDE];
     int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, group = lane / 4, thread = lane % 4;
-    int first_row = blockIdx.x * R, first_token = blockIdx.y * T;
-    int warp_row = (warp % WR) * 16, warp_token = (warp / WR) * 8;
-    int steps = width / KS;
-    // Every call commits a group (empty past the end) so wait_group counts stay fixed.
-    auto issue = [&](int step) {
-        if (step < steps) {
-            int stage = step % STAGES, k = step * KS;
-            #pragma unroll
-            for (int i = tid; i < R * (KS / 4); i += THREADS) {
-                int r = i / (KS / 4), c = i % (KS / 4);
-                bool valid = first_row + r < rows;
-                router_copy16(&a[stage][r][c * 4], w + (u64)(valid ? first_row + r : 0) * width + k + c * 4, valid);
-            }
-            #pragma unroll
-            for (int i = tid; i < T * (KS / 4); i += THREADS) {
-                int t = i / (KS / 4), c = i % (KS / 4);
-                bool valid = first_token + t < tokens;
-                router_copy16(&b[stage][t][c * 4], x + (u64)(valid ? first_token + t : 0) * width + k + c * 4, valid);
-            }
+    int first_row = blockIdx.x * 64, first_token = blockIdx.y * 16;
+    int warp_row = (warp % 4) * 16, warp_token = (warp / 4) * 8;
+    int span = width / gridDim.z, k_begin = blockIdx.z * span;
+    y += (u64)blockIdx.z * tokens * rows;
+    auto issue = [&](int stage, int k) {
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            int i = tid + j * 256, r = i / 8, c = i % 8;
+            bool valid = first_row + r < rows;
+            router_copy16(&a[stage][r][c * 4], w + (u64)(valid ? first_row + r : 0) * width + k + c * 4, valid);
+        }
+        if (tid < 128) {
+            int t = tid / 8, c = tid % 8;
+            bool valid = first_token + t < tokens;
+            router_copy16(&b[stage][t][c * 4], x + (u64)(valid ? first_token + t : 0) * width + k + c * 4, valid);
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
     };
     float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
-    #pragma unroll
-    for (int s = 0; s < STAGES - 1; s++) issue(s);
+    int steps = span / KS;
+    issue(0, k_begin);
     for (int step = 0; step < steps; step++) {
-        int stage = step % STAGES;
-        asm volatile("cp.async.wait_group %0;" :: "n"(STAGES - 2) : "memory");
+        int stage = step & 1;
+        if (step + 1 < steps) {
+            issue(stage ^ 1, k_begin + (step + 1) * KS);
+            asm volatile("cp.async.wait_group 1;" ::: "memory");
+        } else {
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+        }
         __syncthreads();
-        // The stage refilled here was consumed in the previous step (before the barrier).
-        issue(step + STAGES - 1);
         #pragma unroll
         for (int kk = 0; kk < KS; kk += 8) {
             unsigned int f[4];
@@ -370,6 +371,7 @@ __device__ __forceinline__ void router_tf32_impl(const float *w, const float *x,
                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
                 : "r"(f[0]), "r"(f[1]), "r"(f[2]), "r"(f[3]), "r"(b0), "r"(b1));
         }
+        __syncthreads();
     }
     float result[4] = {c0, c1, c2, c3};
     #pragma unroll
@@ -381,22 +383,10 @@ __device__ __forceinline__ void router_tf32_impl(const float *w, const float *x,
 }
 #endif
 
-// 64 rows x 16 tokens, 256 threads.
 extern "C" __global__ void __launch_bounds__(256)
 router_tf32_tiled(const float *w, int kind, const float *x, float *y, int width, int rows, int tokens) {
 #if __CUDA_ARCH__ >= 800
-    router_tf32_impl<4, 2, 2>(w, x, y, width, rows, tokens);
-#else
-    asm("trap;");
-#endif
-}
-
-#define ROUTER_SMALL_STAGES 6
-// 32 rows x 8 tokens, 64 threads, ROUTER_SMALL_STAGES-deep pipeline: 8x the blocks of router_tf32_tiled for short prompts.
-extern "C" __global__ void __launch_bounds__(64)
-router_tf32_small(const float *w, int kind, const float *x, float *y, int width, int rows, int tokens) {
-#if __CUDA_ARCH__ >= 800
-    router_tf32_impl<2, 1, ROUTER_SMALL_STAGES>(w, x, y, width, rows, tokens);
+    router_tf32_impl(w, x, y, width, rows, tokens);
 #else
     asm("trap;");
 #endif

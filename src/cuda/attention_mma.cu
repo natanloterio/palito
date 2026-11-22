@@ -391,11 +391,12 @@ attention_prefill_mma_half(const float *q, const unsigned short *halves, float *
 // cache into shared memory with cp.async, double buffered, so the next tile loads
 // while this one is computed. Blocks run last-token-first: the longest causal
 // spans start first and the short ones fill the tail.
+template<int WARPS>
 __device__ __forceinline__ void attention_prefill_fast_impl(
     const float *q, const kv_f16 *keys, const kv_f16 *values, float *output, int heads,
     int kv_heads, int tokens, int count) {
 #if __CUDA_ARCH__ >= 800
-    constexpr int WARPS = 8, THREADS = 32 * WARPS, GROUP = 8, K = FA_FAST_KEYS;
+    constexpr int THREADS = 32 * WARPS, GROUP = 8, K = FA_FAST_KEYS;
     constexpr int PIECES = K * FA_DIM / 8 / THREADS;
     static_assert(PIECES * THREADS == K * FA_DIM / 8, "THREADS must divide the tile");
     __shared__ __align__(16) unsigned short ks[2][K * FA_K_STRIDE];
@@ -568,7 +569,14 @@ __device__ __forceinline__ void attention_prefill_fast_impl(
 extern "C" __global__ void __launch_bounds__(256)
 attention_prefill_mma_fast_f16(const float *q, const kv_f16 *keys, const kv_f16 *values,
                                float *output, int heads, int kv_heads, int tokens, int count) {
-    attention_prefill_fast_impl(q, keys, values, output, heads, kv_heads, tokens, count);
+    attention_prefill_fast_impl<8>(q, keys, values, output, heads, kv_heads, tokens, count);
+}
+
+// 4 warps (8 tokens) per block: twice the blocks for short chunks.
+extern "C" __global__ void __launch_bounds__(128)
+attention_prefill_mma_fast4_f16(const float *q, const kv_f16 *keys, const kv_f16 *values,
+                                float *output, int heads, int kv_heads, int tokens, int count) {
+    attention_prefill_fast_impl<4>(q, keys, values, output, heads, kv_heads, tokens, count);
 }
 #endif
 

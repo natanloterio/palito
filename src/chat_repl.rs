@@ -41,19 +41,27 @@ struct Session {
     initial: Vec<Message>,
     history: Vec<Message>,
     context: usize,
-    max_tokens: u32,
+    /// Explicit --tokens; None generates until end of turn or a full context.
+    max_tokens: Option<u32>,
+    /// Context kept free for the reply when dropping old turns.
+    reserve: u32,
 }
 
 pub(crate) fn run(mut args: ChatArgs) -> Result<()> {
     let start = Instant::now();
     args.runtime.use_fast_cuda_defaults();
+    args.runtime.use_model_context()?;
     let mut session = Session::open(&mut args)?;
     let interactive = std::io::stdin().is_terminal();
     if interactive {
+        let limit = match session.max_tokens {
+            Some(tokens) => format!("up to {tokens} tokens per reply"),
+            None => "replies run to the end of turn or a full context".into(),
+        };
         eprintln!(
-            "Model loaded in {:.1}s. Commands: /reset, /exit. Greedy decoding, up to {} tokens per reply.",
+            "Model loaded in {:.1}s. Context {} tokens; {limit}. Commands: /reset, /exit. Greedy decoding.",
             start.elapsed().as_secs_f64(),
-            session.max_tokens
+            session.context
         );
     }
     let stdin = std::io::stdin();
@@ -93,6 +101,14 @@ impl Session {
             None => None,
         };
         let backend = open_backend(&mut args.runtime)?;
+        let requested = args.runtime.context();
+        let opened = backend.info().context_tokens;
+        args.runtime.adopt_context(opened);
+        if opened < requested {
+            eprintln!(
+                "(context {opened} tokens: {requested} do not fit in device memory)"
+            );
+        }
         let runtime = &args.runtime;
         let tokenizer_adds_bos = !backend.tokenize("")?.is_empty();
         let template = ChatTemplate::from_model(
@@ -109,26 +125,66 @@ impl Session {
             template,
             history: initial.clone(),
             initial,
-            context: runtime.context as usize,
+            context: runtime.context() as usize,
             max_tokens: runtime.chat_tokens(),
+            reserve: runtime.chat_reserve(),
         })
     }
 
     /// Generates a reply; history only changes when generation succeeds.
     fn reply(&mut self, text: &str) -> Result<(String, Sample)> {
         let candidate = [self.history.as_slice(), &[Message::user(text)]].concat();
-        let reserved = self.max_tokens.saturating_sub(1) as usize;
+        let reserved = self.reserve.saturating_sub(1) as usize;
         let mut prompt = Vec::new();
-        let fitted = fit_history(&candidate, |messages| {
+        let fitted = match fit_history(&candidate, |messages| {
             prompt = self.prompt_tokens(messages)?;
             Ok(prompt.len() + reserved <= self.context)
-        })?;
+        }) {
+            Ok(fitted) => fitted,
+            // Without --tokens the reserve only guides dropping old turns: a message
+            // that fits alone keeps whatever context is left for the reply.
+            Err(_) if self.max_tokens.is_none() => {
+                let latest: Vec<Message> = candidate
+                    .iter()
+                    .filter(|m| m.role == "system")
+                    .chain(candidate.last())
+                    .cloned()
+                    .collect();
+                prompt = self.prompt_tokens(&latest)?;
+                if prompt.len() >= self.context {
+                    return Err(local_inference::Error::Invalid(format!(
+                        "message of {} tokens does not fit in the {}-token context",
+                        prompt.len(),
+                        self.context
+                    )));
+                }
+                latest
+            }
+            Err(error) => return Err(error),
+        };
         if fitted.len() < candidate.len() {
             eprintln!("(oldest turns dropped to fit --context {})", self.context);
         }
+        // All remaining context (prompt + generated - 1 <= context), or --tokens.
+        let room = (self.context + 1).saturating_sub(prompt.len()) as u32;
+        let budget = self.max_tokens.map_or(room, |tokens| tokens.min(room));
         let sample = self
             .executor
-            .generate(&prompt, self.max_tokens, GenerationMode::UntilEog)?;
+            .generate(&prompt, budget, GenerationMode::UntilEog)?;
+        let ended = sample
+            .generated_tokens
+            .last()
+            .is_some_and(|&token| self.executor.is_eog(token));
+        if !ended && sample.generated_tokens.len() as u32 >= budget {
+            if budget < room {
+                eprintln!("(reply stopped at --tokens {budget})");
+            } else {
+                eprintln!(
+                    "(reply stopped: the {}-token context is full; /reset clears the conversation)",
+                    self.context
+                );
+            }
+        }
         let reply = self
             .executor
             .detokenize(&sample.generated_tokens)?

@@ -115,22 +115,27 @@ impl CudaMatmul {
 pub struct CudaOptions {
     pub device: usize,
     /// Owned device buffers only, excluding driver/JIT overhead and host model loading.
+    /// Default: no limit beyond free device memory minus the 2 GiB headroom.
     pub memory_limit_bytes: u64,
     /// Opt-in private directory for persistent, checksummed NVRTC output.
     pub kernel_cache_dir: Option<PathBuf>,
     pub matmul: CudaMatmul,
     /// Opt-in bounded decode graph and token-only greedy generation.
     pub decode_graph: bool,
+    /// Shrink the requested context to the largest one whose device buffers fit
+    /// (ModelInfo::context_tokens reports it) instead of refusing to open.
+    pub fit_context: bool,
 }
 
 impl Default for CudaOptions {
     fn default() -> Self {
         Self {
             device: 0,
-            memory_limit_bytes: 24 * 1024 * 1024 * 1024,
+            memory_limit_bytes: u64::MAX,
             kernel_cache_dir: None,
             matmul: CudaMatmul::F32,
             decode_graph: false,
+            fit_context: false,
         }
     }
 }
@@ -1273,7 +1278,7 @@ impl CudaBackend {
                 functions.insert(name, module.load_function(name).map_err(failure)?);
             }
         }
-        let weights = Weights::open(path, config)?;
+        let mut weights = Weights::open(path, config)?;
         let s = &weights.spec;
         if matches!(
             s.info.architecture.as_str(),
@@ -1352,50 +1357,19 @@ impl CudaBackend {
         {
             return Err(invalid("expert batch exceeds CUDA indexing"));
         }
-        let weight_bytes = weights.bytes();
-        let kv_elements = (s.kv_heads as u64)
-            .checked_mul(s.dim as u64)
-            .and_then(|n| n.checked_mul(u64::from(config.context_tokens)))
-            .ok_or_else(|| invalid("KV overflow"))?;
-        let kv_bytes = kv_elements
-            .checked_mul(weights.layers.len() as u64)
-            .and_then(|n| n.checked_mul(8))
-            .ok_or_else(|| invalid("KV byte overflow"))?;
-        let routing = routing_elements(s)? as u64;
-        let groups = group_workspace_elements(s, options.matmul)? as u64;
-        let workspace_bytes = workspace_sizes(s, options.matmul)?
-            .into_iter()
-            .try_fold(0u64, |sum, n| sum.checked_add(n as u64))
-            .and_then(|n| n.checked_add(routing * 2 + groups + 1))
-            .and_then(|n| n.checked_add(parallel_group_count_elements(s, options.matmul) as u64))
-            .and_then(|n| n.checked_add(attention_partial_elements(s, options.matmul) as u64))
-            .and_then(|n| {
-                n.checked_add(if prefill_capacity(s) > 1 {
-                    prefill_capacity(s) as u64
-                } else {
-                    0
-                })
-            })
-            .and_then(|n| n.checked_mul(4))
-            .ok_or_else(|| invalid("workspace byte overflow"))?;
-        let workspace_bytes = workspace_bytes
-            .checked_add(residual_workspace_bytes(s, options.matmul)?)
-            .and_then(|n| n.checked_add(attention_half_elements(s, options.matmul) as u64 * 2))
-            .ok_or_else(|| invalid("workspace byte overflow"))?;
-        let logits_bytes = u64::from(s.info.vocab_tokens) * 4;
-        let reservation = weight_bytes
-            .checked_add(kv_bytes)
-            .and_then(|n| n.checked_add(workspace_bytes))
-            .and_then(|n| n.checked_add(logits_bytes))
-            .and_then(|n| {
-                n.checked_add(if options.decode_graph {
-                    decode::DecodeState::bytes(s.info.vocab_tokens as usize)
-                } else {
-                    0
-                })
-            })
-            .ok_or_else(|| invalid("device reservation overflow"))?;
         let (free, _) = result::mem_get_info().map_err(failure)?;
+        if options.fit_context {
+            fit_context(&mut weights, &options, free as u64)?;
+        }
+        let s = &weights.spec;
+        let DeviceReservation {
+            weight_bytes,
+            kv_elements,
+            kv_bytes,
+            workspace_bytes,
+            logits_bytes,
+            reservation,
+        } = device_reservation(&weights, &options)?;
         admit(reservation, options.memory_limit_bytes, free as u64)?;
         let memory = MemoryUsage {
             allocation_domain: "cuda",
@@ -2261,6 +2235,107 @@ impl CudaBackend {
         }
         Ok(())
     }
+}
+
+/// Device buffers CudaBackend::open allocates for `weights.spec` (its context and
+/// prefill capacity) under `options`.
+struct DeviceReservation {
+    weight_bytes: u64,
+    kv_elements: u64,
+    kv_bytes: u64,
+    workspace_bytes: u64,
+    logits_bytes: u64,
+    reservation: u64,
+}
+
+fn device_reservation(weights: &Weights<Tensor>, options: &CudaOptions) -> Result<DeviceReservation> {
+    let s = &weights.spec;
+    let weight_bytes = weights.bytes();
+    let kv_elements = (s.kv_heads as u64)
+        .checked_mul(s.dim as u64)
+        .and_then(|n| n.checked_mul(u64::from(s.info.context_tokens)))
+        .ok_or_else(|| invalid("KV overflow"))?;
+    let kv_bytes = kv_elements
+        .checked_mul(weights.layers.len() as u64)
+        .and_then(|n| n.checked_mul(8))
+        .ok_or_else(|| invalid("KV byte overflow"))?;
+    let routing = routing_elements(s)? as u64;
+    let groups = group_workspace_elements(s, options.matmul)? as u64;
+    let workspace_bytes = workspace_sizes(s, options.matmul)?
+        .into_iter()
+        .try_fold(0u64, |sum, n| sum.checked_add(n as u64))
+        .and_then(|n| n.checked_add(routing * 2 + groups + 1))
+        .and_then(|n| n.checked_add(parallel_group_count_elements(s, options.matmul) as u64))
+        .and_then(|n| n.checked_add(attention_partial_elements(s, options.matmul) as u64))
+        .and_then(|n| {
+            n.checked_add(if prefill_capacity(s) > 1 {
+                prefill_capacity(s) as u64
+            } else {
+                0
+            })
+        })
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| invalid("workspace byte overflow"))?;
+    let workspace_bytes = workspace_bytes
+        .checked_add(residual_workspace_bytes(s, options.matmul)?)
+        .and_then(|n| n.checked_add(attention_half_elements(s, options.matmul) as u64 * 2))
+        .ok_or_else(|| invalid("workspace byte overflow"))?;
+    let logits_bytes = u64::from(s.info.vocab_tokens) * 4;
+    let reservation = weight_bytes
+        .checked_add(kv_bytes)
+        .and_then(|n| n.checked_add(workspace_bytes))
+        .and_then(|n| n.checked_add(logits_bytes))
+        .and_then(|n| {
+            n.checked_add(if options.decode_graph {
+                decode::DecodeState::bytes(s.info.vocab_tokens as usize)
+            } else {
+                0
+            })
+        })
+        .ok_or_else(|| invalid("device reservation overflow"))?;
+    Ok(DeviceReservation {
+        weight_bytes,
+        kv_elements,
+        kv_bytes,
+        workspace_bytes,
+        logits_bytes,
+        reservation,
+    })
+}
+
+/// Granularity of fitted contexts.
+const FIT_CONTEXT_STEP: u32 = 256;
+
+/// Shrinks `weights.spec` context (and prefill capacity with it) to the largest
+/// multiple of FIT_CONTEXT_STEP whose device reservation is admitted; leaves the
+/// requested context when it fits or when not even one step does (open then reports
+/// the shortfall).
+fn fit_context(weights: &mut Weights<Tensor>, options: &CudaOptions, free: u64) -> Result<()> {
+    let requested = weights.spec.info.context_tokens;
+    let batch = weights.spec.info.batch_tokens;
+    let fits = |weights: &mut Weights<Tensor>, context: u32| -> Result<bool> {
+        weights.spec.info.context_tokens = context;
+        weights.spec.info.batch_tokens = batch.min(context);
+        let reservation = device_reservation(weights, options)?.reservation;
+        Ok(admit(reservation, options.memory_limit_bytes, free).is_ok())
+    };
+    if fits(weights, requested)? {
+        return Ok(());
+    }
+    let (mut low, mut high) = (0u32, requested / FIT_CONTEXT_STEP);
+    // Invariant: low steps fit (0 means none checked yet), high + 1 steps do not.
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        if fits(weights, middle * FIT_CONTEXT_STEP)? {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let context = if low == 0 { requested } else { low * FIT_CONTEXT_STEP };
+    weights.spec.info.context_tokens = context;
+    weights.spec.info.batch_tokens = batch.min(context);
+    Ok(())
 }
 
 fn admit(reservation: u64, budget: u64, free: u64) -> Result<()> {

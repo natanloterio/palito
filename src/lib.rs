@@ -58,6 +58,20 @@ impl Config {
     }
 }
 
+/// Trained context length from GGUF metadata (`<architecture>.context_length`),
+/// read from the file header only.
+pub fn model_context_tokens(path: &std::path::Path) -> Result<u32> {
+    let metadata = gguf::Gguf::read_metadata(path)?;
+    let arch = match metadata.get("general.architecture") {
+        Some(gguf::Value::Text(arch)) => arch.clone(),
+        _ => return Err(Error::Invalid("GGUF: missing general.architecture".into())),
+    };
+    match metadata.get(&format!("{arch}.context_length")) {
+        Some(gguf::Value::Integer(n)) if *n > 0 => Ok(u32::try_from(*n).unwrap_or(u32::MAX)),
+        _ => Err(Error::Invalid(format!("GGUF: missing {arch}.context_length"))),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GenerationMode {
     UntilEog,
@@ -113,6 +127,10 @@ impl<B: Backend> Executor<B> {
 
     pub fn detokenize(&self, tokens: &[i32]) -> Result<String> {
         self.backend.detokenize(tokens)
+    }
+
+    pub fn is_eog(&self, token: i32) -> bool {
+        self.backend.is_eog(token)
     }
 
     pub fn generate(

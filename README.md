@@ -1471,8 +1471,10 @@ baseline; it does not establish a speedup or generalize to larger models.
 
 ```sh
 scripts/package-linux.sh --install
-local-inference chat --model /path/to/model.gguf --context 4096
+local-inference chat --model /path/to/model.gguf
 ```
+
+`chat` uses the model's trained context by default (GGUF `context_length`; Qwen3-30B-A3B: 40,960 tokens). On CUDA it is capped at 65,535 and shrunk, in 256-token steps, to the largest context whose buffers fit in free device memory minus 2 GiB, with a notice. Replies run until end of turn or until the context is full, which is reported (`--tokens N` caps a reply; small models stuck in a greedy loop otherwise run to the full context). Older turns are dropped while a message plus a 2048-token reply reserve exceeds the context; a single message that fits alone keeps the remaining context for its reply. Measured on Qwen3-30B-A3B Q4_K_M (RTX 5090, `int8-fast`): a 40.7k-token prompt reaches the first token in 6.4 s and decodes at 103 tok/s (211 tok/s at 9.9k, ~335 tok/s near empty); a 39.7k-token needle-in-a-haystack prompt recalls the needle at 5%, 50% and 95% depth with `int8-fast` and `int8-prefill`; generating the full 40,960-token context runs at 152 tok/s on average. Other commands keep `--context 512` unless given. Without `--gpu-memory-limit-bytes` the CUDA budget is free device memory minus 2 GiB (previously a fixed 24 GiB).
 
 `LOCAL_INFERENCE_BACKEND`, `LOCAL_INFERENCE_MODEL` and `LOCAL_INFERENCE_CUDA_KERNEL_CACHE` set the defaults, and flags take precedence.
 

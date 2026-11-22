@@ -328,3 +328,14 @@ Descartado: KS 128 nos tiles de 64 tokens, KS 64/256 nos experts, attention pré
 - **Roteador TF32 em tiles** (`router_tf32_tiled`, 64×16 com cp.async): 5,3 → ~0,5 ms por prefill a 1,4k, mesma ordem de MMA por warp. Usado a partir de 64 tokens (antes F32 abaixo de 1024).
 
 Qualidade (`int8-fast`, informada, sem gate): texto real de 256 tokens com max_abs 0,86–0,97 e cos ~0,99966; mesmos 32 tokens do F32 nos prompts curto e longo; 15 testes CUDA; `f32`, `f32-tiled` e `int8-prefill` inalterados bit a bit. Observação: no prompt longo, o `int8-prefill` hoje gera tokens diferentes do F32 (empate: 0,022 de logit entre os dois primeiros) em todas as versões desde a 0.2.4, então não é efeito desta mudança.
+
+**0.2.6 — contexto longo no `chat`.** Respostas longas paravam em 256 tokens: o `chat` abria com `--context 512`, limitava a resposta a `min(2048, contexto/2)` e cortava em silêncio; o orçamento fixo de 24 GiB recusava 32k/40k com 31 GB livres. Agora, sem `--context`, o `chat` usa o `context_length` do GGUF (CUDA: até 65.535, reduzido em passos de 256 ao que cabe na memória livre menos 2 GiB, com aviso); sem `--tokens`, a resposta vai até o fim do turno ou o contexto cheio, com aviso quando corta; sem `--gpu-memory-limit-bytes`, o orçamento é a memória livre menos 2 GiB. Qwen3-30B-A3B Q4_K_M (`int8-fast`, contexto 40.960):
+
+| Prompt | TTFT | Decode |
+|---|---|---|
+| 9,9k | 0,75 s | 211 tok/s |
+| 19,8k | 1,97 s | 160 tok/s |
+| 28,6k | 3,44 s | 129 tok/s |
+| 40,7k | 6,39 s | 103 tok/s |
+
+Agulha num palheiro de 39,7k tokens (5%, 50%, 95%): achada com `int8-fast` (6,2 s de prefill) e `int8-prefill` (15,3 s). Contexto inteiro gerado (40.940 tokens) a 152 tok/s em média. Conto de 3.000 palavras: 5.080 tokens, terminou no fim do turno.

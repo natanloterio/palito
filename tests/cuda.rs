@@ -771,3 +771,37 @@ fn gpu_dense_prefill_numerical_failure_is_sticky_until_reset() {
     gpu.evaluate(&[1, 1], 0).unwrap();
     assert!(gpu.logits().unwrap().iter().all(|&x| x == 0.0));
 }
+
+#[test]
+#[ignore = "requires CUDA 13 NVRTC/driver; run serially in release mode"]
+fn gpu_fit_context_shrinks_to_the_largest_admitted_step() {
+    let fixture = Fixture::from_bytes("fit-context", &tiny_weights_shape(2, false, false, 2, 4096));
+    let config = Config {
+        context_tokens: 4096,
+        batch_tokens: 8,
+        prefill_chunk: 8,
+        ..config()
+    };
+    let full = CudaBackend::open(&fixture.0, &config, CudaOptions::default()).unwrap();
+    let full_bytes = full.memory_usage().unwrap().numerical_reservation_bytes;
+    let per_token = full.memory_usage().unwrap().kv_allocated_bytes / 4096;
+    drop(full);
+    // A budget that admits about half the context: fitted to a 256-token step below.
+    let budget = full_bytes - per_token * 2000;
+    let options = CudaOptions {
+        memory_limit_bytes: budget,
+        fit_context: true,
+        ..CudaOptions::default()
+    };
+    let fitted = CudaBackend::open(&fixture.0, &config, options.clone()).unwrap();
+    let context = fitted.info().context_tokens;
+    assert!(context < 4096 && context % 256 == 0, "fitted {context}");
+    assert!(fitted.memory_usage().unwrap().numerical_reservation_bytes <= budget);
+    let next = Config { context_tokens: context + 256, ..config.clone() };
+    let strict = CudaOptions { fit_context: false, ..options.clone() };
+    assert!(CudaBackend::open(&fixture.0, &next, strict).is_err());
+    // Without fitting the same budget refuses the full context.
+    assert!(
+        CudaBackend::open(&fixture.0, &config, CudaOptions { fit_context: false, ..options }).is_err()
+    );
+}

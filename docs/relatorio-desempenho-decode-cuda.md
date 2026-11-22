@@ -314,3 +314,17 @@ Validação: mesmos 32 tokens do F32 nos prompts curto e longo; texto real de 25
 Descartado: KS 128 nos tiles de 64 tokens, KS 64/256 nos experts, attention pré-convertida com 4 warps.
 
 **0.2.4 — NVRTC 13.** O pacote Linux leva o NVRTC 13.3, e com ele o TTFT era 0,42 s: o kernel dos experts (`mmq_c3_grouped`) fazia 3,7 vezes mais spill de registradores com o limite de 128 registros de 2 blocos por SM. As medições acima usaram o NVRTC 12.8 do sistema, carregado pelo nome `libnvrtc.so`. Agora esse kernel usa 1 bloco por SM quando o NVRTC é 13 ou maior: 0,35 s com as duas versões, mesmos tokens e mesmos gates.
+
+**0.2.5 — `int8-fast` com pipeline.** Perfil opcional (`--cuda-matmul int8-fast`) com a precisão da llama.cpp: um plano de 8 bits por 32 ativações (como `q8_1`), attention FP16 simples e roteador MoE em TF32. Qwen3-30B-A3B Q4_K_M, RTX 5090, NVRTC 13.3:
+
+| Prompt | antes (59dfd45) | 0.2.5 | llama.cpp |
+|---|---|---|---|
+| 553 tokens | 49,9 ms | 42,3 ms | 45 ms |
+| 1.433 tokens | 103,3 ms | 86,6 ms | 90,5 ms |
+| 2.863 tokens | 179,5 ms | 164 ms | 182,6 ms |
+
+- **cp.async em dois estágios** (`mmq_pipe_q4`, tiles de 128/64/32 tokens): com 1 bloco por SM e sem prefetch, o kernel carregava e depois calculava (só cargas 25 ms + só contas 16 ms ≈ 38 ms no gate/up dos experts a 1,4k). Agora os nibbles Q4_K, os cabeçalhos dos blocos e as ativações do passo seguinte entram na memória compartilhada enquanto o passo atual calcula. Mesma aritmética, resultados idênticos bit a bit. Q6_K continua no caminho antigo (blocos de 210 bytes não ficam alinhados a 16 bytes).
+- **Tiles mistos nos experts** (`group_experts_mixed`): tiles inteiros de 128 atribuições por expert e o resto num tile de 64 e/ou 32. Ganho de só 2–3%; o preenchimento não era o principal custo.
+- **Roteador TF32 em tiles** (`router_tf32_tiled`, 64×16 com cp.async): 5,3 → ~0,5 ms por prefill a 1,4k, mesma ordem de MMA por warp. Usado a partir de 64 tokens (antes F32 abaixo de 1024).
+
+Qualidade (`int8-fast`, informada, sem gate): texto real de 256 tokens com max_abs 0,86–0,97 e cos ~0,99966; mesmos 32 tokens do F32 nos prompts curto e longo; 15 testes CUDA; `f32`, `f32-tiled` e `int8-prefill` inalterados bit a bit. Observação: no prompt longo, o `int8-prefill` hoje gera tokens diferentes do F32 (empate: 0,022 de logit entre os dois primeiros) em todas as versões desde a 0.2.4, então não é efeito desta mudança.

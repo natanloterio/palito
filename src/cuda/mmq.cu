@@ -329,6 +329,211 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
 }
 #endif
 
+#if __CUDA_ARCH__ >= 800
+// int8-fast Q4_K tiles with a two-stage cp.async pipeline: the raw Q4_K nibbles and
+// block headers, the s8 activations and their scales / code sums of K step i + 1
+// stream into shared memory while step i computes (mmq_tile without prefetch loads,
+// unpacks and computes in turn at one block per SM). Same arithmetic as mmq_tile<12, 1>.
+__device__ __forceinline__ void mmq_copy(void *dst, const void *src, bool valid, int bytes) {
+    unsigned int d = (unsigned int)__cvta_generic_to_shared(dst);
+    int size = valid ? bytes : 0;
+    if (bytes == 16)
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(size) : "memory");
+    else
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(d), "l"(src), "r"(size) : "memory");
+}
+
+template<int BN, int KS>
+struct MmqPipeShared {
+    // Raw nibble words per row (KS / 2 bytes) padded to a conflict-free stride.
+    static constexpr int GROUPS = KS / 32, WSTRIDE = KS / 8 + 4, XSTRIDE = KS / 4 + 4;
+    unsigned int w[2][MMQ_ROWS][WSTRIDE];
+    uint4 header[2][MMQ_ROWS];
+    unsigned int x[2][BN][XSTRIDE];
+    float xs[2][BN][GROUPS];
+    int xsum[2][BN][GROUPS];
+    float coefficient[MMQ_ROWS][GROUPS], minimum[MMQ_ROWS][GROUPS], msum[BN][GROUPS];
+    int destination[BN], source[BN];
+};
+
+template<int BN, int KS, bool SplitK>
+__device__ void mmq_pipe_q4(const u8 *weights, const signed char *values, const float *scales,
+                            const int *sums, float *output, int width, int rows, int tokens,
+                            const int *groups, int used, int grouped, int assignment_major,
+                            int *status, MmqPipeShared<BN, KS> &sh) {
+    static_assert(KS == 64 || KS == 128, "pipe K step");
+    constexpr int THREADS = 256, NT = BN / 16, GROUPS = KS / 32;
+    constexpr int WCHUNKS = KS / 32, XCHUNKS = KS / 16, SBYTES = GROUPS * 4;
+    int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+    int group = lane / 4, thread = lane % 4;
+    int expert = grouped ? groups[blockIdx.y * (BN + 1)] : 0;
+    if (grouped && expert < 0) return;
+    int first_row = blockIdx.x * MMQ_ROWS;
+    for (int t = tid; t < BN; t += THREADS) {
+        int assignment;
+        if (grouped) {
+            assignment = groups[blockIdx.y * (BN + 1) + 1 + t];
+        } else {
+            int token = blockIdx.y * BN + t;
+            assignment = token < tokens ? token : -1;
+        }
+        sh.destination[t] = assignment;
+        sh.source[t] = grouped && !assignment_major && assignment >= 0 ? assignment / used : assignment;
+    }
+    int warp_row = (warp / 2) * 32, warp_token = (warp % 2) * (BN / 2);
+    float acc[2][NT][4];
+    #pragma unroll
+    for (int m = 0; m < 2; m++)
+        #pragma unroll
+        for (int n = 0; n < NT; n++)
+            #pragma unroll
+            for (int i = 0; i < 4; i++) acc[m][n][i] = 0.0f;
+    __syncthreads();
+    auto issue = [&](int stage, int k) {
+        for (int i = tid; i < MMQ_ROWS * (WCHUNKS + 1); i += THREADS) {
+            int row = i / (WCHUNKS + 1), c = i % (WCHUNKS + 1);
+            bool valid = first_row + row < rows;
+            const u8 *p = weights + (((u64)expert * rows + first_row + (valid ? row : 0)) * width + k)
+                / 256 * 144;
+            if (c == WCHUNKS) mmq_copy(&sh.header[stage][row], p, valid, 16);
+            else mmq_copy(&sh.w[stage][row][c * 4], p + 16 + (k % 256) / 2 + c * 16, valid, 16);
+        }
+        for (int i = tid; i < BN * XCHUNKS; i += THREADS) {
+            int t = i / XCHUNKS, c = i % XCHUNKS, s = sh.source[t];
+            mmq_copy(&sh.x[stage][t][c * 4], values + (u64)(s < 0 ? 0 : s) * width + k + c * 16, s >= 0, 16);
+        }
+        for (int i = tid; i < 2 * BN; i += THREADS) {
+            int t = i % BN, s = sh.source[t];
+            u64 offset = ((u64)(s < 0 ? 0 : s) * width + k) / 32;
+            if (i < BN) mmq_copy(sh.xs[stage][t], scales + offset, s >= 0, SBYTES);
+            else mmq_copy(sh.xsum[stage][t], sums + offset, s >= 0, SBYTES);
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+    auto convert = [&](int stage, int k) {
+        for (int i = tid; i < MMQ_ROWS * GROUPS; i += THREADS) {
+            int row = i / GROUPS, g = i % GROUPS;
+            uint4 h = sh.header[stage][row];
+            unsigned int praw[4] = {h.x, h.y, h.z, h.w};
+            int gi = (k % 256) / 32 + g;
+            #define MMQ_SCALE_BYTE(n) ((int)((praw[1 + (n) / 4] >> (8 * ((n) % 4))) & 255))
+            int sc = gi < 4 ? MMQ_SCALE_BYTE(gi) & 63
+                            : (MMQ_SCALE_BYTE(gi + 4) & 15) | ((MMQ_SCALE_BYTE(gi - 4) >> 6) << 4);
+            int mn = gi < 4 ? MMQ_SCALE_BYTE(gi + 4) & 63
+                            : (MMQ_SCALE_BYTE(gi + 4) >> 4) | ((MMQ_SCALE_BYTE(gi) >> 6) << 4);
+            #undef MMQ_SCALE_BYTE
+            sh.coefficient[row][g] = half_value_bits(praw[0] & 0xffff) * (float)sc;
+            sh.minimum[row][g] = half_value_bits(praw[0] >> 16) * (float)mn;
+        }
+        for (int i = tid; i < BN * GROUPS; i += THREADS) {
+            int t = i / GROUPS, g = i % GROUPS;
+            float m = 0.0f;
+            m += (float)sh.xsum[stage][t][g] * sh.xs[stage][t][g];
+            sh.msum[t][g] = m;
+        }
+    };
+    int k_begin = SplitK ? blockIdx.z * (width / gridDim.z) : 0;
+    int k_end = SplitK ? k_begin + width / gridDim.z : width;
+    if (SplitK) output += (u64)blockIdx.z * tokens * rows;
+    int steps = (k_end - k_begin) / KS;
+    issue(0, k_begin);
+    for (int step = 0; step < steps; step++) {
+        int stage = step & 1, k = k_begin + step * KS;
+        if (step + 1 < steps) {
+            issue(stage ^ 1, k + KS);
+            asm volatile("cp.async.wait_group 1;" ::: "memory");
+        } else {
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+        }
+        __syncthreads();
+        convert(stage, k);
+        __syncthreads();
+        #pragma unroll
+        for (int g = 0; g < GROUPS; g++) {
+            int pack = g * 8 + thread, word = (g / 2) * 8 + thread, shift = 4 * (g % 2);
+            unsigned int a[2][4];
+            float coef[2][2], mins[2][2];
+            #pragma unroll
+            for (int m = 0; m < 2; m++) {
+                int r = warp_row + m * 16 + group;
+                a[m][0] = (sh.w[stage][r][word] >> shift) & 0x0f0f0f0fu;
+                a[m][1] = (sh.w[stage][r + 8][word] >> shift) & 0x0f0f0f0fu;
+                a[m][2] = (sh.w[stage][r][word + 4] >> shift) & 0x0f0f0f0fu;
+                a[m][3] = (sh.w[stage][r + 8][word + 4] >> shift) & 0x0f0f0f0fu;
+                #pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    coef[m][h] = sh.coefficient[r + 8 * h][g];
+                    mins[m][h] = sh.minimum[r + 8 * h][g];
+                }
+            }
+            #pragma unroll
+            for (int n = 0; n < NT; n++) {
+                int tb = warp_token + n * 8, t0 = tb + thread * 2;
+                unsigned int b0 = sh.x[stage][tb + group][pack];
+                unsigned int b1 = sh.x[stage][tb + group][pack + 4];
+                float s0 = sh.xs[stage][t0][g], s1 = sh.xs[stage][t0 + 1][g];
+                float m0 = sh.msum[t0][g], m1 = sh.msum[t0 + 1][g];
+                #pragma unroll
+                for (int m = 0; m < 2; m++) {
+                    float combined[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    int dot[4] = {0, 0, 0, 0};
+                    residual_mma_group<12>(a[m][0], a[m][1], a[m][2], a[m][3], b0, b1, dot);
+                    combined[0] += (float)dot[0] * s0;
+                    combined[1] += (float)dot[1] * s1;
+                    combined[2] += (float)dot[2] * s0;
+                    combined[3] += (float)dot[3] * s1;
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        float value = coef[m][i / 2] * combined[i];
+                        value -= mins[m][i / 2] * (i % 2 ? m1 : m0);
+                        acc[m][n][i] += value;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int m = 0; m < 2; m++) {
+        #pragma unroll
+        for (int n = 0; n < NT; n++) {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int row = first_row + warp_row + m * 16 + group + (i / 2) * 8;
+                int assignment = sh.destination[warp_token + n * 8 + thread * 2 + i % 2];
+                if (row < rows && assignment >= 0) {
+                    float result = acc[m][n][i];
+                    if (!isfinite(result)) atomicOr(status, 4);
+                    output[(u64)assignment * rows + row] = result;
+                }
+            }
+        }
+    }
+}
+#endif
+
+// int8-fast pipelined tiles: Q4_K through mmq_pipe_q4, Q6_K through mmq_tile
+// without prefetch (210-byte blocks are not 16-byte aligned for cp.async).
+#if __CUDA_ARCH__ >= 800
+#define MMQ_PIPE_SIZE(BN, KS) (sizeof(MmqPipeShared<BN, KS>) > sizeof(MmqShared<1, BN, KS, 1>) \
+    ? sizeof(MmqPipeShared<BN, KS>) : sizeof(MmqShared<1, BN, KS, 1>))
+#define MMQ_PIPE_BODY(BN, KS, SK, PF) \
+    __shared__ __align__(16) unsigned char raw[MMQ_PIPE_SIZE(BN, KS)]; \
+    if (kind == 12) mmq_pipe_q4<BN, KS, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, *reinterpret_cast<MmqPipeShared<BN, KS> *>(raw)); \
+    if (kind == 14) mmq_tile<14, 1, BN, KS, false, PF, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, *reinterpret_cast<MmqShared<1, BN, KS, 1> *>(raw)); \
+    if (kind != 12 && kind != 14 && threadIdx.x == 0) atomicOr(status, 8);
+#else
+#define MMQ_PIPE_BODY(BN, KS, SK, PF) if (threadIdx.x == 0) atomicOr(status, 16);
+#endif
+#define MMQ_PIPE_KERNEL(Name, BN, KS, SK) MMQ_PIPE_KERNEL_BLOCKS(Name, BN, KS, SK, 1, false)
+#define MMQ_PIPE_KERNEL_BLOCKS(Name, BN, KS, SK, Blocks, PF) \
+extern "C" __global__ void __launch_bounds__(256, Blocks) \
+Name(const u8 *weights, int kind, const signed char *values, const float *scales, \
+     const int *sums, float *output, int width, int rows, int tokens, const int *groups, \
+     int used, int grouped, int assignment_major, int *status) { \
+    MMQ_PIPE_BODY(BN, KS, SK, PF) \
+}
+
 // 256 threads; grid = (ceil(rows / 128), grouped ? slots : ceil(tokens / BN)).
 // The activation layout must match the quantizer: C = 3 residual components
 // (residual_quantize32_precise3) or the S16 pair (quantize32_residual_pair).
@@ -364,17 +569,15 @@ MMQ_KERNEL(mmq_c3_rows32, 3, 32, 128, false)
 #define MMQ_C3_GROUPED_BLOCKS 2
 #endif
 MMQ_KERNEL_BLOCKS(mmq_c3_grouped, 3, 32, 128, false, MMQ_C3_GROUPED_BLOCKS)
-// int8-fast: one s8 plane per 32 activations, as llama.cpp's q8_1. With one plane
-// the register prefetch spills (KS 128: 1.1 KB) and loses to more resident tiles:
-// 128-token tiles at 1 block/SM without prefetch were fastest on Qwen3-30B.
-MMQ_KERNEL(mmq_c1_rows32, 1, 32, 128, false)
-// Few blocks (short prompts): split K across gridDim.z, then mmq_splitk_reduce.
-MMQ_KERNEL_SPLIT(mmq_c1_rows32_splitk, 1, 32, 128, false, 2, true, true)
-MMQ_KERNEL_FULL(mmq_c1_tokens128, 1, 128, 64, false, 1, false)
-MMQ_KERNEL_SPLIT(mmq_c1_tokens128_splitk, 1, 128, 64, false, 1, false, true)
-MMQ_KERNEL(mmq_c1_grouped, 1, 32, 128, false)
-MMQ_KERNEL_FULL(mmq_c1_grouped64, 1, 64, 128, false, 1, false)
-MMQ_KERNEL_FULL(mmq_c1_grouped128, 1, 128, 64, false, 1, false)
+// int8-fast: one s8 plane per 32 activations, as llama.cpp's q8_1, pipelined (Q4_K)
+// at one block per SM for 64/128-token tiles (register prefetch spills with one
+// plane), two for 32-token tiles. Split-K variants: few blocks (short prompts),
+// gridDim.z K splits, then mmq_splitk_reduce.
+MMQ_PIPE_KERNEL(mmq_c1_pipe128, 128, 64, false)
+MMQ_PIPE_KERNEL(mmq_c1_pipe128_splitk, 128, 64, true)
+MMQ_PIPE_KERNEL(mmq_c1_pipe64, 64, 64, false)
+MMQ_PIPE_KERNEL_BLOCKS(mmq_c1_pipe32, 32, 64, false, 2, true)
+MMQ_PIPE_KERNEL_BLOCKS(mmq_c1_pipe32_splitk, 32, 64, true, 2, true)
 
 // Sums gridDim-z partials of a split-K MMQ in a fixed order (deterministic).
 extern "C" __global__ void mmq_splitk_reduce(const float *partials, float *output, int count,

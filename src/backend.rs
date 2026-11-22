@@ -86,6 +86,21 @@ pub trait Backend {
         }
         Ok(vec![self.sample_greedy()?])
     }
+    /// `sample_tokens`, passing each token to `sink` as soon as it is known (a
+    /// backend that samples several tokens per call may report them before
+    /// returning). A sink error aborts the request; the next request resets.
+    fn sample_tokens_streaming(
+        &mut self,
+        maximum: usize,
+        mode: GenerationMode,
+        sink: &mut dyn FnMut(i32) -> Result<()>,
+    ) -> Result<Vec<i32>> {
+        let tokens = self.sample_tokens(maximum, mode)?;
+        for &token in &tokens {
+            sink(token)?;
+        }
+        Ok(tokens)
+    }
     fn speculation_stats(&self) -> Option<SpeculationStats> {
         None
     }
@@ -130,6 +145,14 @@ impl<B: Backend + ?Sized> Backend for Box<B> {
     }
     fn sample_tokens(&mut self, maximum: usize, mode: GenerationMode) -> Result<Vec<i32>> {
         (**self).sample_tokens(maximum, mode)
+    }
+    fn sample_tokens_streaming(
+        &mut self,
+        maximum: usize,
+        mode: GenerationMode,
+        sink: &mut dyn FnMut(i32) -> Result<()>,
+    ) -> Result<Vec<i32>> {
+        (**self).sample_tokens_streaming(maximum, mode, sink)
     }
     fn speculation_stats(&self) -> Option<SpeculationStats> {
         (**self).speculation_stats()

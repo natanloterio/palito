@@ -70,6 +70,7 @@ prefill chunks of up to 4096 tokens (capped by --context).
 chat uses the model's trained context unless --context is given (CUDA: at most
 65535, shrunk to what fits in free GPU memory minus 2 GiB). Replies run until end
 of turn or a full context (reported); --tokens N caps a reply.
+Replies stream token by token (--no-stream prints them when complete).
 Use --cuda-matmul int8-prefill for the more precise tensor-core prefill,
 --cuda-matmul f32-tiled for F32 prefill or --cuda-matmul f32 for the reference
 profile.

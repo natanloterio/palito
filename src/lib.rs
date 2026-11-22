@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod chat;
+pub mod stream;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
@@ -139,6 +140,18 @@ impl<B: Backend> Executor<B> {
         max_tokens: u32,
         mode: GenerationMode,
     ) -> Result<Sample> {
+        self.generate_streaming(prompt, max_tokens, mode, |_| Ok(()))
+    }
+
+    /// `generate`, passing each generated token to `on_token` as soon as it is
+    /// sampled (same tokens, same order). An `on_token` error aborts the request.
+    pub fn generate_streaming(
+        &mut self,
+        prompt: &[i32],
+        max_tokens: u32,
+        mode: GenerationMode,
+        mut on_token: impl FnMut(i32) -> Result<()>,
+    ) -> Result<Sample> {
         let evaluated = prompt
             .len()
             .checked_add(max_tokens.saturating_sub(1) as usize);
@@ -175,6 +188,7 @@ impl<B: Backend> Executor<B> {
         let prefill_ns = nanos(start);
         let first = self.backend.sample_greedy()?;
         let ttft_ns = nanos(start);
+        on_token(first)?;
         let mut generated_tokens = vec![first];
         let decode_start = Instant::now();
         while generated_tokens.len() < max_tokens as usize {
@@ -185,7 +199,9 @@ impl<B: Backend> Executor<B> {
             let position = (prompt.len() + generated_tokens.len() - 1) as u32;
             self.backend.evaluate_for_sampling(&[last], position)?;
             let maximum = max_tokens as usize - generated_tokens.len();
-            let sampled = self.backend.sample_tokens(maximum, mode)?;
+            let sampled = self
+                .backend
+                .sample_tokens_streaming(maximum, mode, &mut on_token)?;
             if sampled.is_empty()
                 || sampled.len() > maximum
                 || sampled
@@ -311,6 +327,35 @@ mod tests {
         assert_eq!(sample.decode_steps, 2);
     }
 
+    #[test]
+    fn streaming_reports_every_generated_token_and_sink_errors_abort() {
+        let mut executor = Executor::new(Fake::new(), config()).unwrap();
+        let mut streamed = Vec::new();
+        let sample = executor
+            .generate_streaming(&[1, 2, 3, 4], 3, GenerationMode::FixedLength, |token| {
+                streamed.push(token);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(streamed, sample.generated_tokens);
+        let mut seen = 0;
+        let aborted =
+            executor.generate_streaming(&[1, 2], 4, GenerationMode::FixedLength, |_| {
+                seen += 1;
+                if seen == 2 {
+                    Err(Error::Invalid("closed output".into()))
+                } else {
+                    Ok(())
+                }
+            });
+        assert!(aborted.is_err());
+        assert_eq!(seen, 2);
+        // The next request starts clean after the aborted one.
+        let again = executor
+            .generate(&[1, 2, 3, 4], 3, GenerationMode::FixedLength)
+            .unwrap();
+        assert_eq!(again.generated_tokens, sample.generated_tokens);
+    }
     #[test]
     fn admits_exact_capacity_and_rejects_overflow_before_reset() {
         let mut executor = Executor::new(Fake::new(), config()).unwrap();

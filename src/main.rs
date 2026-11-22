@@ -103,8 +103,13 @@ impl std::ops::Deref for ModelArgs {
 #[cfg(feature = "cuda")]
 const KERNEL_CACHE_ENV: &str = "LOCAL_INFERENCE_CUDA_KERNEL_CACHE";
 const DEFAULT_GENERATED_TOKENS: u32 = 32;
-/// Long enough for Qwen3-style reasoning before the answer.
-const CHAT_REPLY_TOKENS: u32 = 2048;
+const DEFAULT_CONTEXT_TOKENS: u32 = 512;
+/// Largest CUDA context (CudaBackend::open).
+#[cfg(feature = "cuda")]
+const CUDA_CONTEXT_MAX: u32 = 65535;
+/// Chat history keeps this much context free for the reply (Qwen3-style reasoning
+/// before the answer); the reply itself may use all remaining context.
+const CHAT_REPLY_RESERVE: u32 = 2048;
 const DEFAULT_BATCH_TOKENS: u32 = 128;
 const DEFAULT_PREFILL_CHUNK: u32 = 64;
 /// Chat prefill batch/chunk on CUDA (PREFILL_CAPACITY_MAX in cuda.rs), capped by
@@ -119,8 +124,11 @@ pub(crate) struct RuntimeArgs {
     backend: LocalBackend,
     #[arg(long, env = "LOCAL_INFERENCE_MODEL")]
     pub(crate) model: PathBuf,
-    #[arg(long, default_value_t = 512)]
-    pub(crate) context: u32,
+    /// Context tokens [default: 512; chat: the model's trained context (GGUF
+    /// context_length; CUDA: at most 65535, shrunk to the largest that fits in free
+    /// device memory)].
+    #[arg(long)]
+    context: Option<u32>,
     /// Prefill batch capacity [default: 128; chat on CUDA: 4096, capped by
     /// --context].
     #[arg(long)]
@@ -131,8 +139,8 @@ pub(crate) struct RuntimeArgs {
     prefill_chunk: Option<u32>,
     #[arg(long, default_value_t = 4)]
     threads: u32,
-    /// Maximum generated tokens [default: 32; chat: 2048 per reply, capped at half
-    /// of --context].
+    /// Maximum generated tokens [default: 32; chat: until end of turn or a full
+    /// context].
     #[arg(long)]
     tokens: Option<u32>,
     /// Expand weights for differential validation rather than retaining packed GGUF blocks.
@@ -193,6 +201,10 @@ pub(crate) struct RuntimeArgs {
     #[cfg(feature = "cuda")]
     #[arg(skip)]
     f32_fallback: bool,
+    /// --context defaulted to the model's trained context (chat): CUDA may shrink it
+    /// to fit device memory.
+    #[arg(skip)]
+    model_context: bool,
 }
 
 #[derive(Args)]
@@ -361,6 +373,7 @@ impl RuntimeArgs {
         });
         options.matmul = self.cuda_matmul();
         options.decode_graph = self.cuda_decode_graph || self.implicit_decode_graph();
+        options.fit_context = self.model_context;
         options
     }
 
@@ -414,15 +427,52 @@ impl RuntimeArgs {
         self.tokens.unwrap_or(DEFAULT_GENERATED_TOKENS)
     }
 
-    /// Reply budget for chat: room to finish, without starving the history.
-    pub(crate) fn chat_tokens(&self) -> u32 {
+    pub(crate) fn context(&self) -> u32 {
+        self.context.unwrap_or(DEFAULT_CONTEXT_TOKENS)
+    }
+
+    /// Explicit --tokens for chat replies; None generates until end of turn or a full
+    /// context.
+    pub(crate) fn chat_tokens(&self) -> Option<u32> {
         self.tokens
-            .unwrap_or(CHAT_REPLY_TOKENS.min((self.context / 2).max(1)))
+    }
+
+    /// Context kept free for the reply when fitting chat history: --tokens, else
+    /// CHAT_REPLY_RESERVE (at most half the context).
+    pub(crate) fn chat_reserve(&self) -> u32 {
+        self.tokens
+            .unwrap_or(CHAT_REPLY_RESERVE.min((self.context() / 2).max(1)))
+    }
+
+    /// Without --context, use the model's trained context (CUDA: at most
+    /// CUDA_CONTEXT_MAX, fitted to device memory when opening).
+    pub(crate) fn use_model_context(&mut self) -> Result<()> {
+        if self.context.is_none() {
+            let trained = local_inference::model_context_tokens(&self.model)?;
+            #[cfg(feature = "cuda")]
+            let cap = if self.backend == LocalBackend::Cuda {
+                CUDA_CONTEXT_MAX
+            } else {
+                u32::MAX
+            };
+            #[cfg(not(feature = "cuda"))]
+            let cap = u32::MAX;
+            self.context = Some(trained.min(cap));
+            self.model_context = true;
+        }
+        Ok(())
+    }
+
+    /// Adopts the context the backend actually opened (fitted to device memory).
+    pub(crate) fn adopt_context(&mut self, opened: u32) {
+        if self.model_context && opened < self.context() {
+            self.context = Some(opened);
+        }
     }
 
     fn batch(&self) -> u32 {
         self.batch.unwrap_or(if self.fast_prefill() {
-            FAST_PREFILL_TOKENS.min(self.context)
+            FAST_PREFILL_TOKENS.min(self.context())
         } else {
             DEFAULT_BATCH_TOKENS
         })
@@ -487,7 +537,7 @@ impl RuntimeArgs {
 
     pub(crate) fn config(&self) -> Config {
         Config {
-            context_tokens: self.context,
+            context_tokens: self.context(),
             batch_tokens: self.batch(),
             prefill_chunk: self.prefill_chunk(),
             threads: self.threads,

@@ -404,13 +404,27 @@ impl Gguf {
         Self::parse(&fs::read(path)?, expand)
     }
 
+    /// Header metadata only: reads a growing file prefix (16 MiB first) instead of
+    /// the whole model, retrying with more bytes while the header is truncated.
     pub fn read_metadata(path: &Path) -> Result<HashMap<String, Value>> {
-        let bytes = fs::read(path)?;
-        let mut reader = Reader {
-            bytes: &bytes,
-            position: 0,
-        };
-        Ok(reader.header()?.1)
+        use std::io::Read;
+        let length = fs::metadata(path)?.len();
+        let mut size: u64 = 16 << 20;
+        loop {
+            let take = size.min(length);
+            let mut bytes = Vec::with_capacity(take as usize);
+            fs::File::open(path)?.take(take).read_to_end(&mut bytes)?;
+            let mut reader = Reader {
+                bytes: &bytes,
+                position: 0,
+            };
+            match reader.header() {
+                Err(Error::Invalid(message)) if message.contains("truncated") && take < length => {
+                    size = size.saturating_mul(4);
+                }
+                result => return Ok(result?.1),
+            }
+        }
     }
 
     fn parse(bytes: &[u8], expand: bool) -> Result<Self> {
@@ -577,6 +591,40 @@ impl Gguf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_prefix_grows_past_large_headers_and_rejects_truncation() {
+        fn text(bytes: &mut Vec<u8>, value: &str) {
+            bytes.extend((value.len() as u64).to_le_bytes());
+            bytes.extend(value.as_bytes());
+        }
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend(3u32.to_le_bytes());
+        bytes.extend(0u64.to_le_bytes());
+        bytes.extend(3u64.to_le_bytes());
+        text(&mut bytes, "general.architecture");
+        bytes.extend(8u32.to_le_bytes());
+        text(&mut bytes, "llama");
+        // Larger than the first 16 MiB read, before the key that matters.
+        text(&mut bytes, "test.blob");
+        bytes.extend(8u32.to_le_bytes());
+        text(&mut bytes, &"x".repeat(20 << 20));
+        text(&mut bytes, "llama.context_length");
+        bytes.extend(4u32.to_le_bytes());
+        bytes.extend(8192u32.to_le_bytes());
+        let path = std::env::temp_dir().join(format!("li-metadata-{}.gguf", std::process::id()));
+        fs::write(&path, &bytes).unwrap();
+        let metadata = Gguf::read_metadata(&path);
+        assert_eq!(crate::model_context_tokens(&path).unwrap(), 8192);
+        fs::write(&path, &bytes[..bytes.len() - 2]).unwrap();
+        let truncated = Gguf::read_metadata(&path);
+        fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            metadata.unwrap().get("llama.context_length"),
+            Some(Value::Integer(8192))
+        ));
+        assert!(truncated.is_err());
+    }
 
     #[test]
     fn split_packed_matrix_preserves_whole_rows() {

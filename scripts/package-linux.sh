@@ -35,6 +35,13 @@ cp -L "$nvrtc/libnvrtc.so.13" "$dist/lib/"
 cp -L "$nvrtc"/libnvrtc-builtins.so.13* "$dist/lib/"
 # cudarc probes the unversioned name first; keep it pointing at the bundled 13.x.
 ln -s libnvrtc.so.13 "$dist/lib/libnvrtc.so"
+# C API: library, header and examples (C and Python ctypes).
+install -m 755 target/release/libpalito.so "$dist/lib/libpalito.so"
+strip "$dist/lib/libpalito.so" 2>/dev/null || true
+mkdir -p "$dist/include" "$dist/examples"
+install -m 644 include/palito.h "$dist/include/palito.h"
+cp -r examples/c examples/python "$dist/examples/"
+find "$dist/examples" -name __pycache__ -prune -exec rm -rf {} +
 
 cat > "$dist/palito" <<'WRAPPER'
 #!/usr/bin/env bash
@@ -74,6 +81,13 @@ Replies stream token by token (--no-stream prints them when complete).
 Use --cuda-matmul int8-prefill for the more precise tensor-core prefill,
 --cuda-matmul f32-tiled for F32 prefill or --cuda-matmul f32 for the reference
 profile.
+
+Library (embed Palito in your program, same process, no server):
+  include/palito.h, lib/libpalito.so (needs lib/ on the library path for NVRTC)
+  cc examples/c/chat.c -Iinclude -Llib -lpalito -o chat
+  LD_LIBRARY_PATH=lib ./chat /path/to/model.gguf "Hello!"
+  LD_LIBRARY_PATH=lib PALITO_LIBRARY=lib/libpalito.so \
+    python3 examples/python/palito.py /path/to/model.gguf "Hello!"
 README
 
 tar -C "$root/target/dist" -czf "$root/target/dist/$name.tar.gz" "$name"

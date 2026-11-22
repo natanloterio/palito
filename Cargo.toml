@@ -24,6 +24,10 @@ cuda-attention-reuse-research = ["cuda"]
 cuda-attention-query-pair-research = ["cuda-attention-reuse-research"]
 cuda-attention-query-pair-even-research = ["cuda-attention-query-pair-research"]
 
+[lib]
+# rlib for Rust users, cdylib for the C API (libpalito.so, include/palito.h).
+crate-type = ["rlib", "cdylib"]
+
 [[bin]]
 name = "palito"
 path = "src/main.rs"

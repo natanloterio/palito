@@ -1465,6 +1465,10 @@ See the [literature review](../../literature_review/review.md) for the evidence 
 limitations behind this order. A successful smoke benchmark establishes a
 baseline; it does not establish a speedup or generalize to larger models.
 
+## Embedding API
+
+`palito::engine::Engine` opens a model with the `chat` defaults: the GGUF context, capped at 65,535 and fitted to free device memory on CUDA. It then tries the CUDA profiles in this order and uses the first that opens: `int8-fast` with the decode graph, `f32-tiled` with and then without the graph, then `f32`. It runs chat (the model's template, `enable_thinking` per call) or plain completion with streamed text and a finish reason (stop, length, context full, cancelled). `src/ffi.rs` wraps it as the C API declared in `include/palito.h`, built as `target/release/libpalito.so` (`crate-type = ["rlib", "cdylib"]`). Panics are caught at the boundary. Strings returned by the library are freed by the library. Tests: `cargo test --release --test engine -- --include-ignored` (needs the SmolLM2 fixture; the CUDA case needs `--features cuda`).
+
 ## Linux CLI bundle
 
 `scripts/package-linux.sh` builds `target/dist/palito-<version>-linux-x86_64.tar.gz`: the CUDA binary, bundled NVRTC 13 and a wrapper that defaults to `--backend cuda` with a kernel cache in `~/.cache/palito/kernels`. With `--install`, the script also links the wrapper as `~/.local/bin/palito`. The host needs an NVIDIA driver with CUDA 13 support.

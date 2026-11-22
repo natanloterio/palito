@@ -353,10 +353,10 @@ fn attention_chunks(spec: &Spec) -> usize {
     (spec.info.context_tokens as usize).div_ceil(128).max(128)
 }
 
-/// Warp chunks of `attention_split_rows` (FP16 KV): at most the 16-key split count
-/// (partial buffer) and the combine's 1024 weights. Fewer, longer chunks halve
-/// the partial traffic; 512 keeps >= 2k warps in flight on 4 KV heads.
-const ATTENTION_ROW_CHUNKS: i32 = 512;
+/// Warp chunks of `attention_decode_mma` (FP16 KV): at most the 16-key split count
+/// (partial buffer) and the combine's 1024 weights. Chunks hold a multiple of
+/// ATTENTION_ROW_BATCH (32) keys.
+const ATTENTION_ROW_CHUNKS: i32 = 64;
 
 fn attention_splits(spec: &Spec) -> usize {
     (spec.info.context_tokens as usize).div_ceil(ATTENTION_SPLIT)
@@ -622,6 +622,19 @@ macro_rules! launch {
     }};
 }
 
+/// launch! with the kernel's dynamic shared memory (shared::configure), if any.
+macro_rules! launch_shared {
+    ($backend:ident, $name:expr, $grid:expr; $threads:expr, $($arg:expr),+ $(,)?) => {{
+        let name: &str = $name;
+        let shared_mem_bytes = $backend.dynamic_shared.get(name).copied().unwrap_or(0);
+        let cfg = LaunchConfig { grid_dim: $grid, block_dim: ($threads, 1, 1), shared_mem_bytes };
+        let mut args = $backend.stream.launch_builder(&$backend.functions[name]);
+        $(args.arg($arg);)+
+        // As launch!; the size is the kernel's opted-in dynamic shared memory.
+        unsafe { args.launch(cfg) }.map_err(failure)?;
+    }};
+}
+
 macro_rules! launch_position {
     ($backend:ident, $device:expr, $name:literal, $dynamic:literal, $grid:expr,
      [$($before:expr),*], $value:expr, [$($after:expr),*]) => {{
@@ -862,6 +875,7 @@ pub mod reference;
 mod residual;
 #[cfg(test)]
 mod residual_precise;
+mod shared;
 
 pub struct CudaBackend {
     // Destroy captured references before their buffers and modules.
@@ -869,6 +883,8 @@ pub struct CudaBackend {
     weights: Weights<DeviceTensor>,
     stream: Arc<CudaStream>,
     functions: HashMap<&'static str, CudaFunction>,
+    /// Dynamic shared bytes per kernel (shared::configure); absent means none.
+    dynamic_shared: HashMap<&'static str, u32>,
     work: Workspace,
     keys: Vec<kv::KvBuffer>,
     values: Vec<kv::KvBuffer>,
@@ -1111,6 +1127,7 @@ impl CudaBackend {
         )?;
         let module = context.load_module(ptx).map_err(failure)?;
         let mut functions = HashMap::new();
+        let mut dynamic_shared = HashMap::new();
         for name in [
             "embedding",
             "check_finite",
@@ -1212,17 +1229,18 @@ impl CudaBackend {
                     "mmq_c1_pipe32",
                     "mmq_c1_pipe32_splitk",
                     "router_tf32_tiled",
+                    "router_tf32_small",
                     "group_experts_mixed",
                     "attention_prefill_mma_fast_f16",
-                    "attention_split_rows2_f16",
-                    "attention_split_rows2_decode_f16",
-                    "attention_split_rows4_f16",
-                    "attention_split_rows4_decode_f16",
-                    "attention_split_rows8_f16",
-                    "attention_split_rows8_decode_f16",
+                    "attention_prefill_mma_fast4_f16",
+                    "attention_decode_mma_f16",
+                    "attention_decode_mma_decode_f16",
+                    "attention_combine_rows",
+                    "attention_combine_rows_decode",
                 ] {
                     functions.insert(name, module.load_function(name).map_err(failure)?);
                 }
+                dynamic_shared = shared::configure(&context, &module, &functions)?;
             }
             if options.matmul == CudaMatmul::Int8Prefill {
                 for name in [
@@ -1456,6 +1474,7 @@ impl CudaBackend {
             weights,
             stream,
             functions,
+            dynamic_shared,
             work,
             keys,
             values,
@@ -1807,20 +1826,21 @@ impl CudaBackend {
                 let group = (heads / kv_heads) as u32;
                 let vector = dim <= 128 && dim % 4 == 0 && chunks <= 1024;
                 let mut threads = 256;
+                let mut combine_threads = 256;
                 let rows = self.matmul.kv_f16() && dim == 128 && (2..=8).contains(&group);
-                let row_chunks = (splits / 8 * 8).min(ATTENTION_ROW_CHUNKS);
-                let (split, combine, grid, blocks) = if rows && row_chunks >= 8 {
-                    // FP16 cache: one warp per key range and all heads of the group,
-                    // so each K/V row is read once per step (attention_split_rows).
-                    let split = match group.next_power_of_two() {
-                        2 => pick("attention_split_rows2_decode_f16", "attention_split_rows2_f16"),
-                        4 => pick("attention_split_rows4_decode_f16", "attention_split_rows4_f16"),
-                        _ => pick("attention_split_rows8_decode_f16", "attention_split_rows8_f16"),
-                    };
+                let row_chunks = splits.min(ATTENTION_ROW_CHUNKS);
+                let (split, combine, grid, blocks) = if rows && row_chunks >= 1 {
+                    // FP16 cache: one warp per key range, the group's heads as MMA rows,
+                    // so each K/V row is read once per step (attention_decode_mma).
+                    threads = 32;
+                    combine_threads = 1024;
                     (
-                        split,
-                        pick("attention_combine_group_decode", "attention_combine_group"),
-                        (kv_heads as u32, (row_chunks / 8) as u32, 1),
+                        pick(
+                            "attention_decode_mma_decode_f16",
+                            "attention_decode_mma_f16",
+                        ),
+                        pick("attention_combine_rows_decode", "attention_combine_rows"),
+                        (kv_heads as u32, row_chunks as u32, 1),
                         row_chunks,
                     )
                 } else if vector && (2..=8).contains(&group) {
@@ -1869,11 +1889,11 @@ impl CudaBackend {
                 }
                 match control {
                     Some(control) => launch!(
-                        self, combine, (heads as u32, 1, 1), &*partials,
+                        self, combine, (heads as u32, 1, 1); combine_threads, &*partials,
                         &mut self.work.attended, &dim, &blocks, control
                     ),
                     None => launch!(
-                        self, combine, (heads as u32, 1, 1), &*partials,
+                        self, combine, (heads as u32, 1, 1); combine_threads, &*partials,
                         &mut self.work.attended, &dim, &blocks, &count
                     ),
                 }

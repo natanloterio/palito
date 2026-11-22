@@ -33,7 +33,7 @@ The `palito` launcher in the bundle uses the GPU by default and keeps compiled k
 
 ### From source
 
-You need Rust 1.85 or newer.
+You need Rust 1.87 or newer.
 
 ```sh
 # GPU build, packaged and installed as ~/.local/bin/palito.
@@ -146,6 +146,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 - **Qwen3 reasoning:** the `<think>` part comes back separately as `reasoning_content` (as with llama.cpp and vLLM), and `content` holds only the answer. Send `"reasoning_format": "none"` to keep it inside `content`, or `"chat_template_kwargs": {"enable_thinking": false}` to turn reasoning off.
 - **Sampling:** `temperature`, `top_p`, `top_k` and `seed` work as usual. When a request leaves them out, the server uses its own defaults: greedy, unless you start it with e.g. `--temperature 0.6 --top-p 0.95 --top-k 20`. Greedy runs about 20% faster (~370 vs ~300 tok/s on Qwen3-30B).
 - **Stop sequences:** `stop` (a string or up to 16 strings) ends the reply; the stop text is not returned. It applies to everything the model writes, reasoning included, so with reasoning on avoid stops like `"\n"`.
+- **JSON output:** `"response_format": {"type": "json_object"}` or `{"type": "json_schema", "json_schema": {"name": "...", "schema": {...}}}` makes the reply JSON that always parses and matches the schema (constrained decoding, also with greedy). Reasoning is turned off for these requests. A schema keyword Palito cannot enforce (e.g. `uniqueItems`, `not`, `if`) returns 400 instead of being ignored. Qwen3-30B decodes at ~327 tok/s greedy (~300 sampled) with a schema.
 - **Not supported:** `n` > 1 is rejected.
 - **One request at a time:** the model runs one request at a time, and others wait in a queue (`--queue`, default 16; beyond that the server returns 503). If a client disconnects, its generation stops.
 - **Local by default:** the server only accepts connections from this machine. To serve your network, use `--host 0.0.0.0 --api-key YOUR_KEY` (or set `PALITO_API_KEY`). Clients then send `Authorization: Bearer YOUR_KEY`.
@@ -191,6 +192,7 @@ How it works:
 - Each call is stateless: pass the whole conversation every time.
 - The callback gets the text as it is generated; return nonzero to stop.
 - `palito_generation` sets the token cap, reasoning, sampling (`temperature`, `top_p`, `top_k`, `seed`) and stop sequences. Fill it with `palito_generation_init` first.
+- `palito_chat_json` and `palito_complete_json` take an extra JSON Schema string; the output is JSON matching it. The struct layouts never change, so programs built against an older header keep working.
 - `libpalito.so` finds the NVRTC bundled next to it, so `LD_LIBRARY_PATH` is not needed.
 - Errors come back as `-1` plus a message.
 - Use one engine per thread, or guard it with a lock.

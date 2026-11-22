@@ -13,11 +13,18 @@ Standard library only (ctypes) on top of the C API in libpalito.so.
                                     temperature=0.7):
             print(text, end="", flush=True)
 
+        person = llm.chat([{"role": "user", "content": "Invent a person."}],
+                          json_schema={"type": "object",
+                                       "properties": {"name": {"type": "string"}},
+                                       "required": ["name"]})
+        print(json.loads(person.text)["name"])
+
 The library is found via $PALITO_LIBRARY, then the installed `palito` command
 (<bundle>/lib/libpalito.so), then the system loader.
 """
 
 import ctypes
+import json
 import os
 import queue
 import shutil
@@ -118,6 +125,11 @@ def _load():
                   POINTER(c_void_p)]
         lib.palito_chat.argtypes = [c_void_p, POINTER(_Message), c_size_t] + common
         lib.palito_complete.argtypes = [c_void_p, c_char_p] + common
+        if hasattr(lib, "palito_chat_json"):  # newer than 0.5.0
+            lib.palito_chat_json.argtypes = ([c_void_p, POINTER(_Message), c_size_t]
+                                             + common[:1] + [c_char_p] + common[1:])
+            lib.palito_complete_json.argtypes = ([c_void_p, c_char_p] + common[:1]
+                                                 + [c_char_p] + common[1:])
         lib.palito_result_free.argtypes = [POINTER(_Result)]
         lib.palito_string_free.argtypes = [c_void_p]
         _lib = lib
@@ -132,6 +144,14 @@ def _take_error(lib, error):
     message = ctypes.string_at(error.value).decode() if error.value else "unknown error"
     lib.palito_string_free(error)
     return message
+
+
+def _schema_bytes(json_schema):
+    if json_schema is None:
+        return None
+    if isinstance(json_schema, (bytes, str)):
+        return json_schema.encode() if isinstance(json_schema, str) else json_schema
+    return json.dumps(json_schema).encode()
 
 
 class Palito:
@@ -173,18 +193,26 @@ class Palito:
 
         on_text(str) receives the reply as it is generated; returning False stops it.
         Generation keywords: max_tokens=0 (no cap), thinking=True, temperature=0.0
-        (greedy), top_p=1.0, top_k=0, seed=None, stop=() (strings).
+        (greedy), top_p=1.0, top_k=0, seed=None, stop=() (strings), json_schema=None
+        (a JSON Schema dict or string: the reply is JSON matching it, reasoning off;
+        {"type": "object"} for any object).
         """
         array = (_Message * len(messages))(
             *[_Message(m["role"].encode(), m["content"].encode()) for m in messages])
-        return self._run(lambda gen, cb, res, err: self._lib.palito_chat(
-            self._handle(), array, len(messages), gen, cb, None, res, err),
+        return self._run(lambda gen, schema, cb, res, err: (
+            self._lib.palito_chat(self._handle(), array, len(messages), gen, cb, None, res, err)
+            if schema is None else
+            self._lib.palito_chat_json(self._handle(), array, len(messages), gen, schema, cb,
+                                       None, res, err)),
             on_text, **generation)
 
     def complete(self, prompt, on_text=None, **generation):
         """Continues prompt without a chat template; keywords as in chat()."""
-        return self._run(lambda gen, cb, res, err: self._lib.palito_complete(
-            self._handle(), prompt.encode(), gen, cb, None, res, err),
+        return self._run(lambda gen, schema, cb, res, err: (
+            self._lib.palito_complete(self._handle(), prompt.encode(), gen, cb, None, res, err)
+            if schema is None else
+            self._lib.palito_complete_json(self._handle(), prompt.encode(), gen, schema, cb,
+                                           None, res, err)),
             on_text, **generation)
 
     def stream_chat(self, messages, **generation):
@@ -225,7 +253,10 @@ class Palito:
             thread.join()
 
     def _run(self, call, on_text, max_tokens=0, thinking=True, temperature=0.0,
-             top_p=1.0, top_k=0, seed=None, stop=()):
+             top_p=1.0, top_k=0, seed=None, stop=(), json_schema=None):
+        schema = _schema_bytes(json_schema)
+        if schema is not None and not hasattr(self._lib, "palito_chat_json"):
+            raise PalitoError("json_schema needs a libpalito newer than 0.5.0")
         generation = _Generation()
         self._lib.palito_generation_init(ctypes.byref(generation))
         generation.max_tokens = max_tokens
@@ -252,7 +283,7 @@ class Palito:
         result = _Result()
         error = c_void_p()
         with self._lock:
-            status = call(ctypes.byref(generation), callback, ctypes.byref(result),
+            status = call(ctypes.byref(generation), schema, callback, ctypes.byref(result),
                           ctypes.byref(error))
         if status:
             raise PalitoError(_take_error(self._lib, error))

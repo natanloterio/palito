@@ -4,11 +4,17 @@
 //! `error` is not NULL, `*error` receives a message to release with
 //! `palito_string_free`. An engine handle must not be used from two threads at
 //! once. Panics never cross the boundary: they become errors.
+//!
+//! ABI: struct layouts never change (`c_abi_layout_matches_the_bindings` in
+//! tests/engine.rs); new options come as new functions, so programs built
+//! against an older header keep working (`palito_chat_json` and
+//! `palito_complete_json` add the JSON Schema argument).
 
 use crate::{
     Error,
     chat::Message,
     engine::{Completion, Device, Engine, EngineOptions, FinishReason, GenerationOptions},
+    grammar::JsonSchema,
     sampling::Sampling,
 };
 use std::{
@@ -193,6 +199,36 @@ pub unsafe extern "C" fn palito_chat(
     result: *mut PalitoResult,
     error: *mut *mut c_char,
 ) -> c_int {
+    unsafe {
+        palito_chat_json(
+            engine,
+            messages,
+            message_count,
+            generation,
+            ptr::null(),
+            callback,
+            user_data,
+            result,
+            error,
+        )
+    }
+}
+
+/// palito_chat whose reply is JSON matching `json_schema` (JSON Schema text;
+/// `{"type":"object"}` for any object; NULL: unconstrained). Reasoning is off.
+/// An unsupported schema fails before generation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn palito_chat_json(
+    engine: *mut PalitoEngine,
+    messages: *const PalitoMessage,
+    message_count: usize,
+    generation: *const PalitoGeneration,
+    json_schema: *const c_char,
+    callback: PalitoTextCallback,
+    user_data: *mut c_void,
+    result: *mut PalitoResult,
+    error: *mut *mut c_char,
+) -> c_int {
     let outcome = guard(|| {
         let engine = unsafe { engine_mut(engine) }?;
         if messages.is_null() && message_count > 0 {
@@ -212,7 +248,7 @@ pub unsafe extern "C" fn palito_chat(
                 ))
             })
             .collect::<crate::Result<Vec<_>>>()?;
-        let options = unsafe { generation_options(generation) }?;
+        let options = unsafe { generation_options(generation, json_schema) }?;
         engine.0.chat(&messages, &options, stream_to(callback, user_data))
     });
     unsafe { finish(outcome, result, error) }
@@ -229,10 +265,37 @@ pub unsafe extern "C" fn palito_complete(
     result: *mut PalitoResult,
     error: *mut *mut c_char,
 ) -> c_int {
+    unsafe {
+        palito_complete_json(
+            engine,
+            prompt,
+            generation,
+            ptr::null(),
+            callback,
+            user_data,
+            result,
+            error,
+        )
+    }
+}
+
+/// palito_complete whose continuation is JSON matching `json_schema` (as in
+/// palito_chat_json).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn palito_complete_json(
+    engine: *mut PalitoEngine,
+    prompt: *const c_char,
+    generation: *const PalitoGeneration,
+    json_schema: *const c_char,
+    callback: PalitoTextCallback,
+    user_data: *mut c_void,
+    result: *mut PalitoResult,
+    error: *mut *mut c_char,
+) -> c_int {
     let outcome = guard(|| {
         let engine = unsafe { engine_mut(engine) }?;
         let prompt = unsafe { text(prompt, "prompt") }?;
-        let options = unsafe { generation_options(generation) }?;
+        let options = unsafe { generation_options(generation, json_schema) }?;
         engine.0.complete(&prompt, &options, stream_to(callback, user_data))
     });
     unsafe { finish(outcome, result, error) }
@@ -306,9 +369,18 @@ unsafe fn engine_options(options: &PalitoOptions) -> crate::Result<EngineOptions
 
 unsafe fn generation_options(
     generation: *const PalitoGeneration,
+    json_schema: *const c_char,
 ) -> crate::Result<GenerationOptions> {
+    let json_schema = if json_schema.is_null() {
+        None
+    } else {
+        Some(JsonSchema::parse(&unsafe { text(json_schema, "json_schema") }?)?)
+    };
     let Some(generation) = (unsafe { generation.as_ref() }) else {
-        return Ok(GenerationOptions::default());
+        return Ok(GenerationOptions {
+            json_schema,
+            ..GenerationOptions::default()
+        });
     };
     if generation.stop.is_null() && generation.stop_count > 0 {
         return Err(Error::Invalid("stop is NULL".into()));
@@ -326,6 +398,7 @@ unsafe fn generation_options(
             seed: u64::try_from(generation.seed).ok(),
         },
         stop,
+        json_schema,
     })
 }
 

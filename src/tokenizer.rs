@@ -417,6 +417,15 @@ impl Tokenizer {
     pub fn vocab_tokens(&self) -> usize {
         self.decoded.len()
     }
+
+    /// The bytes `detokenize` emits for one token; None for controls, unused
+    /// tokens and IDs outside the vocabulary.
+    pub fn token_bytes(&self, id: usize) -> Option<&[u8]> {
+        if self.unused.get(id).copied().unwrap_or(true) {
+            return None;
+        }
+        self.decoded.get(id)?.as_deref()
+    }
 }
 
 #[cfg(test)]

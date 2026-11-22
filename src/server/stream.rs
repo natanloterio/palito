@@ -2,7 +2,8 @@
 //!
 //! Chat: a first chunk with `delta.role`, one chunk per piece of text, a final
 //! chunk with `finish_reason`, an optional usage chunk, then `data: [DONE]`.
-//! Completions use the same order with `text` instead of `delta`.
+//! Completions use the same order with `text` instead of `delta`. Chat
+//! reasoning goes in `delta.reasoning_content` (llama.cpp/vLLM convention).
 
 use super::{
     openai::{self, Usage},
@@ -54,21 +55,22 @@ struct Chunks {
 }
 
 impl Chunks {
-    fn chunk(&self, text: Option<&str>, role: bool, finish: Option<&str>) -> Value {
+    fn chunk(&self, text: Option<(&str, bool)>, role: bool, finish: Option<&str>) -> Value {
         let choice = match self.kind {
             Kind::Chat => {
                 let mut delta = json!({});
                 if role {
                     delta["role"] = json!("assistant");
                 }
-                if let Some(text) = text {
-                    delta["content"] = json!(text);
+                if let Some((text, reasoning)) = text {
+                    let field = if reasoning { "reasoning_content" } else { "content" };
+                    delta[field] = json!(text);
                 }
                 json!({"index": 0, "delta": delta, "finish_reason": finish, "logprobs": null})
             }
             Kind::Text => json!({
                 "index": 0,
-                "text": text.unwrap_or_default(),
+                "text": text.map_or("", |(text, _)| text),
                 "finish_reason": finish,
                 "logprobs": null,
             }),
@@ -112,17 +114,18 @@ pub fn sse(
             Phase::End => return None,
             Phase::Start => {
                 let first = match chunks.kind {
-                    Kind::Chat => vec![chunks.chunk(Some(""), true, None)],
+                    Kind::Chat => vec![chunks.chunk(Some(("", false)), true, None)],
                     Kind::Text => vec![],
                 };
                 return Some((data(first), (chunks, events, Phase::Body)));
             }
             Phase::Body => match events.recv().await {
-                Some(Event::Text(text)) => {
-                    let piece = vec![chunks.chunk(Some(&text), false, None)];
+                Some(Event::Text { reasoning, text }) => {
+                    let piece = vec![chunks.chunk(Some((&text, reasoning)), false, None)];
                     return Some((data(piece), (chunks, events, Phase::Body)));
                 }
-                Some(Event::Done(Ok(completion))) => {
+                Some(Event::Done(Ok(reply))) => {
+                    let completion = reply.completion;
                     super::log(chunks.kind, &completion);
                     let finish = openai::finish_reason(completion.finish_reason);
                     let mut out = vec![chunks.chunk(None, false, Some(finish))];

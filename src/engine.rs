@@ -1,23 +1,29 @@
 //! High-level embedding API: open a GGUF model once, then run chat or plain
 //! completion with streamed text.
 //!
-//! `Engine::open` applies the same defaults as `palito chat`: the model's trained
-//! context (CUDA: at most 65535, shrunk to fit free device memory), the fastest
-//! CUDA profile that opens for the model, and prefill chunks of up to 4096 tokens.
-//! The C API (`crate::ffi`) and other embedders build on this type.
+//! `Engine::open` applies Palito's defaults: the model's trained context (CUDA:
+//! at most 65535, shrunk to fit free device memory), the fastest CUDA profile
+//! that opens for the model, and prefill chunks of up to 4096 tokens. `palito
+//! chat`, `palito serve` and the C API (`crate::ffi`) all build on this type.
+
+mod open;
+mod text;
 
 use crate::{
     Config, Error, Executor, GenerationMode, Result, Sample,
     backend::Backend,
     chat::{ChatTemplate, Message},
-    cpu::{CpuBackend, CpuOptions},
+    sampling::{Sampler, Sampling},
+    stop::{self, StopFilter},
     stream::TextStream,
     tokenizer::Tokenizer,
 };
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+};
+use text::{TextSink, TrimmedText};
 
-const CPU_BATCH_TOKENS: u32 = 128;
-const CPU_PREFILL_CHUNK: u32 = 64;
 const DEFAULT_THREADS: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,11 +39,23 @@ pub struct EngineOptions {
     /// None: the model's trained context (CUDA: fitted to device memory).
     pub context_tokens: Option<u32>,
     pub threads: u32,
+    /// None: 4096 with the tiled CUDA kernels, else 128.
+    pub batch_tokens: Option<u32>,
+    /// None: 4096 with the tiled CUDA kernels, else 64 (at most the batch).
+    pub prefill_chunk: Option<u32>,
     pub gpu_device: usize,
     /// None: free device memory minus the 2 GiB headroom.
     pub gpu_memory_limit_bytes: Option<u64>,
     /// None: $PALITO_CUDA_KERNEL_CACHE, else $XDG_CACHE_HOME (or ~/.cache)/palito/kernels.
     pub kernel_cache_dir: Option<PathBuf>,
+    /// None: try int8-fast, then f32-tiled, then f32. Some: only this profile.
+    #[cfg(feature = "cuda")]
+    pub cuda_matmul: Option<crate::cuda::CudaMatmul>,
+    /// None: on for the tiled profiles, dropped if it cannot be captured.
+    #[cfg(feature = "cuda")]
+    pub decode_graph: Option<bool>,
+    /// Jinja source replacing the GGUF `tokenizer.chat_template`.
+    pub chat_template: Option<String>,
 }
 
 impl Default for EngineOptions {
@@ -50,9 +68,16 @@ impl Default for EngineOptions {
             },
             context_tokens: None,
             threads: DEFAULT_THREADS,
+            batch_tokens: None,
+            prefill_chunk: None,
             gpu_device: 0,
             gpu_memory_limit_bytes: None,
             kernel_cache_dir: None,
+            #[cfg(feature = "cuda")]
+            cuda_matmul: None,
+            #[cfg(feature = "cuda")]
+            decode_graph: None,
+            chat_template: None,
         }
     }
 }
@@ -63,6 +88,10 @@ pub struct GenerationOptions {
     pub max_tokens: Option<u32>,
     /// Reasoning for templates that support it (Qwen3 `enable_thinking`).
     pub enable_thinking: bool,
+    /// Default: greedy.
+    pub sampling: Sampling,
+    /// Generation ends at the first of these; it is not part of the text.
+    pub stop: Vec<String>,
 }
 
 impl Default for GenerationOptions {
@@ -70,13 +99,15 @@ impl Default for GenerationOptions {
         Self {
             max_tokens: None,
             enable_thinking: true,
+            sampling: Sampling::GREEDY,
+            stop: Vec::new(),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FinishReason {
-    /// The model ended its turn.
+    /// The model ended its turn, or a stop sequence appeared.
     Stop,
     /// `max_tokens` was reached.
     Length,
@@ -88,15 +119,15 @@ pub enum FinishReason {
 
 #[derive(Clone, Debug)]
 pub struct Completion {
-    /// Generated text (for chat, trimmed like `palito chat` replies).
+    /// Generated text (for chat, trimmed like `palito chat` replies), without
+    /// any stop sequence.
     pub text: String,
     pub finish_reason: FinishReason,
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
-    /// Prompt evaluation plus the first token, in nanoseconds (0 when cancelled).
+    /// Prompt evaluation plus the first token, in nanoseconds.
     pub ttft_ns: u64,
-    /// Decode steps per second after the first token (0 when cancelled or fewer
-    /// than two tokens).
+    /// Decode steps per second after the first token (0 with fewer than two tokens).
     pub tokens_per_second: f64,
 }
 
@@ -106,20 +137,37 @@ pub struct Engine {
     /// None when the model has no chat template (only `complete` works).
     template: Option<ChatTemplate>,
     profile: &'static str,
+    notices: Vec<String>,
 }
 
 impl Engine {
     pub fn open(path: &Path, options: &EngineOptions) -> Result<Self> {
-        if options.threads == 0 {
-            return Err(Error::Invalid("threads must be positive".into()));
-        }
-        let trained = crate::model_context_tokens(path)?;
-        let (backend, config, profile) = match options.device {
-            Device::Cpu => open_cpu(path, options, trained)?,
-            Device::Cuda => open_cuda(path, options, trained)?,
-        };
+        let opened = open::open(path, options)?;
+        let mut engine = Self::from_backend(
+            path,
+            opened.backend,
+            opened.config,
+            opened.profile,
+            options.chat_template.as_deref(),
+        )?;
+        engine.notices = opened.notices;
+        Ok(engine)
+    }
+
+    /// Wraps a backend opened by the caller (e.g. with validation-only CPU
+    /// options). `config` must fit the backend.
+    pub fn from_backend(
+        path: &Path,
+        backend: Box<dyn Backend>,
+        config: Config,
+        profile: &'static str,
+        chat_template: Option<&str>,
+    ) -> Result<Self> {
         let tokenizer_adds_bos = !backend.tokenize("")?.is_empty();
-        let template = ChatTemplate::from_model(path, None, tokenizer_adds_bos).ok();
+        let template = match chat_template {
+            Some(source) => Some(ChatTemplate::from_model(path, Some(source), tokenizer_adds_bos)?),
+            None => ChatTemplate::from_model(path, None, tokenizer_adds_bos).ok(),
+        };
         let executor = Executor::new(backend, config)?;
         executor.detokenize(&[])?;
         Ok(Self {
@@ -127,6 +175,7 @@ impl Engine {
             tokenizer: Tokenizer::open(path)?,
             template,
             profile,
+            notices: Vec::new(),
         })
     }
 
@@ -140,12 +189,26 @@ impl Engine {
         self.profile
     }
 
+    /// What `open` changed from the request: profile fallbacks, a context
+    /// shrunk to fit device memory.
+    pub fn notices(&self) -> &[String] {
+        &self.notices
+    }
+
     pub fn has_chat_template(&self) -> bool {
         self.template.is_some()
     }
 
     pub fn tokenize(&self, text: &str) -> Result<Vec<i32>> {
         self.executor.tokenize(text)
+    }
+
+    /// The prompt `chat` would evaluate for `messages`.
+    pub fn render_chat(&self, messages: &[Message], enable_thinking: bool) -> Result<String> {
+        let template = self.template.as_ref().ok_or_else(|| {
+            Error::Invalid("model has no chat template; use plain completion".into())
+        })?;
+        template.render_thinking(messages, true, enable_thinking)
     }
 
     /// Renders `messages` with the model's chat template and generates the
@@ -157,10 +220,7 @@ impl Engine {
         options: &GenerationOptions,
         on_text: impl FnMut(&str) -> bool,
     ) -> Result<Completion> {
-        let template = self.template.as_ref().ok_or_else(|| {
-            Error::Invalid("model has no chat template; use plain completion".into())
-        })?;
-        let prompt = template.render_thinking(messages, true, options.enable_thinking)?;
+        let prompt = self.render_chat(messages, options.enable_thinking)?;
         let mut completion = self.generate(&prompt, options, TrimmedText::new(on_text))?;
         completion.text = completion.text.trim().to_owned();
         Ok(completion)
@@ -182,6 +242,8 @@ impl Engine {
         options: &GenerationOptions,
         mut sink: impl TextSink,
     ) -> Result<Completion> {
+        stop::validate(&options.stop)?;
+        let mut sampler = Sampler::new(options.sampling)?;
         let tokens = self.executor.tokenize(prompt)?;
         let context = self.context_tokens() as usize;
         if tokens.is_empty() || tokens.len() >= context {
@@ -196,44 +258,73 @@ impl Engine {
             return Err(Error::Invalid("max_tokens must be positive".into()));
         }
         let mut stream = TextStream::new();
+        let mut stops = StopFilter::new(&options.stop);
+        let mut clock = TokenClock::new();
         let mut generated = Vec::new();
+        let mut cancelled = false;
         let tokenizer = &self.tokenizer;
         let detokenize = |ids: &[i32]| tokenizer.detokenize(ids);
-        let result =
+        let mut on_token = |token: i32| {
+            clock.tick();
+            generated.push(token);
+            let piece = stops.push(&stream.push(token, detokenize)?);
+            if !piece.is_empty() && !sink.write(&piece) {
+                cancelled = true;
+                return Err(Error::Cancelled);
+            }
+            if stops.stopped() {
+                return Err(Error::Cancelled);
+            }
+            Ok(())
+        };
+        let mode = GenerationMode::UntilEog;
+        let result = if sampler.is_greedy() {
             self.executor
-                .generate_streaming(&tokens, budget, GenerationMode::UntilEog, |token| {
-                    generated.push(token);
-                    let piece = stream.push(token, detokenize)?;
-                    if piece.is_empty() || sink.write(&piece) {
-                        Ok(())
-                    } else {
-                        Err(Error::Cancelled)
-                    }
-                });
-        let rest = stream.finish(detokenize)?;
+                .generate_streaming(&tokens, budget, mode, &mut on_token)
+        } else {
+            self.executor
+                .generate_sampled(&tokens, budget, mode, &mut sampler, &mut on_token)
+        };
         let sample = match result {
             Ok(sample) => Some(sample),
             Err(Error::Cancelled) => None,
             Err(error) => return Err(error),
         };
-        if sample.is_some() && !rest.is_empty() {
-            sink.write(&rest);
+        if sample.is_some() {
+            let mut rest = stops.push(&stream.finish(detokenize)?);
+            if !stops.stopped() {
+                rest += &stops.finish();
+            }
+            if !rest.is_empty() {
+                sink.write(&rest);
+            }
         }
         sink.end();
+        let mut text = tokenizer.detokenize(&generated)?;
+        if let Some(index) = stop::find(&text, &options.stop) {
+            text.truncate(index);
+        }
         let ended = generated.last().is_some_and(|&t| self.executor.is_eog(t));
-        let finish_reason = match &sample {
-            None => FinishReason::Cancelled,
-            Some(_) if ended => FinishReason::Stop,
-            Some(_) if budget < room => FinishReason::Length,
-            Some(_) => FinishReason::ContextFull,
+        let finish_reason = if cancelled {
+            FinishReason::Cancelled
+        } else if stops.stopped() || ended {
+            FinishReason::Stop
+        } else if budget < room {
+            FinishReason::Length
+        } else {
+            FinishReason::ContextFull
+        };
+        let (ttft_ns, tokens_per_second) = match &sample {
+            Some(sample) => (sample.ttft_ns, decode_rate(sample)),
+            None => clock.stats(),
         };
         Ok(Completion {
-            text: tokenizer.detokenize(&generated)?,
+            text,
             finish_reason,
             prompt_tokens: tokens.len(),
             generated_tokens: generated.len(),
-            ttft_ns: sample.as_ref().map_or(0, |s| s.ttft_ns),
-            tokens_per_second: sample.as_ref().map_or(0.0, decode_rate),
+            ttft_ns,
+            tokens_per_second,
         })
     }
 }
@@ -246,185 +337,43 @@ fn decode_rate(sample: &Sample) -> f64 {
     }
 }
 
-/// Receives streamed text; `write` returns false to stop generation.
-trait TextSink {
-    fn write(&mut self, text: &str) -> bool;
-    fn end(&mut self) {}
+/// Timing for generations that end early (a stop sequence or a cancelled
+/// callback), where the executor returns no `Sample`.
+struct TokenClock {
+    start: Instant,
+    first: Option<Instant>,
+    last: Option<Instant>,
+    tokens: usize,
 }
 
-impl<F: FnMut(&str) -> bool> TextSink for F {
-    fn write(&mut self, text: &str) -> bool {
-        self(text)
-    }
-}
-
-/// Streams chat text without leading whitespace and holds trailing whitespace
-/// until more text follows, so the streamed reply equals the trimmed one.
-struct TrimmedText<F> {
-    inner: F,
-    started: bool,
-    pending: String,
-}
-
-impl<F: FnMut(&str) -> bool> TrimmedText<F> {
-    fn new(inner: F) -> Self {
+impl TokenClock {
+    fn new() -> Self {
         Self {
-            inner,
-            started: false,
-            pending: String::new(),
+            start: Instant::now(),
+            first: None,
+            last: None,
+            tokens: 0,
         }
     }
-}
 
-impl<F: FnMut(&str) -> bool> TextSink for TrimmedText<F> {
-    fn write(&mut self, text: &str) -> bool {
-        let text = if self.started {
-            text
+    fn tick(&mut self) {
+        let now = Instant::now();
+        self.first.get_or_insert(now);
+        self.last = Some(now);
+        self.tokens += 1;
+    }
+
+    fn stats(&self) -> (u64, f64) {
+        let (Some(first), Some(last)) = (self.first, self.last) else {
+            return (0, 0.0);
+        };
+        let ttft = (first - self.start).as_nanos() as u64;
+        let decode = (last - first).as_secs_f64();
+        let rate = if self.tokens > 1 && decode > 0.0 {
+            (self.tokens - 1) as f64 / decode
         } else {
-            text.trim_start()
+            0.0
         };
-        if text.is_empty() {
-            return true;
-        }
-        self.started = true;
-        let body = text.trim_end();
-        let keep_going = if body.is_empty() {
-            true
-        } else {
-            let piece = std::mem::take(&mut self.pending) + body;
-            (self.inner)(&piece)
-        };
-        self.pending.push_str(&text[body.len()..]);
-        keep_going
-    }
-}
-
-fn open_cpu(
-    path: &Path,
-    options: &EngineOptions,
-    trained: u32,
-) -> Result<(Box<dyn Backend>, Config, &'static str)> {
-    let context = options.context_tokens.unwrap_or(trained);
-    let config = Config {
-        context_tokens: context,
-        batch_tokens: CPU_BATCH_TOKENS.min(context),
-        prefill_chunk: CPU_PREFILL_CHUNK.min(context),
-        threads: options.threads,
-    };
-    let backend = CpuBackend::open_with_options(path, &config, CpuOptions::default())?;
-    Ok((Box::new(backend), config, "cpu"))
-}
-
-#[cfg(not(feature = "cuda"))]
-fn open_cuda(
-    _: &Path,
-    _: &EngineOptions,
-    _: u32,
-) -> Result<(Box<dyn Backend>, Config, &'static str)> {
-    Err(Error::Invalid(
-        "this build has no CUDA support; use the CPU device".into(),
-    ))
-}
-
-#[cfg(feature = "cuda")]
-fn open_cuda(
-    path: &Path,
-    options: &EngineOptions,
-    trained: u32,
-) -> Result<(Box<dyn Backend>, Config, &'static str)> {
-    use crate::cuda::{CudaMatmul, CudaOptions, open_backend};
-    const CONTEXT_MAX: u32 = 65535;
-    const FAST_PREFILL_TOKENS: u32 = 4096;
-    let (context, fit) = match options.context_tokens {
-        Some(context) => (context, false),
-        None => (trained.min(CONTEXT_MAX), true),
-    };
-    // The chat CLI's order: fastest profile first, then the ones every
-    // quantization supports (Q5_K needs f32 without the decode graph).
-    let attempts = [
-        (CudaMatmul::Int8Fast, true, "int8-fast"),
-        (CudaMatmul::F32Tiled, true, "f32-tiled"),
-        (CudaMatmul::F32Tiled, false, "f32-tiled"),
-        (CudaMatmul::F32, false, "f32"),
-    ];
-    let mut first_error = None;
-    for (matmul, graph, name) in attempts {
-        let (batch, chunk) = if matmul == CudaMatmul::F32 {
-            (CPU_BATCH_TOKENS.min(context), CPU_PREFILL_CHUNK.min(context))
-        } else {
-            let batch = FAST_PREFILL_TOKENS.min(context);
-            (batch, batch)
-        };
-        let config = Config {
-            context_tokens: context,
-            batch_tokens: batch,
-            prefill_chunk: chunk,
-            threads: options.threads,
-        };
-        let cuda = CudaOptions {
-            device: options.gpu_device,
-            memory_limit_bytes: options.gpu_memory_limit_bytes.unwrap_or(u64::MAX),
-            kernel_cache_dir: options.kernel_cache_dir.clone().or_else(default_kernel_cache),
-            matmul,
-            decode_graph: graph,
-            fit_context: fit,
-        };
-        match open_backend(path, &config, cuda) {
-            Ok(backend) => {
-                let opened = backend.info().context_tokens;
-                let config = Config {
-                    context_tokens: opened,
-                    batch_tokens: config.batch_tokens.min(opened),
-                    prefill_chunk: config.prefill_chunk.min(opened),
-                    ..config
-                };
-                return Ok((backend, config, name));
-            }
-            // Files and memory budgets fail the same way for every profile.
-            Err(error @ Error::Io(_)) => return Err(error),
-            Err(error) => {
-                first_error.get_or_insert(error);
-            }
-        }
-    }
-    Err(first_error.expect("at least one CUDA profile was tried"))
-}
-
-#[cfg(feature = "cuda")]
-fn default_kernel_cache() -> Option<PathBuf> {
-    let from_env = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
-    if let Some(dir) = from_env("PALITO_CUDA_KERNEL_CACHE") {
-        return Some(PathBuf::from(dir));
-    }
-    let base = from_env("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| from_env("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
-    Some(base.join("palito").join("kernels"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn trimmed_text_streams_the_trimmed_reply() {
-        let mut out = String::new();
-        {
-            let mut sink = TrimmedText::new(|piece: &str| {
-                out.push_str(piece);
-                true
-            });
-            for piece in ["\n\n", "  Hello", ", world", "  ", "\n", "again", " \n"] {
-                assert!(sink.write(piece));
-            }
-        }
-        assert_eq!(out, "Hello, world  \nagain");
-    }
-
-    #[test]
-    fn trimmed_text_reports_stop() {
-        let mut sink = TrimmedText::new(|_: &str| false);
-        assert!(sink.write(" "));
-        assert!(!sink.write("text"));
+        (ttft, rate)
     }
 }

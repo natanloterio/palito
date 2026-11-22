@@ -1,22 +1,27 @@
-//! Interactive multi-turn chat on top of the greedy `Executor`.
+//! Interactive multi-turn chat on top of `palito::engine::Engine`.
 //!
 //! Each turn re-renders the whole conversation with the model's chat template
-//! and runs a fresh greedy generation (the executor resets state per request).
+//! and runs a fresh generation (the engine resets state per request). Opening,
+//! CUDA profile fallbacks, sampling and stop sequences are the engine's.
 
 use crate::RuntimeArgs;
 use clap::Args;
 use palito::{
-    Executor, GenerationMode, Result, Sample,
-    backend::Backend,
-    chat::{ChatTemplate, Message, fit_history},
+    Result,
+    chat::{Message, fit_history},
+    engine::{Completion, Engine, FinishReason, GenerationOptions},
+    sampling::Sampling,
 };
-use palito::{stream::TextStream, tokenizer::Tokenizer};
 use std::{
     fs,
     io::{BufRead, IsTerminal, Write},
     path::PathBuf,
     time::Instant,
 };
+
+/// Chat history keeps this much context free for the reply (Qwen3-style
+/// reasoning before the answer); the reply itself may use all remaining context.
+const CHAT_REPLY_RESERVE: u32 = 2048;
 
 #[derive(Args)]
 pub(crate) struct ChatArgs {
@@ -37,35 +42,70 @@ pub(crate) struct ChatArgs {
     /// Print each reply only once it is complete instead of token by token.
     #[arg(long)]
     no_stream: bool,
+    #[command(flatten)]
+    sampling: SamplingArgs,
+    /// End the reply at this text (not printed); repeat for several.
+    #[arg(long, allow_hyphen_values = true)]
+    stop: Vec<String>,
+}
+
+/// Sampling flags shared by `chat` and `serve`.
+#[derive(Args, Clone)]
+pub(crate) struct SamplingArgs {
+    /// 0 is greedy (deterministic). Qwen3 suggests 0.6 with reasoning, 0.7 without.
+    #[arg(long, default_value_t = 0.0)]
+    pub(crate) temperature: f32,
+    /// Nucleus sampling mass in (0, 1]; 1 disables it.
+    #[arg(long, default_value_t = 1.0)]
+    pub(crate) top_p: f32,
+    /// Sample among the k most likely tokens; 0 disables it.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) top_k: u32,
+    /// Seed for reproducible sampling [default: a new one each reply].
+    #[arg(long)]
+    pub(crate) seed: Option<u64>,
+}
+
+impl SamplingArgs {
+    pub(crate) fn sampling(&self) -> Sampling {
+        Sampling {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            seed: self.seed,
+        }
+    }
 }
 
 struct Session {
-    executor: Executor<Box<dyn Backend>>,
-    /// Detokenizes streamed replies while the executor is generating.
-    tokenizer: Tokenizer,
-    template: ChatTemplate,
+    engine: Engine,
+    options: GenerationOptions,
     initial: Vec<Message>,
     history: Vec<Message>,
     context: usize,
-    /// Explicit --tokens; None generates until end of turn or a full context.
-    max_tokens: Option<u32>,
     /// Context kept free for the reply when dropping old turns.
     reserve: u32,
 }
 
 pub(crate) fn run(mut args: ChatArgs) -> Result<()> {
     let start = Instant::now();
-    args.runtime.use_fast_cuda_defaults();
-    args.runtime.use_model_context()?;
+    let sampling = args.sampling.sampling();
+    sampling.validate()?;
+    palito::stop::validate(&args.stop)?;
     let mut session = Session::open(&mut args)?;
     let interactive = std::io::stdin().is_terminal();
     if interactive {
-        let limit = match session.max_tokens {
+        let limit = match session.options.max_tokens {
             Some(tokens) => format!("up to {tokens} tokens per reply"),
             None => "replies run to the end of turn or a full context".into(),
         };
+        let decoding = if sampling.is_greedy() {
+            "Greedy decoding".to_owned()
+        } else {
+            format!("Sampling at temperature {}", sampling.temperature)
+        };
         eprintln!(
-            "Model loaded in {:.1}s. Context {} tokens; {limit}. Commands: /reset, /exit. Greedy decoding.",
+            "Model loaded in {:.1}s. Context {} tokens; {limit}. Commands: /reset, /exit. {decoding}.",
             start.elapsed().as_secs_f64(),
             session.context
         );
@@ -87,12 +127,12 @@ pub(crate) fn run(mut args: ChatArgs) -> Result<()> {
                 eprintln!("(conversation cleared)");
             }
             text => match session.reply(text, !args.no_stream) {
-                Ok((reply, sample)) => {
+                Ok(completion) => {
                     if args.no_stream {
-                        println!("{reply}");
+                        println!("{}", completion.text);
                     }
                     if args.stats {
-                        print_stats(&sample);
+                        print_stats(&completion);
                     }
                 }
                 Err(error) => eprintln!("palito: {error}"),
@@ -104,68 +144,74 @@ pub(crate) fn run(mut args: ChatArgs) -> Result<()> {
 
 impl Session {
     fn open(args: &mut ChatArgs) -> Result<Self> {
-        let override_source = match &args.chat_template_file {
+        let template = match &args.chat_template_file {
             Some(path) => Some(fs::read_to_string(path)?),
             None => None,
         };
-        let backend = open_backend(&mut args.runtime)?;
-        let requested = args.runtime.context();
-        let opened = backend.info().context_tokens;
-        args.runtime.adopt_context(opened);
-        if opened < requested {
-            eprintln!(
-                "(context {opened} tokens: {requested} do not fit in device memory)"
-            );
+        let runtime = &mut args.runtime;
+        let engine = if runtime.is_cuda() {
+            open_cuda(runtime, template)?
+        } else {
+            runtime.use_model_context()?;
+            let backend = runtime.open()?;
+            let config = runtime.config();
+            Engine::from_backend(
+                &runtime.model,
+                backend,
+                config,
+                runtime.cpu_profile(),
+                template.as_deref(),
+            )?
+        };
+        for notice in engine.notices() {
+            eprintln!("({notice})");
         }
-        let runtime = &args.runtime;
-        let tokenizer_adds_bos = !backend.tokenize("")?.is_empty();
-        let template = ChatTemplate::from_model(
-            &runtime.model,
-            override_source.as_deref(),
-            tokenizer_adds_bos,
-        )?
-        .with_thinking(!args.no_thinking);
-        let executor = Executor::new(backend, runtime.config())?;
-        executor.detokenize(&[])?;
+        if !engine.has_chat_template() {
+            return Err(palito::Error::Invalid(
+                "model has no chat template; pass --chat-template-file or use generate".into(),
+            ));
+        }
+        let context = engine.context_tokens();
+        let max_tokens = runtime.chat_tokens();
         let initial: Vec<_> = args.system.iter().map(Message::system).collect();
         Ok(Self {
-            executor,
-            tokenizer: Tokenizer::open(&runtime.model)?,
-            template,
+            engine,
+            options: GenerationOptions {
+                max_tokens,
+                enable_thinking: !args.no_thinking,
+                sampling: args.sampling.sampling(),
+                stop: args.stop.clone(),
+            },
             history: initial.clone(),
             initial,
-            context: runtime.context() as usize,
-            max_tokens: runtime.chat_tokens(),
-            reserve: runtime.chat_reserve(),
+            context: context as usize,
+            reserve: max_tokens.unwrap_or(CHAT_REPLY_RESERVE.min((context / 2).max(1))),
         })
     }
 
     /// Generates a reply; history only changes when generation succeeds.
-    /// With `stream`, prints the reply to stdout as it is generated (trimmed like
-    /// the returned reply) and ends it with a newline.
-    fn reply(&mut self, text: &str, stream: bool) -> Result<(String, Sample)> {
+    /// With `stream`, prints the reply to stdout as it is generated and ends it
+    /// with a newline.
+    fn reply(&mut self, text: &str, stream: bool) -> Result<Completion> {
         let candidate = [self.history.as_slice(), &[Message::user(text)]].concat();
         let reserved = self.reserve.saturating_sub(1) as usize;
-        let mut prompt = Vec::new();
         let fitted = match fit_history(&candidate, |messages| {
-            prompt = self.prompt_tokens(messages)?;
-            Ok(prompt.len() + reserved <= self.context)
+            Ok(self.prompt_tokens(messages)? + reserved <= self.context)
         }) {
             Ok(fitted) => fitted,
             // Without --tokens the reserve only guides dropping old turns: a message
             // that fits alone keeps whatever context is left for the reply.
-            Err(_) if self.max_tokens.is_none() => {
+            Err(_) if self.options.max_tokens.is_none() => {
                 let latest: Vec<Message> = candidate
                     .iter()
                     .filter(|m| m.role == "system")
                     .chain(candidate.last())
                     .cloned()
                     .collect();
-                prompt = self.prompt_tokens(&latest)?;
-                if prompt.len() >= self.context {
+                let tokens = self.prompt_tokens(&latest)?;
+                if tokens >= self.context {
                     return Err(palito::Error::Invalid(format!(
-                        "message of {} tokens does not fit in the {}-token context",
-                        prompt.len(),
+                        "message of {tokens} tokens does not fit in the {}-token context",
                         self.context
                     )));
                 }
@@ -176,149 +222,69 @@ impl Session {
         if fitted.len() < candidate.len() {
             eprintln!("(oldest turns dropped to fit --context {})", self.context);
         }
-        // All remaining context (prompt + generated - 1 <= context), or --tokens.
-        let room = (self.context + 1).saturating_sub(prompt.len()) as u32;
-        let budget = self.max_tokens.map_or(room, |tokens| tokens.min(room));
-        let sample = if stream {
-            self.generate_printing(&prompt, budget)?
-        } else {
-            self.executor
-                .generate(&prompt, budget, GenerationMode::UntilEog)?
-        };
-        let ended = sample
-            .generated_tokens
-            .last()
-            .is_some_and(|&token| self.executor.is_eog(token));
-        if !ended && sample.generated_tokens.len() as u32 >= budget {
-            if budget < room {
-                eprintln!("(reply stopped at --tokens {budget})");
-            } else {
-                eprintln!(
-                    "(reply stopped: the {}-token context is full; /reset clears the conversation)",
-                    self.context
-                );
+        let completion = if stream {
+            let mut stdout = std::io::stdout().lock();
+            let mut failed = None;
+            let result = self.engine.chat(&fitted, &self.options, |piece| {
+                match stdout.write_all(piece.as_bytes()).and_then(|()| stdout.flush()) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        failed = Some(error);
+                        false
+                    }
+                }
+            });
+            // End the line even when generation failed part way.
+            writeln!(stdout)?;
+            stdout.flush()?;
+            if let Some(error) = failed {
+                return Err(error.into());
             }
+            result?
+        } else {
+            self.engine.chat(&fitted, &self.options, |_| true)?
+        };
+        match completion.finish_reason {
+            FinishReason::Length => {
+                eprintln!("(reply stopped at --tokens {})", completion.generated_tokens)
+            }
+            FinishReason::ContextFull => eprintln!(
+                "(reply stopped: the {}-token context is full; /reset clears the conversation)",
+                self.context
+            ),
+            FinishReason::Stop | FinishReason::Cancelled => {}
         }
-        let reply = self
-            .executor
-            .detokenize(&sample.generated_tokens)?
-            .trim()
-            .to_owned();
-        self.history = [fitted, vec![Message::assistant(reply.clone())]].concat();
-        Ok((reply, sample))
+        self.history = [fitted, vec![Message::assistant(completion.text.clone())]].concat();
+        Ok(completion)
     }
 
-    fn generate_printing(&mut self, prompt: &[i32], budget: u32) -> Result<Sample> {
-        let mut text = TextStream::new();
-        let mut out = TrimmedOutput::default();
-        // The model's own tokenizer, separate from the executor it borrows.
-        let tokenizer = &self.tokenizer;
-        let detokenize = |tokens: &[i32]| tokenizer.detokenize(tokens);
-        let result =
-            self.executor
-                .generate_streaming(prompt, budget, GenerationMode::UntilEog, |token| {
-                    out.write(&text.push(token, detokenize)?)
-                });
-        // Print what was generated even when the request failed part way.
-        let rest = text.finish(detokenize)?;
-        out.write(&rest)?;
-        out.end()?;
-        result
-    }
-
-    fn prompt_tokens(&self, messages: &[Message]) -> Result<Vec<i32>> {
-        self.executor
-            .tokenize(&self.template.render(messages, true)?)
-    }
-}
-
-/// Opens the backend; if only the implicit decode graph fails (unsupported
-/// architecture or shape), retries without it instead of refusing to chat.
-fn open_backend(runtime: &mut RuntimeArgs) -> Result<Box<dyn Backend>> {
-    match runtime.open() {
-        #[cfg(feature = "cuda")]
-        Err(error) if runtime.fall_back_from_implicit_int8() => {
-            eprintln!("(int8-fast unavailable: {error}; using f32-tiled)");
-            open_with_graph_fallback(runtime)
-        }
-        #[cfg(feature = "cuda")]
-        Err(error) if runtime.implicit_decode_graph() => {
-            eprintln!("(decode graph unavailable: {error}; continuing without it)");
-            runtime.disable_implicit_decode_graph();
-            runtime.open()
-        }
-        result => result,
+    fn prompt_tokens(&self, messages: &[Message]) -> Result<usize> {
+        let prompt = self
+            .engine
+            .render_chat(messages, self.options.enable_thinking)?;
+        Ok(self.engine.tokenize(&prompt)?.len())
     }
 }
 
 #[cfg(feature = "cuda")]
-fn open_with_graph_fallback(runtime: &mut RuntimeArgs) -> Result<Box<dyn Backend>> {
-    let result = match runtime.open() {
-        Err(_) if runtime.implicit_decode_graph() => {
-            runtime.disable_implicit_decode_graph();
-            runtime.open()
-        }
-        result => result,
+fn open_cuda(runtime: &RuntimeArgs, template: Option<String>) -> Result<Engine> {
+    let options = palito::engine::EngineOptions {
+        chat_template: template,
+        ..runtime.cuda_engine_options()?
     };
-    match result {
-        Err(error) if runtime.fall_back_to_reference() => {
-            eprintln!("(f32-tiled unavailable: {error}; using the f32 profile)");
-            runtime.open()
-        }
-        result => result,
-    }
+    Engine::open(&runtime.model, &options)
 }
 
-fn print_stats(sample: &Sample) {
-    let decode_seconds = sample.decode_ns as f64 / 1e9;
-    let rate = if decode_seconds > 0.0 {
-        sample.decode_steps as f64 / decode_seconds
-    } else {
-        0.0
-    };
+#[cfg(not(feature = "cuda"))]
+fn open_cuda(_: &RuntimeArgs, _: Option<String>) -> Result<Engine> {
+    unreachable!("CUDA backend without the cuda feature")
+}
+
+fn print_stats(completion: &Completion) {
     eprintln!(
         "[{} tokens · first token {:.0} ms · {:.1} tok/s]",
-        sample.generated_tokens.len(),
-        sample.ttft_ns as f64 / 1e6,
-        rate
+        completion.generated_tokens,
+        completion.ttft_ns as f64 / 1e6,
+        completion.tokens_per_second
     );
-}
-
-/// Streams text to stdout without leading whitespace and holding trailing
-/// whitespace until more text follows, so the printed reply equals the trimmed one.
-#[derive(Default)]
-struct TrimmedOutput {
-    started: bool,
-    pending: String,
-}
-
-impl TrimmedOutput {
-    fn write(&mut self, piece: &str) -> Result<()> {
-        let piece = if self.started {
-            piece
-        } else {
-            piece.trim_start()
-        };
-        if piece.is_empty() {
-            return Ok(());
-        }
-        self.started = true;
-        let body = piece.trim_end();
-        let mut stdout = std::io::stdout().lock();
-        if !body.is_empty() {
-            stdout.write_all(self.pending.as_bytes())?;
-            stdout.write_all(body.as_bytes())?;
-            stdout.flush()?;
-            self.pending.clear();
-        }
-        self.pending.push_str(&piece[body.len()..]);
-        Ok(())
-    }
-
-    fn end(self) -> Result<()> {
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
-        Ok(())
-    }
 }

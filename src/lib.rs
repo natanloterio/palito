@@ -2,6 +2,8 @@ pub mod backend;
 pub mod chat;
 pub mod engine;
 pub mod ffi;
+pub mod sampling;
+pub mod stop;
 pub mod stream;
 pub mod cpu;
 #[cfg(feature = "cuda")]
@@ -157,39 +159,9 @@ impl<B: Backend> Executor<B> {
         mode: GenerationMode,
         mut on_token: impl FnMut(i32) -> Result<()>,
     ) -> Result<Sample> {
-        let evaluated = prompt
-            .len()
-            .checked_add(max_tokens.saturating_sub(1) as usize);
-        if prompt.is_empty()
-            || max_tokens == 0
-            || evaluated.is_none_or(|n| n > self.config.context_tokens as usize)
-            || prompt
-                .iter()
-                .any(|&t| t < 0 || t as u32 >= self.info().vocab_tokens)
-        {
-            return Err(Error::Invalid(
-                "empty prompt, invalid token/count, or prompt + generated - 1 exceeds context"
-                    .into(),
-            ));
-        }
-        // Every request, including a retry after partial native work, starts clean.
-        self.backend.reset()?;
+        self.check_request(prompt, max_tokens)?;
         let start = Instant::now();
-        let cached_prompt_tokens = self.backend.restore_prefix(prompt)?;
-        if cached_prompt_tokens > prompt.len() {
-            return Err(Error::Backend(
-                "prefix restoration exceeds prompt length".into(),
-            ));
-        }
-        for (index, chunk) in prompt[cached_prompt_tokens..]
-            .chunks(self.config.prefill_chunk as usize)
-            .enumerate()
-        {
-            let position =
-                (cached_prompt_tokens + index * self.config.prefill_chunk as usize) as u32;
-            self.backend.evaluate_for_sampling(chunk, position)?;
-        }
-        self.backend.store_prefix(prompt)?;
+        let cached_prompt_tokens = self.prefill(prompt, false)?;
         let prefill_ns = nanos(start);
         let first = self.backend.sample_greedy()?;
         let ttft_ns = nanos(start);
@@ -231,6 +203,102 @@ impl<B: Backend> Executor<B> {
             cached_prompt_tokens,
             speculation: self.backend.speculation_stats(),
         })
+    }
+
+    /// Generation drawing every token with `sampler` from the host logits (no
+    /// token-only fast path). Same contract as `generate_streaming`.
+    pub fn generate_sampled(
+        &mut self,
+        prompt: &[i32],
+        max_tokens: u32,
+        mode: GenerationMode,
+        sampler: &mut sampling::Sampler,
+        mut on_token: impl FnMut(i32) -> Result<()>,
+    ) -> Result<Sample> {
+        self.check_request(prompt, max_tokens)?;
+        let start = Instant::now();
+        let cached_prompt_tokens = self.prefill(prompt, true)?;
+        let prefill_ns = nanos(start);
+        let first = self.draw(sampler)?;
+        let ttft_ns = nanos(start);
+        on_token(first)?;
+        let mut generated_tokens = vec![first];
+        let decode_start = Instant::now();
+        while generated_tokens.len() < max_tokens as usize {
+            let last = *generated_tokens.last().expect("first token exists");
+            if mode == GenerationMode::UntilEog && self.backend.is_eog(last) {
+                break;
+            }
+            let position = (prompt.len() + generated_tokens.len() - 1) as u32;
+            self.backend.evaluate(&[last], position)?;
+            let token = self.draw(sampler)?;
+            on_token(token)?;
+            generated_tokens.push(token);
+        }
+        let decode_steps = generated_tokens.len() - 1;
+        Ok(Sample {
+            prefill_ns,
+            ttft_ns,
+            decode_ns: if decode_steps == 0 { 0 } else { nanos(decode_start) },
+            decode_steps,
+            generated_tokens,
+            cached_prompt_tokens,
+            speculation: self.backend.speculation_stats(),
+        })
+    }
+
+    fn draw(&mut self, sampler: &mut sampling::Sampler) -> Result<i32> {
+        let logits = self.backend.logits()?;
+        if logits.len() != self.info().vocab_tokens as usize {
+            return Err(Error::Backend("logits do not cover the vocabulary".into()));
+        }
+        sampler.sample(logits)
+    }
+
+    fn check_request(&self, prompt: &[i32], max_tokens: u32) -> Result<()> {
+        let evaluated = prompt
+            .len()
+            .checked_add(max_tokens.saturating_sub(1) as usize);
+        if prompt.is_empty()
+            || max_tokens == 0
+            || evaluated.is_none_or(|n| n > self.config.context_tokens as usize)
+            || prompt
+                .iter()
+                .any(|&t| t < 0 || t as u32 >= self.info().vocab_tokens)
+        {
+            return Err(Error::Invalid(
+                "empty prompt, invalid token/count, or prompt + generated - 1 exceeds context"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resets, restores any cached prefix and evaluates the rest of `prompt` in
+    /// chunks; `host_logits` materializes the final logits on the host.
+    /// Returns the number of prompt tokens restored from the prefix cache.
+    fn prefill(&mut self, prompt: &[i32], host_logits: bool) -> Result<usize> {
+        // Every request, including a retry after partial native work, starts clean.
+        self.backend.reset()?;
+        let cached_prompt_tokens = self.backend.restore_prefix(prompt)?;
+        if cached_prompt_tokens > prompt.len() {
+            return Err(Error::Backend(
+                "prefix restoration exceeds prompt length".into(),
+            ));
+        }
+        let chunk_size = self.config.prefill_chunk as usize;
+        let rest = &prompt[cached_prompt_tokens..];
+        let chunks = rest.len().div_ceil(chunk_size);
+        for (index, chunk) in rest.chunks(chunk_size).enumerate() {
+            let position = (cached_prompt_tokens + index * chunk_size) as u32;
+            if host_logits && index + 1 == chunks {
+                self.backend.evaluate(chunk, position)?;
+            } else {
+                self.backend.evaluate_for_sampling(chunk, position)?;
+            }
+        }
+        self.backend.store_prefix(prompt)?;
+        Ok(cached_prompt_tokens)
     }
 }
 

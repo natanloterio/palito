@@ -117,15 +117,8 @@ const DEFAULT_CONTEXT_TOKENS: u32 = 512;
 /// Largest CUDA context (CudaBackend::open).
 #[cfg(feature = "cuda")]
 const CUDA_CONTEXT_MAX: u32 = 65535;
-/// Chat history keeps this much context free for the reply (Qwen3-style reasoning
-/// before the answer); the reply itself may use all remaining context.
-const CHAT_REPLY_RESERVE: u32 = 2048;
 const DEFAULT_BATCH_TOKENS: u32 = 128;
 const DEFAULT_PREFILL_CHUNK: u32 = 64;
-/// Chat prefill batch/chunk on CUDA (PREFILL_CAPACITY_MAX in cuda.rs), capped by
-/// --context: one chunk covers a 4k prompt (Qwen3-30B 2.9k prompt, int8-prefill:
-/// TTFT 0.40 s with 512-token chunks, 0.30 s in one chunk, ~0.7 GB more workspace).
-const FAST_PREFILL_TOKENS: u32 = 4096;
 
 /// Backend, model and execution-plan options shared by every local model command.
 #[derive(Args)]
@@ -203,18 +196,6 @@ pub(crate) struct RuntimeArgs {
     #[cfg(feature = "cuda")]
     #[arg(long, conflicts_with = "cuda_decode_graph")]
     no_cuda_decode_graph: bool,
-    /// Set by commands that default to the fastest quality-admitted CUDA settings.
-    #[cfg(feature = "cuda")]
-    #[arg(skip)]
-    fast_cuda_defaults: bool,
-    /// Fast defaults fall back from int8-fast to f32-tiled (backend open failed).
-    #[cfg(feature = "cuda")]
-    #[arg(skip)]
-    f32_fallback: bool,
-    /// f32-tiled also failed (e.g. Q5_K weights): the implicit profile becomes f32.
-    #[cfg(feature = "cuda")]
-    #[arg(skip)]
-    reference_fallback: bool,
     /// --context defaulted to the model's trained context (chat): CUDA may shrink it
     /// to fit device memory.
     #[arg(skip)]
@@ -333,18 +314,7 @@ impl RuntimeArgs {
                     "CUDA options require --backend cuda".into(),
                 ));
             }
-            if self.backend != LocalBackend::Cpu
-                && (self.f32_weights
-                    || self.sequential_prefill
-                    || self.memory_limit_bytes.is_some()
-                    || self.prefix_cache_bytes != 0
-                    || self.speculative_window != 0
-                    || self.scalar_kernels)
-            {
-                return Err(palito::Error::Invalid(
-                    "CPU policy options require --backend cpu".into(),
-                ));
-            }
+            self.check_cpu_policy()?;
             match self.backend {
                 LocalBackend::Cuda => {
                     return palito::cuda::open_backend(
@@ -386,57 +356,76 @@ impl RuntimeArgs {
                 .map(PathBuf::from)
         });
         options.matmul = self.cuda_matmul();
-        options.decode_graph = self.cuda_decode_graph || self.implicit_decode_graph();
+        options.decode_graph = self.cuda_decode_graph;
         options.fit_context = self.model_context;
         options
     }
 
     #[cfg(feature = "cuda")]
     fn cuda_matmul(&self) -> palito::cuda::CudaMatmul {
-        use palito::cuda::CudaMatmul;
-        self.cuda_matmul.unwrap_or(if self.fast_cuda_defaults && self.reference_fallback {
-            CudaMatmul::F32
-        } else if self.fast_cuda_defaults && self.f32_fallback {
-            CudaMatmul::F32Tiled
-        } else if self.fast_cuda_defaults {
-            // Tensor-core prefill at llama.cpp precision, F32 decode.
-            CudaMatmul::Int8Fast
-        } else {
-            CudaMatmul::F32
+        self.cuda_matmul.unwrap_or_default()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn check_cpu_policy(&self) -> Result<()> {
+        if self.backend != LocalBackend::Cpu
+            && (self.f32_weights
+                || self.sequential_prefill
+                || self.memory_limit_bytes.is_some()
+                || self.prefix_cache_bytes != 0
+                || self.speculative_window != 0
+                || self.scalar_kernels)
+        {
+            return Err(palito::Error::Invalid(
+                "CPU policy options require --backend cpu".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Engine options for `--backend cuda` (chat and serve defaults: model
+    /// context, fastest profile that opens, decode graph, 4096-token prefill).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn cuda_engine_options(&self) -> Result<palito::engine::EngineOptions> {
+        self.check_cpu_policy()?;
+        Ok(palito::engine::EngineOptions {
+            device: palito::engine::Device::Cuda,
+            context_tokens: self.context,
+            threads: self.threads,
+            batch_tokens: self.batch,
+            prefill_chunk: self.prefill_chunk,
+            gpu_device: self.cuda_device.unwrap_or(0),
+            gpu_memory_limit_bytes: self.gpu_memory_limit_bytes,
+            kernel_cache_dir: self.cuda_kernel_cache.clone(),
+            cuda_matmul: self.cuda_matmul,
+            decode_graph: if self.cuda_decode_graph {
+                Some(true)
+            } else if self.no_cuda_decode_graph {
+                Some(false)
+            } else {
+                None
+            },
+            chat_template: None,
         })
     }
 
-    /// Decode graph enabled by fast defaults rather than requested by the user.
-    #[cfg(feature = "cuda")]
-    pub(crate) fn implicit_decode_graph(&self) -> bool {
-        self.fast_cuda_defaults
-            && self.backend == LocalBackend::Cuda
-            && !self.cuda_decode_graph
-            && !self.no_cuda_decode_graph
-            && self.fast_cuda_matmul()
-    }
-
-    /// Profiles whose decode is f32-tiled (graph, packed matvec, large prefill chunks).
-    #[cfg(feature = "cuda")]
-    fn fast_cuda_matmul(&self) -> bool {
-        use palito::cuda::CudaMatmul;
-        matches!(
-            self.cuda_matmul(),
-            CudaMatmul::F32Tiled | CudaMatmul::Int8Prefill | CudaMatmul::Int8Fast
-        )
-    }
-
-    /// Large prefill chunks only pay off with the tiled CUDA kernels (measured
-    /// 7.2 s -> 2.8 s TTFT at 2.9k tokens on Qwen3-30B, 64 -> 512).
-    fn fast_prefill(&self) -> bool {
+    /// True when the backend is CUDA (chat then opens through `Engine`).
+    pub(crate) fn is_cuda(&self) -> bool {
         #[cfg(feature = "cuda")]
         {
-            self.fast_cuda_defaults
-                && self.backend == LocalBackend::Cuda
-                && self.fast_cuda_matmul()
+            self.backend == LocalBackend::Cuda
         }
         #[cfg(not(feature = "cuda"))]
         false
+    }
+
+    /// "cpu" or "cpu-reference".
+    pub(crate) fn cpu_profile(&self) -> &'static str {
+        #[cfg(feature = "cuda")]
+        if self.backend == LocalBackend::Reference {
+            return "cpu-reference";
+        }
+        "cpu"
     }
 
     pub(crate) fn tokens(&self) -> u32 {
@@ -451,13 +440,6 @@ impl RuntimeArgs {
     /// context.
     pub(crate) fn chat_tokens(&self) -> Option<u32> {
         self.tokens
-    }
-
-    /// Context kept free for the reply when fitting chat history: --tokens, else
-    /// CHAT_REPLY_RESERVE (at most half the context).
-    pub(crate) fn chat_reserve(&self) -> u32 {
-        self.tokens
-            .unwrap_or(CHAT_REPLY_RESERVE.min((self.context() / 2).max(1)))
     }
 
     /// Without --context, use the model's trained context (CUDA: at most
@@ -479,64 +461,12 @@ impl RuntimeArgs {
         Ok(())
     }
 
-    /// Adopts the context the backend actually opened (fitted to device memory).
-    pub(crate) fn adopt_context(&mut self, opened: u32) {
-        if self.model_context && opened < self.context() {
-            self.context = Some(opened);
-        }
-    }
-
     fn batch(&self) -> u32 {
-        self.batch.unwrap_or(if self.fast_prefill() {
-            FAST_PREFILL_TOKENS.min(self.context())
-        } else {
-            DEFAULT_BATCH_TOKENS
-        })
+        self.batch.unwrap_or(DEFAULT_BATCH_TOKENS)
     }
 
     fn prefill_chunk(&self) -> u32 {
-        self.prefill_chunk.unwrap_or(if self.fast_prefill() {
-            FAST_PREFILL_TOKENS.min(self.batch())
-        } else {
-            DEFAULT_PREFILL_CHUNK
-        })
-    }
-
-    /// Opts into int8-fast (f32-tiled decode) plus the decode graph unless the user
-    /// chose otherwise.
-    pub(crate) fn use_fast_cuda_defaults(&mut self) {
-        #[cfg(feature = "cuda")]
-        {
-            self.fast_cuda_defaults = true;
-        }
-    }
-
-    /// Replaces an implicit int8-fast (needs sm_80+) with f32-tiled; true if changed.
-    #[cfg(feature = "cuda")]
-    pub(crate) fn fall_back_from_implicit_int8(&mut self) -> bool {
-        let implicit = self.fast_cuda_defaults
-            && self.backend == LocalBackend::Cuda
-            && self.cuda_matmul.is_none()
-            && !self.f32_fallback;
-        self.f32_fallback |= implicit;
-        implicit
-    }
-
-    /// Replaces an implicit f32-tiled fallback with the f32 reference profile (which
-    /// supports every quantization); true if changed.
-    #[cfg(feature = "cuda")]
-    pub(crate) fn fall_back_to_reference(&mut self) -> bool {
-        let implicit = self.f32_fallback && self.cuda_matmul.is_none() && !self.reference_fallback;
-        self.reference_fallback |= implicit;
-        implicit
-    }
-
-    /// Drops an implicit decode graph (after its capture failed); explicit flags stay.
-    #[cfg(feature = "cuda")]
-    pub(crate) fn disable_implicit_decode_graph(&mut self) {
-        if self.implicit_decode_graph() {
-            self.no_cuda_decode_graph = true;
-        }
+        self.prefill_chunk.unwrap_or(DEFAULT_PREFILL_CHUNK)
     }
 
     fn execution(&self, _info: &palito::backend::ModelInfo) -> serde_json::Value {

@@ -515,23 +515,39 @@ __device__ void mmq_pipe_q4(const u8 *weights, const signed char *values, const 
 // int8-fast pipelined tiles: Q4_K through mmq_pipe_q4, Q6_K through mmq_tile
 // without prefetch (210-byte blocks are not 16-byte aligned for cp.async).
 #if __CUDA_ARCH__ >= 800
-#define MMQ_PIPE_SIZE(BN, KS) (sizeof(MmqPipeShared<BN, KS>) > sizeof(MmqShared<1, BN, KS, 1>) \
-    ? sizeof(MmqPipeShared<BN, KS>) : sizeof(MmqShared<1, BN, KS, 1>))
-#define MMQ_PIPE_BODY(BN, KS, SK, PF) \
-    __shared__ __align__(16) unsigned char raw[MMQ_PIPE_SIZE(BN, KS)]; \
-    if (kind == 12) mmq_pipe_q4<BN, KS, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, *reinterpret_cast<MmqPipeShared<BN, KS> *>(raw)); \
+// KQ: Q4_K K step (mmq_pipe_q4); KS: Q6_K K step (mmq_tile).
+#define MMQ_PIPE_SIZE(BN, KQ, KS) (sizeof(MmqPipeShared<BN, KQ>) > sizeof(MmqShared<1, BN, KS, 1>) \
+    ? sizeof(MmqPipeShared<BN, KQ>) : sizeof(MmqShared<1, BN, KS, 1>))
+#define MMQ_PIPE_BODY(BN, KQ, KS, SK, PF) \
+    __shared__ __align__(16) unsigned char raw[MMQ_PIPE_SIZE(BN, KQ, KS)]; \
+    MMQ_PIPE_DISPATCH(BN, KQ, KS, SK, PF)
+// Dynamic shared memory (> 48 KB): the host sizes it from mmq_dynamic_shared.
+#define MMQ_PIPE_BODY_DYNAMIC(BN, KQ, KS, SK, PF) \
+    extern __shared__ __align__(16) unsigned char raw[]; \
+    MMQ_PIPE_DISPATCH(BN, KQ, KS, SK, PF)
+#define MMQ_PIPE_DISPATCH(BN, KQ, KS, SK, PF) \
+    if (kind == 12) mmq_pipe_q4<BN, KQ, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, *reinterpret_cast<MmqPipeShared<BN, KQ> *>(raw)); \
     if (kind == 14) mmq_tile<14, 1, BN, KS, false, PF, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, *reinterpret_cast<MmqShared<1, BN, KS, 1> *>(raw)); \
     if (kind != 12 && kind != 14 && threadIdx.x == 0) atomicOr(status, 8);
 #else
-#define MMQ_PIPE_BODY(BN, KS, SK, PF) if (threadIdx.x == 0) atomicOr(status, 16);
+#define MMQ_PIPE_BODY(BN, KQ, KS, SK, PF) if (threadIdx.x == 0) atomicOr(status, 16);
+#define MMQ_PIPE_BODY_DYNAMIC(BN, KQ, KS, SK, PF) if (threadIdx.x == 0) atomicOr(status, 16);
+#define MMQ_PIPE_SIZE(BN, KQ, KS) 0
 #endif
-#define MMQ_PIPE_KERNEL(Name, BN, KS, SK) MMQ_PIPE_KERNEL_BLOCKS(Name, BN, KS, SK, 1, false)
-#define MMQ_PIPE_KERNEL_BLOCKS(Name, BN, KS, SK, Blocks, PF) \
+#define MMQ_PIPE_KERNEL(Name, BN, KS, SK) MMQ_PIPE_KERNEL_BLOCKS(Name, BN, KS, KS, SK, 1, false)
+#define MMQ_PIPE_KERNEL_DYNAMIC(Name, BN, KQ, KS, SK) \
+extern "C" __global__ void __launch_bounds__(256, 1) \
+Name(const u8 *weights, int kind, const signed char *values, const float *scales, \
+     const int *sums, float *output, int width, int rows, int tokens, const int *groups, \
+     int used, int grouped, int assignment_major, int *status) { \
+    MMQ_PIPE_BODY_DYNAMIC(BN, KQ, KS, SK, false) \
+}
+#define MMQ_PIPE_KERNEL_BLOCKS(Name, BN, KQ, KS, SK, Blocks, PF) \
 extern "C" __global__ void __launch_bounds__(256, Blocks) \
 Name(const u8 *weights, int kind, const signed char *values, const float *scales, \
      const int *sums, float *output, int width, int rows, int tokens, const int *groups, \
      int used, int grouped, int assignment_major, int *status) { \
-    MMQ_PIPE_BODY(BN, KS, SK, PF) \
+    MMQ_PIPE_BODY(BN, KQ, KS, SK, PF) \
 }
 
 // 256 threads; grid = (ceil(rows / 128), grouped ? slots : ceil(tokens / BN)).
@@ -573,11 +589,21 @@ MMQ_KERNEL_BLOCKS(mmq_c3_grouped, 3, 32, 128, false, MMQ_C3_GROUPED_BLOCKS)
 // at one block per SM for 64/128-token tiles (register prefetch spills with one
 // plane), two for 32-token tiles. Split-K variants: few blocks (short prompts),
 // gridDim.z K splits, then mmq_splitk_reduce.
-MMQ_PIPE_KERNEL(mmq_c1_pipe128, 128, 64, false)
-MMQ_PIPE_KERNEL(mmq_c1_pipe128_splitk, 128, 64, true)
-MMQ_PIPE_KERNEL(mmq_c1_pipe64, 64, 64, false)
-MMQ_PIPE_KERNEL_BLOCKS(mmq_c1_pipe32, 32, 64, false, 2, true)
-MMQ_PIPE_KERNEL_BLOCKS(mmq_c1_pipe32_splitk, 32, 64, true, 2, true)
+// Q4_K takes 128-wide K steps (half the barriers of 64; Qwen3-30B 0.5k TTFT
+// 48 -> 44 ms for the 32-token tiles), Q6_K (mmq_tile) 64. The 64/128-token tiles
+// exceed 48 KB of shared memory: dynamic, sized by mmq_dynamic_shared.
+MMQ_PIPE_KERNEL_DYNAMIC(mmq_c1_pipe128, 128, 128, 64, false)
+MMQ_PIPE_KERNEL_DYNAMIC(mmq_c1_pipe128_splitk, 128, 128, 64, true)
+MMQ_PIPE_KERNEL_DYNAMIC(mmq_c1_pipe64, 64, 128, 64, false)
+MMQ_PIPE_KERNEL_BLOCKS(mmq_c1_pipe32, 32, 128, 64, false, 2, true)
+MMQ_PIPE_KERNEL_BLOCKS(mmq_c1_pipe32_splitk, 32, 128, 64, true, 2, true)
+
+// Dynamic shared bytes of mmq_c1_pipe128, mmq_c1_pipe128_splitk, mmq_c1_pipe64.
+extern "C" __global__ void mmq_dynamic_shared(int *bytes) {
+    bytes[0] = (int)MMQ_PIPE_SIZE(128, 128, 64);
+    bytes[1] = (int)MMQ_PIPE_SIZE(128, 128, 64);
+    bytes[2] = (int)MMQ_PIPE_SIZE(64, 128, 64);
+}
 
 // Sums gridDim-z partials of a split-K MMQ in a fixed order (deterministic).
 extern "C" __global__ void mmq_splitk_reduce(const float *partials, float *output, int count,

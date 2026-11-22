@@ -4,7 +4,7 @@
 
 Fast local LLM inference for GGUF models, written in Rust, with its own CUDA kernels.
 
-- **Fast:** on an RTX 5090 with Qwen3-30B-A3B (Q4_K_M), the first token of a 2.9k-token prompt arrives in ~0.16 s (llama.cpp: 0.18 s), and decoding runs at ~300–350 tok/s.
+- **Fast:** on an RTX 5090 with Qwen3-30B-A3B (Q4_K_M), the first token of a 2.9k-token prompt arrives in ~0.15 s (llama.cpp: 0.21 s), and decoding runs at ~300–360 tok/s.
 - **Uses the model's full context:** `chat` opens with the model's trained context (Qwen3-30B-A3B: 40,960 tokens) and replies run until the model finishes.
 - **One binary:** chat in the terminal, an OpenAI-compatible server (`palito serve`), or a C library for your own program. No Python and no llama.cpp; the Linux bundle ships the CUDA compiler it needs.
 
@@ -213,10 +213,12 @@ Qwen3-30B-A3B Q4_K_M on an RTX 5090:
 
 | Prompt length | Time to first token | Decode speed |
 |---|---|---|
-| 0.5k tokens | 0.04 s | ~340 tok/s |
-| 2.9k tokens | 0.16 s | ~300 tok/s |
-| 10k tokens | 0.75 s | 211 tok/s |
-| 40k tokens | 6.4 s | 103 tok/s |
+| 0.5k tokens | 0.035 s | ~360 tok/s |
+| 2.9k tokens | 0.15 s | ~340 tok/s |
+| 10k tokens | 0.68 s | ~300 tok/s |
+| 40k tokens | 5.1 s | ~190 tok/s |
+
+llama.cpp (`-fa on`, same GPU and model) measured 0.035 / 0.21 / 0.82 / 5.5 s and 345 / 310 / 281 / 184 tok/s. See the [long-context comparison](docs/technical-reference.md#long-context-comparison-with-llamacpp).
 
 Continuing a conversation is faster: with ~9.7k tokens of history, the next turn's first token comes after 0.18 s instead of 0.77 s, because the history is not read again.
 

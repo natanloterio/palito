@@ -353,6 +353,11 @@ fn attention_chunks(spec: &Spec) -> usize {
     (spec.info.context_tokens as usize).div_ceil(128).max(128)
 }
 
+/// Warp chunks of `attention_split_rows` (FP16 KV): at most the 16-key split count
+/// (partial buffer) and the combine's 1024 weights. Fewer, longer chunks halve
+/// the partial traffic; 512 keeps >= 2k warps in flight on 4 KV heads.
+const ATTENTION_ROW_CHUNKS: i32 = 512;
+
 fn attention_splits(spec: &Spec) -> usize {
     (spec.info.context_tokens as usize).div_ceil(ATTENTION_SPLIT)
 }
@@ -367,9 +372,10 @@ fn attention_half_stride(spec: &Spec) -> usize {
     (spec.info.context_tokens as usize).div_ceil(64) * 64
 }
 
-/// u16 elements of the int8-prefill FP16 hi/lo K/V buffer (4 planes), or 0.
+/// u16 elements of the int8-prefill FP16 hi/lo K/V buffer (4 planes), or 0
+/// (int8-fast reads its FP16 K/V cache directly).
 fn attention_half_elements(spec: &Spec, matmul: CudaMatmul) -> usize {
-    if matmul.tensor_prefill()
+    if matmul == CudaMatmul::Int8Prefill
         && spec.dim == 128
         && spec.kv_heads > 0
         && spec.heads == 8 * spec.kv_heads
@@ -841,6 +847,7 @@ mod cache;
 mod decode;
 #[cfg(test)]
 mod grouped_bench;
+mod kv;
 #[cfg(test)]
 mod model_quality;
 #[cfg(test)]
@@ -863,8 +870,8 @@ pub struct CudaBackend {
     stream: Arc<CudaStream>,
     functions: HashMap<&'static str, CudaFunction>,
     work: Workspace,
-    keys: Vec<CudaSlice<f32>>,
-    values: Vec<CudaSlice<f32>>,
+    keys: Vec<kv::KvBuffer>,
+    values: Vec<kv::KvBuffer>,
     logits: Vec<f32>,
     state: State,
     memory: MemoryUsage,
@@ -1056,6 +1063,11 @@ impl CudaBackend {
         } else {
             source
         };
+        let source = if options.matmul.kv_f16() {
+            format!("#define CUDA_KV_F16 1\n{source}")
+        } else {
+            source
+        };
         let source = if cfg!(feature = "cuda-mma3-wide-rows-research")
             && options.matmul == CudaMatmul::ResidualMma3Research
         {
@@ -1201,9 +1213,13 @@ impl CudaBackend {
                     "mmq_c1_pipe32_splitk",
                     "router_tf32_tiled",
                     "group_experts_mixed",
-                    "attention_prefill_mma_fast",
-                    "attention_half_kv",
-                    "attention_prefill_mma_half_fast",
+                    "attention_prefill_mma_fast_f16",
+                    "attention_split_rows2_f16",
+                    "attention_split_rows2_decode_f16",
+                    "attention_split_rows4_f16",
+                    "attention_split_rows4_decode_f16",
+                    "attention_split_rows8_f16",
+                    "attention_split_rows8_decode_f16",
                 ] {
                     functions.insert(name, module.load_function(name).map_err(failure)?);
                 }
@@ -1284,6 +1300,13 @@ impl CudaBackend {
                 "greedy_finish",
             ] {
                 functions.insert(name, module.load_function(name).map_err(failure)?);
+            }
+        }
+        if options.matmul.kv_f16() {
+            for (name, entry) in kv::F16_KERNELS {
+                if functions.contains_key(name) {
+                    functions.insert(name, module.load_function(entry).map_err(failure)?);
+                }
             }
         }
         let mut weights = Weights::open(path, config)?;
@@ -1417,8 +1440,8 @@ impl CudaBackend {
         let mut keys = Vec::new();
         let mut values = Vec::new();
         for _ in &weights.layers {
-            keys.push(stream.alloc_zeros(kv_elements as usize).map_err(failure)?);
-            values.push(stream.alloc_zeros(kv_elements as usize).map_err(failure)?);
+            keys.push(kv::KvBuffer::zeros(&stream, kv_elements as usize, options.matmul)?);
+            values.push(kv::KvBuffer::zeros(&stream, kv_elements as usize, options.matmul)?);
         }
         let logits = vec![0.0; s.info.vocab_tokens as usize];
         let mut weights = weights.map(|t| DeviceTensor::upload(t, &stream))?;
@@ -1784,7 +1807,23 @@ impl CudaBackend {
                 let group = (heads / kv_heads) as u32;
                 let vector = dim <= 128 && dim % 4 == 0 && chunks <= 1024;
                 let mut threads = 256;
-                let (split, combine, grid, blocks) = if vector && (2..=8).contains(&group) {
+                let rows = self.matmul.kv_f16() && dim == 128 && (2..=8).contains(&group);
+                let row_chunks = (splits / 8 * 8).min(ATTENTION_ROW_CHUNKS);
+                let (split, combine, grid, blocks) = if rows && row_chunks >= 8 {
+                    // FP16 cache: one warp per key range and all heads of the group,
+                    // so each K/V row is read once per step (attention_split_rows).
+                    let split = match group.next_power_of_two() {
+                        2 => pick("attention_split_rows2_decode_f16", "attention_split_rows2_f16"),
+                        4 => pick("attention_split_rows4_decode_f16", "attention_split_rows4_f16"),
+                        _ => pick("attention_split_rows8_decode_f16", "attention_split_rows8_f16"),
+                    };
+                    (
+                        split,
+                        pick("attention_combine_group_decode", "attention_combine_group"),
+                        (kv_heads as u32, (row_chunks / 8) as u32, 1),
+                        row_chunks,
+                    )
+                } else if vector && (2..=8).contains(&group) {
                     // Grouped-query attention: one block per KV head and chunk, one warp
                     // per query head, so the group shares each key/value row through L1.
                     threads = 32 * group;
@@ -2264,9 +2303,10 @@ fn device_reservation(weights: &Weights<Tensor>, options: &CudaOptions) -> Resul
         .checked_mul(s.dim as u64)
         .and_then(|n| n.checked_mul(u64::from(s.info.context_tokens)))
         .ok_or_else(|| invalid("KV overflow"))?;
+    // Keys and values, per layer.
     let kv_bytes = kv_elements
         .checked_mul(weights.layers.len() as u64)
-        .and_then(|n| n.checked_mul(8))
+        .and_then(|n| n.checked_mul(2 * options.matmul.kv_element_bytes()))
         .ok_or_else(|| invalid("KV byte overflow"))?;
     let routing = routing_elements(s)? as u64;
     let groups = group_workspace_elements(s, options.matmul)? as u64;

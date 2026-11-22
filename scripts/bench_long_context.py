@@ -136,7 +136,7 @@ def run_palito(args, prompts):
     results = {}
     for target, prompt in prompts.items():
         command = [args.palito, "chat", "--model", args.model, "--backend", "cuda",
-                   "--tokens", str(args.tokens), "--stats", "--no-stream"]
+                   "--tokens", str(args.tokens), "--stats", "--no-stream", "--no-prefix-cache"]
         with gpu_lock():
             log(f"palito: {target} tokens")
             done = subprocess.run(command, input=palito_input(prompt, args.runs + 1),

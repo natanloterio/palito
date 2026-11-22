@@ -206,7 +206,7 @@ fn open_backend(runtime: &mut RuntimeArgs) -> Result<Box<dyn Backend>> {
     match runtime.open() {
         #[cfg(feature = "cuda")]
         Err(error) if runtime.fall_back_from_implicit_int8() => {
-            eprintln!("(int8 prefill unavailable: {error}; using f32-tiled)");
+            eprintln!("(int8-fast unavailable: {error}; using f32-tiled)");
             open_with_graph_fallback(runtime)
         }
         #[cfg(feature = "cuda")]
@@ -221,10 +221,16 @@ fn open_backend(runtime: &mut RuntimeArgs) -> Result<Box<dyn Backend>> {
 
 #[cfg(feature = "cuda")]
 fn open_with_graph_fallback(runtime: &mut RuntimeArgs) -> Result<Box<dyn Backend>> {
-    match runtime.open() {
-        Err(error) if runtime.implicit_decode_graph() => {
-            eprintln!("(decode graph unavailable: {error}; continuing without it)");
+    let result = match runtime.open() {
+        Err(_) if runtime.implicit_decode_graph() => {
             runtime.disable_implicit_decode_graph();
+            runtime.open()
+        }
+        result => result,
+    };
+    match result {
+        Err(error) if runtime.fall_back_to_reference() => {
+            eprintln!("(f32-tiled unavailable: {error}; using the f32 profile)");
             runtime.open()
         }
         result => result,

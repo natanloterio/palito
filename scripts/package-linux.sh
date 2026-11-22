@@ -64,14 +64,15 @@ Defaults set by the wrapper (override with flags or by exporting them):
   LOCAL_INFERENCE_CUDA_KERNEL_CACHE=~/.cache/local-inference/kernels
   LOCAL_INFERENCE_MODEL      (unset; export it to skip --model)
 
-chat on CUDA uses the int8-prefill profile (tensor-core prefill, F32 decode; falls
-back to f32-tiled below sm_80), the decode graph and prefill chunks of up to 4096
-tokens (capped by --context).
+chat on CUDA uses the int8-fast profile (tensor-core prefill at llama.cpp
+precision, F32 decode; falls back to f32-tiled below sm_80), the decode graph and
+prefill chunks of up to 4096 tokens (capped by --context).
 chat uses the model's trained context unless --context is given (CUDA: at most
 65535, shrunk to what fits in free GPU memory minus 2 GiB). Replies run until end
 of turn or a full context (reported); --tokens N caps a reply.
-Use --cuda-matmul f32-tiled for F32 prefill or --cuda-matmul f32 for the
-reference profile.
+Use --cuda-matmul int8-prefill for the more precise tensor-core prefill,
+--cuda-matmul f32-tiled for F32 prefill or --cuda-matmul f32 for the reference
+profile.
 README
 
 tar -C "$root/target/dist" -czf "$root/target/dist/$name.tar.gz" "$name"

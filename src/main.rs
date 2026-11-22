@@ -173,7 +173,7 @@ pub(crate) struct RuntimeArgs {
     #[cfg(feature = "cuda")]
     #[arg(long)]
     cuda_kernel_cache: Option<PathBuf>,
-    /// CUDA matrix profile [default: f32; chat: int8-prefill, f32-tiled below sm_80]. f32 keeps its existing
+    /// CUDA matrix profile [default: f32; chat: int8-fast, f32-tiled below sm_80]. f32 keeps its existing
     /// kernels and arithmetic. f32-tiled selects measured F32 prefill/decode kernels
     /// without activation quantization. int8-prefill keeps f32-tiled decode and runs
     /// prefill on tensor cores (INT8 projections, FP16 hi/lo attention): faster long
@@ -185,7 +185,7 @@ pub(crate) struct RuntimeArgs {
     #[arg(long, value_enum)]
     cuda_matmul: Option<local_inference::cuda::CudaMatmul>,
     /// Captured decode with token-only greedy output (f32: context <= 1024). On by
-    /// default for chat with f32-tiled and int8-prefill.
+    /// default for chat with f32-tiled, int8-prefill and int8-fast.
     #[cfg(feature = "cuda")]
     #[arg(long)]
     cuda_decode_graph: bool,
@@ -197,10 +197,14 @@ pub(crate) struct RuntimeArgs {
     #[cfg(feature = "cuda")]
     #[arg(skip)]
     fast_cuda_defaults: bool,
-    /// Fast defaults fall back from int8-prefill to f32-tiled (backend open failed).
+    /// Fast defaults fall back from int8-fast to f32-tiled (backend open failed).
     #[cfg(feature = "cuda")]
     #[arg(skip)]
     f32_fallback: bool,
+    /// f32-tiled also failed (e.g. Q5_K weights): the implicit profile becomes f32.
+    #[cfg(feature = "cuda")]
+    #[arg(skip)]
+    reference_fallback: bool,
     /// --context defaulted to the model's trained context (chat): CUDA may shrink it
     /// to fit device memory.
     #[arg(skip)]
@@ -380,11 +384,13 @@ impl RuntimeArgs {
     #[cfg(feature = "cuda")]
     fn cuda_matmul(&self) -> local_inference::cuda::CudaMatmul {
         use local_inference::cuda::CudaMatmul;
-        self.cuda_matmul.unwrap_or(if self.fast_cuda_defaults && self.f32_fallback {
+        self.cuda_matmul.unwrap_or(if self.fast_cuda_defaults && self.reference_fallback {
+            CudaMatmul::F32
+        } else if self.fast_cuda_defaults && self.f32_fallback {
             CudaMatmul::F32Tiled
         } else if self.fast_cuda_defaults {
-            // Tensor-core prefill; relaxed logit gate (same top token), F32 decode.
-            CudaMatmul::Int8Prefill
+            // Tensor-core prefill at llama.cpp precision, F32 decode.
+            CudaMatmul::Int8Fast
         } else {
             CudaMatmul::F32
         })
@@ -486,7 +492,7 @@ impl RuntimeArgs {
         })
     }
 
-    /// Opts into int8-prefill (f32-tiled decode) plus the decode graph unless the user
+    /// Opts into int8-fast (f32-tiled decode) plus the decode graph unless the user
     /// chose otherwise.
     pub(crate) fn use_fast_cuda_defaults(&mut self) {
         #[cfg(feature = "cuda")]
@@ -495,7 +501,7 @@ impl RuntimeArgs {
         }
     }
 
-    /// Replaces an implicit int8-prefill (needs sm_80+) with f32-tiled; true if changed.
+    /// Replaces an implicit int8-fast (needs sm_80+) with f32-tiled; true if changed.
     #[cfg(feature = "cuda")]
     pub(crate) fn fall_back_from_implicit_int8(&mut self) -> bool {
         let implicit = self.fast_cuda_defaults
@@ -503,6 +509,15 @@ impl RuntimeArgs {
             && self.cuda_matmul.is_none()
             && !self.f32_fallback;
         self.f32_fallback |= implicit;
+        implicit
+    }
+
+    /// Replaces an implicit f32-tiled fallback with the f32 reference profile (which
+    /// supports every quantization); true if changed.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn fall_back_to_reference(&mut self) -> bool {
+        let implicit = self.f32_fallback && self.cuda_matmul.is_none() && !self.reference_fallback;
+        self.reference_fallback |= implicit;
         implicit
     }
 

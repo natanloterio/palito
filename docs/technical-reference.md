@@ -1580,35 +1580,44 @@ python3 -m unittest discover -s scripts -p 'test_bench_long_context.py'
 ```
 
 Conditions (2026-11-22): RTX 5090 (driver 615.71.09), i9-14900K, Qwen3-30B-A3B Q4_K_M.
-- **Palito:** a release build with the FP16 KV cache (`feat/f16-kv-cache-int8-fast` on `50bca67`), `chat --backend cuda --tokens 256 --stats --no-stream --no-prefix-cache`, defaults (`int8-fast`, decode graph, context 40,960, FP16 KV), one `/reset` between requests. TTFT and tok/s come from `--stats`. The first run (0.5.0, F32 KV) is kept in the "F32 KV" columns.
+- **Palito:** a release build of `perf/beat-llama-cpp` (on 0.6.0), `chat --backend cuda --tokens 256 --stats --no-stream --no-prefix-cache`, defaults (`int8-fast`, decode graph, context 40,960, FP16 KV), one `/reset` between requests. TTFT and tok/s come from `--stats`. The "0.6.0" columns are the previous release, measured the same way.
 - **llama.cpp:** commit `6b01a4767` (build 12434, `target/benchmark-llama-cuda13`), `llama-server -c 40960 -ngl 99 -np 1 --jinja --reasoning-format none` plus the flags in the column header, requested through `/v1/chat/completions` with `temperature 0`, `top_k 1` and `cache_prompt false`. TTFT is `timings.prompt_ms` and decode is `timings.predicted_per_second`.
 - Prompt tokens are the templated counts that llama.cpp reports. Palito receives the same message text, whose untemplated size `palito tokenize` cut to the target.
 
-| Prompt tokens | Palito TTFT | Palito decode | F32 KV TTFT | F32 KV decode | llama.cpp `-fa off` TTFT | `-fa off` decode | `-fa on` TTFT | `-fa on` decode | `-fa on -ctk q8_0 -ctv q8_0` TTFT | q8_0 KV decode |
+| Prompt tokens | Palito TTFT | Palito decode | 0.6.0 TTFT | 0.6.0 decode | llama.cpp `-fa off` TTFT | `-fa off` decode | `-fa on` TTFT | `-fa on` decode | `-fa on -ctk q8_0 -ctv q8_0` TTFT | q8_0 KV decode |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 507 | 48 ms | 343 tok/s | 49 ms | 339 tok/s | 39 ms | 310 tok/s | 35 ms | 343 tok/s | 36 ms | 319 tok/s |
-| 2,907 | 166 ms | 305 tok/s | 169 ms | 291 tok/s | 305 ms | 261 tok/s | 205 ms | 307 tok/s | 212 ms | 279 tok/s |
-| 10,003 | 750 ms | 264 tok/s | 777 ms | 221 tok/s | 1,749 ms | 186 tok/s | 825 ms | 278 tok/s | 850 ms | 234 tok/s |
-| 40,001 | 5,960 ms | 172 tok/s | 6,421 ms | 107 tok/s | 21,948 ms | 76 tok/s | 5,481 ms | 184 tok/s | 5,666 ms | 126 tok/s |
+| 507 | 35 ms | 364 tok/s | 48 ms | 343 tok/s | 39 ms | 311 tok/s | 35 ms | 345 tok/s | 36 ms | 319 tok/s |
+| 2,907 | 153 ms | 343 tok/s | 166 ms | 305 tok/s | 305 ms | 264 tok/s | 205 ms | 310 tok/s | 212 ms | 279 tok/s |
+| 10,003 | 679 ms | 298 tok/s | 750 ms | 264 tok/s | 1,751 ms | 187 tok/s | 824 ms | 281 tok/s | 851 ms | 233 tok/s |
+| 40,001 | 5,120 ms | 192 tok/s | 5,960 ms | 172 tok/s | 21,933 ms | 77 tok/s | 5,485 ms | 184 tok/s | 5,663 ms | 126 tok/s |
 
-Run-to-run spread was at most 5% for decode and 8% for TTFT in the first run, and under 1.5% for Palito in this one. llama.cpp's default `-fa auto` enables flash attention on this GPU, so the `-fa on` columns show what it does out of the box. The script now passes `--no-prefix-cache`: since the prefix cache (d61ddf8), `chat` would otherwise reuse the repeated prompt. Back to back with the same flags, the F32-KV build at `50bca67` measured 48/170/774/6,314 ms TTFT and 344/293/226/108 tok/s.
+At 0.5k the TTFT samples were 34/35/35 ms for Palito (`--stats` rounds to whole ms) and 34.5/34.6/34.8 ms for llama.cpp `-fa on`: a tie. Every other cell is ahead of every llama.cpp configuration. The script passes `--no-prefix-cache`: since the prefix cache (d61ddf8), `chat` would otherwise reuse the repeated prompt.
 
-**Reading:**
-- **Prefill:** Palito's TTFT is ahead of llama.cpp with flash attention up to 10k and 9% behind at 40k. The FP16 cache removed the per-layer K/V conversion, which saved 3–7% at 10k–40k.
-- **Decode against llama.cpp's default:** 172 against 184 tok/s at 40k (was 107, 1.68x behind; now 1.07x) and 264 against 278 at 10k (was 221).
-- **Decode against plain llama.cpp:** ahead at every length (172 against 76 tok/s at 40k).
+**What changed after 0.6.0:**
+- **Decode attention on tensor cores** (`attention_decode_mma`): the GQA group's heads are MMA rows, keys stream through shared memory in 32-key cp.async stages, and 64 key chunks are merged by a 1024-thread `attention_combine_rows`.
+- **Prefill attention** (`attention_prefill_mma_fast_f16`): 32-key double-buffered cp.async tiles, blocks with the longest causal span first, and P·V accumulated per tile in FP16 (twice the FP32-accumulate tensor rate on GeForce) and then added into F32. Below 340 blocks of 16 tokens, `attention_prefill_mma_fast4_f16` uses 8-token blocks (0.5k: 29 → 22 µs per layer).
+- **Q4_K MMQ in 128-wide K steps** (half the barriers). The 64- and 128-token tiles exceed 48 KB and get dynamic shared memory, sized on the device by `mmq_dynamic_shared` (`cuda/shared.rs`).
+- **Expert tiles:** 32-token tiles below 128 assignments per expert (`MIX_MIN_AVERAGE`), mixed 128/64/32 above (0.5k 44 → 37 ms).
+- **Router:** below 512 64×16 tiles, 32×8 TF32 tiles with a 6-stage pipeline (`router_tf32_small`). The per-output K order is unchanged, so the expert choices are identical (0.5k: 33 → 21 µs per layer).
 
-The context-dependent part of a decode step is the step time minus the near-empty step time:
+**Precision:** `f32` and `f32-tiled` are bit-identical to 0.6.0 (`kv-precision` against fresh 0.6.0 dumps: max_abs 0.0). `int8-fast` against the F32 oracle: prompt-boundary max_abs 0.25 at 256 tokens and 0.77 at 2.9k (0.6.0: 0.24 and 0.80), cosine ≥ 0.9976 and the same argmax at all 16 steps. Greedy replies can differ from 0.6.0 after a few dozen tokens: the FP16 P·V tiles change near-tie tokens (3 of 5 test prompts). Neither version is closer to `f32-tiled`: the replies match it for the same number of words on two prompts (20, 64) and 65 against 55 on the third.
 
-| | step at 40k | near-empty step | context-dependent part |
+**Tried and dropped:**
+- A split-K router was 0.35 ms faster at 0.5k, but its different summation order changed expert choices near ties.
+- 64-token tiles for small dense grids were slower.
+- Two cp.async-pipelined Q6_K tiles were slower than `mmq_tile`.
+
+Q6_K expert down projections remain the largest gap at 0.5k (~265 against llama.cpp's ~162 µs per layer). In a test kernel, removing their epilogue saved 8% and removing their unpacking 13%, so most of the cost is in loading the 210-byte, 2-byte-aligned blocks.
+
+The context-dependent part of a decode step is the step time at 40k minus the step time at 0.5k:
+
+| | step at 40k | step at 0.5k | context-dependent part |
 |---|---|---|---|
-| Palito, FP16 KV | 5.81 ms | 2.92 ms | 2.9 ms |
-| Palito, F32 KV (first run) | 9.38 ms | 2.95 ms | 6.4 ms |
-| llama.cpp `-fa on` | 5.44 ms | 2.91 ms | 2.5 ms |
-
-At 40k each step reads 3.9 GB of FP16 KV (48 layers × 4 KV heads × 128 dimensions × K and V × 2 bytes). That is ~1.35 TB/s for Palito and ~1.55 TB/s for llama.cpp, against ~1.2 TB/s for the old F32 path. The first FP16 version reused the grouped kernel, where all 8 warps of a block read the same rows. It only reached 124 tok/s (~0.77 TB/s), because too few distinct bytes were in flight. Giving each warp its own key range (`attention_split_rows`) took it to 172.
+| Palito | 5.21 ms | 2.75 ms | 2.5 ms |
+| Palito 0.6.0 | 5.81 ms | 2.92 ms | 2.9 ms |
+| llama.cpp `-fa on` | 5.44 ms | 2.90 ms | 2.5 ms |
 
 **Remaining:**
 - **q8_0 KV is not worth it for speed:** on this GPU it is slower than FP16 KV in llama.cpp (126 against 184 tok/s at 40k), because dequantizing costs more than the saved bandwidth. It is only worth it to fit longer contexts in memory.
 - **`f32` and `f32-tiled`** keep F32 KV, since FP16 would change their output.
-- **Prefill:** prefill attention needs no change for these lengths.
+- **Short prompts:** a faster Q6_K expert tile is the next lever for 0.5k TTFT.

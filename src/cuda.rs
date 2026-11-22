@@ -1229,6 +1229,7 @@ impl CudaBackend {
                     "mmq_c1_pipe32",
                     "mmq_c1_pipe32_splitk",
                     "router_tf32_tiled",
+                    "router_tf32_small",
                     "group_experts_mixed",
                     "attention_prefill_mma_fast_f16",
                     "attention_prefill_mma_fast4_f16",

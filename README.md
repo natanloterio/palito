@@ -20,6 +20,8 @@ You can also run without a GPU on the CPU backend (small models only, see below)
 
 ### From a release bundle
 
+Download `palito-<version>-linux-x86_64.tar.gz` from the [releases page](https://github.com/natanloterio/palito/releases), then:
+
 ```sh
 tar xzf palito-<version>-linux-x86_64.tar.gz
 mkdir -p ~/.local/bin

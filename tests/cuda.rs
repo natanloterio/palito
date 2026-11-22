@@ -1,5 +1,5 @@
 #![cfg(feature = "cuda")]
-use local_inference::{
+use palito::{
     Config, Executor, GenerationMode,
     backend::Backend,
     cuda::{CudaBackend, CudaMatmul, CudaOptions, reference::ReferenceBackend},

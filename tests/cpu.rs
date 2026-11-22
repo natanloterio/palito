@@ -1,4 +1,4 @@
-use local_inference::{
+use palito::{
     Config, Error, Executor, GenerationMode,
     backend::Backend,
     cpu::{CpuBackend, CpuOptions},

@@ -53,7 +53,7 @@ def main():
     parser.add_argument("--reference", type=Path, required=True,
                         help="Separately built native/bin/li-reference; never linked into Rust")
     parser.add_argument("--model", type=Path, default=ROOT / "models/SmolLM2-135M-Instruct-Q4_K_M.gguf")
-    parser.add_argument("--rust", type=Path, default=ROOT / "target/release/local-inference")
+    parser.add_argument("--rust", type=Path, default=ROOT / "target/release/palito")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--repetitions", type=positive, default=3)
     args = parser.parse_args()

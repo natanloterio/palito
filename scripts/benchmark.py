@@ -139,7 +139,7 @@ def slowdown(value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=ROOT / "models/SmolLM2-135M-Instruct-Q4_K_M.gguf")
-    parser.add_argument("--binary", type=Path, default=ROOT / "target/release/local-inference")
+    parser.add_argument("--binary", type=Path, default=ROOT / "target/release/palito")
     parser.add_argument("--prompt-file", type=Path, default=ROOT / "fixtures/prompt.txt")
     parser.add_argument("--output", type=Path, default=ROOT / "results/baseline.json")
     parser.add_argument("--context", type=positive, default=512)

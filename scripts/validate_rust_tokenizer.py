@@ -35,7 +35,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--model", type=Path, default=ROOT / "models/SmolLM2-135M-Instruct-Q4_K_M.gguf")
-    parser.add_argument("--rust", type=Path, default=ROOT / "target/release/local-inference")
+    parser.add_argument("--rust", type=Path, default=ROOT / "target/release/palito")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     model, rust, reference = (p.resolve(strict=True) for p in (args.model, args.rust, args.reference))

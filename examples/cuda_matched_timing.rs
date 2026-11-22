@@ -7,7 +7,7 @@ fn main() {
 
 #[cfg(feature = "cuda")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use local_inference::{
+    use palito::{
         Config,
         backend::Backend,
         cuda::{CudaBackend, CudaMatmul, CudaOptions},

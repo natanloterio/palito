@@ -1,6 +1,6 @@
 #![cfg(feature = "ktransformers")]
 
-use local_inference::{
+use palito::{
     GenerationMode,
     backend::{CompletionRequest, GenerationInput, RequestBackend},
     ktransformers::{KTransformersBackend, KTransformersConfig},
@@ -226,7 +226,7 @@ fn admits_exact_reported_context_but_rejects_one_token_over_without_io() {
             ..request()
         })
         .unwrap_err();
-    assert!(matches!(error, local_inference::Error::Invalid(_)));
+    assert!(matches!(error, palito::Error::Invalid(_)));
     assert_eq!(
         backend.generate(&request()).unwrap().generated_tokens,
         vec![7, 8]
@@ -253,7 +253,7 @@ fn missing_context_does_not_invent_a_capacity_or_disable_accounting_checks() {
     };
     assert!(matches!(
         backend.generate(&request),
-        Err(local_inference::Error::Backend(_))
+        Err(palito::Error::Backend(_))
     ));
     let result = backend.generate(&request).unwrap();
     assert_eq!(result.prompt_tokens, 256);
@@ -539,7 +539,7 @@ fn cli_benchmark_requires_exactly_one_input_source_before_connecting() {
 #[test]
 fn unified_cli_uses_request_adapter_without_inventing_token_step_timings() {
     let (endpoint, task) = serve(responses(server_info(), model_info(), vec![completion()]));
-    let output = Command::new(env!("CARGO_BIN_EXE_local-inference"))
+    let output = Command::new(env!("CARGO_BIN_EXE_palito"))
         .args([
             "remote",
             "--endpoint",

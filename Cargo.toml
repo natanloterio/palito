@@ -1,10 +1,10 @@
 [package]
-name = "local-inference"
+name = "palito"
 version = "0.2.6"
 edition = "2024"
 rust-version = "1.85"
 description = "Independent Rust GGUF inference engine with external-reference benchmarks"
-default-run = "local-inference"
+default-run = "palito"
 license = "MIT"
 
 [features]
@@ -25,7 +25,7 @@ cuda-attention-query-pair-research = ["cuda-attention-reuse-research"]
 cuda-attention-query-pair-even-research = ["cuda-attention-query-pair-research"]
 
 [[bin]]
-name = "local-inference"
+name = "palito"
 path = "src/main.rs"
 
 [[bin]]

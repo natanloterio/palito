@@ -31,7 +31,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--cuda-root", type=Path, required=True)
-    parser.add_argument("--binary", type=Path, default=ROOT / "target/release/local-inference")
+    parser.add_argument("--binary", type=Path, default=ROOT / "target/release/palito")
     args = parser.parse_args()
     directory = args.output_dir.resolve()
     directory.mkdir(parents=True, exist_ok=False)

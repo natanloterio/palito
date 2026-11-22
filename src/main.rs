@@ -1,5 +1,5 @@
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
-use local_inference::{
+use palito::{
     Config, Executor, GenerationMode, Result,
     backend::Backend,
     cpu::{CpuBackend, CpuOptions},
@@ -101,7 +101,7 @@ impl std::ops::Deref for ModelArgs {
 
 /// Read only by the CUDA backend, so a global setting never breaks CPU runs.
 #[cfg(feature = "cuda")]
-const KERNEL_CACHE_ENV: &str = "LOCAL_INFERENCE_CUDA_KERNEL_CACHE";
+const KERNEL_CACHE_ENV: &str = "PALITO_CUDA_KERNEL_CACHE";
 const DEFAULT_GENERATED_TOKENS: u32 = 32;
 const DEFAULT_CONTEXT_TOKENS: u32 = 512;
 /// Largest CUDA context (CudaBackend::open).
@@ -120,9 +120,9 @@ const FAST_PREFILL_TOKENS: u32 = 4096;
 /// Backend, model and execution-plan options shared by every local model command.
 #[derive(Args)]
 pub(crate) struct RuntimeArgs {
-    #[arg(long, value_enum, env = "LOCAL_INFERENCE_BACKEND", default_value_t = LocalBackend::Cpu)]
+    #[arg(long, value_enum, env = "PALITO_BACKEND", default_value_t = LocalBackend::Cpu)]
     backend: LocalBackend,
-    #[arg(long, env = "LOCAL_INFERENCE_MODEL")]
+    #[arg(long, env = "PALITO_MODEL")]
     pub(crate) model: PathBuf,
     /// Context tokens [default: 512; chat: the model's trained context (GGUF
     /// context_length; CUDA: at most 65535, shrunk to the largest that fits in free
@@ -169,7 +169,7 @@ pub(crate) struct RuntimeArgs {
     #[arg(long)]
     gpu_memory_limit_bytes: Option<u64>,
     /// Opt-in private directory for persistent CUDA kernel compilation cache
-    /// [fallback when omitted with --backend cuda: $LOCAL_INFERENCE_CUDA_KERNEL_CACHE].
+    /// [fallback when omitted with --backend cuda: $PALITO_CUDA_KERNEL_CACHE].
     #[cfg(feature = "cuda")]
     #[arg(long)]
     cuda_kernel_cache: Option<PathBuf>,
@@ -183,7 +183,7 @@ pub(crate) struct RuntimeArgs {
     /// 1 off F32 and generated text can differ. residual-int8-research is opt-in approximate prefill, not quality-admitted.
     #[cfg(feature = "cuda")]
     #[arg(long, value_enum)]
-    cuda_matmul: Option<local_inference::cuda::CudaMatmul>,
+    cuda_matmul: Option<palito::cuda::CudaMatmul>,
     /// Captured decode with token-only greedy output (f32: context <= 1024). On by
     /// default for chat with f32-tiled, int8-prefill and int8-fast.
     #[cfg(feature = "cuda")]
@@ -250,7 +250,7 @@ struct RemoteArgs {
 
 #[cfg(feature = "ktransformers")]
 fn remote(args: RemoteArgs) -> Result<()> {
-    use local_inference::{
+    use palito::{
         backend::{CompletionRequest, GenerationInput, RequestBackend},
         ktransformers::{KTransformersBackend, KTransformersConfig},
     };
@@ -288,7 +288,7 @@ fn text_input(prompt: &Option<String>, file: &Option<PathBuf>) -> Result<String>
     match (prompt, file) {
         (Some(text), None) => Ok(text.clone()),
         (None, Some(path)) => Ok(fs::read_to_string(path)?),
-        _ => Err(local_inference::Error::Invalid(
+        _ => Err(palito::Error::Invalid(
             "supply exactly one of --prompt and --prompt-file".into(),
         )),
     }
@@ -315,11 +315,11 @@ impl RuntimeArgs {
                     || self.cuda_kernel_cache.is_some()
                     || self
                         .cuda_matmul
-                        .is_some_and(|m| m != local_inference::cuda::CudaMatmul::F32)
+                        .is_some_and(|m| m != palito::cuda::CudaMatmul::F32)
                     || self.cuda_decode_graph
                     || self.no_cuda_decode_graph)
             {
-                return Err(local_inference::Error::Invalid(
+                return Err(palito::Error::Invalid(
                     "CUDA options require --backend cuda".into(),
                 ));
             }
@@ -331,13 +331,13 @@ impl RuntimeArgs {
                     || self.speculative_window != 0
                     || self.scalar_kernels)
             {
-                return Err(local_inference::Error::Invalid(
+                return Err(palito::Error::Invalid(
                     "CPU policy options require --backend cpu".into(),
                 ));
             }
             match self.backend {
                 LocalBackend::Cuda => {
-                    return local_inference::cuda::open_backend(
+                    return palito::cuda::open_backend(
                         &self.model,
                         &self.config(),
                         self.cuda_options(),
@@ -345,7 +345,7 @@ impl RuntimeArgs {
                 }
                 LocalBackend::Reference => {
                     return Ok(Box::new(
-                        local_inference::cuda::reference::ReferenceBackend::open(
+                        palito::cuda::reference::ReferenceBackend::open(
                             &self.model,
                             &self.config(),
                         )?,
@@ -362,8 +362,8 @@ impl RuntimeArgs {
     }
 
     #[cfg(feature = "cuda")]
-    fn cuda_options(&self) -> local_inference::cuda::CudaOptions {
-        let mut options = local_inference::cuda::CudaOptions::default();
+    fn cuda_options(&self) -> palito::cuda::CudaOptions {
+        let mut options = palito::cuda::CudaOptions::default();
         if let Some(device) = self.cuda_device {
             options.device = device;
         }
@@ -382,8 +382,8 @@ impl RuntimeArgs {
     }
 
     #[cfg(feature = "cuda")]
-    fn cuda_matmul(&self) -> local_inference::cuda::CudaMatmul {
-        use local_inference::cuda::CudaMatmul;
+    fn cuda_matmul(&self) -> palito::cuda::CudaMatmul {
+        use palito::cuda::CudaMatmul;
         self.cuda_matmul.unwrap_or(if self.fast_cuda_defaults && self.reference_fallback {
             CudaMatmul::F32
         } else if self.fast_cuda_defaults && self.f32_fallback {
@@ -409,7 +409,7 @@ impl RuntimeArgs {
     /// Profiles whose decode is f32-tiled (graph, packed matvec, large prefill chunks).
     #[cfg(feature = "cuda")]
     fn fast_cuda_matmul(&self) -> bool {
-        use local_inference::cuda::CudaMatmul;
+        use palito::cuda::CudaMatmul;
         matches!(
             self.cuda_matmul(),
             CudaMatmul::F32Tiled | CudaMatmul::Int8Prefill | CudaMatmul::Int8Fast
@@ -454,7 +454,7 @@ impl RuntimeArgs {
     /// CUDA_CONTEXT_MAX, fitted to device memory when opening).
     pub(crate) fn use_model_context(&mut self) -> Result<()> {
         if self.context.is_none() {
-            let trained = local_inference::model_context_tokens(&self.model)?;
+            let trained = palito::model_context_tokens(&self.model)?;
             #[cfg(feature = "cuda")]
             let cap = if self.backend == LocalBackend::Cuda {
                 CUDA_CONTEXT_MAX
@@ -529,7 +529,7 @@ impl RuntimeArgs {
         }
     }
 
-    fn execution(&self, _info: &local_inference::backend::ModelInfo) -> serde_json::Value {
+    fn execution(&self, _info: &palito::backend::ModelInfo) -> serde_json::Value {
         #[cfg(feature = "cuda")]
         match self.backend {
             LocalBackend::Cuda => {
@@ -659,7 +659,7 @@ fn execute() -> Result<()> {
             let mut backend = model.open()?;
             let input = model.input(backend.as_ref())?;
             if input.is_empty() || input.len() > config.context_tokens as usize {
-                return Err(local_inference::Error::Invalid(
+                return Err(palito::Error::Invalid(
                     "invalid prompt length".into(),
                 ));
             }
@@ -679,7 +679,7 @@ fn execute() -> Result<()> {
 
 fn main() {
     if let Err(error) = execute() {
-        eprintln!("local-inference: {error}");
+        eprintln!("palito: {error}");
         std::process::exit(1);
     }
 }
@@ -691,7 +691,7 @@ mod tests {
     #[test]
     fn model_commands_require_exactly_one_input_source() {
         for command in ["generate", "bench", "logits"] {
-            let args = ["local-inference", command, "--model", "unused.gguf"];
+            let args = ["palito", command, "--model", "unused.gguf"];
             assert!(Cli::try_parse_from(args).is_err());
             for source in ["--input-tokens-file", "--prompt", "--prompt-file"] {
                 assert!(
@@ -709,7 +709,7 @@ mod tests {
                 }
             }
         }
-        let args = ["local-inference", "tokenize", "--model", "unused.gguf"];
+        let args = ["palito", "tokenize", "--model", "unused.gguf"];
         assert!(Cli::try_parse_from(args).is_err());
         assert!(Cli::try_parse_from([args.as_slice(), &["--prompt", ""]].concat()).is_ok());
         assert!(

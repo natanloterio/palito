@@ -82,7 +82,7 @@ def summarize(record):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--binary", type=Path, default=ROOT / "target/release/local-inference")
+    parser.add_argument("--binary", type=Path, default=ROOT / "target/release/palito")
     parser.add_argument("--cuda-root", type=Path, required=True)
     parser.add_argument("--label", required=True)
     parser.add_argument("--compare-to", type=Path)

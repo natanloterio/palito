@@ -1,4 +1,4 @@
-# Local inference Rust: independent GGUF engine
+# Palito: independent Rust GGUF engine
 
 The default runtime is now an independent Rust numerical engine. Cargo does not
 build, load, or link llama.cpp, GGML, or the native bridge. llama.cpp is only an
@@ -105,7 +105,7 @@ Exact text, BOS/header/turn IDs, four separately generated greedy IDs and
 bitwise reset/replay were checked. This is short-context evidence, not a
 validation of the advertised 128K context, other quants, or decode graphs.
 
-To reproduce the dense compatibility checkpoint, from `runtime/`:
+To reproduce the dense compatibility checkpoint, from the repository root:
 
 ```sh
 git --no-pager -C ../llama.cpp rev-parse HEAD  # must match the pinned revision above
@@ -116,7 +116,7 @@ mkdir -p results/compat-native
 python3 scripts/build_f32_oracle.py --output-dir results/compat-native/oracle-build
 export LLAMA32_GGUF=models/compat-llama32/Llama-3.2-1B-Instruct-Q8_0.gguf
 python3 scripts/validate_dense_compat.py --fixture llama32 --backend reference \
-  --model "$LLAMA32_GGUF" --rust "$CARGO_TARGET_DIR/release/local-inference" \
+  --model "$LLAMA32_GGUF" --rust "$CARGO_TARGET_DIR/release/palito" \
   --oracle target/llama-f32-oracle/bin/logits-oracle \
   --output results/compat-native/llama32-reference-new.json
 cargo test --release --locked --features cuda --test dense_compat \
@@ -302,7 +302,7 @@ profiles with BF16 weights are not supported.
 
 ```sh
 cargo build --release --locked --features cuda
-target/release/local-inference generate --backend reference \
+target/release/palito generate --backend reference \
   --model models/compat-qwen3/Qwen3-0.6B-Q4_K_M.gguf \
   --prompt 'The capital of France is' --tokens 4
 # Use --backend cuda to run the same file on a configured CUDA machine.
@@ -336,7 +336,7 @@ the CPU reference, CUDA, and the F32-GELU oracle on this fixture.
 python3 scripts/build_f32_oracle.py --f32-gelu --output-dir results/gemma3-oracle-NEW
 python3 scripts/validate_gemma3_logits.py \
   --model models/compat-gemma3/gemma-3-270m-it-Q8_0.gguf \
-  --rust target/release/local-inference \
+  --rust target/release/palito \
   --oracle target/llama-f32-gelu-oracle/bin/logits-oracle
 # Add --backend cuda to validate CUDA on a configured machine.
 ```
@@ -448,7 +448,7 @@ With an existing CUDA installation and already provisioned model:
 ```sh
 cargo build --release --locked --features cuda,ktransformers -j 4
 export LD_LIBRARY_PATH="$CUDA_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-target/release/local-inference generate --backend cuda \
+target/release/palito generate --backend cuda \
   --model models/benchmark-qwen3/gguf/Qwen3-30B-A3B-Q4_K_M.gguf \
   --cuda-kernel-cache target/cuda-kernel-cache \
   --prompt 'The capital of France is' --tokens 16
@@ -482,7 +482,7 @@ KTransformers remains a distinct whole-request adapter; SGLang/KT, not this
 Rust CUDA backend, owns its kernels and KV. Both are available from the same CLI:
 
 ```sh
-target/release/local-inference remote \
+target/release/palito remote \
   --endpoint http://127.0.0.1:30171 --model qwen3-moe-benchmark \
   --kt-method LLAMAFILE --prompt 'The capital of France is' --tokens 16
 
@@ -965,7 +965,7 @@ Run from this directory:
 python3 scripts/download_model.py
 cargo build --release --locked -j 4
 # input.json contains nonnegative token IDs from this GGUF's vocabulary.
-target/release/local-inference bench \
+target/release/palito bench \
   --model models/SmolLM2-135M-Instruct-Q4_K_M.gguf \
   --input-tokens-file input.json --tokens 8 --warmups 1 --repetitions 3
 ```
@@ -1038,14 +1038,14 @@ For text completion, use exactly one of `--prompt`, `--prompt-file`, or
 with decoded text and generated IDs:
 
 ```sh
-target/release/local-inference generate \
+target/release/palito generate \
   --model models/SmolLM2-135M-Instruct-Q4_K_M.gguf \
   --prompt 'The capital of France is' --tokens 16
 
 # These commands read metadata without expanding model weights:
-target/release/local-inference tokenize \
+target/release/palito tokenize \
   --model models/SmolLM2-135M-Instruct-Q4_K_M.gguf --prompt 'Hello, world!'
-target/release/local-inference detokenize \
+target/release/palito detokenize \
   --model models/SmolLM2-135M-Instruct-Q4_K_M.gguf --input-tokens-file input.json
 ```
 
@@ -1116,14 +1116,14 @@ the numerical budget is checked.
 
 ```sh
 # Optional optimizations; defaults remain cold-cache, non-speculative execution:
-target/release/local-inference bench \
+target/release/palito bench \
   --model models/SmolLM2-135M-Instruct-Q4_K_M.gguf \
   --prompt 'The capital of France is' --tokens 16 \
   --memory-limit-bytes 150000000 \
   --prefix-cache-bytes 8388608 --speculative-window 4
 
 # Independent expanded/scalar/sequential control for differential validation:
-target/release/local-inference bench \
+target/release/palito bench \
   --model models/SmolLM2-135M-Instruct-Q4_K_M.gguf \
   --input-tokens-file input.json --tokens 8 \
   --f32-weights --sequential-prefill --scalar-kernels
@@ -1467,16 +1467,16 @@ baseline; it does not establish a speedup or generalize to larger models.
 
 ## Linux CLI bundle
 
-`scripts/package-linux.sh` builds `target/dist/local-inference-<version>-linux-x86_64.tar.gz`: the CUDA binary, bundled NVRTC 13 and a wrapper that defaults to `--backend cuda` with a kernel cache in `~/.cache/local-inference/kernels`. With `--install`, the script also links the wrapper as `~/.local/bin/local-inference`. The host needs an NVIDIA driver with CUDA 13 support.
+`scripts/package-linux.sh` builds `target/dist/palito-<version>-linux-x86_64.tar.gz`: the CUDA binary, bundled NVRTC 13 and a wrapper that defaults to `--backend cuda` with a kernel cache in `~/.cache/palito/kernels`. With `--install`, the script also links the wrapper as `~/.local/bin/palito`. The host needs an NVIDIA driver with CUDA 13 support.
 
 ```sh
 scripts/package-linux.sh --install
-local-inference chat --model /path/to/model.gguf
+palito chat --model /path/to/model.gguf
 ```
 
 `chat` uses the model's trained context by default (GGUF `context_length`; Qwen3-30B-A3B: 40,960 tokens). On CUDA it is capped at 65,535 and shrunk, in 256-token steps, to the largest context whose buffers fit in free device memory minus 2 GiB, with a notice. Replies run until end of turn or until the context is full, which is reported (`--tokens N` caps a reply; small models stuck in a greedy loop otherwise run to the full context). Older turns are dropped while a message plus a 2048-token reply reserve exceeds the context; a single message that fits alone keeps the remaining context for its reply. Measured on Qwen3-30B-A3B Q4_K_M (RTX 5090, `int8-fast`): a 40.7k-token prompt reaches the first token in 6.4 s and decodes at 103 tok/s (211 tok/s at 9.9k, ~335 tok/s near empty); a 39.7k-token needle-in-a-haystack prompt recalls the needle at 5%, 50% and 95% depth with `int8-fast` and `int8-prefill`; generating the full 40,960-token context runs at 152 tok/s on average. Other commands keep `--context 512` unless given. Without `--gpu-memory-limit-bytes` the CUDA budget is free device memory minus 2 GiB (previously a fixed 24 GiB).
 
-`LOCAL_INFERENCE_BACKEND`, `LOCAL_INFERENCE_MODEL` and `LOCAL_INFERENCE_CUDA_KERNEL_CACHE` set the defaults, and flags take precedence.
+`PALITO_BACKEND`, `PALITO_MODEL` and `PALITO_CUDA_KERNEL_CACHE` set the defaults, and flags take precedence.
 
 `chat` on CUDA defaults to `--cuda-matmul int8-fast` (below) with the decode graph and prefill chunks of up to 4096 tokens; GPUs below sm_80 fall back to `f32-tiled`, and models whose weights only the reference path supports (Q5_K, e.g. Phi-3-mini-128k Q4_K_M) to `f32` without the decode graph, each with a notice. `--cuda-matmul int8-prefill` keeps the more precise tensor-core prefill: INT8 MMA projections, FP16 hi/lo attention over K/V converted once per layer; attention projections use a two-plane residual pair with an integer factor, FFN/expert projections three residual components; decode is the `f32-tiled` path. Its logits pass a relaxed gate against the F32 oracle (same argmax, cos >= 0.99999, max_abs <= 0.15; 0.09 on a 256-token real-text prompt); Qwen3-30B-A3B 2.9k prompt on an RTX 5090: 0.35 s to the first token. Pass `--cuda-matmul f32-tiled` for F32 prefill.
 

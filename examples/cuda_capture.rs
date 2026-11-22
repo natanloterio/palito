@@ -2,7 +2,7 @@
 //! JSONL file. --cases reads cuda-precision's case map and --output names a new
 //! directory, with one JSONL per case. Graph replay is deliberately disabled.
 use clap::Parser;
-use local_inference::{
+use palito::{
     Config, Error, Result,
     backend::Backend,
     cuda::{CudaBackend, CudaMatmul, CudaOptions, diagnostics::CaptureOptions},

@@ -1,6 +1,6 @@
 #![cfg(feature = "llama-cpp")]
 
-use local_inference::{Config, Executor, GenerationMode, backend::Backend, llama::LlamaBackend};
+use palito::{Config, Executor, GenerationMode, backend::Backend, llama::LlamaBackend};
 use serde_json::Value;
 use std::{path::PathBuf, process::Command};
 

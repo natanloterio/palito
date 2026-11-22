@@ -1,5 +1,5 @@
 use clap::{Args, Parser, Subcommand};
-use local_inference::{Config, Executor, GenerationMode, Result, llama::LlamaBackend};
+use palito::{Config, Executor, GenerationMode, Result, llama::LlamaBackend};
 use serde_json::json;
 use std::{fs, path::PathBuf, time::Instant};
 
@@ -119,7 +119,7 @@ fn execute() -> Result<()> {
 
 fn main() {
     if let Err(error) = execute() {
-        eprintln!("local-inference: {error}");
+        eprintln!("palito: {error}");
         std::process::exit(1);
     }
 }

@@ -26,7 +26,11 @@ struct MmqShared {
 };
 
 #if __CUDA_ARCH__ >= 800
-template<int Kind, int C, int BN, int KS, bool S16>
+// Prefetch: load the next K tile into registers during the MMAs (more registers);
+// without it the block loads, stores and computes in turn and relies on occupancy.
+// SplitK (dense only): blockIdx.z covers width / gridDim.z columns (a multiple of
+// KS and 256) and writes partial sums to output + blockIdx.z * tokens * rows.
+template<int Kind, int C, int BN, int KS, bool S16, bool Prefetch = true, bool SplitK = false>
 __device__ void mmq_tile(const u8 *weights, const signed char *values, const float *scales,
                          const int *sums, float *output, int width, int rows, int tokens,
                          const int *groups, int used, int grouped, int assignment_major,
@@ -207,12 +211,20 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
             sh.msum[t][g] = Kind == 12 ? m : 0.0f;
         }
     };
-    fetch(0);
-    store(0);
+    int k_begin = SplitK ? blockIdx.z * (width / gridDim.z) : 0;
+    int k_end = SplitK ? k_begin + width / gridDim.z : width;
+    if (SplitK) output += (u64)blockIdx.z * tokens * rows;
+    fetch(k_begin);
+    store(k_begin);
     __syncthreads();
-    for (int k = 0; k < width; k += KS) {
-        bool more = k + KS < width;
-        if (more) fetch(k + KS);
+    for (int k = k_begin; k < k_end; k += KS) {
+        bool more = k + KS < k_end;
+        if (!Prefetch && k > k_begin) {
+            fetch(k);
+            store(k);
+            __syncthreads();
+        }
+        if (Prefetch && more) fetch(k + KS);
         #pragma unroll
         for (int g = 0; g < GROUPS; g++) {
             #pragma unroll
@@ -293,7 +305,7 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
             }
         }
         __syncthreads();
-        if (more) {
+        if (Prefetch && more) {
             store(k + KS);
             __syncthreads();
         }
@@ -321,21 +333,23 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
 // The activation layout must match the quantizer: C = 3 residual components
 // (residual_quantize32_precise3) or the S16 pair (quantize32_residual_pair).
 #if __CUDA_ARCH__ >= 800
-#define MMQ_BODY(C, BN, KS, S16) \
+#define MMQ_BODY(C, BN, KS, S16, PF, SK) \
     __shared__ MmqShared<C, BN, KS, S16 ? 2 : C> sh; \
-    if (kind == 12) mmq_tile<12, C, BN, KS, S16>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, sh); \
-    if (kind == 14) mmq_tile<14, C, BN, KS, S16>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, sh); \
+    if (kind == 12) mmq_tile<12, C, BN, KS, S16, PF, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, sh); \
+    if (kind == 14) mmq_tile<14, C, BN, KS, S16, PF, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, sh); \
     if (kind != 12 && kind != 14 && threadIdx.x == 0) atomicOr(status, 8);
 #else
-#define MMQ_BODY(C, BN, KS, S16) if (threadIdx.x == 0) atomicOr(status, 16);
+#define MMQ_BODY(C, BN, KS, S16, PF, SK) if (threadIdx.x == 0) atomicOr(status, 16);
 #endif
 #define MMQ_KERNEL(Name, C, BN, KS, S16) MMQ_KERNEL_BLOCKS(Name, C, BN, KS, S16, 2)
-#define MMQ_KERNEL_BLOCKS(Name, C, BN, KS, S16, Blocks) \
+#define MMQ_KERNEL_BLOCKS(Name, C, BN, KS, S16, Blocks) MMQ_KERNEL_FULL(Name, C, BN, KS, S16, Blocks, true)
+#define MMQ_KERNEL_FULL(Name, C, BN, KS, S16, Blocks, PF) MMQ_KERNEL_SPLIT(Name, C, BN, KS, S16, Blocks, PF, false)
+#define MMQ_KERNEL_SPLIT(Name, C, BN, KS, S16, Blocks, PF, SK) \
 extern "C" __global__ void __launch_bounds__(256, Blocks) \
 Name(const u8 *weights, int kind, const signed char *values, const float *scales, \
      const int *sums, float *output, int width, int rows, int tokens, const int *groups, \
      int used, int grouped, int assignment_major, int *status) { \
-    MMQ_BODY(C, BN, KS, S16) \
+    MMQ_BODY(C, BN, KS, S16, PF, SK) \
 }
 // int8-prefill (S16 activations, quantize32_residual_pair). Tiles measured on
 // Qwen3-30B: KS 128 for 64-token tiles was slower, 32-token tiles beat 16 and 64
@@ -350,6 +364,59 @@ MMQ_KERNEL(mmq_c3_rows32, 3, 32, 128, false)
 #define MMQ_C3_GROUPED_BLOCKS 2
 #endif
 MMQ_KERNEL_BLOCKS(mmq_c3_grouped, 3, 32, 128, false, MMQ_C3_GROUPED_BLOCKS)
+// int8-fast: one s8 plane per 32 activations, as llama.cpp's q8_1. With one plane
+// the register prefetch spills (KS 128: 1.1 KB) and loses to more resident tiles:
+// 128-token tiles at 1 block/SM without prefetch were fastest on Qwen3-30B.
+MMQ_KERNEL(mmq_c1_rows32, 1, 32, 128, false)
+// Few blocks (short prompts): split K across gridDim.z, then mmq_splitk_reduce.
+MMQ_KERNEL_SPLIT(mmq_c1_rows32_splitk, 1, 32, 128, false, 2, true, true)
+MMQ_KERNEL_FULL(mmq_c1_tokens128, 1, 128, 64, false, 1, false)
+MMQ_KERNEL_SPLIT(mmq_c1_tokens128_splitk, 1, 128, 64, false, 1, false, true)
+MMQ_KERNEL(mmq_c1_grouped, 1, 32, 128, false)
+MMQ_KERNEL_FULL(mmq_c1_grouped64, 1, 64, 128, false, 1, false)
+MMQ_KERNEL_FULL(mmq_c1_grouped128, 1, 128, 64, false, 1, false)
+
+// Sums gridDim-z partials of a split-K MMQ in a fixed order (deterministic).
+extern "C" __global__ void mmq_splitk_reduce(const float *partials, float *output, int count,
+                                             int splits, int *status) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    float sum = partials[i];
+    for (int s = 1; s < splits; s++) sum += partials[(u64)s * count + i];
+    if (!isfinite(sum)) atomicOr(status, 4);
+    output[i] = sum;
+}
+
+extern "C" __global__ void quantize32_q8(const float *x, signed char *q, float *scales,
+                                         int *sums, int count, int *status) {
+    residual_quantize32_precise<1>(x, q, scales, sums, count, status);
+}
+
+// swiglu (same expression) fused with quantize32_q8 for the down-projection input:
+// the activated values never reach global memory. count % 32 == 0.
+extern "C" __global__ void swiglu_quantize32_q8(const float *gate, const float *up, signed char *q,
+                                                float *scales, int *sums, int count, int *status) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x, lane = threadIdx.x % 32;
+    if (i >= count) return;
+    float g = gate[i];
+    float x = g / (1.0f + expf(-g)) * up[i];
+    if (__any_sync(0xffffffff, !isfinite(x))) {
+        atomicOr(status, 1);
+        return;
+    }
+    float maximum = fabsf(x);
+    for (int stride = 16; stride > 0; stride /= 2)
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, stride));
+    float d = maximum == 0.0f ? 0.0f : fmaxf(__fdiv_rn(maximum, 127.0f), __uint_as_float(1));
+    int value = d == 0.0f ? 0 : max(-127, min(127, __float2int_rn(__fdiv_rn(x, d))));
+    q[i] = (signed char)value;
+    for (int stride = 16; stride > 0; stride /= 2)
+        value += __shfl_down_sync(0xffffffff, value, stride);
+    if (lane == 0) {
+        scales[i / 32] = d;
+        sums[i / 32] = value;
+    }
+}
 
 // Two residual s8 planes per 32-value warp block with integer-related scales:
 // d1 = max|x| / 127, q1 = round(x / d1), r = x - d1 * q1, K = floor(127 * d1 / max|r|)
@@ -397,3 +464,30 @@ extern "C" __global__ void quantize32_residual_pair(const float *x, signed char 
         sums[2 * (i / 32) + 1] = factor;
     }
 }
+
+// int8-fast: per-head RMS norm (head_norm) fused with rotary (rotary): one block of
+// dim / 2 threads per head row, one rotary pair per thread. grid = rows of n tokens
+// x (width / dim) heads; dim / 2 <= 1024 and a multiple of 32.
+extern "C" __global__ void head_norm_rotary(float *x, const u8 *w, int dim, float epsilon,
+                                            int width, int position, float base, int neox) {
+    __shared__ float partial[32];
+    int heads = width / dim, token = blockIdx.x / heads, pair = threadIdx.x;
+    x += (u64)blockIdx.x * dim;
+    const float *weight = (const float *)w;
+    int a = neox ? pair : 2 * pair, b = neox ? pair + dim / 2 : 2 * pair + 1;
+    float u = x[a], v = x[b];
+    float sum = u * u + v * v;
+    for (int stride = 16; stride > 0; stride /= 2) sum += __shfl_xor_sync(0xffffffff, sum, stride);
+    if (threadIdx.x % 32 == 0) partial[threadIdx.x / 32] = sum;
+    __syncthreads();
+    sum = 0.0f;
+    for (int i = 0; i < (int)blockDim.x / 32; i++) sum += partial[i];
+    float inverse = 1.0f / sqrtf(sum / (float)dim + epsilon);
+    u *= inverse * weight[a];
+    v *= inverse * weight[b];
+    float angle = (float)(position + token) * powf(base, -(float)(2 * pair) / (float)dim);
+    float sine = sinf(angle), cosine = cosf(angle);
+    x[a] = u * cosine - v * sine;
+    x[b] = u * sine + v * cosine;
+}
+

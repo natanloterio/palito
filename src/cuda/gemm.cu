@@ -214,9 +214,10 @@ gemm_packed_grouped(const u8 *w, int kind, const float *x, float *y, int width, 
 // Same descriptor layout and order (tiles by expert, assignments ascending within
 // an expert) as group_experts_reg32, without the serial per-expert scans.
 #define GROUP_FAST_EXPERTS 256
-extern "C" __global__ void __launch_bounds__(1024)
-group_experts_fast32(const int *ids, int *groups, int experts, int used, int tokens, int slots) {
-    constexpr int TILE = 32, WARPS = 32;
+template<int TILE>
+__device__ __forceinline__ void group_experts_fast(const int *ids, int *groups, int experts,
+                                                   int used, int tokens, int slots) {
+    constexpr int WARPS = 32;
     __shared__ int counts[GROUP_FAST_EXPERTS], offsets[GROUP_FAST_EXPERTS];
     __shared__ int running[GROUP_FAST_EXPERTS];
     __shared__ int warp_counts[WARPS][GROUP_FAST_EXPERTS];
@@ -268,4 +269,20 @@ group_experts_fast32(const int *ids, int *groups, int experts, int used, int tok
         }
         __syncthreads();
     }
+}
+
+extern "C" __global__ void __launch_bounds__(1024)
+group_experts_fast32(const int *ids, int *groups, int experts, int used, int tokens, int slots) {
+    group_experts_fast<32>(ids, groups, experts, used, tokens, slots);
+}
+
+extern "C" __global__ void __launch_bounds__(1024)
+group_experts_fast128(const int *ids, int *groups, int experts, int used, int tokens, int slots) {
+    group_experts_fast<128>(ids, groups, experts, used, tokens, slots);
+}
+
+// 64-assignment tiles for int8-fast expert MMQ (mmq_c1_grouped64).
+extern "C" __global__ void __launch_bounds__(1024)
+group_experts_fast64(const int *ids, int *groups, int experts, int used, int tokens, int slots) {
+    group_experts_fast<64>(ids, groups, experts, used, tokens, slots);
 }

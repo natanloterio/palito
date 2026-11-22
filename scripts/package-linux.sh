@@ -35,13 +35,15 @@ cp -L "$nvrtc/libnvrtc.so.13" "$dist/lib/"
 cp -L "$nvrtc"/libnvrtc-builtins.so.13* "$dist/lib/"
 # cudarc probes the unversioned name first; keep it pointing at the bundled 13.x.
 ln -s libnvrtc.so.13 "$dist/lib/libnvrtc.so"
-# C API: library, header and examples (C and Python ctypes).
+# C API: library, header, C example and the language bindings.
 install -m 755 target/release/libpalito.so "$dist/lib/libpalito.so"
 strip "$dist/lib/libpalito.so" 2>/dev/null || true
 mkdir -p "$dist/include" "$dist/examples"
 install -m 644 include/palito.h "$dist/include/palito.h"
-cp -r examples/c examples/python "$dist/examples/"
-find "$dist/examples" -name __pycache__ -prune -exec rm -rf {} +
+cp -r examples/c "$dist/examples/"
+# Sources only: no dependencies, build output or caches.
+rsync -a --exclude node_modules --exclude package-lock.json --exclude target --exclude bin --exclude obj \
+  --exclude __pycache__ --exclude '*.sln' bindings "$dist/"
 
 cat > "$dist/palito" <<'WRAPPER'
 #!/usr/bin/env bash
@@ -78,19 +80,30 @@ chat uses the model's trained context unless --context is given (CUDA: at most
 65535, shrunk to what fits in free GPU memory minus 2 GiB). Replies run until end
 of turn or a full context (reported); --tokens N caps a reply.
 Replies stream token by token (--no-stream prints them when complete).
+Decoding is greedy by default; --temperature T (with --top-p, --top-k, --seed)
+samples instead, and --stop TEXT ends a reply at TEXT.
 Use --cuda-matmul int8-prefill for the more precise tensor-core prefill,
 --cuda-matmul f32-tiled for F32 prefill or --cuda-matmul f32 for the reference
 profile.
 
 OpenAI-compatible server:
   ./palito serve --model /path/to/model.gguf     # http://127.0.0.1:8080/v1
+  Qwen3 reasoning is returned as reasoning_content; temperature, top_p, top_k,
+  seed and stop are honored (omitted sampling fields: greedy, or the server's
+  --temperature/--top-p/--top-k defaults).
 
 Library (embed Palito in your program, same process, no server):
-  include/palito.h, lib/libpalito.so (needs lib/ on the library path for NVRTC)
-  cc examples/c/chat.c -Iinclude -Llib -lpalito -o chat
-  LD_LIBRARY_PATH=lib ./chat /path/to/model.gguf "Hello!"
-  LD_LIBRARY_PATH=lib PALITO_LIBRARY=lib/libpalito.so \
-    python3 examples/python/palito.py /path/to/model.gguf "Hello!"
+  include/palito.h, lib/libpalito.so (finds the bundled NVRTC by itself)
+  cc examples/c/chat.c -Iinclude -Llib -lpalito -Wl,-rpath,"$PWD/lib" -o chat
+  ./chat /path/to/model.gguf "Hello!"
+
+Language bindings in bindings/ (each finds lib/libpalito.so through the
+installed palito command, or set PALITO_LIBRARY):
+  Python   bindings/python   pip install ./bindings/python
+  Node.js  bindings/node     npm install ./bindings/node   (uses koffi)
+  Java 22+ bindings/java     mvn -f bindings/java/pom.xml install
+  C#       bindings/csharp   dotnet add reference bindings/csharp/Palito/Palito.csproj
+  Go       bindings/go       go get github.com/natanloterio/palito/bindings/go
 README
 
 tar -C "$root/target/dist" -czf "$root/target/dist/$name.tar.gz" "$name"

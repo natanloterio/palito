@@ -1469,6 +1469,31 @@ baseline; it does not establish a speedup or generalize to larger models.
 
 `palito serve` (`src/server/`) is an OpenAI-compatible server on axum/tokio. The `Engine` is opened on a dedicated worker thread and serves one request at a time. HTTP handlers queue jobs into a bounded channel (`--queue`; full → 503 with `Retry-After`) and receive text over an unbounded channel. When the client disconnects, that channel closes and the engine cancels generation at the next token. Streaming follows the OpenAI chunk format (role chunk, content deltas, a finish chunk, an optional `stream_options.include_usage` chunk, `[DONE]`). Responses add a `timings` object (`ttft_ms`, `tokens_per_second`). `/v1` routes require `Authorization: Bearer` when `--api-key`/`PALITO_API_KEY` is set (constant-time comparison). Bodies are limited to 16 MiB. Tests: `cargo test --release --test serve -- --include-ignored` (SmolLM2 fixture, CPU). Checked with the official OpenAI Python SDK (models, chat, streaming, completions) against Qwen3-30B-A3B: about 360 tok/s per request, same as the CLI.
 
+Chat replies are split into `reasoning_content` and `content` (`src/server/reasoning.rs`) unless the request sends `"reasoning_format": "none"`. The split works on streamed pieces: a tag cut across pieces is held until complete, so streamed and non-streamed replies match. When the rendered prompt already ends with `<think>`, generation starts inside the reasoning. Omitted sampling fields take the server's `--temperature/--top-p/--top-k/--seed` defaults (greedy).
+
+## Sampling and stop sequences
+
+`GenerationOptions` carries `sampling: Sampling { temperature, top_p, top_k, seed }` and `stop: Vec<String>`, shared by `palito chat`, `palito serve` and the C API.
+
+- **Greedy** (`temperature == 0` or `top_k == 1`, the default) keeps the token-only fast path: device argmax and the CUDA decode graph's pipelined replays.
+- **Any other setting** runs `Executor::generate_sampled`. Each step is evaluated with host logits (`Backend::evaluate` + `logits`), and `Sampler` (`src/sampling.rs`) draws the token. Temperature is applied first, then top-k (partial selection), then top-p over the top-k set (llama.cpp order). Without top-k, the nucleus is first built from candidates with at least 1e-6 of the top token's probability. If those together hold less than `top_p`, an exact full pass follows. The RNG is SplitMix64, seeded from `seed` or the clock.
+- **Cost:** on Qwen3-30B-A3B (RTX 5090), sampling decodes at ~296 tok/s against ~370 tok/s greedy. The difference is the per-token 600 KB logits copy and the lost replay pipelining. Device-side top-k would recover most of it.
+- **Correctness check:** a near-zero temperature (`1e-4`) reproduces the greedy text byte for byte on int8-fast with the graph, on the f32 fallback (Phi-3 Q5_K) and on CPU. So the host logits match what device argmax sees.
+
+Stop sequences (`src/stop.rs`, at most 16 of up to 256 bytes) are matched on the detokenized text. `StopFilter` holds back any suffix that could begin a stop sequence, so streamed text never contains part of one. Returned text ends before the earliest stop, and `finish_reason` is `Stop`. Generation stops on the token that completes the match.
+
+`palito chat` opens CUDA models through `Engine::open` (`src/engine/open.rs`); CPU and the reference backend go through `Engine::from_backend` to keep the validation-only CPU flags. The profile chain is int8-fast (graph) → f32-tiled (graph, then without) → f32. It now lives only in the engine and reports its fallbacks through `Engine::notices`. Explicit `--cuda-matmul`, `--cuda-decode-graph`/`--no-cuda-decode-graph`, `--batch` and `--prefill-chunk` map to `EngineOptions`. Six fixed chat transcripts (Qwen3 with and without reasoning, Phi-3 fallback, SmolLM2 on CPU, a full context, explicit flags) were byte-identical to 0.4.0, stderr included.
+
+## Language bindings
+
+`bindings/` wraps the C API for Python (ctypes), Node.js (koffi), Java 22+ (FFM), C# (P/Invoke) and Go (cgo with a `dlopen` shim, so building needs no link flags). Each mirrors the C structs. `tests/engine.rs::c_abi_layout_matches_the_bindings` locks their sizes and offsets, and the Go test keeps its vendored `palito.h` identical to `include/palito.h`. Every binding:
+- finds the library through `$PALITO_LIBRARY`, then the installed `palito` command (`<bundle>/lib`), then the system loader;
+- serializes requests per engine with a lock or queue;
+- never lets a callback exception cross into native code, re-raising it after the call;
+- turns streaming into the language's idiom: a generator, an async iterator, `IAsyncEnumerable`, or `context.Context` cancellation.
+
+`libpalito.so` carries `RUNPATH=$ORIGIN`, and the binary `$ORIGIN/../lib` (`build.rs`). cudarc opens NVRTC by name from inside the library, so the bundled CUDA 13 NVRTC is found before any system copy. Before this, a machine with CUDA 12.8 in the loader cache got a mix of both versions unless `LD_LIBRARY_PATH` pointed at the bundle. All five examples ran Qwen3-30B-A3B on the GPU from the 0.5.0 bundle without `PALITO_LIBRARY` or `LD_LIBRARY_PATH`. The Python binding with a streaming callback decodes at 368 tok/s, the same as `palito chat` (363).
+
 ## Embedding API
 
 `palito::engine::Engine` opens a model with the `chat` defaults: the GGUF context, capped at 65,535 and fitted to free device memory on CUDA. It then tries the CUDA profiles in this order and uses the first that opens: `int8-fast` with the decode graph, `f32-tiled` with and then without the graph, then `f32`. It runs chat (the model's template, `enable_thinking` per call) or plain completion with streamed text and a finish reason (stop, length, context full, cancelled). `src/ffi.rs` wraps it as the C API declared in `include/palito.h`, built as `target/release/libpalito.so` (`crate-type = ["rlib", "cdylib"]`). Panics are caught at the boundary. Strings returned by the library are freed by the library. Tests: `cargo test --release --test engine -- --include-ignored` (needs the SmolLM2 fixture; the CUDA case needs `--features cuda`).

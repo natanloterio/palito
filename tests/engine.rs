@@ -25,6 +25,15 @@ fn cpu() -> EngineOptions {
     }
 }
 
+/// Serializes the tests that load a model on the GPU: the test harness runs
+/// tests in parallel threads, and two Qwen3-30B-A3B engines do not fit in GPU
+/// memory at once. Poison-tolerant so one failing test does not fail the rest.
+#[cfg(feature = "cuda")]
+fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPU.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn capped(max_tokens: u32) -> GenerationOptions {
     GenerationOptions {
         max_tokens: Some(max_tokens),
@@ -197,6 +206,7 @@ fn c_api_reports_errors_without_a_model() {
 #[test]
 #[ignore = "requires CUDA 13 and models/SmolLM2-135M-Instruct-Q4_K_M.gguf"]
 fn cuda_engine_uses_the_trained_context_and_matches_cpu_text() {
+    let _gpu = gpu_lock();
     let mut gpu = Engine::open(
         &smollm(),
         &EngineOptions {
@@ -438,6 +448,7 @@ fn assert_prefix_cache_is_exact(model: &str, profiles: &[(palito::cuda::CudaMatm
 #[test]
 #[ignore = "requires CUDA 13 and models/compat-qwen3/Qwen3-0.6B-Q4_K_M.gguf"]
 fn cuda_prefix_cache_hit_partial_and_miss_keep_greedy_output() {
+    let _gpu = gpu_lock();
     use palito::cuda::CudaMatmul;
     assert_prefix_cache_is_exact(
         "compat-qwen3/Qwen3-0.6B-Q4_K_M.gguf",
@@ -455,6 +466,7 @@ fn cuda_prefix_cache_hit_partial_and_miss_keep_greedy_output() {
 #[test]
 #[ignore = "requires CUDA 13, ~20 GB of GPU memory and Qwen3-30B-A3B-Q4_K_M"]
 fn cuda_prefix_cache_keeps_qwen3_30b_greedy_output() {
+    let _gpu = gpu_lock();
     assert_prefix_cache_is_exact(
         "benchmark-qwen3/gguf/Qwen3-30B-A3B-Q4_K_M.gguf",
         &[(palito::cuda::CudaMatmul::Int8Fast, true)],
@@ -467,6 +479,7 @@ fn cuda_prefix_cache_keeps_qwen3_30b_greedy_output() {
 #[test]
 #[ignore = "benchmark: requires CUDA 13, ~20 GB of GPU memory and Qwen3-30B-A3B-Q4_K_M"]
 fn cuda_prefix_cache_speeds_up_long_conversations() {
+    let _gpu = gpu_lock();
     let document: String = (0..480)
         .map(|i| {
             format!(

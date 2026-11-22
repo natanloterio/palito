@@ -4,3 +4,9 @@
 __pycache__/
 /.venv-ktransformers-bench/
 /.venv-cuda-bench/
+bindings/node/node_modules/
+bindings/java/target/
+bindings/csharp/**/bin/
+bindings/csharp/**/obj/
+__pycache__/
+bindings/node/package-lock.json

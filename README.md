@@ -77,6 +77,11 @@ Useful options:
 | `--tokens N` | Caps each reply at N tokens (default: until the model stops or the context is full) |
 | `--context N` | Uses N context tokens instead of the model's full context |
 | `--no-stream` | Prints each reply only once it is complete |
+| `--temperature T` | Samples instead of always picking the most likely token (default 0: greedy, the same reply every time) |
+| `--top-p P`, `--top-k K`, `--seed S` | Narrow the sampling to the most likely tokens; a seed makes it repeatable |
+| `--stop TEXT` | Ends the reply at TEXT, which is not printed (repeat for several) |
+
+For Qwen3, its authors suggest `--temperature 0.6 --top-p 0.95 --top-k 20` with reasoning on, and `--temperature 0.7 --top-p 0.8 --top-k 20` with `--no-thinking`. Greedy decoding works well for short answers, but long reasoning can start repeating itself.
 
 Set `PALITO_MODEL` once to skip `--model`:
 
@@ -137,17 +142,29 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 ```
 
 - **Endpoints:** `POST /v1/chat/completions`, `POST /v1/completions` (both support `"stream": true`), `GET /v1/models`, `GET /health`.
-- **Qwen3 reasoning:** send `"chat_template_kwargs": {"enable_thinking": false}` to turn it off.
-- **Decoding is greedy:** `temperature` and `top_p` are accepted but ignored. `n` > 1 and `stop` sequences are rejected.
+- **Qwen3 reasoning:** the `<think>` part comes back separately as `reasoning_content` (as with llama.cpp and vLLM), and `content` holds only the answer. Send `"reasoning_format": "none"` to keep it inside `content`, or `"chat_template_kwargs": {"enable_thinking": false}` to turn reasoning off.
+- **Sampling:** `temperature`, `top_p`, `top_k` and `seed` work as usual. When a request leaves them out, the server uses its own defaults: greedy, unless you start it with e.g. `--temperature 0.6 --top-p 0.95 --top-k 20`. Greedy runs about 20% faster (~370 vs ~300 tok/s on Qwen3-30B).
+- **Stop sequences:** `stop` (a string or up to 16 strings) ends the reply; the stop text is not returned. It applies to everything the model writes, reasoning included, so with reasoning on avoid stops like `"\n"`.
+- **Not supported:** `n` > 1 is rejected.
 - **One request at a time:** the model runs one request at a time, and others wait in a queue (`--queue`, default 16; beyond that the server returns 503). If a client disconnects, its generation stops.
 - **Local by default:** the server only accepts connections from this machine. To serve your network, use `--host 0.0.0.0 --api-key YOUR_KEY` (or set `PALITO_API_KEY`). Clients then send `Authorization: Bearer YOUR_KEY`.
 - **Other options:** `--port`, `--context`, `--backend cpu`, `--gpu-memory-limit-bytes`, `--model-name`.
 
 ## Use Palito from your own program
 
-Palito is also a library, `libpalito.so`, with a C API in [`include/palito.h`](include/palito.h). Your program loads it and calls it directly, in the same process: no server, no subprocess. Any language that can call C can use it.
+Palito is also a library, `libpalito.so`, with a C API in [`include/palito.h`](include/palito.h). Your program loads it and calls it directly, in the same process: no server, no subprocess. Ready-made bindings for **Python, Node.js, Java, C# and Go** are in [`bindings/`](bindings/README.md), and in the release bundle. They run at the same speed as `palito chat`.
 
-The release bundle contains `lib/libpalito.so`, `include/palito.h` and two examples. Keep the bundle's `lib/` on the library path, since the GPU kernel compiler loads from there.
+Every binding finds the library through the installed `palito` command, so once Palito is installed there is nothing to configure. Elsewhere, set `PALITO_LIBRARY=/path/to/libpalito.so`.
+
+| Language | Install | Hello |
+|---|---|---|
+| Python | `pip install ./bindings/python` | `palito.Palito("model.gguf").chat([{"role": "user", "content": "Hi"}])` |
+| Node.js | `npm install ./bindings/node` | `await (await Palito.open("model.gguf")).chat([{ role: "user", content: "Hi" }])` |
+| Java 22+ | `mvn -f bindings/java/pom.xml install` | `Palito.open(Path.of("model.gguf"), new Options()).chat(List.of(Message.user("Hi")), new Generation())` |
+| C# | `dotnet add reference bindings/csharp/Palito/Palito.csproj` | `PalitoEngine.Open("model.gguf").Chat(new[] { Message.User("Hi") })` |
+| Go | `go get github.com/natanloterio/palito/bindings/go` | `engine.Chat(ctx, []palito.Message{{Role: "user", Content: "Hi"}}, nil)` |
+
+Each binding streams the reply as it is generated, can stop early, and takes the same settings: token cap, reasoning, sampling and stop sequences. See its README for an example.
 
 **C** ([`examples/c/chat.c`](examples/c/chat.c)):
 
@@ -163,27 +180,16 @@ palito_close(engine);
 ```
 
 ```sh
-cc examples/c/chat.c -Iinclude -Llib -lpalito -o chat
-LD_LIBRARY_PATH=lib ./chat models/Qwen3-30B-A3B-Q4_K_M.gguf "Hello!"
+cc examples/c/chat.c -Iinclude -Llib -lpalito -Wl,-rpath,"$PWD/lib" -o chat
+./chat models/Qwen3-30B-A3B-Q4_K_M.gguf "Hello!"
 ```
-
-**Python** ([`examples/python/palito.py`](examples/python/palito.py), standard library only):
-
-```python
-from palito import Palito
-
-with Palito("models/Qwen3-30B-A3B-Q4_K_M.gguf") as llm:
-    reply = llm.chat([{"role": "user", "content": "Hello!"}],
-                     on_text=lambda text: print(text, end="", flush=True))
-    print(reply["finish_reason"], reply["tokens_per_second"])
-```
-
-Run it with `LD_LIBRARY_PATH=lib PALITO_LIBRARY=lib/libpalito.so`.
 
 How it works:
 - Open a model once, then call `palito_chat` or `palito_complete` as many times as you like. The defaults are the same as `palito chat`: full context, fastest GPU profile.
 - Each call is stateless: pass the whole conversation every time.
 - The callback gets the text as it is generated; return nonzero to stop.
+- `palito_generation` sets the token cap, reasoning, sampling (`temperature`, `top_p`, `top_k`, `seed`) and stop sequences. Fill it with `palito_generation_init` first.
+- `libpalito.so` finds the NVRTC bundled next to it, so `LD_LIBRARY_PATH` is not needed.
 - Errors come back as `-1` plus a message.
 - Use one engine per thread, or guard it with a lock.
 

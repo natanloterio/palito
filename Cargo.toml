@@ -48,6 +48,11 @@ path = "examples/cuda_precision.rs"
 required-features = ["cuda"]
 
 [[example]]
+name = "kv-precision"
+path = "examples/kv_precision.rs"
+required-features = ["cuda"]
+
+[[example]]
 name = "cuda-capture"
 path = "examples/cuda_capture.rs"
 required-features = ["cuda"]

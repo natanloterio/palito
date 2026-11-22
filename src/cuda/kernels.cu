@@ -1,6 +1,45 @@
 typedef unsigned char u8;
 typedef unsigned long long u64;
 
+// KV cache element access. F32 caches (every profile but int8-fast) load and store
+// floats unchanged; int8-fast stores FP16 bits (round to nearest, the conversion its
+// FP16 prefill attention applies) and every kernel accumulates in F32.
+typedef unsigned short kv_f16;
+
+__device__ __forceinline__ float kv_load(const float *p, u64 i) { return p[i]; }
+
+__device__ __forceinline__ float kv_load(const kv_f16 *p, u64 i) {
+    float value;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(value) : "h"(p[i]));
+    return value;
+}
+
+__device__ __forceinline__ float2 kv_unpack2(unsigned int packed) {
+    float lo, hi;
+    asm("{.reg .f16 l, h; mov.b32 {l, h}, %2; cvt.f32.f16 %0, l; cvt.f32.f16 %1, h;}"
+        : "=f"(lo), "=f"(hi) : "r"(packed));
+    return make_float2(lo, hi);
+}
+
+// Four consecutive elements; i % 4 == 0 (16-byte F32 / 8-byte F16 aligned).
+__device__ __forceinline__ float4 kv_load4(const float *p, u64 i) {
+    return *(const float4 *)(p + i);
+}
+
+__device__ __forceinline__ float4 kv_load4(const kv_f16 *p, u64 i) {
+    uint2 bits = *(const uint2 *)(p + i);
+    float2 a = kv_unpack2(bits.x), b = kv_unpack2(bits.y);
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+
+__device__ __forceinline__ void kv_store(float *p, u64 i, float value) { p[i] = value; }
+
+__device__ __forceinline__ void kv_store(kv_f16 *p, u64 i, float value) {
+    unsigned short bits;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(bits) : "f"(value));
+    p[i] = bits;
+}
+
 __device__ float half_value_bits(unsigned int h) {
 #ifdef CUDA_NATIVE_HALF
     // Preserve legacy reserved-exponent handling; every finite half is exact in F32.
@@ -857,15 +896,16 @@ extern "C" __global__ void rotary_decode(float *x, int n, int dim, const int *co
     rotary_impl(x, n, dim, control[1], base, neox, nullptr, 1.0f);
 }
 
+template<typename KV>
 __device__ __forceinline__ void cache_kv_impl(const float *k, const float *v,
-                                              float *keys, float *values, int width, int position) {
+                                              KV *keys, KV *values, int width, int position) {
     k += (u64)blockIdx.y * width;
     v += (u64)blockIdx.y * width;
     position += blockIdx.y;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < width) {
-        keys[(u64)position * width + i] = k[i];
-        values[(u64)position * width + i] = v[i];
+        kv_store(keys, (u64)position * width + i, k[i]);
+        kv_store(values, (u64)position * width + i, v[i]);
     }
 }
 
@@ -880,8 +920,21 @@ extern "C" __global__ void cache_kv_decode(const float *k, const float *v,
     cache_kv_impl(k, v, keys, values, width, control[1]);
 }
 
-template<bool Gemma, bool Alibi = false>
-__device__ __forceinline__ void attention_scores_impl(const float *q, const float *keys,
+#ifdef CUDA_KV_F16
+extern "C" __global__ void cache_kv_f16(const float *k, const float *v, kv_f16 *keys,
+                                       kv_f16 *values, int width, int position) {
+    cache_kv_impl(k, v, keys, values, width, position);
+}
+
+extern "C" __global__ void cache_kv_decode_f16(const float *k, const float *v,
+                                              kv_f16 *keys, kv_f16 *values, int width,
+                                              const int *control) {
+    cache_kv_impl(k, v, keys, values, width, control[1]);
+}
+#endif
+
+template<bool Gemma, bool Alibi = false, typename KV = float>
+__device__ __forceinline__ void attention_scores_impl(const float *q, const KV *keys,
     float *scores, int dim, int heads, int kv_heads, int context, int count, int window, float scale,
     float softcap) {
     int head = blockIdx.x, time = blockIdx.y;
@@ -893,7 +946,7 @@ __device__ __forceinline__ void attention_scores_impl(const float *q, const floa
     float sum = 0.0f;
     for (int i = threadIdx.x; i < dim; i += blockDim.x)
         sum += (Gemma ? q[(u64)head * dim + i] * scale : q[(u64)head * dim + i])
-             * keys[((u64)time * kv_heads + kv_head) * dim + i];
+             * kv_load(keys, ((u64)time * kv_heads + kv_head) * dim + i);
     sum = sum_block(sum);
     if (threadIdx.x == 0) {
         float score = Gemma ? sum : sum / sqrtf((float)dim);
@@ -927,8 +980,8 @@ extern "C" __global__ void gemma_attention_scores(const float *q, const float *k
     attention_scores_impl<true>(q, keys, scores, dim, heads, kv_heads, context, count, window, scale, softcap);
 }
 
-template<bool Gemma>
-__device__ __forceinline__ void attention_values_impl(float *scores, const float *values,
+template<bool Gemma, typename KV = float>
+__device__ __forceinline__ void attention_values_impl(float *scores, const KV *values,
     float *output, int dim, int heads, int kv_heads, int context, int count, int window) {
     count += blockIdx.y;
     int start = Gemma && window > 0 && count > window ? count - window : 0;
@@ -956,7 +1009,7 @@ __device__ __forceinline__ void attention_values_impl(float *scores, const float
     for (int i = lane; i < dim; i += blockDim.x) {
         float value = 0.0f;
         for (int t = start; t < count; t++)
-            value += s[t] / total * values[((u64)t * kv_heads + kv_head) * dim + i];
+            value += s[t] / total * kv_load(values, ((u64)t * kv_heads + kv_head) * dim + i);
         output[(u64)head * dim + i] = value;
     }
 }
@@ -970,6 +1023,19 @@ extern "C" __global__ void gemma_attention_values(float *scores, const float *va
     int dim, int heads, int kv_heads, int context, int count, int window) {
     attention_values_impl<true>(scores, values, output, dim, heads, kv_heads, context, count, window);
 }
+
+#ifdef CUDA_KV_F16
+extern "C" __global__ void attention_scores_f16(const float *q, const kv_f16 *keys,
+    float *scores, int dim, int heads, int kv_heads, int context, int count) {
+    attention_scores_impl<false, false>(q, keys, scores, dim, heads, kv_heads, context, count, 0,
+                                        1.0f, 0.0f);
+}
+
+extern "C" __global__ void attention_values_f16(float *scores, const kv_f16 *values,
+    float *output, int dim, int heads, int kv_heads, int context, int count) {
+    attention_values_impl<false>(scores, values, output, dim, heads, kv_heads, context, count, 0);
+}
+#endif
 
 extern "C" __global__ void gemma_embedding_scale(float *x, int count, float scale) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1148,10 +1214,11 @@ extern "C" __global__ void router_warp128(const float *scores, int used,
 #if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_DECODE_FUSION_RESEARCH) || defined(CUDA_PACKED_DECODE)
 // Equals head_norm (256-lane tree) + rotary + cache_kv for dim-128 heads with
 // full, unscaled RoPE; grid=(heads + kv_heads), block=256.
+template<typename KV>
 __device__ __forceinline__ void qkv_head_norm_rope_cache_impl(
     float *q, const u8 *q_norm, int heads,
     float *k, const u8 *k_norm, const float *v,
-    float *keys, float *values, int kv_heads,
+    KV *keys, KV *values, int kv_heads,
     float epsilon, int position, float base, int neox) {
     __shared__ float normed[128];
     int b = blockIdx.x, tid = threadIdx.x;
@@ -1178,14 +1245,14 @@ __device__ __forceinline__ void qkv_head_norm_rope_cache_impl(
         vec[b_idx] = rb;
         if (!is_q) {
             u64 kv_base = ((u64)position * kv_heads + head) * 128;
-            keys[kv_base + a] = ra;
-            keys[kv_base + b_idx] = rb;
+            kv_store(keys, kv_base + a, ra);
+            kv_store(keys, kv_base + b_idx, rb);
         }
     }
     if (!is_q && tid >= 128) {
         int i = tid - 128;
         u64 kv_base = ((u64)position * kv_heads + head) * 128;
-        values[kv_base + i] = v[(u64)head * 128 + i];
+        kv_store(values, kv_base + i, v[(u64)head * 128 + i]);
     }
 }
 
@@ -1206,6 +1273,26 @@ extern "C" __global__ void qkv_head_norm_rope_cache_decode(
     qkv_head_norm_rope_cache_impl(
         q, q_norm, heads, k, k_norm, v, keys, values, kv_heads, epsilon, control[1], base, neox);
 }
+
+#ifdef CUDA_KV_F16
+extern "C" __global__ void qkv_head_norm_rope_cache_f16(
+    float *q, const u8 *q_norm, int heads,
+    float *k, const u8 *k_norm, const float *v,
+    kv_f16 *keys, kv_f16 *values, int kv_heads,
+    float epsilon, int position, float base, int neox) {
+    qkv_head_norm_rope_cache_impl(
+        q, q_norm, heads, k, k_norm, v, keys, values, kv_heads, epsilon, position, base, neox);
+}
+
+extern "C" __global__ void qkv_head_norm_rope_cache_decode_f16(
+    float *q, const u8 *q_norm, int heads,
+    float *k, const u8 *k_norm, const float *v,
+    kv_f16 *keys, kv_f16 *values, int kv_heads,
+    float epsilon, const int *control, float base, int neox) {
+    qkv_head_norm_rope_cache_impl(
+        q, q_norm, heads, k, k_norm, v, keys, values, kv_heads, epsilon, control[1], base, neox);
+}
+#endif
 #endif
 
 #ifdef CUDA_M8_PROTOTYPES

@@ -12,7 +12,7 @@ Fast local LLM inference for GGUF models, written in Rust, with its own CUDA ker
 
 - Linux x86_64.
 - For the GPU: an NVIDIA GPU with a driver that supports CUDA 13. Ampere (RTX 30xx, A100) or newer gets the fast path; older GPUs work, but more slowly.
-- Enough GPU memory for the model: Qwen3-30B-A3B Q4_K_M needs ~18 GB for the weights, plus ~0.2 MB per context token.
+- Enough GPU memory for the model: Qwen3-30B-A3B Q4_K_M needs ~18 GB for the weights, plus ~0.1 MB per context token (the default GPU profile keeps its K/V cache in FP16; the strict `f32` profiles use ~0.2 MB).
 
 You can also run without a GPU on the CPU backend (small models only, see below).
 

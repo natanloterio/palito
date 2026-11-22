@@ -10,6 +10,7 @@ use palito::{
     backend::Backend,
     chat::{ChatTemplate, Message, fit_history},
 };
+use palito::{stream::TextStream, tokenizer::Tokenizer};
 use std::{
     fs,
     io::{BufRead, IsTerminal, Write},
@@ -33,10 +34,15 @@ pub(crate) struct ChatArgs {
     /// Print per-reply timing to stderr.
     #[arg(long)]
     stats: bool,
+    /// Print each reply only once it is complete instead of token by token.
+    #[arg(long)]
+    no_stream: bool,
 }
 
 struct Session {
     executor: Executor<Box<dyn Backend>>,
+    /// Detokenizes streamed replies while the executor is generating.
+    tokenizer: Tokenizer,
     template: ChatTemplate,
     initial: Vec<Message>,
     history: Vec<Message>,
@@ -80,9 +86,11 @@ pub(crate) fn run(mut args: ChatArgs) -> Result<()> {
                 session.history = session.initial.clone();
                 eprintln!("(conversation cleared)");
             }
-            text => match session.reply(text) {
+            text => match session.reply(text, !args.no_stream) {
                 Ok((reply, sample)) => {
-                    println!("{reply}");
+                    if args.no_stream {
+                        println!("{reply}");
+                    }
                     if args.stats {
                         print_stats(&sample);
                     }
@@ -122,6 +130,7 @@ impl Session {
         let initial: Vec<_> = args.system.iter().map(Message::system).collect();
         Ok(Self {
             executor,
+            tokenizer: Tokenizer::open(&runtime.model)?,
             template,
             history: initial.clone(),
             initial,
@@ -132,7 +141,9 @@ impl Session {
     }
 
     /// Generates a reply; history only changes when generation succeeds.
-    fn reply(&mut self, text: &str) -> Result<(String, Sample)> {
+    /// With `stream`, prints the reply to stdout as it is generated (trimmed like
+    /// the returned reply) and ends it with a newline.
+    fn reply(&mut self, text: &str, stream: bool) -> Result<(String, Sample)> {
         let candidate = [self.history.as_slice(), &[Message::user(text)]].concat();
         let reserved = self.reserve.saturating_sub(1) as usize;
         let mut prompt = Vec::new();
@@ -168,9 +179,12 @@ impl Session {
         // All remaining context (prompt + generated - 1 <= context), or --tokens.
         let room = (self.context + 1).saturating_sub(prompt.len()) as u32;
         let budget = self.max_tokens.map_or(room, |tokens| tokens.min(room));
-        let sample = self
-            .executor
-            .generate(&prompt, budget, GenerationMode::UntilEog)?;
+        let sample = if stream {
+            self.generate_printing(&prompt, budget)?
+        } else {
+            self.executor
+                .generate(&prompt, budget, GenerationMode::UntilEog)?
+        };
         let ended = sample
             .generated_tokens
             .last()
@@ -192,6 +206,24 @@ impl Session {
             .to_owned();
         self.history = [fitted, vec![Message::assistant(reply.clone())]].concat();
         Ok((reply, sample))
+    }
+
+    fn generate_printing(&mut self, prompt: &[i32], budget: u32) -> Result<Sample> {
+        let mut text = TextStream::new();
+        let mut out = TrimmedOutput::default();
+        // The model's own tokenizer, separate from the executor it borrows.
+        let tokenizer = &self.tokenizer;
+        let detokenize = |tokens: &[i32]| tokenizer.detokenize(tokens);
+        let result =
+            self.executor
+                .generate_streaming(prompt, budget, GenerationMode::UntilEog, |token| {
+                    out.write(&text.push(token, detokenize)?)
+                });
+        // Print what was generated even when the request failed part way.
+        let rest = text.finish(detokenize)?;
+        out.write(&rest)?;
+        out.end()?;
+        result
     }
 
     fn prompt_tokens(&self, messages: &[Message]) -> Result<Vec<i32>> {
@@ -250,4 +282,43 @@ fn print_stats(sample: &Sample) {
         sample.ttft_ns as f64 / 1e6,
         rate
     );
+}
+
+/// Streams text to stdout without leading whitespace and holding trailing
+/// whitespace until more text follows, so the printed reply equals the trimmed one.
+#[derive(Default)]
+struct TrimmedOutput {
+    started: bool,
+    pending: String,
+}
+
+impl TrimmedOutput {
+    fn write(&mut self, piece: &str) -> Result<()> {
+        let piece = if self.started {
+            piece
+        } else {
+            piece.trim_start()
+        };
+        if piece.is_empty() {
+            return Ok(());
+        }
+        self.started = true;
+        let body = piece.trim_end();
+        let mut stdout = std::io::stdout().lock();
+        if !body.is_empty() {
+            stdout.write_all(self.pending.as_bytes())?;
+            stdout.write_all(body.as_bytes())?;
+            stdout.flush()?;
+            self.pending.clear();
+        }
+        self.pending.push_str(&piece[body.len()..]);
+        Ok(())
+    }
+
+    fn end(self) -> Result<()> {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(b"\n")?;
+        stdout.flush()?;
+        Ok(())
+    }
 }

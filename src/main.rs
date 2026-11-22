@@ -6,7 +6,7 @@ use palito::{
     tokenizer::Tokenizer,
 };
 use serde_json::json;
-use std::{fs, path::PathBuf, time::Instant};
+use std::{fs, io::Write, path::PathBuf, time::Instant};
 
 mod chat_repl;
 
@@ -37,6 +37,10 @@ enum Command {
     Generate {
         #[command(flatten)]
         model: ModelArgs,
+        /// Print the completion as plain text token by token instead of one JSON
+        /// object at the end.
+        #[arg(long)]
+        stream: bool,
     },
     /// Tokenize text offline without loading model weights.
     Tokenize {
@@ -597,7 +601,32 @@ fn execute() -> Result<()> {
                 serde_json::to_string(&json!({"text": tokenizer.detokenize(&tokens)?}))?
             );
         }
-        Command::Generate { model } => {
+        Command::Generate { model, stream: true } => {
+            let config = model.config();
+            let backend = model.open()?;
+            let input = model.input(backend.as_ref())?;
+            let tokenizer = Tokenizer::open(&model.model)?;
+            let detokenize = |tokens: &[i32]| tokenizer.detokenize(tokens);
+            let mut executor = Executor::new(backend, config)?;
+            executor.detokenize(&[])?;
+            let mut text = palito::stream::TextStream::new();
+            let mut stdout = std::io::stdout().lock();
+            let result = executor.generate_streaming(
+                &input,
+                model.tokens(),
+                GenerationMode::UntilEog,
+                |token| {
+                    stdout.write_all(text.push(token, detokenize)?.as_bytes())?;
+                    Ok(stdout.flush()?)
+                },
+            );
+            writeln!(stdout, "{}", text.finish(detokenize)?)?;
+            result?;
+        }
+        Command::Generate {
+            model,
+            stream: false,
+        } => {
             let config = model.config();
             let start = Instant::now();
             let backend = model.open()?;

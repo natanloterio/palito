@@ -2396,7 +2396,15 @@ impl Backend for CudaBackend {
         self.evaluate_inner(tokens, position, self.decode.is_none())
     }
     fn sample_tokens(&mut self, maximum: usize, mode: crate::GenerationMode) -> Result<Vec<i32>> {
-        self.sample_decode_tokens(maximum, mode)
+        self.sample_decode_tokens(maximum, mode, &mut |_| Ok(()))
+    }
+    fn sample_tokens_streaming(
+        &mut self,
+        maximum: usize,
+        mode: crate::GenerationMode,
+        sink: &mut dyn FnMut(i32) -> Result<()>,
+    ) -> Result<Vec<i32>> {
+        self.sample_decode_tokens(maximum, mode, sink)
     }
     fn sample_greedy(&mut self) -> Result<i32> {
         self.state.logits(&[])?;

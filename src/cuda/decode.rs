@@ -157,11 +157,13 @@ impl CudaBackend {
         &mut self,
         maximum: usize,
         mode: crate::GenerationMode,
+        sink: &mut dyn FnMut(i32) -> Result<()>,
     ) -> Result<Vec<i32>> {
         if maximum == 0 {
             return Err(invalid("sample maximum must be positive"));
         }
         let first = self.sample_greedy()?;
+        sink(first)?;
         let until_eog = mode == crate::GenerationMode::UntilEog;
         if self.decode.is_none() || (until_eog && self.is_eog(first)) {
             return Ok(vec![first]);
@@ -214,6 +216,8 @@ impl CudaBackend {
                 ));
             }
             tokens.push(token);
+            // The replays already in flight keep the GPU busy while the sink runs.
+            sink(token)?;
             if until_eog && self.is_eog(token) {
                 break;
             }

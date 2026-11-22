@@ -938,166 +938,78 @@ extern "C" __global__ void attention_combine_group_decode(const float *partial,
 #endif
 
 #if defined(CUDA_PACKED_DECODE) && defined(CUDA_KV_F16)
-// Sum G per-lane values across the warp in log2(G) halving steps plus the rest
-// (G - 1 + 5 - log2(G) shuffles instead of 5 G). Returns the full sum of value
-// kv_row_head(lane) of every lane.
-template<int G>
-__device__ __forceinline__ float kv_row_reduce(float v[G], int lane) {
-    #pragma unroll
-    for (int s = 0; (G >> s) > 1; s++) {
-        const int half = G >> (s + 1), offset = 16 >> s;
-        bool upper = lane & offset;
-        #pragma unroll
-        for (int j = 0; j < half; j++) {
-            float send = upper ? v[j] : v[j + half], keep = upper ? v[j + half] : v[j];
-            v[j] = keep + __shfl_xor_sync(0xffffffff, send, offset);
-        }
-    }
-    float sum = v[0];
-    #pragma unroll
-    for (int offset = 16 / G; offset > 0; offset /= 2)
-        sum += __shfl_xor_sync(0xffffffff, sum, offset);
-    return sum;
+// Keys per pipeline stage of attention_decode_mma (attention_mma.cu); its warp
+// chunks are multiples of it.
+#define ATTENTION_ROW_BATCH 32
+
+__device__ __forceinline__ int attention_row_chunk(int count, int chunks) {
+    int per = (count + chunks - 1) / chunks;
+    return max(ATTENTION_ROW_BATCH,
+               (per + ATTENTION_ROW_BATCH - 1) / ATTENTION_ROW_BATCH * ATTENTION_ROW_BATCH);
 }
 
-template<int G>
-__device__ __forceinline__ int kv_row_head(int lane) {
-    int head = 0;
-    #pragma unroll
-    for (int s = 0; (G >> s) > 1; s++)
-        if (lane & (16 >> s)) head += G >> (s + 1);
-    return head;
+__device__ __forceinline__ void kv_copy_async(void *shared, const void *global) {
+    unsigned int address = (unsigned int)__cvta_generic_to_shared(shared);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(address), "l"(global));
 }
 
-#define ATTENTION_ROW_UNROLL 8
-
-// GQA decode split pass, warp-parallel over keys: grid = (kv_heads, chunks / 8),
-// block = 256, dim == 128 and group = heads / kv_heads <= G (G in {2, 4, 8}). Warp
-// w of block (x, y) is chunk c = 8 y + w: a contiguous key range (attention_chunk
-// with chunks = 8 gridDim.y, ATTENTION_GROUP_GRANULE) for all `group` query heads of
-// KV head x, so every K/V row is read once per step and the 8 warps of a block keep
-// distinct rows in flight. Lane l owns dims 4l..4l+3; online softmax per 32-key
-// batch. Same partial layout and combine (attention_combine_group) as
-// attention_split_group; F32 accumulation.
-template<int G, typename KV>
-__device__ __forceinline__ void attention_split_rows_impl(
-    const float *q, const KV *keys, const KV *values, float *partial, int heads, int kv_heads,
-    int count) {
-    __shared__ float probability[8][G][32];
-    const int dim = ATTENTION_KV_DIM, per = 32 / G;
-    int kv_head = blockIdx.x, group = heads / kv_heads;
+// Combine for attention_decode_mma: grid = (heads), block = 1024, dim == 128.
+// Warp w accumulates active chunks w, w + 32, ... (32 in flight per head).
+__device__ __forceinline__ void attention_combine_rows_impl(const float *partial, float *output,
+                                                           int chunks, int count) {
+    __shared__ float weights[1024];
+    __shared__ float reduce[32][ATTENTION_KV_DIM];
+    __shared__ float denominator;
+    const int dim = ATTENTION_KV_DIM;
+    int chunk = attention_row_chunk(count, chunks), active = (count + chunk - 1) / chunk;
     int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    int chunks = gridDim.y * 8, index = blockIdx.y * 8 + warp;
-    int chunk = attention_chunk(count, chunks, ATTENTION_GROUP_GRANULE);
-    int begin = index * chunk, end = min(count, begin + chunk);
-    if (begin >= end) return;
-    float4 query[G], acc[G];
-    #pragma unroll
-    for (int h = 0; h < G; h++) {
-        query[h] = h < group ? *(const float4 *)(q + (u64)(kv_head * group + h) * dim + 4 * lane)
-                             : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        acc[h] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    }
-    // Softmax state of head lane / per, held by its `per` lanes.
-    int mine = lane / per, slot = lane % per, leader = kv_row_head<G>(lane);
-    bool writes = (lane & (16 / G * 2 - 1)) == 0;
-    float scale = sqrtf((float)dim), maximum = -__int_as_float(0x7f800000), total = 0.0f;
-    float (*p)[32] = probability[warp];
-    for (int base = begin; base < end; base += 32) {
-        int n = min(32, end - base);
-        for (int u = 0; u < n; u += ATTENTION_ROW_UNROLL) {
-            float4 k[ATTENTION_ROW_UNROLL];
-            #pragma unroll
-            for (int j = 0; j < ATTENTION_ROW_UNROLL; j++)
-                k[j] = u + j < n
-                    ? kv_load4(keys, ((u64)(base + u + j) * kv_heads + kv_head) * dim + 4 * lane)
-                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            #pragma unroll
-            for (int j = 0; j < ATTENTION_ROW_UNROLL; j++) {
-                float part[G];
-                #pragma unroll
-                for (int h = 0; h < G; h++)
-                    part[h] = query[h].x * k[j].x + query[h].y * k[j].y + query[h].z * k[j].z
-                            + query[h].w * k[j].w;
-                float score = kv_row_reduce<G>(part, lane);
-                if (writes && u + j < n) p[leader][u + j] = score / scale;
-            }
-        }
-        __syncwarp();
-        float step = -__int_as_float(0x7f800000);
-        for (int t = slot; t < n; t += per) step = fmaxf(step, p[mine][t]);
+    const float *base = partial + (u64)blockIdx.x * chunks * (dim + 2);
+    if (warp == 0) {
+        float maximum = -__int_as_float(0x7f800000);
+        for (int j = lane; j < active; j += 32)
+            maximum = fmaxf(maximum, base[(u64)j * (dim + 2) + dim]);
         #pragma unroll
-        for (int offset = per / 2; offset > 0; offset /= 2)
-            step = fmaxf(step, __shfl_xor_sync(0xffffffff, step, offset));
-        float updated = fmaxf(maximum, step), rescale = expf(maximum - updated), sum = 0.0f;
-        for (int t = slot; t < n; t += per) {
-            float e = expf(p[mine][t] - updated);
-            p[mine][t] = e;
-            sum += e;
+        for (int offset = 16; offset > 0; offset /= 2)
+            maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset));
+        float total = 0.0f;
+        for (int j = lane; j < active; j += 32) {
+            const float *stats = base + (u64)j * (dim + 2) + dim;
+            float weight = expf(stats[0] - maximum);
+            weights[j] = weight;
+            total += weight * stats[1];
         }
-        #pragma unroll
-        for (int offset = per / 2; offset > 0; offset /= 2)
-            sum += __shfl_xor_sync(0xffffffff, sum, offset);
-        total = total * rescale + sum;
-        maximum = updated;
-        __syncwarp();
-        #pragma unroll
-        for (int h = 0; h < G; h++) {
-            float r = __shfl_sync(0xffffffff, rescale, h * per);
-            acc[h].x *= r;
-            acc[h].y *= r;
-            acc[h].z *= r;
-            acc[h].w *= r;
-        }
-        for (int u = 0; u < n; u += ATTENTION_ROW_UNROLL) {
-            float4 v[ATTENTION_ROW_UNROLL];
-            #pragma unroll
-            for (int j = 0; j < ATTENTION_ROW_UNROLL; j++)
-                v[j] = u + j < n
-                    ? kv_load4(values, ((u64)(base + u + j) * kv_heads + kv_head) * dim + 4 * lane)
-                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            #pragma unroll
-            for (int j = 0; j < ATTENTION_ROW_UNROLL; j++) {
-                if (u + j >= n) continue;
-                #pragma unroll
-                for (int h = 0; h < G; h++) {
-                    float e = p[h][u + j];
-                    acc[h].x += e * v[j].x;
-                    acc[h].y += e * v[j].y;
-                    acc[h].z += e * v[j].z;
-                    acc[h].w += e * v[j].w;
-                }
-            }
-        }
-        __syncwarp();
+        total = warp_sum(total);
+        if (lane == 0) denominator = total;
     }
-    #pragma unroll
-    for (int h = 0; h < G; h++) {
-        if (h >= group) continue;
-        float *out = partial + ((u64)(kv_head * group + h) * chunks + index) * (dim + 2);
-        // dim + 2 is even: partial rows are 8-byte aligned.
-        *(float2 *)(out + 4 * lane) = make_float2(acc[h].x, acc[h].y);
-        *(float2 *)(out + 4 * lane + 2) = make_float2(acc[h].z, acc[h].w);
+    __syncthreads();
+    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int j = warp; j < active; j += 32) {
+        const float *split = base + (u64)j * (dim + 2) + 4 * lane;
+        float weight = weights[j];
+        float2 a = *(const float2 *)split, b = *(const float2 *)(split + 2);
+        acc.x += weight * a.x;
+        acc.y += weight * a.y;
+        acc.z += weight * b.x;
+        acc.w += weight * b.y;
     }
-    if (slot == 0 && mine < group) {
-        float *out = partial + ((u64)(kv_head * group + mine) * chunks + index) * (dim + 2);
-        out[dim] = maximum;
-        out[dim + 1] = total;
+    *(float4 *)&reduce[warp][4 * lane] = acc;
+    __syncthreads();
+    if (threadIdx.x < dim) {
+        float value = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < 32; w++) value += reduce[w][threadIdx.x];
+        output[(u64)blockIdx.x * dim + threadIdx.x] = value / denominator;
     }
 }
 
-#define ATTENTION_SPLIT_ROWS(G)                                                                    \
-extern "C" __global__ void __launch_bounds__(256) attention_split_rows##G##_f16(                   \
-    const float *q, const kv_f16 *keys, const kv_f16 *values, float *partial, int dim,             \
-    int heads, int kv_heads, int count) {                                                          \
-    attention_split_rows_impl<G>(q, keys, values, partial, heads, kv_heads, count);                \
-}                                                                                                  \
-extern "C" __global__ void __launch_bounds__(256) attention_split_rows##G##_decode_f16(            \
-    const float *q, const kv_f16 *keys, const kv_f16 *values, float *partial, int dim,             \
-    int heads, int kv_heads, const int *control) {                                                 \
-    attention_split_rows_impl<G>(q, keys, values, partial, heads, kv_heads, control[1] + 1);       \
+extern "C" __global__ void __launch_bounds__(1024)
+attention_combine_rows(const float *partial, float *output, int dim, int chunks, int count) {
+    attention_combine_rows_impl(partial, output, chunks, count);
 }
-ATTENTION_SPLIT_ROWS(2)
-ATTENTION_SPLIT_ROWS(4)
-ATTENTION_SPLIT_ROWS(8)
+
+extern "C" __global__ void __launch_bounds__(1024)
+attention_combine_rows_decode(const float *partial, float *output, int dim, int chunks,
+                              const int *control) {
+    attention_combine_rows_impl(partial, output, chunks, control[1] + 1);
+}
 #endif

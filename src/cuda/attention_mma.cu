@@ -383,3 +383,156 @@ attention_prefill_mma_fast_f16(const float *q, const kv_f16 *keys, const kv_f16 
 #endif
 }
 #endif
+
+#ifdef CUDA_KV_F16
+// GQA decode split pass on tensor cores over the FP16 cache (sm_80+): grid =
+// (kv_heads, chunks), block = 32, dim == 128, group = heads / kv_heads <= 8. One
+// warp per contiguous key range (attention_row_chunk, multiples of
+// ATTENTION_ROW_BATCH) for all `group` query heads: the heads are rows 0..7 of the
+// m16n8k16 A operand (rows 8..15 zero), keys its columns, so S = Q K^T and
+// O += P V take 2 x 32 MMAs per 32-key stage instead of scalar FMAs. FP16 Q and P,
+// FP32 accumulation and softmax (log2 units), as attention_prefill_mma_fast_f16.
+// K/V stages stream through shared memory with cp.async, double buffered. Writes
+// the attention_split_group partial layout (max in natural-log units) for
+// attention_combine_rows.
+__device__ __forceinline__ void attention_decode_mma_impl(
+    const float *q, const kv_f16 *keys, const kv_f16 *values, float *partial, int heads,
+    int kv_heads, int count) {
+#if __CUDA_ARCH__ >= 800
+    constexpr int B = ATTENTION_ROW_BATCH;
+    __shared__ __align__(16) unsigned short ks[2][B * FA_K_STRIDE];
+    __shared__ __align__(16) unsigned short vs[2][B * FA_K_STRIDE];
+    int kv_head = blockIdx.x, group = heads / kv_heads, lane = threadIdx.x;
+    int g = lane / 4, t = lane % 4;
+    int chunks = gridDim.y, index = blockIdx.y, chunk = attention_row_chunk(count, chunks);
+    int begin = index * chunk, end = min(count, begin + chunk);
+    if (begin >= end) return;
+    // Scores in log2 units: Q is pre-scaled by log2(e) / sqrt(dim).
+    const float qscale = 1.4426950408889634f * rsqrtf((float)FA_DIM);
+    bool row = g < group;
+    const float *query = q + (u64)(kv_head * group + (row ? g : 0)) * FA_DIM;
+    unsigned int qf[FA_DIM / 16][2];
+    #pragma unroll
+    for (int s = 0; s < FA_DIM / 16; s++) {
+        int d = 16 * s + 2 * t;
+        float2 x = row ? *(const float2 *)(query + d) : make_float2(0.0f, 0.0f);
+        float2 y = row ? *(const float2 *)(query + d + 8) : make_float2(0.0f, 0.0f);
+        qf[s][0] = fa_pack(x.x * qscale, x.y * qscale);
+        qf[s][1] = fa_pack(y.x * qscale, y.y * qscale);
+    }
+    float o[FA_DIM / 8][4];
+    #pragma unroll
+    for (int j = 0; j < FA_DIM / 8; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
+    float maximum = FA_NEG_INF, total = 0.0f;
+    u64 stride = (u64)kv_heads * FA_DIM;
+    const kv_f16 *key_base = keys + (u64)kv_head * FA_DIM, *value_base = values + (u64)kv_head * FA_DIM;
+    auto issue = [&](int buffer, int first) {
+        int n = min(B, end - first);
+        #pragma unroll
+        for (int i = lane; i < B * FA_DIM / 8; i += 32) {
+            int key = i / (FA_DIM / 8), c = i % (FA_DIM / 8);
+            unsigned short *k = &ks[buffer][key * FA_K_STRIDE + 8 * c];
+            unsigned short *v = &vs[buffer][key * FA_K_STRIDE + 8 * c];
+            if (key < n) {
+                u64 at = (u64)(first + key) * stride + 8 * c;
+                kv_copy_async(k, key_base + at);
+                kv_copy_async(v, value_base + at);
+            } else {
+                *(uint4 *)k = make_uint4(0u, 0u, 0u, 0u);
+                *(uint4 *)v = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    issue(0, begin);
+    int buffer = 0;
+    for (int base = begin; base < end; base += B, buffer ^= 1) {
+        int n = min(B, end - base);
+        if (base + B < end) {
+            issue(buffer ^ 1, base + B);
+            asm volatile("cp.async.wait_group 1;\n" ::);
+        } else {
+            asm volatile("cp.async.wait_group 0;\n" ::);
+        }
+        __syncwarp();
+        float s[B / 8][4];
+        #pragma unroll
+        for (int j = 0; j < B / 8; j++) {
+            s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.0f;
+            const unsigned int *krow = (const unsigned int *)&ks[buffer][(8 * j + g) * FA_K_STRIDE];
+            #pragma unroll
+            for (int k = 0; k < FA_DIM / 16; k++) {
+                unsigned int a[4] = {qf[k][0], 0u, qf[k][1], 0u};
+                fa_mma(s[j], a, krow[8 * k + t], krow[8 * k + 4 + t]);
+            }
+        }
+        float step = FA_NEG_INF;
+        #pragma unroll
+        for (int j = 0; j < B / 8; j++) {
+            #pragma unroll
+            for (int e = 0; e < 2; e++) {
+                if (8 * j + 2 * t + e >= n) s[j][e] = FA_NEG_INF;
+                step = fmaxf(step, s[j][e]);
+            }
+        }
+        step = fmaxf(step, __shfl_xor_sync(0xffffffff, step, 1));
+        step = fmaxf(step, __shfl_xor_sync(0xffffffff, step, 2));
+        // Finite: every stage has at least one key.
+        float updated = fmaxf(maximum, step), rescale = exp2f(maximum - updated);
+        maximum = updated;
+        total *= rescale;
+        #pragma unroll
+        for (int j = 0; j < FA_DIM / 8; j++) {
+            o[j][0] *= rescale;
+            o[j][1] *= rescale;
+        }
+        #pragma unroll
+        for (int j = 0; j < B / 8; j++) {
+            s[j][0] = exp2f(s[j][0] - maximum);
+            s[j][1] = exp2f(s[j][1] - maximum);
+            total += s[j][0] + s[j][1];
+        }
+        #pragma unroll
+        for (int k = 0; k < B / 16; k++) {
+            unsigned int a[4] = {fa_pack(s[2 * k][0], s[2 * k][1]), 0u,
+                                 fa_pack(s[2 * k + 1][0], s[2 * k + 1][1]), 0u};
+            const unsigned short *vrow = &vs[buffer][(16 * k + lane % 16) * FA_K_STRIDE + 8 * (lane / 16)];
+            #pragma unroll
+            for (int j = 0; j < FA_DIM / 8; j += 2) {
+                unsigned int b[4];
+                fa_ldmatrix_x4_trans(b, vrow + 8 * j);
+                fa_mma(o[j], a, b[0], b[1]);
+                fa_mma(o[j + 1], a, b[2], b[3]);
+            }
+        }
+        // The next iteration refills the other buffer; this one after it.
+        __syncwarp();
+    }
+    total += __shfl_xor_sync(0xffffffff, total, 1);
+    total += __shfl_xor_sync(0xffffffff, total, 2);
+    if (!row) return;
+    float *out = partial + ((u64)(kv_head * group + g) * chunks + index) * (FA_DIM + 2);
+    // dim + 2 is even: partial rows are 8-byte aligned.
+    #pragma unroll
+    for (int j = 0; j < FA_DIM / 8; j++)
+        *(float2 *)(out + 8 * j + 2 * t) = make_float2(o[j][0], o[j][1]);
+    if (t == 0) {
+        out[FA_DIM] = maximum * 0.6931471805599453f;
+        out[FA_DIM + 1] = total;
+    }
+#endif
+}
+
+extern "C" __global__ void __launch_bounds__(32)
+attention_decode_mma_f16(const float *q, const kv_f16 *keys, const kv_f16 *values,
+                         float *partial, int dim, int heads, int kv_heads, int count) {
+    attention_decode_mma_impl(q, keys, values, partial, heads, kv_heads, count);
+}
+
+extern "C" __global__ void __launch_bounds__(32)
+attention_decode_mma_decode_f16(const float *q, const kv_f16 *keys, const kv_f16 *values,
+                                float *partial, int dim, int heads, int kv_heads,
+                                const int *control) {
+    attention_decode_mma_impl(q, keys, values, partial, heads, kv_heads, control[1] + 1);
+}
+#endif

@@ -1,4 +1,5 @@
 """Run: PALITO_TEST_MODEL=/path/to/SmolLM2-135M-Instruct-Q4_K_M.gguf python3 tests/test_palito.py"""
+import json
 import os
 import sys
 import unittest
@@ -41,6 +42,20 @@ class PalitoTest(unittest.TestCase):
         next(stream)
         stream.close()  # stops generation; the engine is usable again
         self.assertEqual(self.llm.complete("Hi", max_tokens=2).generated_tokens, 2)
+
+    def test_json_schema(self):
+        schema = {"type": "object", "properties": {"ok": {"type": "boolean"}},
+                  "required": ["ok"], "additionalProperties": False}
+        for temperature in (0.0, 0.9):
+            reply = self.llm.chat([{"role": "user", "content": "Is water wet?"}],
+                                  max_tokens=64, temperature=temperature, seed=1,
+                                  json_schema=schema)
+            self.assertIsInstance(json.loads(reply.text)["ok"], bool)
+        streamed = "".join(self.llm.stream_chat(HELLO, max_tokens=64,
+                                                json_schema='{"enum": ["hi", "hello"]}'))
+        self.assertIn(json.loads(streamed), ("hi", "hello"))
+        with self.assertRaisesRegex(palito.PalitoError, "uniqueItems"):
+            self.llm.chat(HELLO, json_schema={"type": "array", "uniqueItems": True})
 
     def test_errors(self):
         with self.assertRaises(palito.PalitoError):

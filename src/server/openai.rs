@@ -1,12 +1,13 @@
 //! OpenAI-compatible request and response shapes (the subset Palito serves).
 //!
 //! Supported generation fields: `max_tokens`/`max_completion_tokens`,
-//! `temperature`, `top_p`, `top_k` (llama.cpp extension), `seed` and `stop`.
+//! `temperature`, `top_p`, `top_k` (llama.cpp extension), `seed`, `stop` and
+//! `response_format` (`text`, `json_object`, `json_schema`).
 //! Omitted sampling fields take the server defaults (greedy unless `palito
 //! serve` was started with `--temperature`). Unsupported behavior (`n` > 1) is
 //! rejected rather than silently ignored; other unknown fields are ignored.
 
-use palito::{chat::Message, engine::FinishReason, sampling::Sampling};
+use palito::{chat::Message, engine::FinishReason, grammar::JsonSchema, sampling::Sampling};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -29,6 +30,7 @@ pub struct ChatRequest {
     pub reasoning_format: Option<String>,
     pub n: Option<u32>,
     pub stop: Option<Value>,
+    pub response_format: Option<Value>,
     #[serde(flatten)]
     pub sampling: SamplingFields,
 }
@@ -42,6 +44,7 @@ pub struct CompletionRequest {
     pub stream_options: Option<StreamOptions>,
     pub n: Option<u32>,
     pub stop: Option<Value>,
+    pub response_format: Option<Value>,
     #[serde(flatten)]
     pub sampling: SamplingFields,
 }
@@ -118,6 +121,10 @@ impl ChatRequest {
         stop_sequences(self.stop.as_ref())
     }
 
+    pub fn json_schema(&self) -> Result<Option<JsonSchema>, String> {
+        json_schema(self.response_format.as_ref())
+    }
+
     pub fn split_reasoning(&self) -> bool {
         self.reasoning_format.as_deref() != Some("none")
     }
@@ -140,6 +147,40 @@ impl CompletionRequest {
 
     pub fn stop(&self) -> Result<Vec<String>, String> {
         stop_sequences(self.stop.as_ref())
+    }
+
+    pub fn json_schema(&self) -> Result<Option<JsonSchema>, String> {
+        json_schema(self.response_format.as_ref())
+    }
+}
+
+/// `response_format`: `{"type": "text"}` (or null), `{"type": "json_object"}`,
+/// or `{"type": "json_schema", "json_schema": {"name": ..., "schema": {...}}}`.
+/// `name` and `strict` are accepted and ignored: output always follows the
+/// schema.
+fn json_schema(format: Option<&Value>) -> Result<Option<JsonSchema>, String> {
+    let Some(format) = format.filter(|format| !format.is_null()) else {
+        return Ok(None);
+    };
+    let kind = format
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or("response_format must be an object with a string \"type\"")?;
+    match kind {
+        "text" => Ok(None),
+        "json_object" => Ok(Some(JsonSchema::any_object())),
+        "json_schema" => {
+            let schema = format
+                .get("json_schema")
+                .and_then(|spec| spec.get("schema"))
+                .ok_or("response_format json_schema needs json_schema.schema")?;
+            JsonSchema::new(schema.clone())
+                .map(Some)
+                .map_err(|error| error.to_string())
+        }
+        other => Err(format!(
+            "unsupported response_format type {other:?} (text, json_object or json_schema)"
+        )),
     }
 }
 
@@ -285,5 +326,35 @@ mod tests {
         assert!(chat(json!({"messages": []})).messages().is_err());
         let prompt: CompletionRequest = serde_json::from_value(json!({"prompt": ["a", "b"]})).unwrap();
         assert!(prompt.prompt().is_err());
+    }
+
+    #[test]
+    fn parses_response_format() {
+        let format = |value: Value| {
+            chat(json!({"messages": [], "response_format": value})).json_schema()
+        };
+        assert_eq!(chat(json!({"messages": []})).json_schema(), Ok(None));
+        assert_eq!(format(json!({"type": "text"})), Ok(None));
+        assert_eq!(format(json!({"type": "json_object"})), Ok(Some(JsonSchema::any_object())));
+        let schema = json!({"type": "object", "properties": {"a": {"type": "integer"}}});
+        let parsed = format(json!({
+            "type": "json_schema",
+            "json_schema": {"name": "thing", "strict": true, "schema": schema}
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.schema(), &schema);
+        for (bad, needle) in [
+            (json!("json"), "string \"type\""),
+            (json!({"type": "xml"}), "unsupported response_format"),
+            (json!({"type": "json_schema", "json_schema": {"name": "x"}}), "json_schema.schema"),
+            (
+                json!({"type": "json_schema", "json_schema": {"schema": {"type": "array", "uniqueItems": true}}}),
+                "uniqueItems",
+            ),
+        ] {
+            let error = format(bad.clone()).unwrap_err();
+            assert!(error.contains(needle), "{bad}: {error}");
+        }
     }
 }

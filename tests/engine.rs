@@ -547,3 +547,161 @@ fn cuda_prefix_cache_speeds_up_long_conversations() {
     let speedup = cold[1].2 as f64 / warm[1].2 as f64;
     assert!(speedup >= 3.0, "second-turn speedup {speedup:.2}x");
 }
+
+#[cfg(feature = "cuda")]
+fn json_schemas() -> Vec<(&'static str, serde_json::Value)> {
+    use serde_json::json;
+    vec![
+        ("Describe a fictional person.", json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+            "required": ["name", "age"],
+            "additionalProperties": false
+        })),
+        ("List three fruits.", json!({
+            "type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 3
+        })),
+        ("What colour is the sky on a clear day?", json!({"enum": ["red", "green", "blue"]})),
+        ("Rate the movie Inception.", json!({
+            "type": "object",
+            "properties": {
+                "liked": {"type": "boolean"},
+                "score": {"type": "number"},
+                "comment": {"type": ["string", "null"]}
+            },
+            "required": ["liked", "score", "comment"],
+            "additionalProperties": false
+        })),
+        ("Describe Paris.", json!({
+            "type": "object",
+            "properties": {
+                "city": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}, "population": {"type": "integer"}},
+                    "required": ["name", "population"],
+                    "additionalProperties": false
+                },
+                "landmarks": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
+                "capital": {"type": "boolean"}
+            },
+            "required": ["city", "landmarks", "capital"],
+            "additionalProperties": false
+        })),
+    ]
+}
+
+/// Runs every schema greedy and sampled; returns the constrained decode rates.
+#[cfg(feature = "cuda")]
+fn check_json_replies(engine: &mut Engine, max_tokens: u32) -> Vec<f64> {
+    let mut rates = Vec::new();
+    for (prompt, schema) in json_schemas() {
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for temperature in [0.0, 0.8] {
+            let options = GenerationOptions {
+                max_tokens: Some(max_tokens),
+                sampling: Sampling { temperature, seed: Some(5), ..Sampling::GREEDY },
+                json_schema: Some(palito::grammar::JsonSchema::new(schema.clone()).unwrap()),
+                ..GenerationOptions::default()
+            };
+            let reply = engine.chat(&[Message::user(prompt)], &options, |_| true).unwrap();
+            assert_eq!(reply.finish_reason, FinishReason::Stop, "{}", reply.text);
+            let value: serde_json::Value = serde_json::from_str(&reply.text)
+                .unwrap_or_else(|e| panic!("{:?} is not JSON: {e}", reply.text));
+            assert!(validator.is_valid(&value), "{} violates {schema}", reply.text);
+            eprintln!(
+                "t={temperature} {} tokens, {:.1} tok/s: {}",
+                reply.generated_tokens, reply.tokens_per_second, reply.text
+            );
+            rates.push(reply.tokens_per_second);
+        }
+    }
+    rates
+}
+
+#[test]
+#[ignore = "requires models/SmolLM2-135M-Instruct-Q4_K_M.gguf"]
+fn json_schema_replies_validate_and_the_c_api_takes_a_schema() {
+    let mut engine = Engine::open(&smollm(), &cpu()).unwrap();
+    // A small model drifts on unbounded strings; bounded reruns live in tests/serve.rs.
+    let options = GenerationOptions {
+        max_tokens: Some(64),
+        json_schema: Some(palito::grammar::JsonSchema::parse(r#"{"enum": ["yes", "no"]}"#).unwrap()),
+        ..GenerationOptions::default()
+    };
+    let reply = engine.chat(&[Message::user("Is water wet?")], &options, |_| true).unwrap();
+    assert!(reply.text == r#""yes""# || reply.text == r#""no""#, "{}", reply.text);
+    drop(engine);
+
+    let path = CString::new(smollm().to_str().unwrap()).unwrap();
+    let mut open = std::mem::MaybeUninit::<PalitoOptions>::uninit();
+    let engine = unsafe {
+        palito_options_init(open.as_mut_ptr());
+        let mut open = open.assume_init();
+        open.device = PALITO_DEVICE_CPU;
+        open.context_tokens = 512;
+        palito_open(path.as_ptr(), &open, ptr::null_mut())
+    };
+    assert!(!engine.is_null());
+    let mut generation = std::mem::MaybeUninit::<PalitoGeneration>::uninit();
+    let mut generation = unsafe {
+        palito_generation_init(generation.as_mut_ptr());
+        generation.assume_init()
+    };
+    generation.max_tokens = 64;
+    let role = CString::new("user").unwrap();
+    let content = CString::new("Is water wet?").unwrap();
+    let messages = [PalitoMessage { role: role.as_ptr(), content: content.as_ptr() }];
+    let schema = CString::new(r#"{"type": "boolean"}"#).unwrap();
+    let mut result = std::mem::MaybeUninit::<PalitoResult>::zeroed();
+    let status = unsafe {
+        palito_chat_json(engine, messages.as_ptr(), 1, &generation, schema.as_ptr(), None,
+            ptr::null_mut(), result.as_mut_ptr(), ptr::null_mut())
+    };
+    assert_eq!(status, 0);
+    let mut result = unsafe { result.assume_init() };
+    let text = unsafe { CStr::from_ptr(result.text) }.to_str().unwrap().to_owned();
+    assert!(text == "true" || text == "false", "{text}");
+    unsafe { palito_result_free(&mut result) };
+
+    let unsupported = CString::new(r#"{"type": "array", "uniqueItems": true}"#).unwrap();
+    let mut error: *mut c_char = ptr::null_mut();
+    let status = unsafe {
+        palito_complete_json(engine, content.as_ptr(), &generation, unsupported.as_ptr(), None,
+            ptr::null_mut(), ptr::null_mut(), &mut error)
+    };
+    assert_eq!(status, -1);
+    let message = unsafe { CStr::from_ptr(error) }.to_str().unwrap().to_owned();
+    assert!(message.contains("uniqueItems"), "{message}");
+    unsafe {
+        palito_string_free(error);
+        palito_close(engine);
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CUDA 13 and models/benchmark-qwen3/gguf/Qwen3-30B-A3B-Q4_K_M.gguf"]
+fn qwen3_30b_json_schema_replies_validate() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("models/benchmark-qwen3/gguf/Qwen3-30B-A3B-Q4_K_M.gguf");
+    let mut engine = Engine::open(
+        &path,
+        &EngineOptions { device: Device::Cuda, context_tokens: Some(4096), ..EngineOptions::default() },
+    )
+    .unwrap();
+    let rates = check_json_replies(&mut engine, 400);
+    let free = GenerationOptions { max_tokens: Some(200), enable_thinking: false, ..GenerationOptions::default() };
+    let greedy = engine.chat(&[Message::user("Describe Paris.")], &free, |_| true).unwrap();
+    let sampled = GenerationOptions {
+        sampling: Sampling { temperature: 0.8, seed: Some(5), ..Sampling::GREEDY },
+        ..free.clone()
+    };
+    let sampled = engine.chat(&[Message::user("Describe Paris.")], &sampled, |_| true).unwrap();
+    let mean = rates.iter().sum::<f64>() / rates.len() as f64;
+    eprintln!(
+        "constrained mean {mean:.1} tok/s (min {:.1}); unconstrained greedy {:.1}, sampled {:.1}",
+        rates.iter().copied().fold(f64::INFINITY, f64::min),
+        greedy.tokens_per_second,
+        sampled.tokens_per_second
+    );
+}

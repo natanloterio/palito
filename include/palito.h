@@ -13,6 +13,7 @@
  *  - Strings are UTF-8. Text passed to callbacks is not NUL-terminated.
  *  - A palito_engine must not be used from two threads at the same time.
  *    Separate engines are independent.
+ *  - ABI: struct layouts never change; new options come as new functions.
  */
 #ifndef PALITO_H
 #define PALITO_H
@@ -109,6 +110,23 @@ int palito_complete(palito_engine *engine, const char *prompt,
                     const palito_generation *generation,
                     palito_text_callback callback, void *user_data,
                     palito_result *result, char **error);
+
+/*
+ * palito_chat / palito_complete whose output is JSON matching `json_schema`
+ * (JSON Schema text; "{\"type\":\"object\"}" for any object; NULL:
+ * unconstrained). Reasoning is turned off. A schema with unsupported keywords
+ * fails before generation. Output cut by max_tokens may be incomplete JSON
+ * (finish_reason PALITO_FINISH_LENGTH).
+ */
+int palito_chat_json(palito_engine *engine,
+                     const palito_message *messages, size_t message_count,
+                     const palito_generation *generation, const char *json_schema,
+                     palito_text_callback callback, void *user_data,
+                     palito_result *result, char **error);
+int palito_complete_json(palito_engine *engine, const char *prompt,
+                         const palito_generation *generation, const char *json_schema,
+                         palito_text_callback callback, void *user_data,
+                         palito_result *result, char **error);
 
 void palito_result_free(palito_result *result);
 void palito_string_free(char *string);

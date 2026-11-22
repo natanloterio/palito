@@ -161,3 +161,115 @@ fn stop_sequences_and_seeded_sampling() {
         Some(json!({"prompt": "x", "top_p": 2})), None);
     assert_eq!(status, 400);
 }
+
+/// Bounded schemas: a small model always finishes them within the token cap.
+fn json_schemas() -> Vec<Value> {
+    vec![
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "maxLength": 20},
+                "age": {"type": "integer", "minimum": 0, "maximum": 150}
+            },
+            "required": ["name", "age"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "array",
+            "items": {"type": "string", "maxLength": 12},
+            "minItems": 1,
+            "maxItems": 3
+        }),
+        json!({"enum": ["red", "green", "blue"]}),
+        json!({
+            "type": "object",
+            "properties": {
+                "ok": {"type": "boolean"},
+                "score": {"type": "number", "minimum": 0, "maximum": 10},
+                "note": {"type": ["string", "null"], "maxLength": 16}
+            },
+            "required": ["ok", "score", "note"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "city": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string", "maxLength": 16}},
+                    "required": ["name"],
+                    "additionalProperties": false
+                },
+                "tags": {"type": "array", "items": {"enum": ["a", "b"]}, "maxItems": 2}
+            },
+            "required": ["city", "tags"],
+            "additionalProperties": false
+        }),
+    ]
+}
+
+fn json_chat(schema: &Value, extra: Value) -> Value {
+    let mut body = json!({
+        "messages": [{"role": "user", "content": "Describe a person as JSON."}],
+        "max_tokens": 200,
+        "response_format": {"type": "json_schema", "json_schema": {"name": "answer", "schema": schema}}
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        body[key] = value.clone();
+    }
+    body
+}
+
+#[test]
+#[ignore = "requires models/SmolLM2-135M-Instruct-Q4_K_M.gguf"]
+fn response_format_constrains_replies_to_the_schema() {
+    let server = start(18096, &[]);
+    for schema in json_schemas() {
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for extra in [json!({}), json!({"temperature": 1.0, "seed": 3})] {
+            let (status, body) =
+                request(&server, "POST", "/v1/chat/completions", Some(json_chat(&schema, extra)), None);
+            assert_eq!(status, 200, "{body}");
+            let reply: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(reply["choices"][0]["finish_reason"], "stop", "{body}");
+            let content = reply["choices"][0]["message"]["content"].as_str().unwrap();
+            let value: Value = serde_json::from_str(content)
+                .unwrap_or_else(|e| panic!("{content:?} is not JSON: {e}"));
+            assert!(validator.is_valid(&value), "{content} violates {schema}");
+        }
+    }
+
+    // json_object, streamed: the chunks concatenate to one JSON object.
+    let body = json!({
+        "messages": [{"role": "user", "content": "Reply with a JSON object with one key, \"ok\"."}],
+        "max_tokens": 400,
+        "stream": true,
+        "response_format": {"type": "json_object"}
+    });
+    let (status, raw) = request(&server, "POST", "/v1/chat/completions", Some(body), None);
+    assert_eq!(status, 200);
+    let streamed: String = chunked_body(&raw)
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .filter_map(|data| {
+            let chunk: Value = serde_json::from_str(data).unwrap();
+            chunk["choices"][0]["delta"]["content"].as_str().map(str::to_owned)
+        })
+        .collect();
+    let value: Value = serde_json::from_str(&streamed)
+        .unwrap_or_else(|e| panic!("{streamed:?} is not JSON: {e}"));
+    assert!(value.is_object(), "{streamed}");
+
+    // Unsupported keywords and formats are refused before generation, streamed or not.
+    let unsupported = json!({"type": "array", "uniqueItems": true});
+    for stream in [false, true] {
+        let body = json_chat(&unsupported, json!({"stream": stream}));
+        let (status, body) = request(&server, "POST", "/v1/chat/completions", Some(body), None);
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("uniqueItems"), "{body}");
+    }
+    let bad = json!({"messages": [{"role": "user", "content": "x"}], "response_format": {"type": "xml"}});
+    let (status, _) = request(&server, "POST", "/v1/chat/completions", Some(bad), None);
+    assert_eq!(status, 400);
+}

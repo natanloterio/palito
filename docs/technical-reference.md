@@ -955,7 +955,7 @@ different tokens; the correctness oracle is **not a performance baseline**.
 
 ## Build and first benchmark
 
-Rust/Cargo 1.85+ is sufficient for the runtime, without CMake, C++, a service, or
+Rust/Cargo 1.87+ (llguidance) is sufficient for the runtime, without CMake, C++, a service, or
 a reference checkout. The first Cargo build downloads Rust crates. Model download
 is explicit and separate; inference makes no model-network requests.
 
@@ -1499,6 +1499,19 @@ Chat replies are split into `reasoning_content` and `content` (`src/server/reaso
 - **Any other setting** runs `Executor::generate_sampled`. Each step is evaluated with host logits (`Backend::evaluate` + `logits`), and `Sampler` (`src/sampling.rs`) draws the token. Temperature is applied first, then top-k (partial selection), then top-p over the top-k set (llama.cpp order). Without top-k, the nucleus is first built from candidates with at least 1e-6 of the top token's probability. If those together hold less than `top_p`, an exact full pass follows. The RNG is SplitMix64, seeded from `seed` or the clock.
 - **Cost:** on Qwen3-30B-A3B (RTX 5090), sampling decodes at ~296 tok/s against ~370 tok/s greedy. The difference is the per-token 600 KB logits copy and the lost replay pipelining. Device-side top-k would recover most of it.
 - **Correctness check:** a near-zero temperature (`1e-4`) reproduces the greedy text byte for byte on int8-fast with the graph, on the f32 fallback (Phi-3 Q5_K) and on CPU. So the host logits match what device argmax sees.
+
+## JSON output (constrained decoding)
+
+`GenerationOptions::json_schema: Option<grammar::JsonSchema>` constrains the output to JSON matching a JSON Schema. It is exposed as `response_format` on `/v1/chat/completions` and `/v1/completions`, as `palito_chat_json`/`palito_complete_json` in the C API, and as `json_schema=` in the Python binding.
+
+- **Engine:** [llguidance](https://github.com/guidance-ai/llguidance) 1.9 (the grammar library llama.cpp and vLLM use). `src/grammar.rs` builds its token trie from the GGUF vocabulary (`Tokenizer::token_bytes`) once per engine, on the first constrained request. End-of-generation tokens are registered as special tokens, and controls and unused tokens get no bytes, so the grammar never allows them. Before each token the matcher computes the allowed set; every other logit becomes `f32::MIN` (finite, so the sampler's nonfinite check still guards real logits). After that, greedy takes the argmax and sampling applies temperature, top-k and top-p as usual. Once the value is complete, only end-of-generation tokens are allowed. If a sampler's cumulative draw ever lands outside the mask (float rounding), the best allowed token replaces it.
+- **Path:** a constrained request always runs `Executor::generate_constrained` with host logits, even when greedy. The CUDA decode graph's token-only fast path cannot apply a mask. The `f32`/`f32-tiled` gates and unconstrained greedy tokens are unchanged.
+- **Whitespace:** whitespace between JSON tokens is allowed, but each run is at most 32 characters (`[ \t\n\r]{1,32}`, applied once per gap). Forbidding it entirely is worse: Qwen3-30B wanted a newline after `"age": 28`, and with newlines masked it ran away on digits until `max_tokens`.
+- **Reasoning:** turned off. `GenerationOptions::thinking()` is false when a schema is set, so Qwen3's template renders `enable_thinking=false` and the JSON is the whole reply. The server's `reasoning_content` split therefore stays empty.
+- **Schemas:** `type` (including lists of types), `properties`, `required`, `additionalProperties`, `items`, `enum` and `const` are covered by tests. llguidance also enforces `anyOf`/`oneOf`/`allOf`, local `$ref`, `pattern`, string/array length limits, `minimum`/`maximum` and common `format`s. Annotations (`title`, `description`, `default`, ...) are ignored. Other JSON Schema keywords (`uniqueItems`, `not`, `if`/`then`, `contains`, `dependentRequired`, `propertyNames`, ...), unknown formats, remote `$ref`s, a non-object schema and llguidance's own `x-guidance` options are errors. The server checks schemas against a byte-level vocabulary before queueing, so these return 400 for streamed requests too.
+- **Limits:** output cut by `max_tokens` or a full context is incomplete JSON (`finish_reason: "length"`). An unbounded `number` may take an exponent beyond f64 (`1e7622`, valid JSON that `serde_json` rejects). Set `minimum`/`maximum` when that matters.
+- **Speed** (Qwen3-30B-A3B Q4_K_M, RTX 5090, int8-fast, 4-89-token replies over 5 schemas, `qwen3_30b_json_schema_replies_validate` in `tests/engine.rs`): ~327 tok/s greedy and ~300 tok/s at temperature 0.8 with a schema (mean 314, minimum 295), against 364 tok/s unconstrained greedy and 304 tok/s unconstrained sampling. The mask costs little next to the 600 KB per-token logits copy. Constrained greedy pays that copy because it leaves the decode graph.
+- **Tests:** unit tests in `src/grammar/tests.rs` (random logits over a synthetic vocabulary, greedy and sampled, validated with the `jsonschema` crate; bounded whitespace; EOG only after a complete value; schema errors). End to end: `tests/serve.rs` (five schemas, greedy and sampled, streamed `json_object`, 400s), `tests/engine.rs` (engine and C API on SmolLM2; Qwen3-30B on CUDA) and the Python binding test.
 
 Stop sequences (`src/stop.rs`, at most 16 of up to 256 bytes) are matched on the detokenized text. `StopFilter` holds back any suffix that could begin a stop sequence, so streamed text never contains part of one. Returned text ends before the earliest stop, and `finish_reason` is `Stop`. Generation stops on the token that completes the match.
 

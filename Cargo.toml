@@ -2,7 +2,7 @@
 name = "palito"
 version = "0.5.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 description = "Independent Rust GGUF inference engine with external-reference benchmarks"
 default-run = "palito"
 license = "MIT"
@@ -70,3 +70,7 @@ minijinja-contrib = { version = "3.1.0", default-features = false, features = ["
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+llguidance = "1.9.1"
+
+[dev-dependencies]
+jsonschema = { version = "0.29", default-features = false }

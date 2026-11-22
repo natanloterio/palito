@@ -13,6 +13,7 @@ use crate::{
     Config, Error, Executor, GenerationMode, Result, Sample,
     backend::Backend,
     chat::{ChatTemplate, Message},
+    grammar::{JsonDecoder, JsonSchema},
     sampling::{Sampler, Sampling},
     stop::{self, StopFilter},
     stream::TextStream,
@@ -96,6 +97,17 @@ pub struct GenerationOptions {
     pub sampling: Sampling,
     /// Generation ends at the first of these; it is not part of the text.
     pub stop: Vec<String>,
+    /// Constrains the output to JSON matching this schema
+    /// (`JsonSchema::any_object()` for any object). Turns reasoning off: the
+    /// constrained JSON is the whole reply.
+    pub json_schema: Option<JsonSchema>,
+}
+
+impl GenerationOptions {
+    /// Whether the chat template is asked for reasoning (`<think>`).
+    pub fn thinking(&self) -> bool {
+        self.enable_thinking && self.json_schema.is_none()
+    }
 }
 
 impl Default for GenerationOptions {
@@ -105,6 +117,7 @@ impl Default for GenerationOptions {
             enable_thinking: true,
             sampling: Sampling::GREEDY,
             stop: Vec::new(),
+            json_schema: None,
         }
     }
 }
@@ -144,6 +157,8 @@ pub struct Engine {
     template: Option<ChatTemplate>,
     profile: &'static str,
     notices: Vec<String>,
+    /// Built on the first JSON-constrained request.
+    json_decoder: Option<JsonDecoder>,
 }
 
 impl Engine {
@@ -182,6 +197,7 @@ impl Engine {
             template,
             profile,
             notices: Vec::new(),
+            json_decoder: None,
         })
     }
 
@@ -226,7 +242,7 @@ impl Engine {
         options: &GenerationOptions,
         on_text: impl FnMut(&str) -> bool,
     ) -> Result<Completion> {
-        let prompt = self.render_chat(messages, options.enable_thinking)?;
+        let prompt = self.render_chat(messages, options.thinking())?;
         let mut completion = self.generate(&prompt, options, TrimmedText::new(on_text))?;
         completion.text = completion.text.trim().to_owned();
         Ok(completion)
@@ -242,6 +258,23 @@ impl Engine {
         self.generate(prompt, options, move |text: &str| on_text(text))
     }
 
+    fn json_decoder(&mut self) -> Result<&JsonDecoder> {
+        if self.json_decoder.is_none() {
+            let vocab = self.executor.info().vocab_tokens as usize;
+            let executor = &self.executor;
+            let tokenizer = &self.tokenizer;
+            let decoder = JsonDecoder::new(
+                vocab,
+                |id| tokenizer.token_bytes(id),
+                |id| executor.is_eog(id),
+            )?;
+            self.json_decoder = Some(decoder);
+        }
+        self.json_decoder
+            .as_ref()
+            .ok_or_else(|| Error::Backend("JSON decoder missing".into()))
+    }
+
     fn generate(
         &mut self,
         prompt: &str,
@@ -250,6 +283,10 @@ impl Engine {
     ) -> Result<Completion> {
         stop::validate(&options.stop)?;
         let mut sampler = Sampler::new(options.sampling)?;
+        let mut constraint = match &options.json_schema {
+            Some(schema) => Some(self.json_decoder()?.constraint(schema)?),
+            None => None,
+        };
         let tokens = self.executor.tokenize(prompt)?;
         let context = self.context_tokens() as usize;
         if tokens.is_empty() || tokens.len() >= context {
@@ -284,12 +321,18 @@ impl Engine {
             Ok(())
         };
         let mode = GenerationMode::UntilEog;
-        let result = if sampler.is_greedy() {
+        let result = if sampler.is_greedy() && constraint.is_none() {
             self.executor
                 .generate_streaming(&tokens, budget, mode, &mut on_token)
         } else {
-            self.executor
-                .generate_sampled(&tokens, budget, mode, &mut sampler, &mut on_token)
+            self.executor.generate_constrained(
+                &tokens,
+                budget,
+                mode,
+                &mut sampler,
+                constraint.as_mut(),
+                &mut on_token,
+            )
         };
         let sample = match result {
             Ok(sample) => Some(sample),

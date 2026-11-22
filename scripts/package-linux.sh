@@ -82,6 +82,9 @@ Use --cuda-matmul int8-prefill for the more precise tensor-core prefill,
 --cuda-matmul f32-tiled for F32 prefill or --cuda-matmul f32 for the reference
 profile.
 
+OpenAI-compatible server:
+  ./palito serve --model /path/to/model.gguf     # http://127.0.0.1:8080/v1
+
 Library (embed Palito in your program, same process, no server):
   include/palito.h, lib/libpalito.so (needs lib/ on the library path for NVRTC)
   cc examples/c/chat.c -Iinclude -Llib -lpalito -o chat

@@ -9,6 +9,7 @@ use serde_json::json;
 use std::{fs, io::Write, path::PathBuf, time::Instant};
 
 mod chat_repl;
+mod server;
 
 #[derive(Parser)]
 #[command(
@@ -32,6 +33,11 @@ enum Command {
     Chat {
         #[command(flatten)]
         args: chat_repl::ChatArgs,
+    },
+    /// OpenAI-compatible HTTP server (/v1/chat/completions, /v1/completions, streaming).
+    Serve {
+        #[command(flatten)]
+        args: server::ServeArgs,
     },
     /// Greedy completion, stopping at EOG. No chat template is applied.
     Generate {
@@ -578,6 +584,7 @@ fn execute() -> Result<()> {
         #[cfg(feature = "ktransformers")]
         Command::Remote { args } => remote(args)?,
         Command::Chat { args } => chat_repl::run(args)?,
+        Command::Serve { args } => server::run(args)?,
         Command::Tokenize { model, text } => {
             let tokenizer = Tokenizer::open(&model)?;
             let input = text_input(&text.prompt, &text.prompt_file)?;

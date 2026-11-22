@@ -191,7 +191,7 @@ found direct journal evidence that changes the earlier unknown-cause assessment:
   `refill_obj_stock+0x92/0x260` during slab/buffer-head reclaim. The kernel
   reported exit with `preempt_count 1`; that reclaim worker was absent when
   inspected.
-- At 15:52:31 UTC, `local-inference` PID 224611 suffered another general-
+- At 15:52:31 UTC, `palito` PID 224611 suffered another general-
   protection fault in the same function while an anonymous-memory page fault
   entered direct reclaim. Its stack includes `try_to_free_pages`,
   `try_to_free_buffers`, and `kmem_cache_free`.
@@ -229,7 +229,7 @@ CUDA 13 installation:
 ```sh
 cargo build --release --locked --features cuda,ktransformers -j 4
 mkdir results/cuda-optimization-NEW_RUN
-cp target/release/local-inference results/cuda-optimization-NEW_RUN/baseline-runtime
+cp target/release/palito results/cuda-optimization-NEW_RUN/baseline-runtime
 python3 scripts/benchmark_cuda_iteration.py \
   --output-dir results/cuda-optimization-NEW_RUN --label baseline \
   --cuda-root "$CUDA_ROOT" --llama \

@@ -591,26 +591,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
-name = "local-inference"
-version = "0.2.6"
-dependencies = [
- "clap",
- "cudarc",
- "fancy-regex",
- "half",
- "libloading",
- "minijinja",
- "minijinja-contrib",
- "rayon",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "unicode-normalization",
-]
-
-[[package]]
 name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -662,6 +642,26 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "palito"
+version = "0.2.6"
+dependencies = [
+ "clap",
+ "cudarc",
+ "fancy-regex",
+ "half",
+ "libloading",
+ "minijinja",
+ "minijinja-contrib",
+ "rayon",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "unicode-normalization",
+]
 
 [[package]]
 name = "percent-encoding"

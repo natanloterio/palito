@@ -5,7 +5,7 @@
 
 use crate::RuntimeArgs;
 use clap::Args;
-use local_inference::{
+use palito::{
     Executor, GenerationMode, Result, Sample,
     backend::Backend,
     chat::{ChatTemplate, Message, fit_history},
@@ -87,7 +87,7 @@ pub(crate) fn run(mut args: ChatArgs) -> Result<()> {
                         print_stats(&sample);
                     }
                 }
-                Err(error) => eprintln!("local-inference: {error}"),
+                Err(error) => eprintln!("palito: {error}"),
             },
         }
     }
@@ -152,7 +152,7 @@ impl Session {
                     .collect();
                 prompt = self.prompt_tokens(&latest)?;
                 if prompt.len() >= self.context {
-                    return Err(local_inference::Error::Invalid(format!(
+                    return Err(palito::Error::Invalid(format!(
                         "message of {} tokens does not fit in the {}-token context",
                         prompt.len(),
                         self.context

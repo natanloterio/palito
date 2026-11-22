@@ -1,5 +1,5 @@
 use clap::Parser;
-use local_inference::{
+use palito::{
     Config, Executor, GenerationMode, Result,
     backend::Backend,
     cuda::{CudaBackend, CudaMatmul, CudaOptions},
@@ -52,7 +52,7 @@ fn main() -> Result<()> {
             .values()
             .any(|c| c.ids.is_empty() || c.ids.len() > 1024)
     {
-        return Err(local_inference::Error::Invalid(
+        return Err(palito::Error::Invalid(
             "invalid precision cases".into(),
         ));
     }

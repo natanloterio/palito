@@ -17,7 +17,7 @@ def main():
     parser.add_argument("--oracle-dir", type=Path, required=True,
                         help="Previously verified F32-oracle report with raw logits and provenance")
     parser.add_argument("--model", type=Path, default=ROOT / "models/SmolLM2-135M-Instruct-Q4_K_M.gguf")
-    parser.add_argument("--rust", type=Path, default=ROOT / "target/release/local-inference")
+    parser.add_argument("--rust", type=Path, default=ROOT / "target/release/palito")
     parser.add_argument("--repetitions", type=positive, default=3)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()

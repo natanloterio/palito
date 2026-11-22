@@ -1,18 +1,18 @@
-# Architecture: independent Rust local inference
+# Architecture: Palito, an independent Rust GGUF engine
 
 ## Scope, revision, and evidence
 
 This is a model of **the working tree refreshed on 2026-11-17**, including the
 completed 21:46 UTC small-prefix MMA3 acceptance checkpoint, not a roadmap or a
-directory diagram. Paths below are relative to the `local_inference_rust`
+directory diagram. Paths below are relative to the `palito`
 repository root. Prefer named symbols over line positions when subsequent edits
 move code.
 
 - Analyzed HEAD: `1cf41764d3484899bb104b17d4a89eeb0e06d2a6`
   (`Initial commit of Rust inference runtime and literature review`).
 - The executable project is the single Cargo package in
-  [runtime/Cargo.toml](../runtime/Cargo.toml). There is no top-level Cargo workspace.
-  The package exposes a library, the `local-inference` binary, an optional
+  [Cargo.toml](../Cargo.toml). There is no top-level Cargo workspace.
+  The package exposes a library, the `palito` binary, an optional
   `ktransformers` binary, and three CUDA-gated diagnostic examples.
 - Existing changes were preserved. Tracked modifications cover the root ignore
   rules, runtime README, M8 report, CUDA capture example, iteration/paired
@@ -28,7 +28,7 @@ move code.
   incorporated, including runtime residual arithmetic, reusable quantization
   workspace, profile-gated normalized attention, and ignored full-model quality
   tests. At refresh, all **38 source/configuration entries** in the latest
-  [candidate provenance](../runtime/results/cuda-runtime-m8-mma3-small-acceptance/paired/b1/provenance.json)
+  [candidate provenance](../results/cuda-runtime-m8-mma3-small-acceptance/paired/b1/provenance.json)
   matched the working tree by SHA-256. This checks recorded source identity, not
   a newly rebuilt executable or completeness of the manifest.
 - Source, manifest, native reference adapters, tests, scripts, existing benchmark
@@ -41,7 +41,7 @@ measurement, not reproduced here; **H** = hypothesis requiring measurement;
 **U** = unresolved or out of scope. Numerical quality results are not performance
 measurements, and source inspection alone cannot prove a bottleneck.
 
-The [runtime README](../runtime/README.md) remains the operational index.
+The [runtime README](../README.md) remains the operational index.
 The [literature review](../literature_review/review.md), especially section 6,
 discusses alternatives; those are not automatically implemented here.
 
@@ -53,8 +53,8 @@ flowchart LR
     LIB_CALLER["Rust embedding application"]
     MODEL[("Explicit local GGUF v3 path")]
     KCACHE[("Optional private PTX directory")]
-    subgraph PROJECT["local_inference_rust project"]
-        RUNTIME["Rust local inference process or embedded library"]
+    subgraph PROJECT["palito project"]
+        RUNTIME["Palito process or embedded library"]
         HARNESS["Explicit provisioning and validation scripts"]
         REPORTS[("Local reports and captures")]
     end
@@ -82,9 +82,9 @@ server. It loads a user-specified file; there is no model registry, discovery
 daemon, automatic download, listener, chat-template layer, token stream, or
 request scheduler. The remote adapter calls an existing service; it does not
 launch one. Provisioning scripts and benchmark service launchers are separate
-entry points ([main.rs](../runtime/src/main.rs), `Command`;
-[download_model.py](../runtime/scripts/download_model.py), `main`, line 11;
-[benchmark_moe.py](../runtime/scripts/benchmark_moe.py), `server`, line 85).
+entry points ([main.rs](../src/main.rs), `Command`;
+[download_model.py](../scripts/download_model.py), `main`, line 11;
+[benchmark_moe.py](../scripts/benchmark_moe.py), `server`, line 85).
 
 | Execution choice | Architecture and numerical scope | Important boundary |
 | --- | --- | --- |
@@ -93,12 +93,12 @@ entry points ([main.rs](../runtime/src/main.rs), `Command`;
 | `cuda` + `--backend reference` | Same model layouts as CUDA, sequential packed CPU oracle | Shares parser/layout and CPU primitives; not the optimized CPU backend and not a fully independent parser oracle |
 | `ktransformers` + `remote`, or separate KT binary | Whole completion delegated to loopback SGLang/KT | Service owns tokenizer execution for text, token steps, placement, scheduling, and KV; no local token-step access |
 
-Sources: [Cargo.toml](../runtime/Cargo.toml), features and targets, lines 10-48;
-[cpu.rs](../runtime/src/cpu.rs), `CpuBackend::open_with_options`, line 245;
-[transformer.rs](../runtime/src/transformer.rs), `Weights::open`, line 82;
-[cuda.rs](../runtime/src/cuda.rs), `CudaBackend::open`;
-[reference.rs](../runtime/src/cuda/reference.rs), `ReferenceBackend`, line 41;
-[backend.rs](../runtime/src/backend.rs), `Backend` and `RequestBackend`,
+Sources: [Cargo.toml](../Cargo.toml), features and targets, lines 10-48;
+[cpu.rs](../src/cpu.rs), `CpuBackend::open_with_options`, line 245;
+[transformer.rs](../src/transformer.rs), `Weights::open`, line 82;
+[cuda.rs](../src/cuda.rs), `CudaBackend::open`;
+[reference.rs](../src/cuda/reference.rs), `ReferenceBackend`, line 41;
+[backend.rs](../src/backend.rs), `Backend` and `RequestBackend`,
 lines 53 and 185.
 
 ## 2. Master architecture
@@ -209,12 +209,12 @@ thread pool, expanded in the resource table below.
 
 | Boundary | Responsibility and invariant | Source |
 | --- | --- | --- |
-| CLI input/output | Exactly one of prompt, prompt file, or JSON token-ID file; complete JSON response after work. `logits` bypasses `Executor` and evaluates chunks directly | [main.rs](../runtime/src/main.rs), `ModelArgs`, line 77; `execute`, line 339 |
-| `Executor<B: Backend>` | Owns one backend and validated `Config`; manages request admission, reset, prefill chunks, greedy/EOG policy, output IDs, and timing | [lib.rs](../runtime/src/lib.rs), lines 77-194 |
-| `Backend` | Exclusive `&mut self` execution, explicit positions, reset after failed work; synchronous `evaluate` exposes host logits, while `evaluate_for_sampling` may avoid them | [backend.rs](../runtime/src/backend.rs), lines 44-93 |
-| Shared model loading | GGUF v3 tensor directory/type/bounds/finite validation; CPU extracts dense layout independently, CUDA/reference use generic `Weights<T>` plus `Spec` | [gguf.rs](../runtime/src/gguf.rs), `Gguf::parse`, line 239; [transformer.rs](../runtime/src/transformer.rs), `Weights`/`Spec`, lines 13-82 |
-| `RequestBackend` | Whole-request result and elapsed time, not token-step capability or isolated numerical phases | [backend.rs](../runtime/src/backend.rs), lines 138-188 |
-| Errors | `Invalid`, `Backend`, I/O and JSON errors propagate as `Result`; CLIs print an error and exit 1. No automatic backend fallback | [lib.rs](../runtime/src/lib.rs), `Error`, line 19; [main.rs](../runtime/src/main.rs), `ModelArgs::open` and `main` |
+| CLI input/output | Exactly one of prompt, prompt file, or JSON token-ID file; complete JSON response after work. `logits` bypasses `Executor` and evaluates chunks directly | [main.rs](../src/main.rs), `ModelArgs`, line 77; `execute`, line 339 |
+| `Executor<B: Backend>` | Owns one backend and validated `Config`; manages request admission, reset, prefill chunks, greedy/EOG policy, output IDs, and timing | [lib.rs](../src/lib.rs), lines 77-194 |
+| `Backend` | Exclusive `&mut self` execution, explicit positions, reset after failed work; synchronous `evaluate` exposes host logits, while `evaluate_for_sampling` may avoid them | [backend.rs](../src/backend.rs), lines 44-93 |
+| Shared model loading | GGUF v3 tensor directory/type/bounds/finite validation; CPU extracts dense layout independently, CUDA/reference use generic `Weights<T>` plus `Spec` | [gguf.rs](../src/gguf.rs), `Gguf::parse`, line 239; [transformer.rs](../src/transformer.rs), `Weights`/`Spec`, lines 13-82 |
+| `RequestBackend` | Whole-request result and elapsed time, not token-step capability or isolated numerical phases | [backend.rs](../src/backend.rs), lines 138-188 |
+| Errors | `Invalid`, `Backend`, I/O and JSON errors propagate as `Result`; CLIs print an error and exit 1. No automatic backend fallback | [lib.rs](../src/lib.rs), `Error`, line 19; [main.rs](../src/main.rs), `ModelArgs::open` and `main` |
 
 ## 3. Initialization and end-to-end execution
 
@@ -226,7 +226,7 @@ payloads, and copies tensors into owned vectors. F32 and rank-one tensors are
 expanded to F32; other matrices remain packed unless CPU `--f32-weights` is set.
 Allowed formats are F32, F16, Q5_0, Q8_0, Q4_K, and Q6_K. There is no mmap, demand
 paging, model sharding, or cross-backend weight sharing
-([gguf.rs](../runtime/src/gguf.rs), `layout`, line 145; `open`, line 226;
+([gguf.rs](../src/gguf.rs), `layout`, line 145; `open`, line 226;
 `parse`, line 239).
 
 CPU model validation and numerical admission precede KV/workspace allocation but
@@ -235,8 +235,8 @@ CUDA initialization checks Linux and CUDA libraries, creates a device context,
 compiles or reads PTX and loads functions **before** reading the model, then
 validates layout and device-buffer admission, allocates buffers, uploads tensors,
 synchronizes, and optionally captures a decode graph
-([cpu.rs](../runtime/src/cpu.rs), lines 245-483;
-[cuda.rs](../runtime/src/cuda.rs), `CudaBackend::open`).
+([cpu.rs](../src/cpu.rs), lines 245-483;
+[cuda.rs](../src/cuda.rs), `CudaBackend::open`).
 Thus even an incompatible model can incur CUDA library/JIT work before rejection.
 
 Tokenizer construction validates embedded tokens/types, byte mappings, merge
@@ -246,7 +246,7 @@ Ordinary pieces use regex splitting and rank/leftmost BPE merges maintained by a
 heap. Special/control-token recognition precedes ordinary-piece processing.
 There is no automatic chat template. Decoding reassembles the whole byte sequence,
 omits controls, preserves user-defined tokens, rejects unused/out-of-range IDs,
-and replaces invalid UTF-8 ([tokenizer.rs](../runtime/src/tokenizer.rs),
+and replaces invalid UTF-8 ([tokenizer.rs](../src/tokenizer.rs),
 `from_metadata`, line 51; `bpe`, line 189; `tokenize`, line 279;
 `detokenize`, line 310).
 
@@ -256,9 +256,9 @@ It avoids tensor expansion, not full-file I/O/allocation. Backends retain tokeni
 construction as `Result<Tokenizer>` so raw-ID numerical APIs can remain usable
 when text support fails. However, CLI `generate` explicitly calls
 `detokenize(&[])` before inference, even for ID input; `bench` and `logits` with
-IDs do not require text decoding ([gguf.rs](../runtime/src/gguf.rs), line 230;
-[cpu.rs](../runtime/src/cpu.rs), line 307;
-[main.rs](../runtime/src/main.rs), `execute`, `Generate` branch).
+IDs do not require text decoding ([gguf.rs](../src/gguf.rs), line 230;
+[cpu.rs](../src/cpu.rs), line 307;
+[main.rs](../src/main.rs), `execute`, `Generate` branch).
 
 ### 3.2 Local completion, benchmark samples, and full-logit output
 
@@ -311,8 +311,8 @@ sequenceDiagram
     Note over CLI,BAPI: logits instead evaluates chunks directly, then serializes full host logits
 ```
 
-Source: [lib.rs](../runtime/src/lib.rs), `Executor::generate`, line 117;
-[main.rs](../runtime/src/main.rs), `execute`, line 339.
+Source: [lib.rs](../src/lib.rs), `Executor::generate`, line 117;
+[main.rs](../src/main.rs), `execute`, line 339.
 
 Important semantics:
 
@@ -336,10 +336,10 @@ Important semantics:
   outputs, including speculation/graph replay work; one output means zero decode
   time. CLI `load_ns` excludes tokenization and final output serialization.
 
-Sources: [cpu.rs](../runtime/src/cpu.rs), `forward`, lines 584-625;
-[cuda.rs](../runtime/src/cuda.rs), `evaluate_inner`;
-[transformer.rs](../runtime/src/transformer.rs), EOG construction, lines 185-214;
-[lib.rs](../runtime/src/lib.rs), lines 123-194.
+Sources: [cpu.rs](../src/cpu.rs), `forward`, lines 584-625;
+[cuda.rs](../src/cuda.rs), `evaluate_inner`;
+[transformer.rs](../src/transformer.rs), EOG construction, lines 185-214;
+[lib.rs](../src/lib.rs), lines 123-194.
 
 ### 3.3 CUDA execution and optional captured decode
 
@@ -402,10 +402,10 @@ evaluation, rather than returning stale data. Graph mode requires head dimension
 at most 256 and configured context at most 1024. It does not capture whole
 requests or multi-token prefill. Until-EOG generation samples one token at a time.
 
-Sources: [cuda.rs](../runtime/src/cuda.rs), `finish_evaluation` and
-`evaluate_inner`; [decode.rs](../runtime/src/cuda/decode.rs),
+Sources: [cuda.rs](../src/cuda.rs), `finish_evaluation` and
+`evaluate_inner`; [decode.rs](../src/cuda/decode.rs),
 `capture_decode_graph`, line 42; `read_decode_tokens`, line 124;
-`sample_decode_tokens`, line 146; [decode.cu](../runtime/src/cuda/decode.cu),
+`sample_decode_tokens`, line 146; [decode.cu](../src/cuda/decode.cu),
 `greedy_finish`, line 73.
 
 ### 3.4 Whole-request KTransformers delegation
@@ -447,9 +447,9 @@ Missing context is reported as unknown, not invented.
 The separate KT CLI provides `info`, `run`, and `bench`. Its benchmark rejects
 enabled server radix cache and nonzero cached work; the client never flushes the
 service cache. Runtime calls do not stop the external service. Sources:
-[ktransformers.rs](../runtime/src/ktransformers.rs), `endpoint_url`, line 85;
+[ktransformers.rs](../src/ktransformers.rs), `endpoint_url`, line 85;
 `exchange`, line 117; `connect`, line 167; `generate`, line 261;
-[bin/ktransformers.rs](../runtime/src/bin/ktransformers.rs), `execute`, line 71.
+[bin/ktransformers.rs](../src/bin/ktransformers.rs), `execute`, line 71.
 
 ## 4. Transformer and MoE subsystem
 
@@ -498,17 +498,17 @@ iterates tokens/heads on the pool's executing thread; CPU products and selected
 normalization loops use Rayon parallel iterators. Reference evaluation iterates
 tokens serially and allocates temporary vectors per step/layer; it is a
 correctness aid, not a throughput competitor
-([cpu.rs](../runtime/src/cpu.rs), `attend`, line 199; `forward`, line 485;
-[reference.rs](../runtime/src/cuda/reference.rs), `step`, line 92;
-[batch.rs](../runtime/src/cuda/batch.rs), `batched_prefill`).
+([cpu.rs](../src/cpu.rs), `attend`, line 199; `forward`, line 485;
+[reference.rs](../src/cuda/reference.rs), `step`, line 92;
+[batch.rs](../src/cuda/batch.rs), `batched_prefill`).
 
 CUDA routing uses lowest-index tie breaks and renormalizes probabilities over
 the selected top-k. Assignment ID is `token * used + routing_slot`; grouping
 reorders work for reuse, then kernels scatter into original assignment layout
 and `combine_batch` sums in original top-k order. No expert weights move between
 CPU/GPU during this path
-([kernels.cu](../runtime/src/cuda/kernels.cu), `router`, line 370;
-`combine_batch`, line 446; [prefill.cu](../runtime/src/cuda/prefill.cu),
+([kernels.cu](../src/cuda/kernels.cu), `router`, line 370;
+`combine_batch`, line 446; [prefill.cu](../src/cuda/prefill.cu),
 `group_expert_tiles`, line 79).
 
 ### Active versus experimental kernel selection
@@ -524,13 +524,13 @@ CPU/GPU during this path
 | Fused attention | Multi-token prefill uses shared-memory scores when configured context <=1024 and head dimension <=256. Larger supported configurations use global score buffers. Non-graph singleton `step` uses score/value kernels; graph singleton uses fused attention. MMA3 alone normalizes each shared score once before the value loop; default/F32-tiled arithmetic is unchanged |
 | Prototypes | `CUDA_M8_PROTOTYPES`, `LOCAL_DECODE_BENCH`, alternative tiles/fusion and TF32x4 controls remain non-default/test research. Rust research harness modules are test-gated, but residual CUDA source is also compiled into explicitly selected runtime research profiles |
 
-Dispatch evidence: [cuda.rs](../runtime/src/cuda.rs), `CudaMatmul`,
+Dispatch evidence: [cuda.rs](../src/cuda.rs), `CudaMatmul`,
 `register_group_shape`, and `CudaBackend::open` source defines/function loading;
-[batch.rs](../runtime/src/cuda/batch.rs), `reference_dense_shape`,
+[batch.rs](../src/cuda/batch.rs), `reference_dense_shape`,
 `residual_projection`, `prepare_residual!`, `project_residual!`, and
-`batched_prefill`; [kernels.cu](../runtime/src/cuda/kernels.cu),
-`half_value`, line 4; [prefill.cu](../runtime/src/cuda/prefill.cu),
-prototype guards starting at line 232; [tensorcore.cu](../runtime/src/cuda/tensorcore.cu),
+`batched_prefill`; [kernels.cu](../src/cuda/kernels.cu),
+`half_value`, line 4; [prefill.cu](../src/cuda/prefill.cu),
+prototype guards starting at line 232; [tensorcore.cu](../src/cuda/tensorcore.cu),
 TF32x4 prototype guard, line 210.
 
 Not every kernel name in a compiled source is invoked by production dispatch.
@@ -538,14 +538,14 @@ In particular, Rust modules named `prefill`, `packed_decode`, `grouped_bench`,
 `arithmetic`, `model_replay`, `model_quality`, `residual`, and `residual_precise`
 are under `#[cfg(test)]`;
 production batching is in `batch.rs`, and production CUDA prefill source is
-`prefill.cu` ([cuda.rs](../runtime/src/cuda.rs), test-gated module declarations).
+`prefill.cu` ([cuda.rs](../src/cuda.rs), test-gated module declarations).
 Do not confuse those Rust harness modules with runtime `include_str!` of
 `residual.cu`/`residual_tile.cu` for two-component research or
 `residual.cu`/`residual_precise.cu`/`residual_mma.cu` for MMA3.
-Older [matrix-only evidence](../runtime/results/cuda-runtime-m8-residual-matrices/checkpoint.json)
+Older [matrix-only evidence](../results/cuda-runtime-m8-residual-matrices/checkpoint.json)
 predates full-model integration. The later
-[two-component rejection](../runtime/results/cuda-runtime-m8-int8-model/checkpoint.json)
-and [MMA3 small-prefix admission](../runtime/results/cuda-runtime-m8-mma3-small-acceptance/checkpoint.json)
+[two-component rejection](../results/cuda-runtime-m8-int8-model/checkpoint.json)
+and [MMA3 small-prefix admission](../results/cuda-runtime-m8-mma3-small-acceptance/checkpoint.json)
 supersede it for those explicit modes, not for defaults.
 
 ### Residual prefill arithmetic and fallback boundaries
@@ -596,16 +596,16 @@ Nonfinite conversion/reconstruction/output sets device status and poisons the
 request until reset. Source comments still calling the MMA/precise CUDA files
 "test-only" are stale relative to their explicit runtime inclusion.
 
-Sources: [cuda.rs](../runtime/src/cuda.rs), `CudaMatmul::residual_min_tokens`,
+Sources: [cuda.rs](../src/cuda.rs), `CudaMatmul::residual_min_tokens`,
 `residual_workspace_elements`, `CudaBackend::open`;
-[batch.rs](../runtime/src/cuda/batch.rs), `residual_projection`, macros and
-`integer_groups`; [residual.cu](../runtime/src/cuda/residual.cu),
+[batch.rs](../src/cuda/batch.rs), `residual_projection`, macros and
+`integer_groups`; [residual.cu](../src/cuda/residual.cu),
 `residual_quantize32`, `residual_parameters`;
-[residual_tile.cu](../runtime/src/cuda/residual_tile.cu), `residual_matmul32`;
-[residual_precise.cu](../runtime/src/cuda/residual_precise.cu),
+[residual_tile.cu](../src/cuda/residual_tile.cu), `residual_matmul32`;
+[residual_precise.cu](../src/cuda/residual_precise.cu),
 `residual_quantize32_precise3`;
-[residual_mma.cu](../runtime/src/cuda/residual_mma.cu), `residual_matmul_mma3`;
-[attention.cu](../runtime/src/cuda/attention.cu), `CUDA_NORMALIZED_ATTENTION`.
+[residual_mma.cu](../src/cuda/residual_mma.cu), `residual_matmul_mma3`;
+[attention.cu](../src/cuda/attention.cu), `CUDA_NORMALIZED_ATTENTION`.
 
 ## 5. Execution, ownership, resources, and lifecycle
 
@@ -669,13 +669,13 @@ times head dimension, `B` batch capacity, `S` speculative window, and `V` vocabu
 | CUDA graph | Own captured graph references fixed buffers/modules. Decode control/sampling buffers are counted; driver/JIT/graph-internal allocations are not. Graph must be destroyed before referenced allocations |
 | External service | Owns independent state/resources. Client retains one reusable HTTP client and reported identity, but has no handle to service KV or admission queues |
 
-Sources: [cpu.rs](../runtime/src/cpu.rs), state structs, lines 22-159;
+Sources: [cpu.rs](../src/cpu.rs), state structs, lines 22-159;
 allocation/admission, lines 315-483; transactions/prefixes, lines 634-931;
-[kernels.rs](../runtime/src/kernels.rs), `packed_row`, line 16;
-[reference.rs](../runtime/src/cuda/reference.rs), lines 41-110;
-[cuda.rs](../runtime/src/cuda.rs), `DeviceTensor::upload`, `Workspace`,
+[kernels.rs](../src/kernels.rs), `packed_row`, line 16;
+[reference.rs](../src/cuda/reference.rs), lines 41-110;
+[cuda.rs](../src/cuda.rs), `DeviceTensor::upload`, `Workspace`,
 `workspace_sizes`, and `CudaBackend::open` admission/allocation;
-[decode.rs](../runtime/src/cuda/decode.rs), `DecodeState`, line 4.
+[decode.rs](../src/cuda/decode.rs), `DecodeState`, line 4.
 
 For the recorded Qwen3 shape at batch 512, two components add **7,864,320 bytes**
 and MMA3 adds **11,796,480 bytes (11.25 MiB)** over F32-tiled. At batch 32,
@@ -683,9 +683,9 @@ MMA3 adds **737,280 component bytes plus 12,096 group-descriptor bytes**; below
 32 it adds neither. Batch512 descriptors already cover tile32, so the latest
 small-prefix extension adds no memory over the earlier MMA3 profile.
 These are accounted reservations, not GPU RSS or input-dependent live occupancy
-([cuda.rs](../runtime/src/cuda.rs), `residual_workspace_bytes`,
+([cuda.rs](../src/cuda.rs), `residual_workspace_bytes`,
 `group_workspace_elements`, and `Workspace::new`;
-[small-capacity report](../runtime/results/cuda-runtime-m8-mma3-small-model/small-capacity-summary.json)).
+[small-capacity report](../results/cuda-runtime-m8-mma3-small-model/small-capacity-summary.json)).
 
 **F:** CPU `--memory-limit-bytes` limits counted numerical reservations, not RSS,
 file-loading peaks, metadata, allocator/container overhead, worker stacks, or
@@ -695,8 +695,8 @@ check, not a reservation against other users/processes. It is not a host-memory
 limit and cannot guarantee later allocations under competition.
 Reducing batch reduces workspace, not full-context KV. These paths do not
 silently shrink workspace, quantize activations, or fall back to another device
-when admission fails ([cpu.rs](../runtime/src/cpu.rs), lines 315-386;
-[cuda.rs](../runtime/src/cuda.rs), `admit`).
+when admission fails ([cpu.rs](../src/cpu.rs), lines 315-386;
+[cuda.rs](../src/cuda.rs), `admit`).
 
 ### Concurrency and backpressure
 
@@ -722,9 +722,9 @@ when admission fails ([cpu.rs](../runtime/src/cpu.rs), lines 315-386;
 - **F:** Python benchmark orchestration adds subprocesses, a GPU telemetry
   thread, and explicit owned-service lifecycle management. Model provisioning
   can use a four-worker download pool. Those are tooling concurrency, not runtime
-  token parallelism ([benchmark_cuda_iteration.py](../runtime/scripts/benchmark_cuda_iteration.py),
+  token parallelism ([benchmark_cuda_iteration.py](../scripts/benchmark_cuda_iteration.py),
   `monitor`/`run`, lines 137-188;
-  [download_moe_models.py](../runtime/scripts/download_moe_models.py), line 91).
+  [download_moe_models.py](../scripts/download_moe_models.py), line 91).
 
 ### Reset, speculation, errors, persistence, and cleanup
 
@@ -736,7 +736,7 @@ N-gram speculation searches recent history for suffixes of length at most four,
 verifies a bounded draft causally in one batch, keeps only the greedy-matching
 prefix, and restores/truncates logits/history/position on rejection. Rejected
 rows remain allocated but invisible. It uses no second model
-([cpu.rs](../runtime/src/cpu.rs), `verify_draft`, line 708; `propose`, line 755;
+([cpu.rs](../src/cpu.rs), `verify_draft`, line 708; `propose`, line 755;
 `reset`, line 791; prefix and sampling hooks, lines 844-931).
 
 CPU numerical evaluation errors invalidate logits and mark the backend failed;
@@ -746,9 +746,9 @@ valid state. Reset synchronizes, clears status and host sampling/capture state,
 and retains allocations. The next `Executor::generate` always resets after
 admission, so a failed previous request does not intentionally resume partially
 written KV. Invalid input rejected before numerical work does not advance state
-([cpu.rs](../runtime/src/cpu.rs), lines 683-750 and 801-820;
-[cuda.rs](../runtime/src/cuda.rs), `State` and `Backend::reset`;
-[lib.rs](../runtime/src/lib.rs), line 139).
+([cpu.rs](../src/cpu.rs), lines 683-750 and 801-820;
+[cuda.rs](../src/cuda.rs), `State` and `Backend::reset`;
+[lib.rs](../src/lib.rs), line 139).
 
 There is **no cooperative cancellation API, signal handler, streamed token
 callback, or request deadline** in local execution. HTTP timeouts stop the client
@@ -756,7 +756,7 @@ wait; they do not constitute an explicit service-abort protocol. Benchmark
 subprocess deadlines and process-group cleanup are external controls, and their
 code explicitly reports incomplete cleanup for kernel-blocked children rather
 than claiming guaranteed device cancellation
-([benchmark_cuda_iteration.py](../runtime/scripts/benchmark_cuda_iteration.py),
+([benchmark_cuda_iteration.py](../scripts/benchmark_cuda_iteration.py),
 `capture_process`, line 25).
 
 Rust-owned vectors/pools/handles are released through ordinary ownership teardown.
@@ -764,9 +764,9 @@ CUDA's `Drop` synchronizes and records driver teardown errors in the context;
 it cannot return a `Result` to the caller. Captured references are placed before
 their referenced fields for destruction. The external C++ reference separately
 uses RAII to free native batch/sampler/context/model handles
-([decode.rs](../runtime/src/cuda/decode.rs), lines 34-65;
-[cuda.rs](../runtime/src/cuda.rs), `CudaBackend` field order;
-[bridge.cpp](../runtime/native/bridge.cpp), `li_handle`, line 12).
+([decode.rs](../src/cuda/decode.rs), lines 34-65;
+[cuda.rs](../src/cuda.rs), `CudaBackend` field order;
+[bridge.cpp](../native/bridge.cpp), `li_handle`, line 12).
 
 Persistent runtime state is limited to the opt-in PTX cache, not model/KV
 checkpoints. Its key covers CUDA source, compile options/target, NVRTC-reported
@@ -774,7 +774,7 @@ version, and Cargo lockfile; entries validate a PTX checksum and are published
 using synced temporary files and rename. Corruption/I/O errors fail explicitly.
 This is a trusted private cache, not an authenticated artifact distribution
 mechanism; driver/NVRTC remain necessary on hits
-([cache.rs](../runtime/src/cuda/cache.rs), lines 18-118).
+([cache.rs](../src/cuda/cache.rs), lines 18-118).
 Reports/captures and downloaded model files are separate persistent artifacts;
 there is no database or conversation persistence subsystem.
 
@@ -786,8 +786,8 @@ and per-layer routing. It introduces explicit device copies/synchronization and
 bounded retained host records, so capture timings are not ordinary inference
 timings. Saving creates a new JSONL file; reset cancels capture. Its byte budget
 does not bound JSON encoding size or all staging memory
-([diagnostics.rs](../runtime/src/cuda/diagnostics.rs), lines 20-59, 149-228,
-and 333-397; [cuda_capture.rs](../runtime/examples/cuda_capture.rs), `main`, line 50).
+([diagnostics.rs](../src/cuda/diagnostics.rs), lines 20-59, 149-228,
+and 333-397; [cuda_capture.rs](../examples/cuda_capture.rs), `main`, line 50).
 
 The reference tracer records chosen token/layer intermediates; `cuda-precision`
 supports numerical investigation. Model-backed projection replay and full-model quality
@@ -795,9 +795,9 @@ research use ignored tests with bounded capture/model/routing guards. Those
 harnesses exercise the explicit runtime research modes; they are not a new
 serving endpoint. Captured routing with synthetic matrix operands is not a
 full-model inference benchmark
-([reference.rs](../runtime/src/cuda/reference.rs), `trace_at`, line 76;
-[model_replay.rs](../runtime/src/cuda/model_replay.rs), ignored entry points,
-lines 274-289; [grouped_bench.rs](../runtime/src/cuda/grouped_bench.rs),
+([reference.rs](../src/cuda/reference.rs), `trace_at`, line 76;
+[model_replay.rs](../src/cuda/model_replay.rs), ignored entry points,
+lines 274-289; [grouped_bench.rs](../src/cuda/grouped_bench.rs),
 `parse_routing`, line 381).
 
 **F:** Cargo does not build the native bridge or link llama.cpp/GGML. The native
@@ -806,11 +806,11 @@ the C++ control executable and shared bridge, then llama.cpp/GGML. The separate
 F32-activation oracle patches a pinned external worktree to isolate arithmetic
 differences. Neither is called by Rust numerical inference. The retained legacy
 Rust FFI/backend/build files are not current Cargo targets
-([Cargo.toml](../runtime/Cargo.toml); [CMakeLists.txt](../runtime/native/CMakeLists.txt),
-lines 15-22; [reference.cpp](../runtime/native/reference.cpp), `main`, line 28;
-[bridge.cpp](../runtime/native/bridge.cpp), `li_eval`, line 164;
-[build_f32_oracle.py](../runtime/scripts/build_f32_oracle.py), lines 10-73;
-[legacy/build.rs](../runtime/benchmarks/legacy/build.rs), historical only).
+([Cargo.toml](../Cargo.toml); [CMakeLists.txt](../native/CMakeLists.txt),
+lines 15-22; [reference.cpp](../native/reference.cpp), `main`, line 28;
+[bridge.cpp](../native/bridge.cpp), `li_eval`, line 164;
+[build_f32_oracle.py](../scripts/build_f32_oracle.py), lines 10-73;
+[legacy/build.rs](../benchmarks/legacy/build.rs), historical only).
 
 **F:** Benchmark harnesses run explicit engines/services sequentially and retain
 commands, IDs, timings, hashes, linkage, and environment evidence. Cross-engine
@@ -821,8 +821,8 @@ in `benchmark_rust.py` still describe expanded F32 weights and sequential Rust
 prefill, even for packed/batched runs. Inspect actual command/options, memory
 objects, source hashes and numerical comparisons rather than accepting those
 strings as current architecture
-([benchmark_rust.py](../runtime/scripts/benchmark_rust.py), lines 79-170;
-[benchmark_moe.py](../runtime/scripts/benchmark_moe.py), `main`, line 170).
+([benchmark_rust.py](../scripts/benchmark_rust.py), lines 79-170;
+[benchmark_moe.py](../scripts/benchmark_moe.py), `main`, line 170).
 
 ## 7. Subsystem coverage
 
@@ -831,25 +831,25 @@ omissions avoid promoting directory contents into active architectural roles.
 
 | Subsystem | Status and diagram nodes | Evidence / omission rationale |
 | --- | --- | --- |
-| CLI, input/output, command configuration | Active: `CLI`, `CALLER` | [main.rs](../runtime/src/main.rs), `Command`; `execute`, line 339 |
-| Library policy, admission, reset, timers | Active: `EXEC`, `BAPI` | [lib.rs](../runtime/src/lib.rs), `Executor`, line 77; [backend.rs](../runtime/src/backend.rs), line 53 |
-| GGUF parser, quantized storage, layout validation | Active: `LOADER`, `MODEL` | [gguf.rs](../runtime/src/gguf.rs), line 239; [transformer.rs](../runtime/src/transformer.rs), line 82 |
-| Embedded BPE and full-sequence decoder | Active: `TOKENIZER` | [tokenizer.rs](../runtime/src/tokenizer.rs), line 33 |
-| Dense CPU engine and kernels | Active default: `CPU`, `CKERN`, `CPSTATE` | [cpu.rs](../runtime/src/cpu.rs), line 485; [kernels.rs](../runtime/src/kernels.rs), line 231 |
-| Prefix snapshot, transactions, n-gram speculation | Implemented, opt-in: `CPU`, `PREFIX` | [cpu.rs](../runtime/src/cpu.rs), lines 634-931; no separate process/draft model |
-| CUDA initialization, memory admission, FFI/JIT | Feature-gated: `CUDA`, `CUDAAPI`, `GPUSTATE`, `KCACHE` | [cuda.rs](../runtime/src/cuda.rs), `CudaBackend::open`; [cache.rs](../runtime/src/cuda/cache.rs), line 32 |
-| CUDA prefill, dense/MoE math and kernel dispatch | Feature/profile-gated: `GPUK`, focused forward nodes | [batch.rs](../runtime/src/cuda/batch.rs), `batched_prefill`; [kernels.cu](../runtime/src/cuda/kernels.cu); [prefill.cu](../runtime/src/cuda/prefill.cu) |
-| Residual preparation, integer projections, scratch, normalized attention | Explicit research-profile runtime paths: `RESIDUAL`, `QWORK`, `GPUSTATE`, `GPUK` | [cuda.rs](../runtime/src/cuda.rs), `CudaMatmul`, workspace/admission and JIT selection; [batch.rs](../runtime/src/cuda/batch.rs), actual-chunk/format/width dispatch; [attention.cu](../runtime/src/cuda/attention.cu), MMA3-only score normalization |
-| Captured decode and device greedy sampling | Opt-in: `CUDA`, `GPUK`, `GPUSTATE` | [decode.rs](../runtime/src/cuda/decode.rs), line 42; [decode.cu](../runtime/src/cuda/decode.cu), line 51 |
-| Packed CPU transformer oracle | Active selectable, CUDA feature only: `REF`, `CKERN` | [reference.rs](../runtime/src/cuda/reference.rs), line 41; own host state elided from master |
-| KTransformers adapter and second CLI | Feature-gated: `KT`, `KT_SERVICE` | [ktransformers.rs](../runtime/src/ktransformers.rs), line 167; [bin/ktransformers.rs](../runtime/src/bin/ktransformers.rs), line 71 |
-| Diagnostic capture, traces, precision tools | Active opt-in APIs/examples: `CUDA`, `REF`, `REPORTS` | [diagnostics.rs](../runtime/src/cuda/diagnostics.rs), line 333; examples are not default inference paths |
-| Arithmetic/grouped/packed/prefill/model replay/residual/quality research | Rust harnesses test-only: `HARNESS`/`REPORTS`; runtime residual kernels separately shown as `RESIDUAL` | [cuda.rs](../runtime/src/cuda.rs), test-gated module declarations; [model_quality.rs](../runtime/src/cuda/model_quality.rs), ignored `residual_full_model_quality`; individual experimental tiles elided from master, not mistaken for active defaults |
-| Tests and numerical validators | `HARNESS` | [tests/cpu.rs](../runtime/tests/cpu.rs), line 119; [tests/cuda.rs](../runtime/tests/cuda.rs), line 217; [tests/ktransformers.rs](../runtime/tests/ktransformers.rs), line 138; [validate_cuda.py](../runtime/scripts/validate_cuda.py), line 14 |
-| Download manifests and explicit provisioners | `HARNESS`, `MODEL` | [fixtures/model.json](../runtime/fixtures/model.json); [download_model.py](../runtime/scripts/download_model.py); [download_moe_models.py](../runtime/scripts/download_moe_models.py) |
-| Benchmark orchestration and retained evidence | `HARNESS`, `REPORTS` | [benchmark_cuda_iteration.py](../runtime/scripts/benchmark_cuda_iteration.py); [benchmark_cuda_paired.py](../runtime/scripts/benchmark_cuda_paired.py); [benchmark_moe.py](../runtime/scripts/benchmark_moe.py); milestone documents |
-| Native reference, ABI bridge, matched-precision oracle | External-only: `REFERENCE` | [native/CMakeLists.txt](../runtime/native/CMakeLists.txt); [native/bridge.h](../runtime/native/bridge.h); oracle sources/build script |
-| Legacy control-plane implementation | Inactive; no dedicated runtime nodes | [benchmarks/legacy/](../runtime/benchmarks/legacy/); not selected by current manifest |
+| CLI, input/output, command configuration | Active: `CLI`, `CALLER` | [main.rs](../src/main.rs), `Command`; `execute`, line 339 |
+| Library policy, admission, reset, timers | Active: `EXEC`, `BAPI` | [lib.rs](../src/lib.rs), `Executor`, line 77; [backend.rs](../src/backend.rs), line 53 |
+| GGUF parser, quantized storage, layout validation | Active: `LOADER`, `MODEL` | [gguf.rs](../src/gguf.rs), line 239; [transformer.rs](../src/transformer.rs), line 82 |
+| Embedded BPE and full-sequence decoder | Active: `TOKENIZER` | [tokenizer.rs](../src/tokenizer.rs), line 33 |
+| Dense CPU engine and kernels | Active default: `CPU`, `CKERN`, `CPSTATE` | [cpu.rs](../src/cpu.rs), line 485; [kernels.rs](../src/kernels.rs), line 231 |
+| Prefix snapshot, transactions, n-gram speculation | Implemented, opt-in: `CPU`, `PREFIX` | [cpu.rs](../src/cpu.rs), lines 634-931; no separate process/draft model |
+| CUDA initialization, memory admission, FFI/JIT | Feature-gated: `CUDA`, `CUDAAPI`, `GPUSTATE`, `KCACHE` | [cuda.rs](../src/cuda.rs), `CudaBackend::open`; [cache.rs](../src/cuda/cache.rs), line 32 |
+| CUDA prefill, dense/MoE math and kernel dispatch | Feature/profile-gated: `GPUK`, focused forward nodes | [batch.rs](../src/cuda/batch.rs), `batched_prefill`; [kernels.cu](../src/cuda/kernels.cu); [prefill.cu](../src/cuda/prefill.cu) |
+| Residual preparation, integer projections, scratch, normalized attention | Explicit research-profile runtime paths: `RESIDUAL`, `QWORK`, `GPUSTATE`, `GPUK` | [cuda.rs](../src/cuda.rs), `CudaMatmul`, workspace/admission and JIT selection; [batch.rs](../src/cuda/batch.rs), actual-chunk/format/width dispatch; [attention.cu](../src/cuda/attention.cu), MMA3-only score normalization |
+| Captured decode and device greedy sampling | Opt-in: `CUDA`, `GPUK`, `GPUSTATE` | [decode.rs](../src/cuda/decode.rs), line 42; [decode.cu](../src/cuda/decode.cu), line 51 |
+| Packed CPU transformer oracle | Active selectable, CUDA feature only: `REF`, `CKERN` | [reference.rs](../src/cuda/reference.rs), line 41; own host state elided from master |
+| KTransformers adapter and second CLI | Feature-gated: `KT`, `KT_SERVICE` | [ktransformers.rs](../src/ktransformers.rs), line 167; [bin/ktransformers.rs](../src/bin/ktransformers.rs), line 71 |
+| Diagnostic capture, traces, precision tools | Active opt-in APIs/examples: `CUDA`, `REF`, `REPORTS` | [diagnostics.rs](../src/cuda/diagnostics.rs), line 333; examples are not default inference paths |
+| Arithmetic/grouped/packed/prefill/model replay/residual/quality research | Rust harnesses test-only: `HARNESS`/`REPORTS`; runtime residual kernels separately shown as `RESIDUAL` | [cuda.rs](../src/cuda.rs), test-gated module declarations; [model_quality.rs](../src/cuda/model_quality.rs), ignored `residual_full_model_quality`; individual experimental tiles elided from master, not mistaken for active defaults |
+| Tests and numerical validators | `HARNESS` | [tests/cpu.rs](../tests/cpu.rs), line 119; [tests/cuda.rs](../tests/cuda.rs), line 217; [tests/ktransformers.rs](../tests/ktransformers.rs), line 138; [validate_cuda.py](../scripts/validate_cuda.py), line 14 |
+| Download manifests and explicit provisioners | `HARNESS`, `MODEL` | [fixtures/model.json](../fixtures/model.json); [download_model.py](../scripts/download_model.py); [download_moe_models.py](../scripts/download_moe_models.py) |
+| Benchmark orchestration and retained evidence | `HARNESS`, `REPORTS` | [benchmark_cuda_iteration.py](../scripts/benchmark_cuda_iteration.py); [benchmark_cuda_paired.py](../scripts/benchmark_cuda_paired.py); [benchmark_moe.py](../scripts/benchmark_moe.py); milestone documents |
+| Native reference, ABI bridge, matched-precision oracle | External-only: `REFERENCE` | [native/CMakeLists.txt](../native/CMakeLists.txt); [native/bridge.h](../native/bridge.h); oracle sources/build script |
+| Legacy control-plane implementation | Inactive; no dedicated runtime nodes | [benchmarks/legacy/](../benchmarks/legacy/); not selected by current manifest |
 | Literature review and bibliography | Research documentation; omitted from runtime diagrams | [literature_review/](../literature_review/); staged designs are proposals, not implementation |
 | Local llama.cpp and vLLM checkouts | External reference/resource, not runtime modules | llama.cpp accessed by explicit harness/build paths; no vLLM adapter/dependency in runtime source/manifest. Their internal schedulers/kernels are outside this model |
 | Build outputs, models, virtual environments, results | Artifacts, not components | Used only by explicit commands; result artifacts are local/untracked, may be absent in a clean clone |
@@ -859,18 +859,18 @@ omissions avoid promoting directory contents into active architectural roles.
 
 - Compile-time features default to none. `cuda` adds cudarc/libloading/sha2 and
   exposes CUDA/reference plus diagnostics; `ktransformers` adds blocking reqwest
-  and request-level commands ([Cargo.toml](../runtime/Cargo.toml), lines 10-48).
+  and request-level commands ([Cargo.toml](../Cargo.toml), lines 10-48).
 - Local defaults: CPU, context 512, batch 128, prefill chunk 64, four CPU threads,
   32 output tokens. Configuration enforces `0 < chunk <= batch <= context` and
   positive bounded thread count. Dense CPU rejects unsupported architectures,
   scaling/sliding-window/softcap/MoE metadata and extra tensors. CUDA/reference
-  separately validate their supported layout ([main.rs](../runtime/src/main.rs),
-  `ModelArgs`; [lib.rs](../runtime/src/lib.rs), `Config::validate`, line 40).
+  separately validate their supported layout ([main.rs](../src/main.rs),
+  `ModelArgs`; [lib.rs](../src/lib.rs), `Config::validate`, line 40).
 - CPU policy switches select expanded/scalar/sequential validation controls,
   numerical budget, prefix budget, and speculative window (default disabled).
   CUDA rejects these CPU switches instead of ignoring them. CUDA device/budget/
   cache/matmul/graph switches require CUDA backend selection
-  ([main.rs](../runtime/src/main.rs), `ModelArgs::open` and `cuda_options`).
+  ([main.rs](../src/main.rs), `ModelArgs::open` and `cuda_options`).
 - CUDA defaults are device 0, `f32`, graph off, cache off, 24 GiB owned buffers.
   The loader checks CUDA 13 libraries via the process dynamic-library path;
   Cargo compilation does not invoke nvcc. Reference mode is gated by the same
@@ -882,11 +882,11 @@ omissions avoid promoting directory contents into active architectural roles.
   not offer rejected two-component INT8 in their mode choices; the ignored
   full-model quality harness accepts both research profiles plus F32-tiled.
   CLI and harness availability must not be interpreted as default promotion
-  ([cuda.rs](../runtime/src/cuda.rs), `CudaMatmul`;
-  [main.rs](../runtime/src/main.rs), `cuda_matmul`;
-  [benchmark_cuda_iteration.py](../runtime/scripts/benchmark_cuda_iteration.py),
-  argument choices; [benchmark_cuda_paired.py](../runtime/scripts/benchmark_cuda_paired.py),
-  `validate_controls`; [model_quality.rs](../runtime/src/cuda/model_quality.rs)).
+  ([cuda.rs](../src/cuda.rs), `CudaMatmul`;
+  [main.rs](../src/main.rs), `cuda_matmul`;
+  [benchmark_cuda_iteration.py](../scripts/benchmark_cuda_iteration.py),
+  argument choices; [benchmark_cuda_paired.py](../scripts/benchmark_cuda_paired.py),
+  `validate_controls`; [model_quality.rs](../src/cuda/model_quality.rs)).
 - Remote defaults, handshake, timeout, method/identity and expert-deferral policy
   are separate from numerical execution config. A served model name is not a
   local GGUF path. Model placement and queue tuning belong to the service.
@@ -910,11 +910,11 @@ omissions avoid promoting directory contents into active architectural roles.
 | Diagnostics / harnesses | Device readback/JSONL capture or process launch/hash/telemetry work; excluded from isolated kernel timings where reports say so, not free in end-to-end time |
 
 Mechanisms are located in the initialization/flow/resource sources above;
-especially [kernels.rs](../runtime/src/kernels.rs), lines 16-48 and 231-305;
-[cpu.rs](../runtime/src/cpu.rs), lines 485-625;
-[batch.rs](../runtime/src/cuda/batch.rs), `batched_prefill` and residual macros;
-[reference.rs](../runtime/src/cuda/reference.rs), lines 92-210;
-[ktransformers.rs](../runtime/src/ktransformers.rs), lines 117-164 and 261-355.
+especially [kernels.rs](../src/kernels.rs), lines 16-48 and 231-305;
+[cpu.rs](../src/cpu.rs), lines 485-625;
+[batch.rs](../src/cuda/batch.rs), `batched_prefill` and residual macros;
+[reference.rs](../src/cuda/reference.rs), lines 92-210;
+[ktransformers.rs](../src/ktransformers.rs), lines 117-164 and 261-355.
 
 ### 8.2 Existing measurements, with scope limits
 
@@ -941,35 +941,35 @@ independently revalidated against every raw sample.
 | Fresh retained external control | llama.cpp F32-KV prefill remains **4.76x/4.33x/5.99x** faster at46/256/512 tokens; short decode344.64 versus Rust176.30tok/s (**1.95x**) | Same retained acceptance series, external revision recorded below. Rust ABBA precedes llama controls, timing boundaries/arithmetic differ, and 1-token-prefix decode IDs differ across engines. No cross-engine equivalence or overall superiority |
 
 Evidence:
-[packed comparison](../runtime/results/rust-packed-smollm2-run2/comparison.json),
+[packed comparison](../results/rust-packed-smollm2-run2/comparison.json),
 `summary.short`;
-[CPU policies](../runtime/results/rust-cpu-policies-run1/validation.json),
+[CPU policies](../results/rust-cpu-policies-run1/validation.json),
 `variants`;
-[CPU discussion](../runtime/README.md), section "Packed CPU results and measured policies";
-[wave6c checkpoint](../runtime/results/cuda-runtime-m8-wave6c/checkpoint.json),
+[CPU discussion](../README.md), section "Packed CPU results and measured policies";
+[wave6c checkpoint](../results/cuda-runtime-m8-wave6c/checkpoint.json),
 `profile`, `performance`, `performance_gates`, `moe_memory`, `profiling`, `caveats`;
-[paired samples](../runtime/results/cuda-runtime-m8-wave6c/paired-public-profile/paired.json);
-[matched-precision checkpoint](../runtime/results/moe-numerical-fix/checkpoint.json);
-[INT8 quality](../runtime/results/cuda-runtime-m8-int8-model/quality-summary.json);
-[MMA3 quality](../runtime/results/cuda-runtime-m8-mma3-small-model/quality-summary.json),
-[unchanged snapshots](../runtime/results/cuda-runtime-m8-mma3-small-model/checkpoint.json),
-[small capacities](../runtime/results/cuda-runtime-m8-mma3-small-model/small-capacity-summary.json);
-[attention quality](../runtime/results/cuda-runtime-m8-attention-normalized/quality-summary.json),
-[attention performance](../runtime/results/cuda-runtime-m8-attention-normalized/performance-summary.json);
-[small-prefix performance](../runtime/results/cuda-runtime-m8-mma3-small-acceptance/performance-summary.json),
-[paired controls](../runtime/results/cuda-runtime-m8-mma3-small-acceptance/paired/paired.json),
-[candidate memory/options](../runtime/results/cuda-runtime-m8-mma3-small-acceptance/paired/b1/moe-short.json),
-[diagnostic attribution](../runtime/results/cuda-runtime-m8-mma3-small-acceptance/profile-summary.json),
-[external comparison](../runtime/results/cuda-runtime-m8-mma3-small-acceptance/comparison.json).
+[paired samples](../results/cuda-runtime-m8-wave6c/paired-public-profile/paired.json);
+[matched-precision checkpoint](../results/moe-numerical-fix/checkpoint.json);
+[INT8 quality](../results/cuda-runtime-m8-int8-model/quality-summary.json);
+[MMA3 quality](../results/cuda-runtime-m8-mma3-small-model/quality-summary.json),
+[unchanged snapshots](../results/cuda-runtime-m8-mma3-small-model/checkpoint.json),
+[small capacities](../results/cuda-runtime-m8-mma3-small-model/small-capacity-summary.json);
+[attention quality](../results/cuda-runtime-m8-attention-normalized/quality-summary.json),
+[attention performance](../results/cuda-runtime-m8-attention-normalized/performance-summary.json);
+[small-prefix performance](../results/cuda-runtime-m8-mma3-small-acceptance/performance-summary.json),
+[paired controls](../results/cuda-runtime-m8-mma3-small-acceptance/paired/paired.json),
+[candidate memory/options](../results/cuda-runtime-m8-mma3-small-acceptance/paired/b1/moe-short.json),
+[diagnostic attribution](../results/cuda-runtime-m8-mma3-small-acceptance/profile-summary.json),
+[external comparison](../results/cuda-runtime-m8-mma3-small-acceptance/comparison.json).
 Earlier matrix-only and primitive reconstruction improvements do not independently
 establish full-model quality. Latest admission remains explicitly scoped and
 **neither changes the default nor promotes production arithmetic**.
 
 **Provenance qualification:** all 38 entries in the latest
-[b1 candidate provenance](../runtime/results/cuda-runtime-m8-mma3-small-acceptance/paired/b1/provenance.json)
+[b1 candidate provenance](../results/cuda-runtime-m8-mma3-small-acceptance/paired/b1/provenance.json)
 matched the refreshed working tree. Recorded candidate binary SHA-256 is
 `738cb1c517d4401a278804eb4698599d408ef42485265287be97af753574f2a2`;
-the [acceptance checkpoint](../runtime/results/cuda-runtime-m8-mma3-small-acceptance/checkpoint.json)
+the [acceptance checkpoint](../results/cuda-runtime-m8-mma3-small-acceptance/checkpoint.json)
 also retains a source-archive digest. External llama.cpp revision is
 `6b01a4767f8d3d0c416c410a49861333965c0982`. Historical wave6c hashes are not
 current-source identity. Manifest equality does not prove complete build-input
@@ -982,15 +982,15 @@ experiments require separately approved workloads/tooling; they were not run.
 
 | H | Mechanism and source | Concrete confirmation/rejection experiment |
 | --- | --- | --- |
-| H1: startup peak limits usable model size before numerical admission | Full GGUF bytes coexist with owned tensor copies; budget follows parsing. Metadata utilities also read the full file ([gguf.rs](../runtime/src/gguf.rs), lines 226-239; [cuda.rs](../runtime/src/cuda.rs), `DeviceTensor::upload`) | On provisioned fixtures, measure open-only elapsed time, peak RSS/PSS, bytes read and minor/major faults separately for metadata, packed open, expanded open and CUDA upload. Test cold/warm file-cache conditions without claiming they are equivalent |
-| H2: CPU prefill/decode have different optimal thread/chunk policies | Row-parallel products reuse blocks across batch tokens, then transpose; attention loops remain serial over tokens/heads ([kernels.rs](../runtime/src/kernels.rs), line 231; [cpu.rs](../runtime/src/cpu.rs), line 485) | Sweep approved thread/chunk counts; sample time in packed decode/dot, transpose, attention and Rayon scheduling; record cycles, cache misses, core utilization and output/logit gates. Reject one-size-fits-all tuning if workload rankings differ |
-| H3: launch/readback overhead matters most for small CUDA work | One stream, many per-layer launches, full-vocabulary D2H and host greedy without graph ([cuda.rs](../runtime/src/cuda.rs), `step` and `finish_evaluation`) | Compare matched graph off/on and full-logit/token-only requests; collect CPU submission gaps, launch count/time, D2H bytes/time, device active time and synchronized latency by prompt/output length. Keep matmul/precision/model fixed |
-| H4: expert imbalance and decode/reuse cost constrain long MoE prefill | Top-k assignments grouped by repeated per-expert scans, variable counts, shape-guarded tiles; projections dominate historical and latest diagnostic traces ([prefill.cu](../runtime/src/cuda/prefill.cu), grouping kernels; [batch.rs](../runtime/src/cuda/batch.rs), `integer_groups`) | Use bounded real routing/operand replay: histogram counts and padding, time grouping/gate/up/down separately, measure DRAM traffic, cache behavior, instructions, achieved occupancy/stalls. Require full-model ABBA and bitwise gates for structural changes, explicit full-vector quality gates for approximate modes |
-| H5: long-context attention becomes material after projection improvements | F32 KV reads grow with live positions; fused context capped at 1024, fallback score workspace scales with batch/heads/context ([cpu.rs](../runtime/src/cpu.rs), `attend`, line 200; [cuda.rs](../runtime/src/cuda.rs), `workspace_sizes`) | Sweep supported context lengths with constant generation count; measure attention fraction, KV bytes/read bandwidth, score workspace and latency per output position. Distinguish algorithmic growth from device-memory pressure |
-| H6: caching/speculation can lose to their copies/verification | Prefix copies KV/logits; draft scan plus all-position vocabulary projection can outweigh skipped scalar steps ([cpu.rs](../runtime/src/cpu.rs), lines 708-769 and 844-931) | Measure cold/warm separately; report prefix hit length, copy bytes/time, snapshot time, proposals/acceptance, verification time and total request latency on repetitive and non-repetitive prompts |
-| H7: repeated CLI invocation wastes reusable initialization | One process loads once, but separate invocations reconstruct model/tokenizer/pool/JIT/graph ([main.rs](../runtime/src/main.rs), line 365; [cache.rs](../runtime/src/cuda/cache.rs), line 32) | Compare approved repeated-process completions with repeated calls through one embedded backend; separate load, JIT/cache, capture, reset, numerical work and serialization. Report throughput and aggregate host/VRAM usage, not only warm phase time |
-| H8: slow remote results may be service or transport, not Rust kernels | Blocking request timing includes body parse and opaque server work ([ktransformers.rs](../runtime/src/ktransformers.rs), line 318) | Correlate client elapsed with service queue/tokenizer/prefill/decode metrics and request IDs where supported; measure payload size and response parse time. Without server instrumentation leave phase attribution unknown |
-| H9: residual conversion/grouping break-even is shape- and hardware-dependent | Extra preparation launches, three component planes and tile32 padding can outweigh integer reuse for short/sparse inputs; guard32 is validated only on the retained Qwen3 shape ([batch.rs](../runtime/src/cuda/batch.rs), `residual_projection`, shared preparation and `integer_groups`; [residual_mma.cu](../runtime/src/cuda/residual_mma.cu)) | Sweep actual chunk31/32/33/46/128/255/256 and expert-count distributions with captured real operands. Include quantization, group construction and padding in projection time, memory/workspace and end-to-end ABBA; repeat full-vector/teacher-forced/generated-ID gates before extending eligibility or models |
+| H1: startup peak limits usable model size before numerical admission | Full GGUF bytes coexist with owned tensor copies; budget follows parsing. Metadata utilities also read the full file ([gguf.rs](../src/gguf.rs), lines 226-239; [cuda.rs](../src/cuda.rs), `DeviceTensor::upload`) | On provisioned fixtures, measure open-only elapsed time, peak RSS/PSS, bytes read and minor/major faults separately for metadata, packed open, expanded open and CUDA upload. Test cold/warm file-cache conditions without claiming they are equivalent |
+| H2: CPU prefill/decode have different optimal thread/chunk policies | Row-parallel products reuse blocks across batch tokens, then transpose; attention loops remain serial over tokens/heads ([kernels.rs](../src/kernels.rs), line 231; [cpu.rs](../src/cpu.rs), line 485) | Sweep approved thread/chunk counts; sample time in packed decode/dot, transpose, attention and Rayon scheduling; record cycles, cache misses, core utilization and output/logit gates. Reject one-size-fits-all tuning if workload rankings differ |
+| H3: launch/readback overhead matters most for small CUDA work | One stream, many per-layer launches, full-vocabulary D2H and host greedy without graph ([cuda.rs](../src/cuda.rs), `step` and `finish_evaluation`) | Compare matched graph off/on and full-logit/token-only requests; collect CPU submission gaps, launch count/time, D2H bytes/time, device active time and synchronized latency by prompt/output length. Keep matmul/precision/model fixed |
+| H4: expert imbalance and decode/reuse cost constrain long MoE prefill | Top-k assignments grouped by repeated per-expert scans, variable counts, shape-guarded tiles; projections dominate historical and latest diagnostic traces ([prefill.cu](../src/cuda/prefill.cu), grouping kernels; [batch.rs](../src/cuda/batch.rs), `integer_groups`) | Use bounded real routing/operand replay: histogram counts and padding, time grouping/gate/up/down separately, measure DRAM traffic, cache behavior, instructions, achieved occupancy/stalls. Require full-model ABBA and bitwise gates for structural changes, explicit full-vector quality gates for approximate modes |
+| H5: long-context attention becomes material after projection improvements | F32 KV reads grow with live positions; fused context capped at 1024, fallback score workspace scales with batch/heads/context ([cpu.rs](../src/cpu.rs), `attend`, line 200; [cuda.rs](../src/cuda.rs), `workspace_sizes`) | Sweep supported context lengths with constant generation count; measure attention fraction, KV bytes/read bandwidth, score workspace and latency per output position. Distinguish algorithmic growth from device-memory pressure |
+| H6: caching/speculation can lose to their copies/verification | Prefix copies KV/logits; draft scan plus all-position vocabulary projection can outweigh skipped scalar steps ([cpu.rs](../src/cpu.rs), lines 708-769 and 844-931) | Measure cold/warm separately; report prefix hit length, copy bytes/time, snapshot time, proposals/acceptance, verification time and total request latency on repetitive and non-repetitive prompts |
+| H7: repeated CLI invocation wastes reusable initialization | One process loads once, but separate invocations reconstruct model/tokenizer/pool/JIT/graph ([main.rs](../src/main.rs), line 365; [cache.rs](../src/cuda/cache.rs), line 32) | Compare approved repeated-process completions with repeated calls through one embedded backend; separate load, JIT/cache, capture, reset, numerical work and serialization. Report throughput and aggregate host/VRAM usage, not only warm phase time |
+| H8: slow remote results may be service or transport, not Rust kernels | Blocking request timing includes body parse and opaque server work ([ktransformers.rs](../src/ktransformers.rs), line 318) | Correlate client elapsed with service queue/tokenizer/prefill/decode metrics and request IDs where supported; measure payload size and response parse time. Without server instrumentation leave phase attribution unknown |
+| H9: residual conversion/grouping break-even is shape- and hardware-dependent | Extra preparation launches, three component planes and tile32 padding can outweigh integer reuse for short/sparse inputs; guard32 is validated only on the retained Qwen3 shape ([batch.rs](../src/cuda/batch.rs), `residual_projection`, shared preparation and `integer_groups`; [residual_mma.cu](../src/cuda/residual_mma.cu)) | Sweep actual chunk31/32/33/46/128/255/256 and expert-count distributions with captured real operands. Include quantization, group construction and padding in projection time, memory/workspace and end-to-end ABBA; repeat full-vector/teacher-forced/generated-ID gates before extending eligibility or models |
 
 ## 9. Extension points and prioritized opportunities
 
@@ -1069,13 +1069,13 @@ vectors, finite values, maximum absolute error <=0.01, cosine >=0.99999, and
 matching argmax in the CUDA checker; exact generated IDs/reset/chunk checks are
 separate gates. CPU historical external-oracle thresholds differ and must not be
 silently substituted
-([tests/cpu.rs](../runtime/tests/cpu.rs), lines 119-455;
-[tests/cuda.rs](../runtime/tests/cuda.rs), lines 215-646;
-[tests/ktransformers.rs](../runtime/tests/ktransformers.rs), lines 137-696;
-[validate_cuda.py](../runtime/scripts/validate_cuda.py), lines 14-27;
-[validate_rust_logits.py](../runtime/scripts/validate_rust_logits.py), `compare_logits`, line 11).
+([tests/cpu.rs](../tests/cpu.rs), lines 119-455;
+[tests/cuda.rs](../tests/cuda.rs), lines 215-646;
+[tests/ktransformers.rs](../tests/ktransformers.rs), lines 137-696;
+[validate_cuda.py](../scripts/validate_cuda.py), lines 14-27;
+[validate_rust_logits.py](../scripts/validate_rust_logits.py), `compare_logits`, line 11).
 
-The ignored [model_quality.rs](../runtime/src/cuda/model_quality.rs),
+The ignored [model_quality.rs](../src/cuda/model_quality.rs),
 `residual_full_model_quality`, writes complete per-step vocabulary vectors and
 hashes separately from teacher-forced and freely generated token schedules.
 It checks selected-profile workspace bytes/reuse, a budget one byte below the

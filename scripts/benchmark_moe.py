@@ -181,7 +181,7 @@ def main():
     gguf = ROOT / "models/benchmark-qwen3/gguf"
     llama = ROOT / "target/benchmark-llama-cuda13/bin/llama-server"
     adapter = ROOT / "target/release/ktransformers"
-    rust = ROOT / "target/release/local-inference"
+    rust = ROOT / "target/release/palito"
     manifest = json.loads((model.parent / "models-lock.json").read_text())
     for source in manifest:
         folder = model if source["repository"].endswith("A3B") else gguf

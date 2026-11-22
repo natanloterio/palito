@@ -1,6 +1,6 @@
 #![cfg(feature = "cuda")]
 
-use local_inference::{
+use palito::{
     Config,
     backend::Backend,
     cpu::CpuBackend,
@@ -258,11 +258,11 @@ fn qwen35_lifecycle(cuda: bool) {
             ..CudaOptions::default()
         };
         assert!(
-            local_inference::cuda::open_backend(path, &config, options)
+            palito::cuda::open_backend(path, &config, options)
                 .err()
                 .is_some_and(|e| e.to_string().contains("without a decode graph"))
         );
-        local_inference::cuda::open_backend(path, &config, CudaOptions::default()).unwrap()
+        palito::cuda::open_backend(path, &config, CudaOptions::default()).unwrap()
     } else {
         Box::new(ReferenceBackend::open(path, &config).unwrap())
     };

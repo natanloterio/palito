@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use local_inference::{
+use palito::{
     Error, GenerationMode, Result,
     backend::{CompletionRequest, GenerationInput, RequestBackend},
     ktransformers::{API_SOURCE_REVISION, KTransformersBackend, KTransformersConfig},

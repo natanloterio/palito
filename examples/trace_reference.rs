@@ -1,5 +1,5 @@
 use clap::Parser;
-use local_inference::{Config, Result, backend::Backend, cuda::reference::ReferenceBackend};
+use palito::{Config, Result, backend::Backend, cuda::reference::ReferenceBackend};
 use std::{fs, path::PathBuf};
 
 #[derive(Parser)]
@@ -16,7 +16,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let ids: Vec<i32> = serde_json::from_slice(&fs::read(args.input)?)?;
     if ids.is_empty() || ids.len() > 1024 {
-        return Err(local_inference::Error::Invalid(
+        return Err(palito::Error::Invalid(
             "trace needs 1..=1024 tokens".into(),
         ));
     }

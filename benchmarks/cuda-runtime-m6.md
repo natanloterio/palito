@@ -215,10 +215,10 @@ From the runtime directory, using the already provisioned models/toolkit:
 ```sh
 export CUDA_ROOT="$PWD/.venv-cuda-bench/lib/python3.11/site-packages/nvidia/cu13"
 export LD_LIBRARY_PATH="$CUDA_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-cargo build --release --locked --features cuda,ktransformers --examples --bin local-inference
+cargo build --release --locked --features cuda,ktransformers --examples --bin palito
 
 # Select only for the measured long-MoE workload; F32 is still the default.
-target/release/local-inference bench --backend cuda \
+target/release/palito bench --backend cuda \
   --model models/benchmark-qwen3/gguf/Qwen3-30B-A3B-Q4_K_M.gguf \
   --input-tokens-file results/cuda-runtime-m6/accepted-f32/moe-prefill-input.json \
   --context 1024 --batch 128 --prefill-chunk 128 --threads 4 \
@@ -248,7 +248,7 @@ python3 scripts/validate_cuda.py --cuda-root "$CUDA_ROOT" \
   --output-dir results/cuda-m6-NEW-VALIDATION
 ```
 
-Cargo integration-test builds can replace `target/release/local-inference` with
+Cargo integration-test builds can replace `target/release/palito` with
 a different feature-unification build. Always select the immutable executable
 for validation; the validator records its hash before/after and all CUDA sources.
 

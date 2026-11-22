@@ -60,7 +60,7 @@ def main():
     save("provenance.json", {
         "model_sha256": digest(model), "reference_f32_sha256": digest(f32_model),
         "reference_sha256": digest(reference),
-        "rust_sha256": digest(ROOT / "target/release/local-inference"),
+        "rust_sha256": digest(ROOT / "target/release/palito"),
         "thresholds": limits,
         "scope": "Rust loads original quantized GGUF; external oracle loads explicit F32 dequantization; reference KV remains F16",
     })
@@ -69,7 +69,7 @@ def main():
         save(f"{name}-input.json", tokens)
         text_path = directory / f"{name}-input.txt"
         text_path.write_text(" ".join(map(str, tokens)) + "\n")
-        rust = run([ROOT / "target/release/local-inference", "logits", "--model", model,
+        rust = run([ROOT / "target/release/palito", "logits", "--model", model,
                     "--input-tokens-file", directory / f"{name}-input.json",
                     "--context", 512, "--batch", 128, "--prefill-chunk", 64])
         cpp = run([reference, f32_model, text_path, 512, 128, 64, 4, 1, 1, 1, "v3-logits"])

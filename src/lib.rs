@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod chat;
 pub mod engine;
+pub mod grammar;
 pub mod ffi;
 pub mod sampling;
 pub mod stop;
@@ -213,13 +214,27 @@ impl<B: Backend> Executor<B> {
         max_tokens: u32,
         mode: GenerationMode,
         sampler: &mut sampling::Sampler,
+        on_token: impl FnMut(i32) -> Result<()>,
+    ) -> Result<Sample> {
+        self.generate_constrained(prompt, max_tokens, mode, sampler, None, on_token)
+    }
+
+    /// `generate_sampled` with each token restricted to what `constraint`
+    /// allows (a greedy `sampler` takes the best allowed token).
+    pub fn generate_constrained(
+        &mut self,
+        prompt: &[i32],
+        max_tokens: u32,
+        mode: GenerationMode,
+        sampler: &mut sampling::Sampler,
+        mut constraint: Option<&mut grammar::Constraint>,
         mut on_token: impl FnMut(i32) -> Result<()>,
     ) -> Result<Sample> {
         self.check_request(prompt, max_tokens)?;
         let start = Instant::now();
         let cached_prompt_tokens = self.prefill(prompt, true)?;
         let prefill_ns = nanos(start);
-        let first = self.draw(sampler)?;
+        let first = self.draw(sampler, constraint.as_deref_mut())?;
         let ttft_ns = nanos(start);
         on_token(first)?;
         let mut generated_tokens = vec![first];
@@ -231,7 +246,7 @@ impl<B: Backend> Executor<B> {
             }
             let position = (prompt.len() + generated_tokens.len() - 1) as u32;
             self.backend.evaluate(&[last], position)?;
-            let token = self.draw(sampler)?;
+            let token = self.draw(sampler, constraint.as_deref_mut())?;
             on_token(token)?;
             generated_tokens.push(token);
         }
@@ -247,12 +262,19 @@ impl<B: Backend> Executor<B> {
         })
     }
 
-    fn draw(&mut self, sampler: &mut sampling::Sampler) -> Result<i32> {
+    fn draw(
+        &mut self,
+        sampler: &mut sampling::Sampler,
+        constraint: Option<&mut grammar::Constraint>,
+    ) -> Result<i32> {
         let logits = self.backend.logits()?;
         if logits.len() != self.info().vocab_tokens as usize {
             return Err(Error::Backend("logits do not cover the vocabulary".into()));
         }
-        sampler.sample(logits)
+        match constraint {
+            None => sampler.sample(logits),
+            Some(constraint) => constraint.sample(logits, |masked| sampler.sample(masked)),
+        }
     }
 
     fn check_request(&self, prompt: &[i32], max_tokens: u32) -> Result<()> {

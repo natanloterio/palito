@@ -176,6 +176,6 @@ fn run(engine: &mut Engine, job: Job) {
 /// Whether the rendered prompt already opens a `<think>` block.
 fn opens_reasoning(engine: &Engine, messages: &[Message], options: &GenerationOptions) -> bool {
     engine
-        .render_chat(messages, options.enable_thinking)
+        .render_chat(messages, options.thinking())
         .is_ok_and(|prompt| prompt.trim_end().ends_with("<think>"))
 }

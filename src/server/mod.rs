@@ -221,9 +221,10 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
             request.messages()?,
             request.sampling.resolve(&state.sampling)?,
             request.stop()?,
+            request.json_schema()?,
         ))
     });
-    let (messages, sampling, stop) = match parsed {
+    let (messages, sampling, stop, json_schema) = match parsed {
         Ok(parsed) => parsed,
         Err(message) => return invalid(&message),
     };
@@ -232,6 +233,7 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         enable_thinking: request.enable_thinking(),
         sampling,
         stop,
+        json_schema,
     };
     let reply = Respond {
         kind: Kind::Chat,
@@ -252,9 +254,10 @@ async fn completions(State(state): State<AppState>, body: Bytes) -> Response {
             request.prompt()?,
             request.sampling.resolve(&state.sampling)?,
             request.stop()?,
+            request.json_schema()?,
         ))
     });
-    let (prompt, sampling, stop) = match parsed {
+    let (prompt, sampling, stop, json_schema) = match parsed {
         Ok(parsed) => parsed,
         Err(message) => return invalid(&message),
     };
@@ -263,6 +266,7 @@ async fn completions(State(state): State<AppState>, body: Bytes) -> Response {
         enable_thinking: true,
         sampling,
         stop,
+        json_schema,
     };
     let reply = Respond {
         kind: Kind::Text,

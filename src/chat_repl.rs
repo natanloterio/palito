@@ -181,6 +181,7 @@ impl Session {
                 enable_thinking: !args.no_thinking,
                 sampling: args.sampling.sampling(),
                 stop: args.stop.clone(),
+                json_schema: None,
             },
             history: initial.clone(),
             initial,
@@ -261,7 +262,7 @@ impl Session {
     fn prompt_tokens(&self, messages: &[Message]) -> Result<usize> {
         let prompt = self
             .engine
-            .render_chat(messages, self.options.enable_thinking)?;
+            .render_chat(messages, self.options.thinking())?;
         Ok(self.engine.tokenize(&prompt)?.len())
     }
 }

@@ -196,6 +196,11 @@ pub(crate) struct RuntimeArgs {
     #[cfg(feature = "cuda")]
     #[arg(long, conflicts_with = "cuda_decode_graph")]
     no_cuda_decode_graph: bool,
+    /// Re-evaluate the whole conversation every turn instead of reusing the
+    /// previous prompt's KV cache (chat with --backend cuda).
+    #[cfg(feature = "cuda")]
+    #[arg(long)]
+    no_prefix_cache: bool,
     /// --context defaulted to the model's trained context (chat): CUDA may shrink it
     /// to fit device memory.
     #[arg(skip)]
@@ -308,7 +313,8 @@ impl RuntimeArgs {
                         .cuda_matmul
                         .is_some_and(|m| m != palito::cuda::CudaMatmul::F32)
                     || self.cuda_decode_graph
-                    || self.no_cuda_decode_graph)
+                    || self.no_cuda_decode_graph
+                    || self.no_prefix_cache)
             {
                 return Err(palito::Error::Invalid(
                     "CUDA options require --backend cuda".into(),
@@ -406,6 +412,7 @@ impl RuntimeArgs {
                 None
             },
             chat_template: None,
+            prefix_cache: !self.no_prefix_cache,
         })
     }
 

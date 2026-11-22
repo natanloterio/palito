@@ -175,6 +175,9 @@ impl CudaBackend {
         }
         self.state.valid = false;
         self.state.failed = true;
+        if let Some(prefix) = &mut self.prefix {
+            prefix.overwrite(self.state.position);
+        }
         self.prepare_decode(first, self.state.position, 1)?;
         let decode = self.decode.as_mut().unwrap();
         self.stream

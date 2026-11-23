@@ -13,7 +13,7 @@ use crate::{
     Config, Error, Executor, GenerationMode, Result, Sample,
     backend::Backend,
     chat::{ChatTemplate, Message},
-    grammar::{JsonDecoder, JsonSchema},
+    grammar::{JsonDecoder, JsonSchema, LogitConstraint},
     sampling::{Sampler, Sampling},
     stop::{self, StopFilter},
     stream::TextStream,
@@ -330,7 +330,7 @@ impl Engine {
                 budget,
                 mode,
                 &mut sampler,
-                constraint.as_mut(),
+                constraint.as_mut().map(|c| c as &mut dyn LogitConstraint),
                 &mut on_token,
             )
         };

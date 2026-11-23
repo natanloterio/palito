@@ -23,7 +23,7 @@ use std::sync::{Arc, OnceLock};
 
 /// Score given to tokens the grammar forbids: finite, so the sampler's
 /// nonfinite-logit check still guards real logits, and `exp` of it is 0.
-const MASKED_LOGIT: f32 = f32::MIN;
+pub(crate) const MASKED_LOGIT: f32 = f32::MIN;
 
 /// Longest whitespace run between two JSON tokens: a newline plus indentation.
 const MAX_WHITESPACE: usize = 32;
@@ -209,6 +209,27 @@ impl TokenizerEnv for TrieEnv {
     }
 }
 
+/// Restricts the logits of each generated token.
+pub trait LogitConstraint {
+    /// Draws the next token with `pick` over the restricted logits and
+    /// advances past it.
+    fn sample(
+        &mut self,
+        logits: &[f32],
+        pick: &mut dyn FnMut(&[f32]) -> Result<i32>,
+    ) -> Result<i32>;
+}
+
+impl LogitConstraint for Constraint {
+    fn sample(
+        &mut self,
+        logits: &[f32],
+        pick: &mut dyn FnMut(&[f32]) -> Result<i32>,
+    ) -> Result<i32> {
+        Constraint::sample(self, logits, |masked| pick(masked))
+    }
+}
+
 /// One request's grammar state.
 pub struct Constraint {
     matcher: Matcher,
@@ -245,6 +266,44 @@ impl Constraint {
         }
         self.accept(token)?;
         Ok(token)
+    }
+
+    /// Like `sample` for the body of a tool call: once the JSON is complete,
+    /// `close` is allowed and the end of generation is not. Returns the token
+    /// and whether it closed the call.
+    pub(crate) fn sample_call(
+        &mut self,
+        logits: &[f32],
+        close: i32,
+        pick: &mut dyn FnMut(&[f32]) -> Result<i32>,
+    ) -> Result<(i32, bool)> {
+        self.mask_logits(logits)?;
+        let complete = self.is_complete();
+        if complete {
+            self.swap_end_for(close, logits);
+        }
+        let mut token = pick(&self.masked)?;
+        if !self.allowed(token) {
+            token = self.best_allowed()?;
+        }
+        if complete && token == close {
+            return Ok((token, true));
+        }
+        self.accept(token)?;
+        Ok((token, false))
+    }
+
+    fn swap_end_for(&mut self, close: i32, logits: &[f32]) {
+        for &token in self.eog.iter() {
+            self.mask.disallow_token(token);
+            if let Some(slot) = self.masked.get_mut(token as usize) {
+                *slot = MASKED_LOGIT;
+            }
+        }
+        if let Some(&logit) = logits.get(close as usize) {
+            self.mask.allow_token(close as u32);
+            self.masked[close as usize] = logit;
+        }
     }
 
     fn mask_logits(&mut self, logits: &[f32]) -> Result<()> {

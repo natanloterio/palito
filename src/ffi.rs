@@ -27,6 +27,8 @@ use std::{
 pub const PALITO_DEVICE_DEFAULT: c_int = 0;
 pub const PALITO_DEVICE_CPU: c_int = 1;
 pub const PALITO_DEVICE_CUDA: c_int = 2;
+pub const PALITO_DEVICE_VULKAN: c_int = 3;
+pub const PALITO_DEVICE_METAL: c_int = 4;
 
 pub const PALITO_FINISH_STOP: c_int = 0;
 pub const PALITO_FINISH_LENGTH: c_int = 1;
@@ -342,6 +344,8 @@ unsafe fn engine_options(options: &PalitoOptions) -> crate::Result<EngineOptions
         PALITO_DEVICE_DEFAULT => defaults.device,
         PALITO_DEVICE_CPU => Device::Cpu,
         PALITO_DEVICE_CUDA => Device::Cuda,
+        PALITO_DEVICE_VULKAN => Device::Vulkan,
+        PALITO_DEVICE_METAL => Device::Metal,
         other => return Err(Error::Invalid(format!("unknown device {other}"))),
     };
     let kernel_cache_dir = if options.kernel_cache_dir.is_null() {

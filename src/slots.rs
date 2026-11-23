@@ -1,5 +1,9 @@
 //! Server slots: several sequences taking turns on one device.
 
+mod run;
+
+pub use run::{Advance, SlotRun};
+
 use crate::{Error, Result, backend::Backend};
 
 pub const MAX_SLOTS: u32 = 64;

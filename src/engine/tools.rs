@@ -1,19 +1,23 @@
 //! Chat with tool calling. Separate from `Engine::generate`, so requests
 //! without tools keep their decode path.
 
-use super::{Completion, Engine, FinishReason, GenerationOptions, TokenClock, decode_rate};
+use super::{
+    Completion, Engine, GenerationOptions, ReplyOutput,
+    output::ToolOutput,
+    run_stats,
+};
 use crate::{
     Error, GenerationMode, Result,
     chat::{Message, ToolFormat},
     grammar::{Constraint, LogitConstraint},
     sampling::Sampler,
-    stop::{self, StopFilter},
+    stop,
     tools::{
-        TokenRole, ToolCall, ToolEvent, ToolGate, ToolMode, ToolSpec, ToolStream, ToolTokens,
+        TokenRole, ToolCall, ToolEvent, ToolGate, ToolMode, ToolSpec, ToolTokens,
         call_grammar::call_grammar,
     },
 };
-use std::cell::Cell;
+use std::{cell::Cell, rc::Rc};
 
 const CALL_OPEN: &str = "<tool_call>";
 const CALL_CLOSE: &str = "</tool_call>";
@@ -29,12 +33,12 @@ pub struct ToolCompletion {
 
 /// Publishes each token's role to the token callback, which runs while the
 /// executor holds the gate.
-struct RoleGate<'a> {
+struct RoleGate {
     gate: ToolGate,
-    role: &'a Cell<TokenRole>,
+    role: Rc<Cell<TokenRole>>,
 }
 
-impl LogitConstraint for RoleGate<'_> {
+impl LogitConstraint for RoleGate {
     fn sample(
         &mut self,
         logits: &[f32],
@@ -43,79 +47,6 @@ impl LogitConstraint for RoleGate<'_> {
         let token = self.gate.sample(logits, pick)?;
         self.role.set(self.gate.last_role());
         Ok(token)
-    }
-}
-
-/// Applies stop sequences to text and forwards events to the caller.
-struct EventSink<'s, F> {
-    stream: ToolStream,
-    /// None when stop sequences do not apply (a call is required).
-    stops: Option<StopFilter<'s>>,
-    on_event: F,
-    text: String,
-    cancelled: bool,
-    stopped: bool,
-}
-
-impl<F: FnMut(ToolEvent) -> bool> EventSink<'_, F> {
-    fn token(&mut self, role: TokenRole, piece: &[u8]) -> Result<()> {
-        let events = self.stream.push(role, piece);
-        self.deliver(events)
-    }
-
-    fn finish(&mut self) -> Result<()> {
-        let events = self.stream.finish();
-        self.deliver(events)?;
-        self.release_held()
-    }
-
-    fn deliver(&mut self, events: Vec<ToolEvent>) -> Result<()> {
-        for event in events {
-            match event {
-                ToolEvent::Text(text) => self.text_piece(text)?,
-                other => {
-                    self.release_held()?;
-                    self.send(other)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn text_piece(&mut self, text: String) -> Result<()> {
-        let Some(stops) = &mut self.stops else {
-            return self.send_text(text);
-        };
-        let released = stops.push(&text);
-        let stopped = stops.stopped();
-        if !released.is_empty() {
-            self.send_text(released)?;
-        }
-        if stopped {
-            self.stopped = true;
-            return Err(Error::Cancelled);
-        }
-        Ok(())
-    }
-
-    /// Text held as a possible stop sequence, before a call or the end.
-    fn release_held(&mut self) -> Result<()> {
-        let held = self.stops.as_mut().map(StopFilter::finish).unwrap_or_default();
-        if held.is_empty() { Ok(()) } else { self.send_text(held) }
-    }
-
-    fn send_text(&mut self, text: String) -> Result<()> {
-        self.text.push_str(&text);
-        self.send(ToolEvent::Text(text))
-    }
-
-    fn send(&mut self, event: ToolEvent) -> Result<()> {
-        if (self.on_event)(event) {
-            Ok(())
-        } else {
-            self.cancelled = true;
-            Err(Error::Cancelled)
-        }
     }
 }
 
@@ -162,35 +93,22 @@ impl Engine {
         let prompt = self.render_chat_tools(messages, spec, options.enable_thinking)?;
         let tokens = self.executor.tokenize(&prompt)?;
         let (budget, room) = self.reply_budget(tokens.len(), options.max_tokens)?;
-        let role = Cell::new(TokenRole::Text);
-        let mut gate = RoleGate { gate: self.tool_gate(spec, &prompt)?, role: &role };
+        let role = Rc::new(Cell::new(TokenRole::Text));
+        let mut gate = RoleGate { gate: self.tool_gate(spec, &prompt)?, role: role.clone() };
         for warning in &spec.warnings {
             eprintln!("warning: {warning}");
         }
         let applies_stops = matches!(spec.mode, ToolMode::Auto | ToolMode::Forbidden);
-        let mut sink = EventSink {
-            stream: ToolStream::new(),
-            stops: applies_stops.then(|| StopFilter::new(&options.stop)),
-            on_event,
-            text: String::new(),
-            cancelled: false,
-            stopped: false,
-        };
-        let mut clock = TokenClock::new();
-        let mut generated = Vec::new();
-        let tokenizer = &self.tokenizer;
+        let plan = self.reply_plan(tokens.len(), budget, room);
+        let stops = applies_stops.then_some(options.stop.as_slice());
+        let mut output = ToolOutput::new(plan, role, stops, on_event);
         let result = self.executor.generate_constrained(
             &tokens,
             budget,
             GenerationMode::UntilEog,
             &mut sampler,
             Some(&mut gate as &mut dyn LogitConstraint),
-            |token| {
-                clock.tick();
-                generated.push(token);
-                let piece = usize::try_from(token).ok().and_then(|id| tokenizer.token_bytes(id));
-                sink.token(role.get(), piece.unwrap_or_default())
-            },
+            |token| output.token(token),
         );
         let sample = match result {
             Ok(sample) => Some(sample),
@@ -198,37 +116,9 @@ impl Engine {
             Err(error) => return Err(error),
         };
         if sample.is_some() {
-            match sink.finish() {
-                Ok(()) | Err(Error::Cancelled) => {}
-                Err(error) => return Err(error),
-            }
+            output.drain()?;
         }
-        let ended = generated.last().is_some_and(|&t| self.executor.is_eog(t));
-        let finish_reason = if sink.cancelled {
-            FinishReason::Cancelled
-        } else if sink.stopped || ended {
-            FinishReason::Stop
-        } else if budget < room {
-            FinishReason::Length
-        } else {
-            FinishReason::ContextFull
-        };
-        let (ttft_ns, tokens_per_second) = match &sample {
-            Some(sample) => (sample.ttft_ns, decode_rate(sample)),
-            None => clock.stats(),
-        };
-        Ok(ToolCompletion {
-            completion: Completion {
-                text: sink.text.trim().to_owned(),
-                finish_reason,
-                prompt_tokens: tokens.len(),
-                cached_tokens: sample.as_ref().map_or(0, |s| s.cached_prompt_tokens),
-                generated_tokens: generated.len(),
-                ttft_ns,
-                tokens_per_second,
-            },
-            calls: sink.stream.calls().to_vec(),
-        })
+        output.complete(sample.as_ref().map(run_stats))
     }
 
     fn reply_budget(&self, prompt: usize, max_tokens: Option<u32>) -> Result<(u32, u32)> {

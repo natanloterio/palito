@@ -7,10 +7,14 @@
 //! chat`, `palito serve` and the C API (`crate::ffi`) all build on this type.
 
 mod open;
+mod output;
 mod text;
 mod tools;
 
+pub use output::SlotReply;
 pub use tools::ToolCompletion;
+
+pub(crate) use output::{ReplyOutput, RunStats};
 
 use crate::{
     Config, Error, Executor, GenerationMode, Result, Sample,
@@ -18,12 +22,13 @@ use crate::{
     chat::{ChatTemplate, Message},
     grammar::{JsonDecoder, JsonSchema, LogitConstraint},
     sampling::{Sampler, Sampling},
-    stop::{self, StopFilter},
-    stream::TextStream,
+    stop,
     tokenizer::Tokenizer,
 };
+use output::{ReplyPlan, TextOutput};
 use std::{
     path::{Path, PathBuf},
+    sync::Arc,
     time::Instant,
 };
 use text::{TextSink, TrimmedText};
@@ -155,7 +160,9 @@ pub struct Completion {
 
 pub struct Engine {
     executor: Executor<Box<dyn Backend>>,
-    tokenizer: Tokenizer,
+    tokenizer: Arc<Tokenizer>,
+    /// End-of-generation token IDs.
+    eog: Arc<[i32]>,
     /// None when the model has no chat template (only `complete` works).
     template: Option<ChatTemplate>,
     profile: &'static str,
@@ -196,9 +203,12 @@ impl Engine {
         };
         let executor = Executor::new(backend, config)?;
         executor.detokenize(&[])?;
+        let vocabulary = executor.info().vocab_tokens as i32;
+        let eog = (0..vocabulary).filter(|&id| executor.is_eog(id)).collect();
         Ok(Self {
             executor,
-            tokenizer: Tokenizer::open(path)?,
+            tokenizer: Arc::new(Tokenizer::open(path)?),
+            eog,
             template,
             profile,
             notices: Vec::new(),
@@ -285,7 +295,7 @@ impl Engine {
         &mut self,
         prompt: &str,
         options: &GenerationOptions,
-        mut sink: impl TextSink,
+        sink: impl TextSink,
     ) -> Result<Completion> {
         stop::validate(&options.stop)?;
         let mut sampler = Sampler::new(options.sampling)?;
@@ -306,30 +316,12 @@ impl Engine {
         if budget == 0 {
             return Err(Error::Invalid("max_tokens must be positive".into()));
         }
-        let mut stream = TextStream::new();
-        let mut stops = StopFilter::new(&options.stop);
-        let mut clock = TokenClock::new();
-        let mut generated = Vec::new();
-        let mut cancelled = false;
-        let tokenizer = &self.tokenizer;
-        let detokenize = |ids: &[i32]| tokenizer.detokenize(ids);
-        let mut on_token = |token: i32| {
-            clock.tick();
-            generated.push(token);
-            let piece = stops.push(&stream.push(token, detokenize)?);
-            if !piece.is_empty() && !sink.write(&piece) {
-                cancelled = true;
-                return Err(Error::Cancelled);
-            }
-            if stops.stopped() {
-                return Err(Error::Cancelled);
-            }
-            Ok(())
-        };
+        let plan = self.reply_plan(tokens.len(), budget, room);
+        let mut output = TextOutput::new(plan, &options.stop, sink);
         let mode = GenerationMode::UntilEog;
         let result = if sampler.is_greedy() && constraint.is_none() {
             self.executor
-                .generate_streaming(&tokens, budget, mode, &mut on_token)
+                .generate_streaming(&tokens, budget, mode, |token| output.token(token))
         } else {
             self.executor.generate_constrained(
                 &tokens,
@@ -337,7 +329,7 @@ impl Engine {
                 mode,
                 &mut sampler,
                 constraint.as_mut().map(|c| c as &mut dyn LogitConstraint),
-                &mut on_token,
+                |token| output.token(token),
             )
         };
         let sample = match result {
@@ -346,43 +338,27 @@ impl Engine {
             Err(error) => return Err(error),
         };
         if sample.is_some() {
-            let mut rest = stops.push(&stream.finish(detokenize)?);
-            if !stops.stopped() {
-                rest += &stops.finish();
-            }
-            if !rest.is_empty() {
-                sink.write(&rest);
-            }
+            output.drain()?;
         }
-        sink.end();
-        let mut text = tokenizer.detokenize(&generated)?;
-        if let Some(index) = stop::find(&text, &options.stop) {
-            text.truncate(index);
+        output.complete(sample.as_ref().map(run_stats))
+    }
+
+    fn reply_plan(&self, prompt_tokens: usize, budget: u32, room: u32) -> ReplyPlan {
+        ReplyPlan {
+            tokenizer: self.tokenizer.clone(),
+            eog: self.eog.clone(),
+            prompt_tokens,
+            budget,
+            room,
         }
-        let ended = generated.last().is_some_and(|&t| self.executor.is_eog(t));
-        let finish_reason = if cancelled {
-            FinishReason::Cancelled
-        } else if stops.stopped() || ended {
-            FinishReason::Stop
-        } else if budget < room {
-            FinishReason::Length
-        } else {
-            FinishReason::ContextFull
-        };
-        let cached_tokens = sample.as_ref().map_or(0, |s| s.cached_prompt_tokens);
-        let (ttft_ns, tokens_per_second) = match &sample {
-            Some(sample) => (sample.ttft_ns, decode_rate(sample)),
-            None => clock.stats(),
-        };
-        Ok(Completion {
-            text,
-            finish_reason,
-            prompt_tokens: tokens.len(),
-            cached_tokens,
-            generated_tokens: generated.len(),
-            ttft_ns,
-            tokens_per_second,
-        })
+    }
+}
+
+fn run_stats(sample: &Sample) -> RunStats {
+    RunStats {
+        cached_tokens: sample.cached_prompt_tokens,
+        ttft_ns: sample.ttft_ns,
+        tokens_per_second: decode_rate(sample),
     }
 }
 

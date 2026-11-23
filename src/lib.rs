@@ -14,6 +14,7 @@ mod kernels;
 #[cfg(feature = "ktransformers")]
 pub mod ktransformers;
 pub mod tokenizer;
+pub mod tools;
 #[cfg(feature = "cuda")]
 mod transformer;
 

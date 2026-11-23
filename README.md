@@ -4,7 +4,7 @@
 
 Fast local LLM inference for GGUF models, written in Rust, with its own CUDA kernels.
 
-- **Fast:** on an RTX 5090 with Qwen3-30B-A3B (Q4_K_M), the first token of a 2.9k-token prompt arrives in ~0.15 s (llama.cpp: 0.21 s), and decoding runs at ~300–360 tok/s.
+- **Fast:** on an RTX 5090 with Qwen3-30B-A3B (Q4_K_M), `palito serve` delivers the first token of a 2.9k-token prompt in 164 ms (`llama-server -fa on`: 214 ms) and decodes at 343–362 tok/s (`llama-server`: 305–340 tok/s; see [reproducible benchmarks & raw samples](benchmarks/vs-llama-cpp/README.md)).
 - **Uses the model's full context:** `chat` opens with the model's trained context (Qwen3-30B-A3B: 40,960 tokens) and replies run until the model finishes.
 - **One binary:** chat in the terminal, an OpenAI-compatible server (`palito serve`), or a C library for your own program. No Python and no llama.cpp; the Linux bundle ships the CUDA compiler it needs.
 

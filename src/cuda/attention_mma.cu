@@ -391,35 +391,40 @@ attention_prefill_mma_half(const float *q, const unsigned short *halves, float *
 // cache into shared memory with cp.async, double buffered, so the next tile loads
 // while this one is computed. Blocks run last-token-first: the longest causal
 // spans start first and the short ones fill the tail.
-template<int WARPS>
+template<int WARPS, int GROUP = 8, int DIM = FA_DIM>
 __device__ __forceinline__ void attention_prefill_fast_impl(
     const float *q, const kv_f16 *keys, const kv_f16 *values, float *output, int heads,
     int kv_heads, int tokens, int count) {
 #if __CUDA_ARCH__ >= 800
-    constexpr int THREADS = 32 * WARPS, GROUP = 8, K = FA_FAST_KEYS;
-    constexpr int PIECES = K * FA_DIM / 8 / THREADS;
-    static_assert(PIECES * THREADS == K * FA_DIM / 8, "THREADS must divide the tile");
-    __shared__ __align__(16) unsigned short ks[2][K * FA_K_STRIDE];
-    __shared__ __align__(16) unsigned short vs[2][K * FA_K_STRIDE];
+    constexpr int THREADS = 32 * WARPS, K = FA_FAST_KEYS;
+    constexpr int K_STRIDE = DIM + 8;
+    constexpr int TOKENS_PER_WARP = GROUP == 1 ? 16 : 2;
+    constexpr int BLOCK_TOKENS = TOKENS_PER_WARP * WARPS;
+    constexpr int PIECES = K * DIM / 8 / THREADS;
+    static_assert(PIECES * THREADS == K * DIM / 8, "THREADS must divide the tile");
+    __shared__ __align__(16) unsigned short ks[2][K * K_STRIDE];
+    __shared__ __align__(16) unsigned short vs[2][K * K_STRIDE];
     int kv_head = blockIdx.x, tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
     int group = lane / 4, thread = lane % 4;
-    int first = (gridDim.y - 1 - blockIdx.y) * 2 * WARPS;
-    int token0 = first + 2 * warp, token1 = token0 + 1;
+    int first = (gridDim.y - 1 - blockIdx.y) * BLOCK_TOKENS;
+    int token0 = GROUP == 1 ? first + 16 * warp + group : first + 2 * warp;
+    int token1 = GROUP == 1 ? token0 + 8 : token0 + 1;
     // Rows of tokens past the chunk compute on one valid key and are not stored.
     int limit0 = token0 < tokens ? count + token0 : 1;
     int limit1 = token1 < tokens ? count + token1 : 1;
-    int warp_limit = max(limit0, limit1);
-    int span = count + min(tokens - 1, first + 2 * WARPS - 1);
-    u64 stride = (u64)kv_heads * FA_DIM;
-    const kv_f16 *key_base = keys + (u64)kv_head * FA_DIM, *value_base = values + (u64)kv_head * FA_DIM;
+    int warp_last = min(tokens - 1, first + TOKENS_PER_WARP * (warp + 1) - 1);
+    int warp_limit = first + TOKENS_PER_WARP * warp < tokens ? count + warp_last : 1;
+    int span = count + min(tokens - 1, first + BLOCK_TOKENS - 1);
+    u64 stride = (u64)kv_heads * DIM;
+    const kv_f16 *key_base = keys + (u64)kv_head * DIM, *value_base = values + (u64)kv_head * DIM;
     // Keys past the span are zero-filled (masked scores, finite V).
     auto issue = [&](int buffer, int base) {
         int n = min(K, span - base);
         #pragma unroll
         for (int s = 0; s < PIECES; s++) {
-            int i = tid + s * THREADS, key = i / (FA_DIM / 8), c = i % (FA_DIM / 8);
-            unsigned short *k = &ks[buffer][key * FA_K_STRIDE + 8 * c];
-            unsigned short *v = &vs[buffer][key * FA_K_STRIDE + 8 * c];
+            int i = tid + s * THREADS, key = i / (DIM / 8), c = i % (DIM / 8);
+            unsigned short *k = &ks[buffer][key * K_STRIDE + 8 * c];
+            unsigned short *v = &vs[buffer][key * K_STRIDE + 8 * c];
             if (key < n) {
                 u64 at = (u64)(base + key) * stride + 8 * c;
                 kv_copy_async(k, key_base + at);
@@ -433,14 +438,14 @@ __device__ __forceinline__ void attention_prefill_fast_impl(
     };
     issue(0, 0);
     // Scores are kept in log2 units: Q is pre-scaled by log2(e) / sqrt(dim).
-    const float qscale = 1.4426950408889634f * rsqrtf((float)FA_DIM);
-    unsigned int qf[FA_DIM / 16][4];
+    const float qscale = 1.4426950408889634f * rsqrtf((float)DIM);
+    unsigned int qf[DIM / 16][4];
+    int head = GROUP == 1 ? kv_head : kv_head * GROUP + group;
     {
-        int head = kv_head * GROUP + group;
-        const float *q0 = q + ((u64)min(token0, tokens - 1) * heads + head) * FA_DIM;
-        const float *q1 = q + ((u64)min(token1, tokens - 1) * heads + head) * FA_DIM;
+        const float *q0 = q + ((u64)min(token0, tokens - 1) * heads + head) * DIM;
+        const float *q1 = q + ((u64)min(token1, tokens - 1) * heads + head) * DIM;
         #pragma unroll
-        for (int s = 0; s < FA_DIM / 16; s++) {
+        for (int s = 0; s < DIM / 16; s++) {
             int d = 16 * s + 2 * thread;
             float2 x0 = *(const float2 *)(q0 + d), x1 = *(const float2 *)(q1 + d);
             float2 y0 = *(const float2 *)(q0 + d + 8), y1 = *(const float2 *)(q1 + d + 8);
@@ -450,9 +455,9 @@ __device__ __forceinline__ void attention_prefill_fast_impl(
             qf[s][3] = fa_pack(y1.x * qscale, y1.y * qscale);
         }
     }
-    float o[FA_DIM / 8][4];
+    float o[DIM / 8][4];
     #pragma unroll
-    for (int j = 0; j < FA_DIM / 8; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
+    for (int j = 0; j < DIM / 8; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
     // Index 0: row `group` (token0); index 1: row `group + 8` (token1).
     float maximum[2] = {FA_NEG_INF, FA_NEG_INF}, total[2] = {0.0f, 0.0f};
     int buffer = 0;
@@ -470,9 +475,9 @@ __device__ __forceinline__ void attention_prefill_fast_impl(
             for (int j = 0; j < K / 8; j++) {
                 s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.0f;
                 const unsigned int *row =
-                    (const unsigned int *)&ks[buffer][(8 * j + group) * FA_K_STRIDE];
+                    (const unsigned int *)&ks[buffer][(8 * j + group) * K_STRIDE];
                 #pragma unroll
-                for (int k = 0; k < FA_DIM / 16; k++)
+                for (int k = 0; k < DIM / 16; k++)
                     fa_mma(s[j], qf[k], row[8 * k + thread], row[8 * k + 4 + thread]);
             }
             float step[2] = {FA_NEG_INF, FA_NEG_INF};
@@ -497,7 +502,7 @@ __device__ __forceinline__ void attention_prefill_fast_impl(
                 total[r] *= rescale[r];
             }
             #pragma unroll
-            for (int j = 0; j < FA_DIM / 8; j++) {
+            for (int j = 0; j < DIM / 8; j++) {
                 o[j][0] *= rescale[0];
                 o[j][1] *= rescale[0];
                 o[j][2] *= rescale[1];
@@ -523,14 +528,14 @@ __device__ __forceinline__ void attention_prefill_fast_impl(
                 p[k][3] = fa_pack(s[2 * k + 1][2], s[2 * k + 1][3]);
             }
             const unsigned short *row =
-                &vs[buffer][(lane % 16) * FA_K_STRIDE + 8 * (lane / 16)];
+                &vs[buffer][(lane % 16) * K_STRIDE + 8 * (lane / 16)];
             #pragma unroll
-            for (int j = 0; j < FA_DIM / 8; j += 2) {
+            for (int j = 0; j < DIM / 8; j += 2) {
                 unsigned int h[2][2] = {{0u, 0u}, {0u, 0u}};
                 #pragma unroll
                 for (int k = 0; k < K / 16; k++) {
                     unsigned int b[4];
-                    fa_ldmatrix_x4_trans(b, row + 16 * k * FA_K_STRIDE + 8 * j);
+                    fa_ldmatrix_x4_trans(b, row + 16 * k * K_STRIDE + 8 * j);
                     fa_mma_h(h[0], p[k], b[0], b[1]);
                     fa_mma_h(h[1], p[k], b[2], b[3]);
                 }
@@ -552,15 +557,14 @@ __device__ __forceinline__ void attention_prefill_fast_impl(
         total[r] += __shfl_xor_sync(0xffffffff, total[r], 1);
         total[r] += __shfl_xor_sync(0xffffffff, total[r], 2);
     }
-    int head = kv_head * GROUP + group;
     #pragma unroll
     for (int r = 0; r < 2; r++) {
         int token = r ? token1 : token0;
         if (token >= tokens) continue;
         float inverse = 1.0f / total[r];
-        float *out = output + ((u64)token * heads + head) * FA_DIM + 2 * thread;
+        float *out = output + ((u64)token * heads + head) * DIM + 2 * thread;
         #pragma unroll
-        for (int j = 0; j < FA_DIM / 8; j++)
+        for (int j = 0; j < DIM / 8; j++)
             *(float2 *)(out + 8 * j) = make_float2(o[j][2 * r] * inverse, o[j][2 * r + 1] * inverse);
     }
 #endif
@@ -569,14 +573,28 @@ __device__ __forceinline__ void attention_prefill_fast_impl(
 extern "C" __global__ void __launch_bounds__(256)
 attention_prefill_mma_fast_f16(const float *q, const kv_f16 *keys, const kv_f16 *values,
                                float *output, int heads, int kv_heads, int tokens, int count) {
-    attention_prefill_fast_impl<8>(q, keys, values, output, heads, kv_heads, tokens, count);
+    attention_prefill_fast_impl<8, 8, 128>(q, keys, values, output, heads, kv_heads, tokens, count);
 }
 
 // 4 warps (8 tokens) per block: twice the blocks for short chunks.
 extern "C" __global__ void __launch_bounds__(128)
 attention_prefill_mma_fast4_f16(const float *q, const kv_f16 *keys, const kv_f16 *values,
                                 float *output, int heads, int kv_heads, int tokens, int count) {
-    attention_prefill_fast_impl<4>(q, keys, values, output, heads, kv_heads, tokens, count);
+    attention_prefill_fast_impl<4, 8, 128>(q, keys, values, output, heads, kv_heads, tokens, count);
+}
+
+// MHA (heads == kv_heads): 4 warps x 16 tokens = 64 tokens per block on tensor cores.
+extern "C" __global__ void __launch_bounds__(128)
+attention_prefill_mma_fast_mha_f16(const float *q, const kv_f16 *keys, const kv_f16 *values,
+                                   float *output, int heads, int kv_heads, int tokens, int count) {
+    attention_prefill_fast_impl<4, 1, 128>(q, keys, values, output, heads, kv_heads, tokens, count);
+}
+
+// MHA with head_dim == 96 (e.g. Phi-3-mini): 64 tokens per block on FP16 tensor cores.
+extern "C" __global__ void __launch_bounds__(128)
+attention_prefill_mma_fast_mha96_f16(const float *q, const kv_f16 *keys, const kv_f16 *values,
+                                     float *output, int heads, int kv_heads, int tokens, int count) {
+    attention_prefill_fast_impl<4, 1, 96>(q, keys, values, output, heads, kv_heads, tokens, count);
 }
 #endif
 

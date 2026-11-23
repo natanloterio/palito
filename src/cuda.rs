@@ -327,7 +327,8 @@ fn prefill_capacity(spec: &Spec) -> usize {
 /// Must match the branch order in batched_prefill (ALiBi/BLOOM and Gemma first).
 fn flash_prefill_attention(spec: &Spec, matmul: CudaMatmul) -> bool {
     matmul.f32_tiled()
-        && spec.dim == 128
+        && spec.dim <= 128
+        && spec.dim % 4 == 0
         && spec.kv_heads > 0
         && spec.heads % spec.kv_heads == 0
         && spec.heads / spec.kv_heads <= 8
@@ -911,7 +912,7 @@ pub struct CudaBackend {
 /// Block-aligned Q4_K rows use the wide layout (one warp step covers 4 blocks).
 fn matvec_warps_per_row(kind: i32, rows: u32, selections: u32, width: u32) -> u32 {
     let blocks = (width / 256).max(1);
-    if kind == 12 && width % 256 == 0 {
+    if matches!(kind, 12 | 13) && width % 256 == 0 {
         let mut warps = (blocks / 8).clamp(1, 8);
         while warps < 8 && warps * 4 < blocks && rows * selections * warps < 2048 {
             warps *= 2;
@@ -1217,6 +1218,7 @@ impl CudaBackend {
                 "attention_split_group",
                 "attention_split_group_decode",
                 "attention_prefill_flash4",
+                "attention_prefill_flash4_dim",
                 "gemm_packed_dense",
                 "gemm_packed_grouped",
                 "group_experts_fast32",
@@ -1255,6 +1257,8 @@ impl CudaBackend {
                     "group_experts_mixed",
                     "attention_prefill_mma_fast_f16",
                     "attention_prefill_mma_fast4_f16",
+                    "attention_prefill_mma_fast_mha_f16",
+                    "attention_prefill_mma_fast_mha96_f16",
                     "attention_decode_mma_f16",
                     "attention_decode_mma_decode_f16",
                     "attention_combine_rows",
@@ -1641,9 +1645,9 @@ impl CudaBackend {
                 && l.q.width == l.k.width
                 && l.k.width == l.v.width
                 && l.q.width % 256 == 0
-                && matches!(l.q.kind, 12 | 14)
-                && matches!(l.k.kind, 12 | 14)
-                && matches!(l.v.kind, 12 | 14)
+                && matches!(l.q.kind, 12 | 13 | 14)
+                && matches!(l.k.kind, 12 | 13 | 14)
+                && matches!(l.v.kind, 12 | 13 | 14)
             {
                 launch!(
                     self,

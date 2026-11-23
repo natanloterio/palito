@@ -44,6 +44,10 @@ pub(super) const F16_KERNELS: &[(&str, &str)] = &[
         "attention_split_group_decode_f16",
     ),
     ("attention_prefill_flash4", "attention_prefill_flash4_f16"),
+    (
+        "attention_prefill_flash4_dim",
+        "attention_prefill_flash4_dim_f16",
+    ),
 ];
 
 impl CudaMatmul {

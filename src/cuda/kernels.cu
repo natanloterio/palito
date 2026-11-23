@@ -430,6 +430,51 @@ __device__ __forceinline__ float q4k_wide_row_part(const u8 *w, const float *x, 
     return warp_sum(fold_parts(parts));
 }
 
+// Q5_K with 8 lanes per 256-value block: same layout as q4k_wide_block plus the
+// 32-byte high-bit array `qh` at p + 16.
+__device__ __forceinline__ void q5k_wide_block(const u8 *p, const float *x, int sub,
+                                               float *parts) {
+    uint4 qv = *(const uint4 *)(p + 48 + sub * 16);
+    uint4 qhv = *(const uint4 *)(p + 16 + (sub & 1) * 16);
+    unsigned int dd = *(const unsigned int *)p;
+    float d = half_value_bits(dd & 0xffff), dm = half_value_bits(dd >> 16);
+    const unsigned int *sw = (const unsigned int *)(p + 4);
+    unsigned int s0 = sw[0], s1 = sw[1], s2 = sw[2];
+    unsigned int qw[4] = {qv.x, qv.y, qv.z, qv.w};
+    unsigned int qhw[4] = {qhv.x, qhv.y, qhv.z, qhv.w};
+    int pair = sub >> 1;
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        int group = 2 * pair + half, shift = 8 * (group & 3);
+        unsigned int lo = (s0 >> shift) & 255, mid = (s1 >> shift) & 255;
+        unsigned int hi = (s2 >> shift) & 255;
+        int scale = group < 4 ? lo & 63 : (hi & 15) | ((lo >> 6) << 4);
+        int minimum = group < 4 ? mid & 63 : (hi >> 4) | ((mid >> 6) << 4);
+        float ds = d * (float)scale, ms = dm * (float)minimum;
+        const float *xb = x + 32 * group + (sub & 1) * 16;
+        #pragma unroll
+        for (int word = 0; word < 4; word++) {
+            float4 xv = *(const float4 *)(xb + 4 * word);
+            float xs[4] = {xv.x, xv.y, xv.z, xv.w};
+            #pragma unroll
+            for (int b = 0; b < 4; b++) {
+                unsigned int q = ((qw[word] >> (8 * b + 4 * half)) & 15)
+                    | ((((qhw[word] >> (8 * b)) >> group) & 1) << 4);
+                float decoded = ds * small_uint_float(q) - ms;
+                parts[half * 4 + b] += decoded * xs[b];
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ float q5k_wide_row_part(const u8 *w, const float *x, u64 offset,
+                                                   int width, int lane, int part, int warps) {
+    float parts[8] = {};
+    for (int first = (part * 4 + (lane >> 3)) * 256; first < width; first += warps * 1024)
+        q5k_wide_block(w + ((offset + first) / 256) * 176, x + first, lane & 7, parts);
+    return warp_sum(fold_parts(parts));
+}
+
 template<int Kind>
 __device__ __forceinline__ float packed_matrix_lane(const u8 *w, const float *x,
                                                     u64 offset, int width, int tid) {
@@ -452,7 +497,7 @@ __device__ __forceinline__ float warp_scalar_row(const u8 *w, const float *x, u6
 // cuda.rs, which sizes the grid: grid=(ceil(rows * warps / 8), selections, 1).
 // Block-aligned Q4_K rows use the wide layout, where one warp step covers 4 blocks.
 __device__ __forceinline__ bool q4k_wide(int kind, int width) {
-    return kind == 12 && width % 256 == 0;
+    return (kind == 12 || kind == 13) && width % 256 == 0;
 }
 
 __device__ __forceinline__ int matvec_warps_per_row(int kind, int rows, int selections,
@@ -504,8 +549,10 @@ extern "C" __global__ void matvec_packed_rows(const u8 *w, int kind, const float
         int expert = moe ? ids[selected] : 0;
         u64 offset = ((u64)expert * rows + row) * width;
         const float *input = x + (batched ? (u64)selected * width : 0);
-        if (q4k_wide(kind, width)) {
+        if (kind == 12 && width % 256 == 0) {
             sum = q4k_wide_row_part(w, input, offset, width, lane, part, warps);
+        } else if (kind == 13 && width % 256 == 0) {
+            sum = q5k_wide_row_part(w, input, offset, width, lane, part, warps);
         } else if (kind == 14 && width % 256 == 0) {
             int start = part * 256, step = warps * 256;
             sum = warp_sum(packed_lane_span<14>(w, input, offset, width, lane, start, step));
@@ -585,6 +632,7 @@ extern "C" __global__ void matvec_packed_qkv_rows(
     if (row < total) {
         u64 offset = (u64)local * width;
         sum = kind == 12 ? packed_row_part<12>(w, x, offset, width, lane, part, warps)
+            : kind == 13 ? q5k_wide_row_part(w, x, offset, width, lane, part, warps)
                          : packed_row_part<14>(w, x, offset, width, lane, part, warps);
     }
     if (warps > 1) {

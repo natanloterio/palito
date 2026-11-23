@@ -24,21 +24,19 @@ Raw samples: [qwen3-30b-a3b.json](./qwen3-30b-a3b.json)
 
 Raw samples: [olmoe-1b-7b.json](./olmoe-1b-7b.json)
 
-| Prompt tokens | Palito 0.9.0 TTFT ms | llama.cpp `fa-on` TTFT ms | Palito 0.9.0 decode tok/s | llama.cpp `fa-on` decode tok/s |
+| Prompt tokens | Palito TTFT ms | llama.cpp `fa-on` TTFT ms | Palito decode tok/s | llama.cpp `fa-on` decode tok/s |
 |---:|---:|---:|---:|---:|
-| 512 | 18 | **14** | 785.2 | **924.1** |
-| 2,912 | 188 | **75** | 678.1 | **756.3** |
+| 512 | **14** (tied) | **14** | 794.7 | **927.5** |
+| 2,912 | **55** (-25%) | 73 | 682.2 | **779.4** |
 
 ## Phi-3-mini-128k Q4_K_M (2.4 GB dense, context 4,096)
 
 Raw samples: [phi3-mini-128k.json](./phi3-mini-128k.json)
 
-| Prompt tokens | Palito 0.9.0 TTFT ms | llama.cpp `fa-on` TTFT ms | Palito 0.9.0 decode tok/s | llama.cpp `fa-on` decode tok/s |
+| Prompt tokens | Palito TTFT ms | llama.cpp `fa-on` TTFT ms | Palito decode tok/s | llama.cpp `fa-on` decode tok/s |
 |---:|---:|---:|---:|---:|
-| 501 | 479 | **24** | 197.6 | **395.2** |
-| 2,901 | 8,437 | **136** | 174.8 | **314.7** |
-
-*Note:* Phi-3-mini uses `head_dim = 96` (so prefill falls back to quadratic non-flash attention, since Palito's flash prefill currently targets `head_dim = 128`) and mixes `Q5_K` tensors (which do not yet have MMQ prefill or wide packed decode kernels).
+| 501 | 33 | **23** | 361.6 | **403.1** |
+| 2,901 | 155 | **135** | 298.8 | **317.0** |
 
 ## Reproduce
 

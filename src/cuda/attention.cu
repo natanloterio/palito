@@ -722,13 +722,12 @@ extern "C" __global__ void attention_split_group_decode_f16(const float *q, cons
 // ceil(group / Split) of its query rows (fewer rows per warp, more warps per SM).
 template<int Split, typename KV>
 __device__ __forceinline__ void attention_prefill_flash_impl(
-    const float *q, const KV *keys, const KV *values, float *output, int heads,
+    const float *q, const KV *keys, const KV *values, float *output, int dim, int heads,
     int kv_heads, int tokens, int count) {
     constexpr int ROWS = ATTENTION_GROUP_MAX / Split;
     __shared__ __align__(16) float tile[PREFILL_KEYS * PREFILL_STRIDE];
     __shared__ __align__(16) float query[PREFILL_TOKENS][ATTENTION_GROUP_MAX][ATTENTION_KV_DIM];
     __shared__ float probability[PREFILL_TOKENS][ATTENTION_GROUP_MAX][PREFILL_KEYS];
-    const int dim = ATTENTION_KV_DIM;
     int kv_head = blockIdx.x, group = heads / kv_heads;
     int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     int local = warp / Split, part = warp % Split;
@@ -738,9 +737,10 @@ __device__ __forceinline__ void attention_prefill_flash_impl(
     int limit = active ? count + token : 0;
     int last = min(tokens - 1, first + PREFILL_TOKENS - 1);
     int span = count + last;
-    for (int i = threadIdx.x; i < PREFILL_TOKENS * group * (dim / 4); i += blockDim.x) {
-        int t = i / (group * (dim / 4)), rest = i % (group * (dim / 4));
-        int r = rest / (dim / 4), c = rest % (dim / 4);
+    int dim4 = dim / 4;
+    for (int i = threadIdx.x; i < PREFILL_TOKENS * group * dim4; i += blockDim.x) {
+        int t = i / (group * dim4), rest = i % (group * dim4);
+        int r = rest / dim4, c = rest % dim4;
         float4 v = first + t < tokens
             ? *(const float4 *)(q + ((u64)(first + t) * heads + kv_head * group + r) * dim + 4 * c)
             : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -758,8 +758,8 @@ __device__ __forceinline__ void attention_prefill_flash_impl(
     for (int base = 0; base < span; base += PREFILL_KEYS) {
         int n = min(PREFILL_KEYS, span - base);
         __syncthreads();
-        for (int i = threadIdx.x; i < PREFILL_KEYS * dim / 4; i += blockDim.x) {
-            int key = i / (dim / 4), c = i % (dim / 4);
+        for (int i = threadIdx.x; i < PREFILL_KEYS * dim4; i += blockDim.x) {
+            int key = i / dim4, c = i % dim4;
             float4 v = key < n ? kv_load4(keys, ((u64)(base + key) * kv_heads + kv_head) * dim
                                                     + 4 * c)
                                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -803,15 +803,15 @@ __device__ __forceinline__ void attention_prefill_flash_impl(
             }
         }
         __syncthreads();
-        for (int i = threadIdx.x; i < PREFILL_KEYS * dim / 4; i += blockDim.x) {
-            int key = i / (dim / 4), c = i % (dim / 4);
+        for (int i = threadIdx.x; i < PREFILL_KEYS * dim4; i += blockDim.x) {
+            int key = i / dim4, c = i % dim4;
             float4 v = key < n ? kv_load4(values, ((u64)(base + key) * kv_heads + kv_head) * dim
                                                     + 4 * c)
                                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             *(float4 *)&tile[key * PREFILL_STRIDE + 4 * c] = v;
         }
         __syncthreads();
-        if (base < limit) {
+        if (base < limit && 4 * lane < dim) {
             int keys_here = min(n, limit - base);
             for (int j = 0; j < keys_here; j++) {
                 float4 v = *(const float4 *)&tile[j * PREFILL_STRIDE + 4 * lane];
@@ -828,7 +828,7 @@ __device__ __forceinline__ void attention_prefill_flash_impl(
             }
         }
     }
-    if (!active) return;
+    if (!active || 4 * lane >= dim) return;
     #pragma unroll
     for (int r = 0; r < ROWS; r++) {
         if (r < per && row0 + r < group) {
@@ -843,14 +843,29 @@ __device__ __forceinline__ void attention_prefill_flash_impl(
 extern "C" __global__ void __launch_bounds__(128 * PREFILL_TOKENS)
 attention_prefill_flash4(const float *q, const float *keys, const float *values, float *output,
                          int heads, int kv_heads, int tokens, int count) {
-    attention_prefill_flash_impl<4>(q, keys, values, output, heads, kv_heads, tokens, count);
+    attention_prefill_flash_impl<4>(q, keys, values, output, ATTENTION_KV_DIM, heads, kv_heads,
+                                    tokens, count);
+}
+
+extern "C" __global__ void __launch_bounds__(128 * PREFILL_TOKENS)
+attention_prefill_flash4_dim(const float *q, const float *keys, const float *values, float *output,
+                             int dim, int heads, int kv_heads, int tokens, int count) {
+    attention_prefill_flash_impl<4>(q, keys, values, output, dim, heads, kv_heads, tokens, count);
 }
 
 #ifdef CUDA_KV_F16
 extern "C" __global__ void __launch_bounds__(128 * PREFILL_TOKENS)
 attention_prefill_flash4_f16(const float *q, const kv_f16 *keys, const kv_f16 *values,
                              float *output, int heads, int kv_heads, int tokens, int count) {
-    attention_prefill_flash_impl<4>(q, keys, values, output, heads, kv_heads, tokens, count);
+    attention_prefill_flash_impl<4>(q, keys, values, output, ATTENTION_KV_DIM, heads, kv_heads,
+                                    tokens, count);
+}
+
+extern "C" __global__ void __launch_bounds__(128 * PREFILL_TOKENS)
+attention_prefill_flash4_dim_f16(const float *q, const kv_f16 *keys, const kv_f16 *values,
+                                 float *output, int dim, int heads, int kv_heads, int tokens,
+                                 int count) {
+    attention_prefill_flash_impl<4>(q, keys, values, output, dim, heads, kv_heads, tokens, count);
 }
 #endif
 

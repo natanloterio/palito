@@ -6,8 +6,16 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <PackageId>Palito</PackageId>
-    <Version>0.5.0</Version>
+    <Version>0.7.0</Version>
     <Description>C# binding for Palito, fast local LLM inference for GGUF models</Description>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/natanloterio/palito</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/natanloterio/palito</RepositoryUrl>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Authors>Natan Loterio</Authors>
   </PropertyGroup>
+  <ItemGroup>
+    <None Include="../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
 </Project>

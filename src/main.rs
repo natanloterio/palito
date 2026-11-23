@@ -335,7 +335,7 @@ impl RuntimeArgs {
                 }
                 LocalBackend::Reference => {
                     return Ok(Box::new(
-                        palito::cuda::reference::ReferenceBackend::open(
+                        palito::reference::ReferenceBackend::open(
                             &self.model,
                             &self.config(),
                         )?,

@@ -30,7 +30,6 @@ pub(crate) enum Storage {
     Packed { kind: u32, bytes: Vec<u8> },
 }
 
-#[cfg(any(feature = "cuda", feature = "vulkan", all(feature = "metal", target_os = "macos"), test))]
 impl Tensor {
     pub fn split_vector(mut self, count: usize) -> Result<(Self, Self)> {
         let [total] = self.dims[..] else {
@@ -407,6 +406,36 @@ impl Gguf {
     /// Header metadata only: reads a growing file prefix (16 MiB first) instead of
     /// the whole model, retrying with more bytes while the header is truncated.
     pub fn read_metadata(path: &Path) -> Result<HashMap<String, Value>> {
+        Ok(Self::read_prefix(path, |reader| Ok(reader.header()?.1))?)
+    }
+
+    /// Header metadata and tensor names, without reading tensor data.
+    pub fn read_layout(path: &Path) -> Result<(HashMap<String, Value>, Vec<String>)> {
+        Self::read_prefix(path, |reader| {
+            let (tensor_count, metadata) = reader.header()?;
+            let mut names = Vec::new();
+            for _ in 0..tensor_count {
+                names.push(reader.string()?);
+                let rank = reader.integer(4)?;
+                if !(1..=3).contains(&rank) {
+                    return Err(invalid(
+                        "only vectors, matrices, and expert stacks are supported",
+                    ));
+                }
+                for _ in 0..rank {
+                    reader.count()?;
+                }
+                reader.integer(4)?;
+                reader.count()?;
+            }
+            Ok((metadata, names))
+        })
+    }
+
+    fn read_prefix<T>(
+        path: &Path,
+        read: impl Fn(&mut Reader<'_>) -> Result<T>,
+    ) -> Result<T> {
         use std::io::Read;
         let length = fs::metadata(path)?.len();
         let mut size: u64 = 16 << 20;
@@ -418,11 +447,11 @@ impl Gguf {
                 bytes: &bytes,
                 position: 0,
             };
-            match reader.header() {
+            match read(&mut reader) {
                 Err(Error::Invalid(message)) if message.contains("truncated") && take < length => {
                     size = size.saturating_mul(4);
                 }
-                result => return Ok(result?.1),
+                result => return result,
             }
         }
     }

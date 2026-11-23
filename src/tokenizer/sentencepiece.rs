@@ -41,7 +41,8 @@ impl SentencePiece {
         unused: Vec<bool>,
     ) -> Result<Tokenizer> {
         let phi = matches!(metadata.get("general.architecture"), Some(Value::Text(arch)) if arch == "phi3");
-        let add_space_prefix = phi
+        let llama = matches!(metadata.get("general.architecture"), Some(Value::Text(arch)) if arch == "llama");
+        let add_space_prefix = (phi || llama)
             && !matches!(
                 metadata.get("tokenizer.ggml.add_space_prefix"),
                 Some(Value::Bool(false))
@@ -72,7 +73,7 @@ impl SentencePiece {
             }
             let piece = match kind {
                 1 => Some(token.replace('\u{2581}', " ").into_bytes()),
-                2 if phi => {
+                2 if phi || llama => {
                     special.push((token.clone(), id));
                     None
                 }
@@ -232,6 +233,15 @@ mod tests {
         assert_eq!(ids, [256, 258, 262, 257, 263, 240, 159, 166, 128]);
         assert_eq!(tokenizer.detokenize(&ids).unwrap(), "abc a🦀");
         assert_eq!(tokenizer.tokenize("").unwrap(), [256]);
+    }
+
+    #[test]
+    fn legacy_llama_without_pre_tokenizer_adds_space_prefix() {
+        let mut metadata = fixture();
+        metadata.remove("tokenizer.ggml.pre");
+        metadata.insert("general.architecture".into(), Value::Text("llama".into()));
+        let tokenizer = Tokenizer::from_metadata(&metadata).unwrap();
+        assert_eq!(tokenizer.tokenize("a").unwrap(), [256, 263]);
     }
 
     #[test]

@@ -41,6 +41,10 @@ impl DecodeState {
             sampled: None,
         })
     }
+
+    pub(super) fn has_graph(&self) -> bool {
+        self.graph.is_some()
+    }
 }
 
 impl Drop for CudaBackend {

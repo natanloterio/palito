@@ -79,6 +79,7 @@ fn open_cuda(path: &Path, options: &EngineOptions, trained: u32) -> Result<Opene
             decode_graph: graph,
             fit_context: fit,
             prefix_cache: options.prefix_cache,
+            slots: 1,
         };
         let error = match open_backend(path, &config, cuda) {
             Ok(backend) => {

@@ -1,6 +1,6 @@
 //! Server slots: several sequences taking turns on one device.
 
-use crate::{Error, Result};
+use crate::{Error, Result, backend::Backend};
 
 pub const MAX_SLOTS: u32 = 64;
 /// Most prompt tokens one slot evaluates in a turn.
@@ -27,6 +27,20 @@ pub fn slot_context(total: u32, slots: u32) -> Result<u32> {
         )));
     }
     Ok(share.next_multiple_of(SLOT_CONTEXT_STEP))
+}
+
+/// A backend holding several sequences, one active at a time. The `Backend`
+/// methods act on the active slot.
+pub trait SlotBackend: Backend {
+    fn slot_count(&self) -> usize;
+    /// Waits for the device to finish and makes `slot` the active one.
+    fn select_slot(&mut self, slot: usize) -> Result<()>;
+    /// Tokens of `prompt` the cache of `slot` would restore, without changing it.
+    fn restorable(&self, slot: usize, prompt: &[i32]) -> usize;
+    /// Drops the slot's prefix and clears any failure left on the device.
+    fn abandon_slot(&mut self, slot: usize) -> Result<()>;
+    /// Err when the device context no longer responds.
+    fn device_alive(&mut self) -> Result<()>;
 }
 
 /// A free slot that could take a request.

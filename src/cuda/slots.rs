@@ -72,6 +72,20 @@ impl CudaBackend {
         if slot == self.active_slot {
             return Ok(());
         }
+        // An unread speculative replay may have set the shared status word after the
+        // outgoing slot's last turn; latch it onto that slot and clear before switching.
+        let mut status = [0i32];
+        self.stream
+            .memcpy_dtoh(&self.work.status, &mut status[..])
+            .map_err(failure)?;
+        self.stream.synchronize().map_err(failure)?;
+        if status[0] != 0 {
+            self.state.failed = true;
+            self.stream
+                .memset_zeros(&mut self.work.status)
+                .map_err(failure)?;
+            self.stream.synchronize().map_err(failure)?;
+        }
         let mut next = self.parked[slot]
             .take()
             .ok_or_else(|| failure("slot state missing"))?;

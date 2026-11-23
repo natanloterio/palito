@@ -158,6 +158,42 @@ fn abandoning_a_slot_clears_its_failure_for_the_next() {
 
 #[test]
 #[ignore = "requires a GPU and PALITO_SLOT_MODEL"]
+fn unread_failure_stays_on_its_slot_across_a_switch() {
+    let mut backend = CudaBackend::open(&model(), &config(), options(2)).unwrap();
+    let (a, b) = (prompt(&backend, FRANCE), prompt(&backend, RAIN));
+    let alone_b = run_alone(&mut backend, 1, &b, 8);
+    backend.abandon_slot(1).unwrap();
+
+    // Start slot 1 so resuming it will switch without resetting the shared status word.
+    let mut seq_b = begin(&mut backend, 1, &b);
+    while seq_b.tokens.len() < 3 {
+        advance(&mut backend, &mut seq_b);
+    }
+
+    // Run slot 0, then poison the shared status word as an unread speculative replay would.
+    let seq_a = begin(&mut backend, 0, &a);
+    backend.poison_status_for_test().unwrap();
+
+    // Switching back to slot 1 must not leak slot 0's failure into slot 1.
+    while seq_b.tokens.len() < 8 {
+        advance(&mut backend, &mut seq_b);
+    }
+    assert_eq!(seq_b.tokens, alone_b);
+
+    // Switching back to slot 0 must keep it failed until reset.
+    backend.select_slot(0).unwrap();
+    let next_pos = a.len() as u32;
+    assert!(backend.evaluate_for_sampling(&[seq_a.tokens[0]], next_pos).is_err());
+    assert!(backend.sample_greedy().is_err());
+
+    // After reset, slot 0 is usable again.
+    backend.reset().unwrap();
+    let recovered = begin(&mut backend, 0, &a);
+    assert_eq!(recovered.tokens[0], seq_a.tokens[0]);
+}
+
+#[test]
+#[ignore = "requires a GPU and PALITO_SLOT_MODEL"]
 fn reservation_counts_every_slot() {
     let one = open(1).memory_usage().unwrap().numerical_reservation_bytes;
     let two = open(2).memory_usage().unwrap().numerical_reservation_bytes;

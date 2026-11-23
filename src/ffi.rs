@@ -175,17 +175,25 @@ pub unsafe extern "C" fn palito_context_tokens(engine: *const PalitoEngine) -> u
     unsafe { engine.as_ref() }.map_or(0, |engine| engine.0.context_tokens())
 }
 
-/// Numerical profile in use ("cpu", "int8-fast", "f32-tiled" or "f32"); static string.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn palito_profile(engine: *const PalitoEngine) -> *const c_char {
-    let name: &'static CStr = match unsafe { engine.as_ref() }.map(|engine| engine.0.profile()) {
+fn profile_cstr(profile: Option<&str>) -> &'static CStr {
+    match profile {
         Some("cpu") => c"cpu",
         Some("int8-fast") => c"int8-fast",
+        Some("int8-prefill") => c"int8-prefill",
         Some("f32-tiled") => c"f32-tiled",
         Some("f32") => c"f32",
+        Some("vulkan") => c"vulkan",
+        Some("metal") => c"metal",
+        Some("cuda") => c"cuda",
         _ => c"",
-    };
-    name.as_ptr()
+    }
+}
+
+/// Numerical profile in use ("cpu", "metal", "vulkan", "int8-fast", "int8-prefill",
+/// "f32-tiled", "f32" or "cuda"); static string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn palito_profile(engine: *const PalitoEngine) -> *const c_char {
+    profile_cstr(unsafe { engine.as_ref() }.map(|engine| engine.0.profile())).as_ptr()
 }
 
 /// Generates the assistant reply to `messages` (rendered with the model's chat
@@ -454,4 +462,26 @@ unsafe fn report(error: *mut *mut c_char, failure: &Error) {
 /// Model text may contain NUL bytes; C strings cannot.
 fn c_string(text: &str) -> CString {
     CString::new(text.replace('\0', "")).expect("NUL bytes removed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::profile_cstr;
+
+    #[test]
+    fn profile_cstr_maps_all_backend_profiles() {
+        for name in [
+            "cpu",
+            "metal",
+            "vulkan",
+            "int8-fast",
+            "int8-prefill",
+            "f32-tiled",
+            "f32",
+            "cuda",
+        ] {
+            assert_eq!(profile_cstr(Some(name)).to_str().unwrap(), name);
+        }
+        assert_eq!(profile_cstr(None).to_str().unwrap(), "");
+    }
 }

@@ -360,10 +360,33 @@ impl RuntimeArgs {
             let options = palito::metal::MetalOptions::default();
             return palito::metal::open_backend(&self.model, &self.config(), options);
         }
+        if !palito::cpu::has_fast_path(&self.model)? {
+            return self.open_cpu_reference();
+        }
         Ok(Box::new(CpuBackend::open_with_options(
             &self.model,
             &self.config(),
             self.options(),
+        )?))
+    }
+
+    /// Layouts without the fast path run on the reference backend, which has
+    /// none of the fast path's policy options.
+    fn open_cpu_reference(&self) -> Result<Box<dyn Backend>> {
+        if self.f32_weights
+            || self.sequential_prefill
+            || self.memory_limit_bytes.is_some()
+            || self.prefix_cache_bytes != 0
+            || self.speculative_window != 0
+            || self.scalar_kernels
+        {
+            return Err(palito::Error::Invalid(
+                "CPU policy options are not supported for this model architecture".into(),
+            ));
+        }
+        Ok(Box::new(palito::reference::ReferenceBackend::open(
+            &self.model,
+            &self.config(),
         )?))
     }
 
@@ -496,7 +519,10 @@ impl RuntimeArgs {
         self.prefill_chunk.unwrap_or(DEFAULT_PREFILL_CHUNK)
     }
 
-    fn execution(&self, _info: &palito::backend::ModelInfo) -> serde_json::Value {
+    fn execution(&self, info: &palito::backend::ModelInfo) -> serde_json::Value {
+        if info.backend == "rust-cpu-transformer-reference" {
+            return json!({"backend": "cpu-reference", "prefill": "sequential token steps"});
+        }
         #[cfg(feature = "cuda")]
         match self.backend {
             LocalBackend::Cuda => {
@@ -509,9 +535,7 @@ impl RuntimeArgs {
                     "kv_precision": "f32",
                 });
             }
-            LocalBackend::Reference => {
-                return json!({"backend": "cpu-reference", "prefill": "sequential token steps"});
-            }
+            LocalBackend::Reference => {}
             #[cfg(feature = "vulkan")]
             LocalBackend::Vulkan => {}
             #[cfg(all(feature = "metal", target_os = "macos"))]

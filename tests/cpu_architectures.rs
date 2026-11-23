@@ -8,7 +8,11 @@ use palito::{
     engine::{Device, Engine, EngineOptions, GenerationOptions},
     reference::ReferenceBackend,
 };
-use std::path::{Path, PathBuf};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 
 const GREEDY_TOKENS: usize = 16;
 const PROMPT: &str = "The capital of France is";
@@ -56,8 +60,30 @@ fn print_greedy(name: &str, path: &Path) {
     println!("GREEDY {name} {prompt:?} {generated:?}");
 }
 
+fn assert_cli_generates(path: &Path) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_palito"))
+        .args(["chat", "--backend", "cpu", "--context", "512", "--tokens", "4", "--model"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"What is the capital of France?\n/exit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!output.stdout.is_empty());
+}
+
 fn check(name: &str, path: &Path) {
     assert_engine_generates(path);
+    assert_cli_generates(path);
     print_greedy(name, path);
 }
 

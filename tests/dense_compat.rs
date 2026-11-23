@@ -397,3 +397,104 @@ fn gemma2_reference_lifecycle() {
 fn gemma2_cuda_lifecycle() {
     run_fixture("GEMMA2_GGUF", true, &[1, 107]);
 }
+
+#[test]
+#[ignore = "requires local compat GGUFs under models/ and CUDA 13 NVRTC/driver"]
+fn fast_path_architectures_match_f32_and_select_int8_fast() {
+    use palito::{
+        GenerationMode,
+        cuda::CudaMatmul,
+        engine::{Engine, EngineOptions, SlotEngine},
+    };
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let models = [
+        "models/compat-qwen25/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+        "models/compat-llama32/Llama-3.2-1B-Instruct-Q8_0.gguf",
+        "models/compat-phi3/Phi-3-mini-4k-instruct-Q4_K_M.gguf",
+        "models/Phi-3-mini-128k-instruct.Q4_K_M.gguf",
+        "models/compat-olmo2/OLMo-2-0425-1B-Q4_K_M.gguf",
+        "models/compat-olmoe/olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
+        "models/compat-gemma2/gemma-2-2b-it-Q8_0.gguf",
+        "models/compat-gemma3/gemma-3-270m-it-Q8_0.gguf",
+    ];
+    let config = Config {
+        context_tokens: 512,
+        batch_tokens: 256,
+        prefill_chunk: 256,
+        threads: 4,
+    };
+    let sample_tokens = |path: &Path, matmul: CudaMatmul, decode_graph: bool| -> Vec<i32> {
+        let mut backend = CudaBackend::open(
+            path,
+            &config,
+            CudaOptions {
+                matmul,
+                decode_graph,
+                ..CudaOptions::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{} ({matmul:?}, graph={decode_graph}): {e}", path.display()));
+        let prompt = backend.tokenize("The capital of France is").unwrap();
+        backend.evaluate_for_sampling(&prompt, 0).unwrap();
+        let mut tokens = Vec::new();
+        while tokens.len() < 32 {
+            let chunk = backend
+                .sample_tokens(32 - tokens.len(), GenerationMode::FixedLength)
+                .unwrap();
+            tokens.extend(chunk);
+            if tokens.len() < 32 {
+                let pos = (prompt.len() + tokens.len() - 1) as u32;
+                backend
+                    .evaluate_for_sampling(&[*tokens.last().unwrap()], pos)
+                    .unwrap();
+            }
+        }
+        tokens
+    };
+
+    for rel in models {
+        let path = root.join(rel);
+        let engine = Engine::open(
+            &path,
+            &EngineOptions {
+                context_tokens: Some(512),
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("Engine::open({rel}): {e}"));
+        assert_eq!(engine.profile(), "int8-fast", "{rel} fell back from int8-fast");
+        assert!(engine.notices().is_empty(), "{rel} notices: {:?}", engine.notices());
+        drop(engine);
+
+        let f32_tokens = sample_tokens(&path, CudaMatmul::F32, false);
+        let tiled_tokens = sample_tokens(&path, CudaMatmul::F32Tiled, true);
+        assert_eq!(tiled_tokens, f32_tokens, "{rel}: f32-tiled + decode_graph diverged from f32");
+
+        let int8_tokens = sample_tokens(&path, CudaMatmul::Int8Fast, true);
+        assert_eq!(int8_tokens.len(), 32, "{rel}: int8-fast short output");
+        assert_eq!(
+            int8_tokens[0], f32_tokens[0],
+            "{rel}: int8-fast first token diverged from f32"
+        );
+    }
+
+    // Verify multi-slot fast path opens cleanly on newly unlocked architectures.
+    for rel in [
+        "models/compat-qwen25/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+        "models/compat-gemma3/gemma-3-270m-it-Q8_0.gguf",
+    ] {
+        let path = root.join(rel);
+        let engine = SlotEngine::open_slots(
+            &path,
+            &EngineOptions {
+                context_tokens: Some(1024),
+                ..EngineOptions::default()
+            },
+            2,
+        )
+        .unwrap_or_else(|e| panic!("SlotEngine::open_slots({rel}): {e}"));
+        assert_eq!(engine.profile(), "int8-fast", "{rel} multi-slot fell back");
+        assert_eq!(engine.slots(), 2);
+    }
+}

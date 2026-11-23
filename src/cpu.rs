@@ -308,7 +308,7 @@ pub(crate) fn attend_with_divisor(
 
 /// Whether the fast packed CPU path can run this model. Other layouts use the
 /// slower reference backend.
-pub(crate) fn has_fast_path(path: &Path) -> Result<bool> {
+pub fn has_fast_path(path: &Path) -> Result<bool> {
     let (metadata, tensors) = Gguf::read_layout(path)?;
     Ok(
         matches!(metadata.get("general.architecture"), Some(crate::gguf::Value::Text(arch)) if arch == "llama")

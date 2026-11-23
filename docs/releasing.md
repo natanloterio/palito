@@ -15,8 +15,8 @@ One version for everything: `Cargo.toml` `[package] version`. The bindings follo
    |---|---|---|
    | crates.io | `palito` | `CARGO_REGISTRY_TOKEN` |
    | PyPI | `palito` | trusted publisher (workflow `release.yml`, environment `pypi`) |
-   | npm | `palito` | `NPM_TOKEN` |
-   | NuGet | `Palito` | `NUGET_API_KEY` |
+   | npm | `palito` (maintained by the `gaiahub` org) | `NPM_TOKEN` (granular token; move to trusted publishing after the first release) |
+   | NuGet | `Palito` | trusted publishing (policy `palito-release`: workflow `release.yml`, environment `nuget`) |
    | Maven Central | `io.github.natanloterio:palito` | `MAVEN_CENTRAL_USERNAME`, `MAVEN_CENTRAL_PASSWORD`, `GPG_PRIVATE_KEY`, `GPG_PASSPHRASE` |
    | Go | `github.com/natanloterio/palito/bindings/go` | none: the workflow pushes the tag `bindings/go/vX.Y.Z` |
 

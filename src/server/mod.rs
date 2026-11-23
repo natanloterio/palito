@@ -23,8 +23,10 @@ use crate::chat_repl::SamplingArgs;
 use clap::{Args, ValueEnum};
 use openai::{ChatRequest, CompletionRequest, Usage, error_body};
 use palito::{
+    chat::{Message, ToolFormat},
     engine::{Completion, Device, EngineOptions, GenerationOptions},
     sampling::Sampling,
+    tools::{ToolMode, ToolSpec},
 };
 use serde_json::{Value, json};
 use std::{net::IpAddr, path::PathBuf, sync::Arc, time::Instant};
@@ -217,17 +219,24 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         return invalid("this model has no chat template; use /v1/completions");
     }
     let parsed = request.check_supported().and_then(|()| {
+        let json_schema = request.json_schema()?;
+        let format = state.report.tool_format.as_ref();
+        let (messages, tools) = chat_route(&request, format, json_schema.is_some())?;
         Ok((
-            request.messages()?,
+            messages,
+            tools,
             request.sampling.resolve(&state.sampling)?,
             request.stop()?,
-            request.json_schema()?,
+            json_schema,
         ))
     });
-    let (messages, sampling, stop, json_schema) = match parsed {
+    let (messages, tools, sampling, stop, json_schema) = match parsed {
         Ok(parsed) => parsed,
         Err(message) => return invalid(&message),
     };
+    if tools.is_some() {
+        return invalid("tool call responses are not available yet");
+    }
     let options = GenerationOptions {
         max_tokens: request.max_tokens(),
         enable_thinking: request.enable_thinking(),
@@ -242,6 +251,28 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         split_reasoning: request.split_reasoning(),
     };
     respond(state, reply, Prompt::Chat(messages), options).await
+}
+
+/// The messages, and the tool spec when generation must go through the gate.
+/// `tool_choice: "none"` with JSON output needs no gate: the grammar already
+/// excludes a call.
+fn chat_route(
+    request: &ChatRequest,
+    format: Option<&ToolFormat>,
+    json_output: bool,
+) -> Result<(Vec<Message>, Option<ToolSpec>), String> {
+    let Some(spec) = request.tool_spec()? else {
+        return Ok((request.messages()?, None));
+    };
+    let forbidden = spec.mode == ToolMode::Forbidden;
+    let Some(format) = format else {
+        if forbidden && !request.has_tool_history() {
+            return Ok((request.messages()?, None));
+        }
+        return Err("this model's chat template has no supported tool call format".into());
+    };
+    let messages = request.messages_for(format.string_arguments)?;
+    Ok((messages, (!(forbidden && json_output)).then_some(spec)))
 }
 
 async fn completions(State(state): State<AppState>, body: Bytes) -> Response {

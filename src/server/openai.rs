@@ -7,7 +7,13 @@
 //! serve` was started with `--temperature`). Unsupported behavior (`n` > 1) is
 //! rejected rather than silently ignored; other unknown fields are ignored.
 
-use palito::{chat::Message, engine::FinishReason, grammar::JsonSchema, sampling::Sampling};
+use palito::{
+    chat::Message,
+    engine::FinishReason,
+    grammar::JsonSchema,
+    sampling::Sampling,
+    tools::{ToolMode, ToolSpec},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -31,6 +37,9 @@ pub struct ChatRequest {
     pub n: Option<u32>,
     pub stop: Option<Value>,
     pub response_format: Option<Value>,
+    pub tools: Option<Vec<Value>>,
+    pub tool_choice: Option<Value>,
+    pub parallel_tool_calls: Option<bool>,
     #[serde(flatten)]
     pub sampling: SamplingFields,
 }
@@ -75,6 +84,63 @@ impl SamplingFields {
 pub struct ChatMessage {
     pub role: String,
     pub content: Option<Value>,
+    pub tool_calls: Option<Value>,
+    pub tool_call_id: Option<String>,
+    pub reasoning_content: Option<String>,
+}
+
+impl ChatMessage {
+    fn has_tool_turn(&self) -> bool {
+        self.role == "tool"
+            || self
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.as_array().is_none_or(|calls| !calls.is_empty()))
+    }
+
+    fn to_message(&self, string_arguments: bool) -> Result<Message, String> {
+        let tool_calls = match &self.tool_calls {
+            None | Some(Value::Null) => None,
+            Some(calls) => Some(history_calls(calls, string_arguments)?),
+        };
+        Ok(Message {
+            tool_calls,
+            tool_call_id: self.tool_call_id.clone(),
+            reasoning_content: self.reasoning_content.clone(),
+            ..Message::new(&self.role, content_text(self.content.as_ref())?)
+        })
+    }
+}
+
+/// Validated copy of a history turn's `tool_calls`. With `string_arguments`
+/// false the template applies `tojson`, so JSON text becomes an object first.
+fn history_calls(calls: &Value, string_arguments: bool) -> Result<Value, String> {
+    let calls = calls.as_array().ok_or("tool_calls must be an array")?;
+    calls
+        .iter()
+        .map(|call| history_call(call, string_arguments))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::Array)
+}
+
+fn history_call(call: &Value, string_arguments: bool) -> Result<Value, String> {
+    let function = call.get("function").ok_or("tool call without \"function\"")?;
+    function
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or("tool call function needs a non-empty string \"name\"")?;
+    let arguments = match function.get("arguments") {
+        Some(Value::String(text)) if !string_arguments => serde_json::from_str::<Value>(text)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| Value::String(text.clone())),
+        Some(value @ (Value::String(_) | Value::Object(_))) => value.clone(),
+        _ => return Err("tool call arguments must be a string or an object".into()),
+    };
+    let mut copy = call.clone();
+    copy["function"]["arguments"] = arguments;
+    Ok(copy)
 }
 
 #[derive(Deserialize, Default)]
@@ -93,13 +159,43 @@ pub const COMPLETION_DEFAULT_MAX_TOKENS: u32 = 16;
 
 impl ChatRequest {
     pub fn messages(&self) -> Result<Vec<Message>, String> {
+        self.messages_for(true)
+    }
+
+    /// The messages for a template; see `history_calls` for `string_arguments`.
+    pub fn messages_for(&self, string_arguments: bool) -> Result<Vec<Message>, String> {
         if self.messages.is_empty() {
             return Err("messages must not be empty".into());
         }
         self.messages
             .iter()
-            .map(|m| Ok(Message::new(&m.role, content_text(m.content.as_ref())?)))
+            .map(|message| message.to_message(string_arguments))
             .collect()
+    }
+
+    pub fn has_tool_history(&self) -> bool {
+        self.messages.iter().any(ChatMessage::has_tool_turn)
+    }
+
+    /// Whether the request has tools or tool turns in its history.
+    pub fn uses_tools(&self) -> bool {
+        self.tools.as_ref().is_some_and(|tools| !tools.is_empty()) || self.has_tool_history()
+    }
+
+    /// None when the request does not involve tools.
+    pub fn tool_spec(&self) -> Result<Option<ToolSpec>, String> {
+        let tools = self.tools.as_deref().unwrap_or_default();
+        if tools.is_empty() {
+            if demands_a_call(self.tool_choice.as_ref()) {
+                return Err("tool_choice needs a non-empty tools list".into());
+            }
+            return Ok(self.uses_tools().then(ToolSpec::forbidden));
+        }
+        let spec = ToolSpec::parse(tools, self.tool_choice.as_ref(), self.parallel_tool_calls)?;
+        if spec.mode != ToolMode::Forbidden && self.json_schema()?.is_some() {
+            return Err("response_format cannot be combined with active tools".into());
+        }
+        Ok(Some(spec))
     }
 
     pub fn max_tokens(&self) -> Option<u32> {
@@ -182,6 +278,12 @@ fn json_schema(format: Option<&Value>) -> Result<Option<JsonSchema>, String> {
             "unsupported response_format type {other:?} (text, json_object or json_schema)"
         )),
     }
+}
+
+fn demands_a_call(choice: Option<&Value>) -> bool {
+    !matches!(choice.map(|choice| (choice, choice.as_str())), None
+        | Some((Value::Null, _))
+        | Some((_, Some("none" | "auto"))))
 }
 
 fn check_supported(n: Option<u32>) -> Result<(), String> {
@@ -326,6 +428,66 @@ mod tests {
         assert!(chat(json!({"messages": []})).messages().is_err());
         let prompt: CompletionRequest = serde_json::from_value(json!({"prompt": ["a", "b"]})).unwrap();
         assert!(prompt.prompt().is_err());
+    }
+
+    #[test]
+    fn tool_spec_rules() {
+        let tool = json!({"type": "function", "function": {"name": "a"}});
+        let base = json!({"messages": [{"role": "user", "content": "x"}]});
+        let with = |extra: Value| {
+            let mut body = base.clone();
+            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            chat(body)
+        };
+        assert!(with(json!({})).tool_spec().unwrap().is_none());
+        assert!(with(json!({"tools": []})).tool_spec().unwrap().is_none());
+        assert!(with(json!({"tools": [], "tool_choice": "required"})).tool_spec().is_err());
+        assert!(
+            with(json!({"tools": [tool], "response_format": {"type": "json_object"}}))
+                .tool_spec()
+                .is_err()
+        );
+        assert!(
+            with(json!({"tools": [tool], "tool_choice": "none", "response_format": {"type": "json_object"}}))
+                .tool_spec()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn history_without_tools_is_forbidden_mode() {
+        let request = chat(json!({"messages": [
+            {"role": "user", "content": "x"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "1", "type": "function", "function": {"name": "a", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "1", "content": "ok"}]}));
+        assert!(request.uses_tools());
+        assert_eq!(request.tool_spec().unwrap().unwrap().mode, ToolMode::Forbidden);
+    }
+
+    #[test]
+    fn string_arguments_become_objects_only_when_the_template_needs_it() {
+        let body = |args: &str| {
+            chat(json!({"messages": [{"role": "assistant", "content": "", "tool_calls": [
+                {"id": "1", "type": "function", "function": {"name": "a", "arguments": args}}]}]}))
+        };
+        let arguments =
+            |m: &Message| m.tool_calls.as_ref().unwrap()[0]["function"]["arguments"].clone();
+        assert_eq!(arguments(&body("{\"x\":1}").messages_for(true).unwrap()[0]), json!("{\"x\":1}"));
+        assert_eq!(arguments(&body("{\"x\":1}").messages_for(false).unwrap()[0]), json!({"x": 1}));
+        assert_eq!(arguments(&body("{\"x\":").messages_for(false).unwrap()[0]), json!("{\"x\":"));
+    }
+
+    #[test]
+    fn malformed_history_calls_are_rejected() {
+        for call in [
+            json!({"function": {"arguments": "{}"}}),
+            json!({"function": {"name": "a", "arguments": 1}}),
+        ] {
+            let request =
+                chat(json!({"messages": [{"role": "assistant", "content": "", "tool_calls": [call]}]}));
+            assert!(request.messages_for(true).is_err());
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@
 
 use palito::{
     Error,
-    chat::Message,
+    chat::{Message, ToolFormat},
     engine::{Completion, Engine, EngineOptions, FinishReason, GenerationOptions},
 };
 use super::reasoning::{self, Part, ReasoningSplitter};
@@ -49,6 +49,8 @@ pub struct ModelReport {
     pub context_tokens: u32,
     pub profile: &'static str,
     pub has_chat_template: bool,
+    /// None when the template has no tool call format Palito can generate.
+    pub tool_format: Option<ToolFormat>,
 }
 
 #[derive(Clone)]
@@ -89,6 +91,7 @@ impl Worker {
                     context_tokens: engine.context_tokens(),
                     profile: engine.profile(),
                     has_chat_template: engine.has_chat_template(),
+                    tool_format: engine.tool_format(),
                 }));
                 for job in inbox {
                     run(&mut engine, job);

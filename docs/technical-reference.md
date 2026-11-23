@@ -12,7 +12,8 @@ The [standalone master Mermaid chart](architecture.mmd) is editable.
 
 ## Default CPU execution scope
 
-- One dense, decoder-only `llama` architecture model, one sequence, CPU execution.
+- One dense, decoder-only `llama` architecture model, one sequence, CPU execution
+  (several sequences exist only in the CUDA server; see "Concurrent slots").
 - GGUF v3 with an explicit tensor allowlist: F32, F16, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K.
 - Own GGUF reader, tensor dequantization, RMSNorm, adjacent-pair RoPE, causal
   grouped-query attention, SwiGLU, residuals, and tied/separate output weights.
@@ -1487,9 +1488,23 @@ baseline; it does not establish a speedup or generalize to larger models.
 
 ## HTTP server
 
-`palito serve` (`src/server/`) is an OpenAI-compatible server on axum/tokio. The `Engine` is opened on a dedicated worker thread and serves one request at a time. HTTP handlers queue jobs into a bounded channel (`--queue`; full → 503 with `Retry-After`) and receive text over an unbounded channel. When the client disconnects, that channel closes and the engine cancels generation at the next token. Streaming follows the OpenAI chunk format (role chunk, content deltas, a finish chunk, an optional `stream_options.include_usage` chunk, `[DONE]`). Responses add a `timings` object (`ttft_ms`, `tokens_per_second`). `/v1` routes require `Authorization: Bearer` when `--api-key`/`PALITO_API_KEY` is set (constant-time comparison). Bodies are limited to 16 MiB. Tests: `cargo test --release --test serve -- --include-ignored` (SmolLM2 fixture, CPU). Checked with the official OpenAI Python SDK (models, chat, streaming, completions) against Qwen3-30B-A3B: about 360 tok/s per request, same as the CLI.
+`palito serve` (`src/server/`) is an OpenAI-compatible server on axum/tokio. The `Engine` is opened on a dedicated worker thread and serves one request at a time, or `--parallel` requests in turns (see "Concurrent slots"). HTTP handlers queue jobs into a bounded channel (`--queue`; full → 503 with `Retry-After`) and receive text over an unbounded channel. When the client disconnects, that channel closes and the engine cancels generation at the next token. Streaming follows the OpenAI chunk format (role chunk, content deltas, a finish chunk, an optional `stream_options.include_usage` chunk, `[DONE]`). Responses add a `timings` object (`ttft_ms`, `tokens_per_second`). `/v1` routes require `Authorization: Bearer` when `--api-key`/`PALITO_API_KEY` is set (constant-time comparison). Bodies are limited to 16 MiB. Tests: `cargo test --release --test serve -- --include-ignored` (SmolLM2 fixture, CPU). Checked with the official OpenAI Python SDK (models, chat, streaming, completions) against Qwen3-30B-A3B: about 360 tok/s per request, same as the CLI.
 
 Chat replies are split into `reasoning_content` and `content` (`src/server/reasoning.rs`) unless the request sends `"reasoning_format": "none"`. The split works on streamed pieces: a tag cut across pieces is held until complete, so streamed and non-streamed replies match. When the rendered prompt already ends with `<think>`, generation starts inside the reasoning. Omitted sampling fields take the server's `--temperature/--top-p/--top-k/--seed` defaults (greedy).
+
+### Concurrent slots
+
+`palito serve --parallel N` (1 to 64, CUDA only; `src/slots.rs`, `src/slots/`, `src/cuda/slots.rs`, `src/server/slot_worker.rs`) time-slices N sequences on one engine thread. `--parallel 1` keeps the single-request path unchanged.
+
+- **Shared and per-slot state.** Weights, kernels and the workspace are shared. Each slot owns its K/V, logits, decode state and graph, and prefix cache. The active slot's state lives in the backend fields and is swapped with `mem::swap`.
+- **Context.** `slot_context = ceil_256(C / N)`. Without `--context`, C is the trained context, and the per-slot value is capped at 65535 and fitted to GPU memory. `/health` reports `slots`, and `context_tokens` is per slot.
+- **Turns.** Each active slot gets one turn per round, in slot order. A turn is one prompt block of at most 512 tokens, aligned from position 0, or one generated token. A slot running alone may generate bursts of up to 8 tokens.
+- **Slot choice.** A new request takes the free slot that restores the longest prefix of its prompt. Ties go to the least recently used slot, then the lowest index.
+- **Queue.** `--queue` counts only requests waiting for a slot, and a full queue returns 503 with `Retry-After`. A queued request whose client left is dropped without touching the GPU.
+- **Failures.** A request error ends only that request and resets its slot. After a device or numerical error the worker synchronizes the CUDA stream: if that works, the other slots continue; if not, all active and queued requests get an error.
+- **Determinism.** On a server with a given `N > 1`, a request produces the same tokens with or without other active slots, greedy or with a fixed `seed`. Equality between `--parallel 1` and `N > 1` is not promised above 512 prompt tokens, because the kernels are not invariant to batch size. On Qwen3-30B, a 1486-token prompt matched under greedy and diverged under `seed`; the three shorter prompts matched in both.
+- **Measured** (Qwen3-30B-A3B Q4_K_M, RTX 5090, `benchmarks/concurrency/`): 354 tok/s for one request and 355 tok/s total for four (ratio 1.004); 32 ms to first token for a short request during a long one; `--parallel 1` median 0.45% below master over 3 runs.
+- **Not supported:** a unified K/V cache shared between slots, true batched decoding across slots, the `/slots` endpoint, `id_slot`, the CPU backend, and `qwen35` models.
 
 ## Sampling and stop sequences
 

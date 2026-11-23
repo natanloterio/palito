@@ -154,7 +154,7 @@ fn prepare(engine: &mut SlotEngine, job: Job) -> Option<ServerTask> {
 }
 
 enum Next {
-    Job(Job),
+    Job(Box<Job>),
     Empty,
     Closed,
 }
@@ -175,7 +175,7 @@ fn next_job(inbox: &Receiver<Job>, block: bool) -> Next {
             }
         };
         if !job.events.is_closed() {
-            return Next::Job(job);
+            return Next::Job(Box::new(job));
         }
     }
 }
@@ -186,7 +186,7 @@ pub(super) fn serve_slots(mut engine: SlotEngine, inbox: Receiver<Job>) {
         while scheduler.has_free_slot() {
             match next_job(&inbox, scheduler.is_idle()) {
                 Next::Job(job) => {
-                    if let Some(task) = prepare(&mut engine, job) {
+                    if let Some(task) = prepare(&mut engine, *job) {
                         scheduler.admit(engine.backend_mut(), task);
                     }
                 }
@@ -232,7 +232,9 @@ mod tests {
         sender.send(gone).ok().unwrap();
         sender.send(live).ok().unwrap();
         match next_job(&inbox, false) {
-            Next::Job(Job { prompt: Prompt::Text(text), .. }) => assert_eq!(text, "live"),
+            Next::Job(job) => {
+                assert!(matches!(&job.prompt, Prompt::Text(text) if text == "live"));
+            }
             _ => panic!("expected the live request"),
         }
         assert!(matches!(next_job(&inbox, false), Next::Empty));

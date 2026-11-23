@@ -173,12 +173,7 @@ fn text_sink() -> Box<dyn FnMut(&str) -> bool> {
 }
 
 fn finish(engine: &mut SlotEngine, mut run: SlotRun) -> Completion {
-    loop {
-        match run.advance(engine.backend_mut(), true).unwrap() {
-            Advance::Working => {}
-            Advance::Finished => break,
-        }
-    }
+    while let Advance::Working = run.advance(engine.backend_mut(), true).unwrap() {}
     match run.into_reply().unwrap() {
         SlotReply::Text(completion) => completion,
         SlotReply::Tools(_) => panic!("expected a text reply"),

@@ -6,10 +6,14 @@
 
 use palito::{
     Error,
-    chat::Message,
+    chat::{Message, ToolFormat},
     engine::{Completion, Engine, EngineOptions, FinishReason, GenerationOptions},
+    tools::{ToolEvent, ToolSpec},
 };
-use super::reasoning::{self, Part, ReasoningSplitter};
+use super::{
+    openai,
+    reasoning::{self, Part, ReasoningSplitter},
+};
 use std::{
     path::PathBuf,
     sync::mpsc::{SyncSender, TrySendError, sync_channel},
@@ -19,12 +23,15 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 pub enum Prompt {
     Chat(Vec<Message>),
+    ChatTools(Vec<Message>, ToolSpec),
     Text(String),
 }
 
 pub enum Event {
     /// Generated text; `reasoning` marks `<think>` content when splitting.
     Text { reasoning: bool, text: String },
+    CallStart { index: usize, id: String, name: String },
+    CallArguments { index: usize, text: String },
     Done(Result<Reply, String>),
 }
 
@@ -34,6 +41,16 @@ pub struct Reply {
     pub reasoning: Option<String>,
     /// The answer (the whole text when not splitting).
     pub content: String,
+    pub tool_calls: Vec<ReplyCall>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReplyCall {
+    pub id: String,
+    pub name: String,
+    /// JSON text; partial when `complete` is false.
+    pub arguments: String,
+    pub complete: bool,
 }
 
 struct Job {
@@ -49,6 +66,8 @@ pub struct ModelReport {
     pub context_tokens: u32,
     pub profile: &'static str,
     pub has_chat_template: bool,
+    /// None when the template has no tool call format Palito can generate.
+    pub tool_format: Option<ToolFormat>,
 }
 
 #[derive(Clone)]
@@ -89,6 +108,7 @@ impl Worker {
                     context_tokens: engine.context_tokens(),
                     profile: engine.profile(),
                     has_chat_template: engine.has_chat_template(),
+                    tool_format: engine.tool_format(),
                 }));
                 for job in inbox {
                     run(&mut engine, job);
@@ -143,6 +163,7 @@ fn run(engine: &mut Engine, job: Job) {
     };
     let result = match &job.prompt {
         Prompt::Chat(messages) => engine.chat(messages, &job.options, on_text),
+        Prompt::ChatTools(messages, spec) => return run_tools(engine, &job, messages, spec),
         Prompt::Text(text) => engine.complete(text, &job.options, on_text),
     };
     if let Some(splitter) = &mut splitter {
@@ -150,27 +171,90 @@ fn run(engine: &mut Engine, job: Job) {
             send(part == Part::Reasoning, text);
         }
     }
-    let reply = result.map_err(|e| e.to_string()).map(|completion| {
-        if completion.finish_reason == FinishReason::Cancelled {
-            eprintln!(
-                "request cancelled by the client after {} tokens",
-                completion.generated_tokens
-            );
+    let reply = result
+        .map_err(|e| e.to_string())
+        .map(|completion| build_reply(completion, opened, Vec::new()));
+    let _ = job.events.send(Event::Done(reply));
+}
+
+fn run_tools(engine: &mut Engine, job: &Job, messages: &[Message], spec: &ToolSpec) {
+    let events = &job.events;
+    let opened = job.split_reasoning.then(|| {
+        engine
+            .render_chat_tools(messages, spec, job.options.enable_thinking)
+            .is_ok_and(|prompt| prompt.trim_end().ends_with("<think>"))
+    });
+    let mut splitter = opened.map(ReasoningSplitter::new);
+    let mut ids = Vec::new();
+    let result = engine.chat_tools(messages, spec, &job.options, |event| match event {
+        ToolEvent::Text(text) => send_text(events, &mut splitter, &text),
+        ToolEvent::CallStart { index, name } => {
+            // Text held by the splitter comes before the call.
+            let flushed = flush_text(events, &mut splitter);
+            let id = openai::response_id("call");
+            ids.push(id.clone());
+            flushed && events.send(Event::CallStart { index, id, name }).is_ok()
         }
-        let (reasoning, content) = match opened {
-            Some(opened) => {
-                let (reasoning, content) = reasoning::split(&completion.text, opened);
-                ((!reasoning.is_empty()).then_some(reasoning), content)
-            }
-            None => (None, completion.text.clone()),
-        };
-        Reply {
-            completion,
-            reasoning,
-            content,
+        ToolEvent::CallArguments { index, text } => {
+            events.send(Event::CallArguments { index, text }).is_ok()
         }
     });
-    let _ = job.events.send(Event::Done(reply));
+    flush_text(events, &mut splitter);
+    let reply = result.map_err(|e| e.to_string()).map(|done| {
+        let calls = done.calls.into_iter().zip(ids).map(|(call, id)| ReplyCall {
+            id,
+            name: call.name,
+            arguments: call.arguments,
+            complete: call.complete,
+        });
+        build_reply(done.completion, opened, calls.collect())
+    });
+    let _ = events.send(Event::Done(reply));
+}
+
+fn send_text(
+    events: &UnboundedSender<Event>,
+    splitter: &mut Option<ReasoningSplitter>,
+    piece: &str,
+) -> bool {
+    match splitter {
+        None => send_part(events, Part::Content, piece.to_owned()),
+        Some(splitter) => {
+            splitter.push(piece).into_iter().all(|(part, text)| send_part(events, part, text))
+        }
+    }
+}
+
+fn flush_text(events: &UnboundedSender<Event>, splitter: &mut Option<ReasoningSplitter>) -> bool {
+    splitter.as_mut().is_none_or(|splitter| {
+        splitter.finish().into_iter().all(|(part, text)| send_part(events, part, text))
+    })
+}
+
+fn send_part(events: &UnboundedSender<Event>, part: Part, text: String) -> bool {
+    events.send(Event::Text { reasoning: part == Part::Reasoning, text }).is_ok()
+}
+
+fn build_reply(completion: Completion, opened: Option<bool>, tool_calls: Vec<ReplyCall>) -> Reply {
+    if completion.finish_reason == FinishReason::Cancelled {
+        eprintln!(
+            "request cancelled by the client after {} tokens",
+            completion.generated_tokens
+        );
+    }
+    let (reasoning, content) = match opened {
+        Some(opened) => {
+            let (reasoning, content) = reasoning::split(&completion.text, opened);
+            ((!reasoning.is_empty()).then_some(reasoning), content)
+        }
+        None => (None, completion.text.clone()),
+    };
+    Reply {
+        completion,
+        reasoning,
+        content,
+        tool_calls,
+    }
 }
 
 /// Whether the rendered prompt already opens a `<think>` block.

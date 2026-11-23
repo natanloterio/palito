@@ -8,12 +8,15 @@
 
 mod open;
 mod text;
+mod tools;
+
+pub use tools::ToolCompletion;
 
 use crate::{
     Config, Error, Executor, GenerationMode, Result, Sample,
     backend::Backend,
     chat::{ChatTemplate, Message},
-    grammar::{JsonDecoder, JsonSchema},
+    grammar::{JsonDecoder, JsonSchema, LogitConstraint},
     sampling::{Sampler, Sampling},
     stop::{self, StopFilter},
     stream::TextStream,
@@ -159,6 +162,8 @@ pub struct Engine {
     notices: Vec<String>,
     /// Built on the first JSON-constrained request.
     json_decoder: Option<JsonDecoder>,
+    /// Built on the first request with tools.
+    tool_tokens: Option<crate::tools::ToolTokens>,
 }
 
 impl Engine {
@@ -198,6 +203,7 @@ impl Engine {
             profile,
             notices: Vec::new(),
             json_decoder: None,
+            tool_tokens: None,
         })
     }
 
@@ -330,7 +336,7 @@ impl Engine {
                 budget,
                 mode,
                 &mut sampler,
-                constraint.as_mut(),
+                constraint.as_mut().map(|c| c as &mut dyn LogitConstraint),
                 &mut on_token,
             )
         };

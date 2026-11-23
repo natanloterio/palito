@@ -23,8 +23,13 @@ impl Drop for Server {
 
 fn start(port: u16, extra: &[&str]) -> Server {
     let model = concat!(env!("CARGO_MANIFEST_DIR"), "/models/SmolLM2-135M-Instruct-Q4_K_M.gguf");
+    launch(port, &["--backend", "cpu", "--context", "512", "--model", model], extra)
+}
+
+fn launch(port: u16, model_args: &[&str], extra: &[&str]) -> Server {
     let mut child = Command::new(env!("CARGO_BIN_EXE_palito"))
-        .args(["serve", "--backend", "cpu", "--context", "512", "--model", model])
+        .arg("serve")
+        .args(model_args)
         .args(["--port", &port.to_string()])
         .args(extra)
         .env_remove("PALITO_API_KEY")
@@ -60,6 +65,46 @@ fn request(server: &Server, method: &str, path: &str, body: Option<Value>, key: 
     let status = response[9..12].parse().unwrap();
     let body = response.split_once("\r\n\r\n").map_or("", |(_, b)| b).to_owned();
     (status, body)
+}
+
+/// Leaves a tool call stream after its first call delta; the next request
+/// must still be answered.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a GPU and PALITO_TOOL_MODEL (a Qwen3 GGUF)"]
+fn client_disconnect_during_a_call_frees_the_engine() {
+    let model = std::env::var("PALITO_TOOL_MODEL").unwrap_or_else(|_| {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/models/compat-qwen3/Qwen3-0.6B-Q4_K_M.gguf").into()
+    });
+    let server = launch(18471, &["--backend", "cuda", "--context", "4096", "--model", &model], &[]);
+    let tool = json!({"type": "function", "function": {"name": "weather", "parameters": {
+        "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}});
+    let body = json!({
+        "messages": [{"role": "user", "content": "Tempo no Rio?"}],
+        "tools": [tool], "tool_choice": "required", "max_tokens": 2000, "stream": true,
+        "chat_template_kwargs": {"enable_thinking": false},
+    })
+    .to_string();
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    write!(
+        stream,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    while !line.contains("tool_calls") {
+        line.clear();
+        assert!(reader.read_line(&mut line).unwrap() > 0, "stream ended without a call");
+    }
+    drop(reader);
+    let next = json!({"messages": [{"role": "user", "content": "Oi"}], "max_tokens": 4});
+    let started = std::time::Instant::now();
+    let (status, _) = request(&server, "POST", "/v1/chat/completions", Some(next), None);
+    assert_eq!(status, 200);
+    assert!(started.elapsed() < Duration::from_secs(30));
 }
 
 fn chunked_body(raw: &str) -> String {

@@ -8,7 +8,9 @@ use crate::{
     Error, Result,
     gguf::{Gguf, Value},
 };
-use minijinja::{Environment, ErrorKind, Value as TemplateValue, context, syntax::SyntaxConfig};
+use minijinja::{
+    Environment, ErrorKind, Value as TemplateValue, context, syntax::SyntaxConfig, value::Serde,
+};
 use serde::Serialize;
 use std::{collections::HashMap, path::Path, time::SystemTime};
 
@@ -19,6 +21,14 @@ const TEMPLATE_KEY: &str = "tokenizer.chat_template";
 pub struct Message {
     pub role: String,
     pub content: String,
+    /// OpenAI-shaped calls of an assistant turn. Absent fields stay undefined
+    /// in the template.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl Message {
@@ -26,6 +36,9 @@ impl Message {
         Self {
             role: role.into(),
             content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
         }
     }
     pub fn system(content: impl Into<String>) -> Self {
@@ -39,8 +52,17 @@ impl Message {
     }
 }
 
+/// A template that writes tool calls as Qwen's JSON inside `<tool_call>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolFormat {
+    /// The template inserts string `arguments` as they are; otherwise it
+    /// applies `tojson` to them.
+    pub string_arguments: bool,
+}
+
 pub struct ChatTemplate {
     env: Environment<'static>,
+    source: String,
     bos_token: String,
     eos_token: String,
     enable_thinking: bool,
@@ -67,6 +89,7 @@ impl ChatTemplate {
             .map_err(template_error)?;
         Ok(Self {
             env,
+            source: source.to_owned(),
             bos_token: bos_token.into(),
             eos_token: eos_token.into(),
             enable_thinking: true,
@@ -133,6 +156,43 @@ impl ChatTemplate {
                 })
             })
             .map_err(template_error)
+    }
+
+    /// Renders a conversation with tool fields and, when given, tool
+    /// definitions, ending with the generation prompt.
+    pub fn render_tools(
+        &self,
+        messages: &[Message],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+    ) -> Result<String> {
+        let tools = tools.map_or(TemplateValue::UNDEFINED, |tools| {
+            TemplateValue::from(Serde(tools))
+        });
+        self.env
+            .get_template(TEMPLATE_NAME)
+            .and_then(|template| {
+                template.render(context! {
+                    messages => TemplateValue::from(Serde(messages)),
+                    tools => tools,
+                    add_generation_prompt => true,
+                    bos_token => &self.bos_token,
+                    eos_token => &self.eos_token,
+                    enable_thinking => enable_thinking,
+                })
+            })
+            .map_err(template_error)
+    }
+
+    /// The tool call format of this template, if Palito supports it.
+    pub fn tool_format(&self) -> Option<ToolFormat> {
+        let source = &self.source;
+        let qwen_json = source.contains("<tool_call>")
+            && source.contains("<function-name>")
+            && !source.contains("<function=");
+        qwen_json.then(|| ToolFormat {
+            string_arguments: source.contains("arguments is string"),
+        })
     }
 }
 
@@ -236,6 +296,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     const CHATML: &str = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}";
 
@@ -337,5 +398,78 @@ mod tests {
         let messages = [Message::user("u")];
         let result = fit_history(&messages, |_| Err(Error::Invalid("boom".into())));
         assert!(result.unwrap_err().to_string().contains("boom"));
+    }
+
+    /// The parts of the Qwen3-30B-A3B template that handle tools.
+    const QWEN3_TOOLS_TEMPLATE: &str = r#"{%- if tools %}
+{{- '<|im_start|>system\n# Tools\n<tools>' }}
+{%- for tool in tools %}{{- "\n" }}{{- tool | tojson }}{%- endfor %}
+{{- '\n</tools>\n<tool_call>\n{"name": <function-name>}\n</tool_call><|im_end|>\n' }}
+{%- elif messages[0].role == 'system' %}
+{{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
+{%- endif %}
+{%- for message in messages %}
+{%- if message.role == "user" or (message.role == "system" and not loop.first) %}
+{{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' }}
+{%- elif message.role == "assistant" %}
+{{- '<|im_start|>assistant\n' + message.content }}
+{%- if message.tool_calls %}
+{%- for tool_call in message.tool_calls %}
+{%- if tool_call.function %}{%- set tool_call = tool_call.function %}{%- endif %}
+{{- '<tool_call>\n{"name": "' }}{{- tool_call.name }}{{- '", "arguments": ' }}
+{%- if tool_call.arguments is string %}{{- tool_call.arguments }}{%- else %}{{- tool_call.arguments | tojson }}{%- endif %}
+{{- '}\n</tool_call>' }}
+{%- endfor %}
+{%- endif %}
+{{- '<|im_end|>\n' }}
+{%- elif message.role == "tool" %}
+{{- '<|im_start|>user\n<tool_response>\n' + message.content + '\n</tool_response><|im_end|>\n' }}
+{%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}{%- endif %}"#;
+
+    #[test]
+    fn renders_tools_calls_and_results_with_the_qwen3_template() {
+        let template = ChatTemplate::new(QWEN3_TOOLS_TEMPLATE, "", "<|im_end|>").unwrap();
+        let tools = [json!({"type": "function", "function": {"name": "weather", "parameters": {"type": "object"}}})];
+        let mut call = Message::assistant("");
+        call.tool_calls = Some(json!([{"id": "call_1", "type": "function",
+            "function": {"name": "weather", "arguments": "{\"city\":\"Rio\"}"}}]));
+        let messages = [Message::user("Tempo?"), call, Message::new("tool", "28C")];
+        let prompt = template.render_tools(&messages, Some(&tools), true).unwrap();
+        assert!(prompt.contains("<tools>"));
+        assert!(prompt.contains("{\"name\": \"weather\", \"arguments\": {\"city\":\"Rio\"}}"));
+        assert!(prompt.contains("<tool_response>\n28C\n</tool_response>"));
+    }
+
+    #[test]
+    fn render_without_tool_fields_is_unchanged() {
+        let template = ChatTemplate::new(QWEN3_TOOLS_TEMPLATE, "", "<|im_end|>").unwrap();
+        let messages = [Message::system("S"), Message::user("Oi")];
+        assert_eq!(
+            template.render_tools(&messages, None, true).unwrap(),
+            template.render_thinking(&messages, true, true).unwrap()
+        );
+    }
+
+    #[test]
+    fn absent_reasoning_content_is_undefined_in_the_template() {
+        let source = "{% for m in messages %}{% if m.reasoning_content is defined %}set{% else %}unset{% endif %}{% endfor %}";
+        let template = ChatTemplate::new(source, "", "").unwrap();
+        let mut with = Message::assistant("a");
+        with.reasoning_content = Some("r".into());
+        let prompt = template.render_tools(&[Message::assistant("a"), with], None, true).unwrap();
+        assert_eq!(prompt, "unsetset");
+    }
+
+    #[test]
+    fn detects_only_the_qwen_json_tool_format() {
+        let qwen3 = ChatTemplate::new(QWEN3_TOOLS_TEMPLATE, "", "").unwrap();
+        assert_eq!(qwen3.tool_format(), Some(ToolFormat { string_arguments: true }));
+        let qwen25 = ChatTemplate::new("<tool_call> <function-name> {{ a | tojson }}", "", "").unwrap();
+        assert_eq!(qwen25.tool_format(), Some(ToolFormat { string_arguments: false }));
+        let qwen35 = ChatTemplate::new("<tool_call><function=x> <function-name>", "", "").unwrap();
+        assert_eq!(qwen35.tool_format(), None);
+        assert_eq!(ChatTemplate::new("{{ messages }}", "", "").unwrap().tool_format(), None);
     }
 }

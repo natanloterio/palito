@@ -76,9 +76,15 @@ impl Tokenizer {
             None => Ok(false),
             _ => Err(invalid(format!("invalid boolean {key}"))),
         };
-        let pre = text("tokenizer.ggml.pre")?;
         let model = text("tokenizer.ggml.model")?;
+        // Older SentencePiece conversions predate the pre-tokenizer key.
+        let pre = match (model, metadata.contains_key("tokenizer.ggml.pre")) {
+            ("llama", false) => "default",
+            _ => text("tokenizer.ggml.pre")?,
+        };
         let spm = model == "llama" && pre == "default";
+        let llama_spm = spm
+            && matches!(metadata.get("general.architecture"), Some(Value::Text(arch)) if arch == "llama");
         let phi = spm
             && matches!(metadata.get("general.architecture"), Some(Value::Text(arch)) if arch == "phi3");
         let gemma = spm
@@ -87,6 +93,7 @@ impl Tokenizer {
         let split_digits = matches!(pre, "smollm" | "starcoder");
         if !gemma
             && !phi
+            && !llama_spm
             && !llama3
             && (model != "gpt2"
                 || (!split_digits
@@ -96,12 +103,12 @@ impl Tokenizer {
                     )))
         {
             return Err(invalid(
-                "supported tokenizers: gpt2/gpt-2, gpt2/bloom, gpt2/mpt, gpt2/olmo, gpt2/dbrx, gpt2/smollm, gpt2/starcoder, gpt2/qwen2, gpt2/qwen35, gpt2/llama-bpe, and Gemma 3/Phi-3 SentencePiece",
+                "supported tokenizers: gpt2/gpt-2, gpt2/bloom, gpt2/mpt, gpt2/olmo, gpt2/dbrx, gpt2/smollm, gpt2/starcoder, gpt2/qwen2, gpt2/qwen35, gpt2/llama-bpe, and Llama/Gemma 3/Phi-3 SentencePiece",
             ));
         }
         for (key, supported) in [
             ("tokenizer.ggml.remove_extra_whitespaces", false),
-            ("tokenizer.ggml.add_space_prefix", phi),
+            ("tokenizer.ggml.add_space_prefix", phi || llama_spm),
             ("tokenizer.ggml.ignore_merges", llama3),
         ] {
             if flag(key)? && !supported {
@@ -126,7 +133,7 @@ impl Tokenizer {
             }
         };
         let bos = match metadata.get("tokenizer.ggml.add_bos_token") {
-            None if llama3 || phi => match metadata.get("tokenizer.ggml.bos_token_id") {
+            None if llama3 || phi || llama_spm => match metadata.get("tokenizer.ggml.bos_token_id") {
                 Some(Value::Integer(id)) if *id < tokens.len() as u64 => Some(*id as i32),
                 _ => return Err(invalid("missing or invalid tokenizer.ggml.bos_token_id")),
             },
@@ -140,7 +147,7 @@ impl Tokenizer {
             "tokenizer.ggml.eos_token_id",
         )?;
         let unused = types.iter().map(|kind| *kind == 5).collect();
-        if gemma || phi {
+        if gemma || phi || llama_spm {
             return SentencePiece::from_metadata(metadata, tokens, types, bos, eos, unused);
         }
         let mut vocab = HashMap::new();

@@ -80,6 +80,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Compile Metal shaders
+        if: matrix.features == 'metal'
+        run: xcrun -sdk macosx metal -c src/metal/shaders.metal -o "$RUNNER_TEMP/shaders.air"
       - name: Build libpalito (${{ matrix.platform }})
         run: cargo build --release --lib --features ${{ matrix.features }}
       - name: Upload native library
@@ -89,7 +92,7 @@ jobs:
           path: ${{ matrix.src }}
 
   crates:
-    needs: version
+    needs: [version, native]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

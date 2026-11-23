@@ -8,7 +8,8 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const koffi = require('koffi');
+// The prebuilt package, not `koffi`: its install script makes pnpm's default install fail.
+const koffi = require('@koromix/koffi-linux-x64');
 
 const DEVICES = { default: 0, cpu: 1, cuda: 2 };
 const FINISH_REASONS = ['stop', 'length', 'context_full', 'cancelled'];

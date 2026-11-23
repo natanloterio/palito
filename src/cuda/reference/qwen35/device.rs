@@ -117,10 +117,7 @@ pub(in crate::cuda) fn open(
             "Qwen3.5 CUDA requires {required} device bytes"
         )));
     }
-    for name in ["libcuda.so.1", "libnvrtc.so.13"] {
-        // cudarc uses lazy loading, so report unavailable libraries before calling it.
-        unsafe { libloading::Library::new(name) }.map_err(failure)?;
-    }
+    crate::cuda::nvrtc::ensure_libraries().map_err(failure)?;
     let cuda = CudaContext::new(options.device).map_err(failure)?;
     let major = cuda
         .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)

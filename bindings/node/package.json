@@ -10,5 +10,5 @@
   "files": ["index.js", "index.d.ts", "README.md"],
   "engines": { "node": ">=18" },
   "scripts": { "test": "node --test test/*.test.js" },
-  "dependencies": { "koffi": "^3.3.8" }
+  "dependencies": { "@koromix/koffi-linux-x64": "3.3.8" }
 }

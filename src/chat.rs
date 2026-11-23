@@ -144,14 +144,21 @@ impl ChatTemplate {
         add_generation_prompt: bool,
         enable_thinking: bool,
     ) -> Result<String> {
+        let has_tool_turns =
+            messages.iter().any(|m| m.tool_calls.is_some() || m.tool_call_id.is_some());
+        let template_messages = if has_tool_turns {
+            TemplateValue::from(Serde(messages))
+        } else {
+            TemplateValue::from_iter(messages.iter().map(|m| context! {
+                role => &m.role,
+                content => &m.content,
+            }))
+        };
         self.env
             .get_template(TEMPLATE_NAME)
             .and_then(|template| {
                 template.render(context! {
-                    messages => TemplateValue::from_iter(messages.iter().map(|m| context! {
-                        role => &m.role,
-                        content => &m.content,
-                    })),
+                    messages => template_messages,
                     add_generation_prompt => add_generation_prompt,
                     bos_token => &self.bos_token,
                     eos_token => &self.eos_token,
@@ -463,6 +470,18 @@ mod tests {
         with.reasoning_content = Some("r".into());
         let prompt = template.render_tools(&[Message::assistant("a"), with], None, true).unwrap();
         assert_eq!(prompt, "unsetset");
+    }
+
+    #[test]
+    fn plain_render_keeps_tool_history() {
+        let template = ChatTemplate::new(QWEN3_TOOLS_TEMPLATE, "", "<|im_end|>").unwrap();
+        let mut call = Message::assistant("");
+        call.tool_calls = Some(serde_json::json!([{"id": "1", "type": "function",
+            "function": {"name": "get_weather", "arguments": "{\"city\": \"Rio\"}"}}]));
+        let messages = [Message::user("Tempo?"), call, Message::new("tool", "22 C")];
+        let prompt = template.render_thinking(&messages, true, false).unwrap();
+        assert!(prompt.contains("get_weather"), "{prompt}");
+        assert_eq!(prompt, template.render_tools(&messages, None, false).unwrap());
     }
 
     #[test]

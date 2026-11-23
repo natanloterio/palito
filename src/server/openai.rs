@@ -114,7 +114,7 @@ impl ChatMessage {
 }
 
 /// Validated copy of a history turn's `tool_calls`. With `string_arguments`
-/// false the template applies `tojson`, so JSON text becomes an object first.
+/// false the template applies `tojson`, so valid JSON text is parsed first.
 fn history_calls(calls: &Value, string_arguments: bool) -> Result<Value, String> {
     let calls = calls.as_array().ok_or("tool_calls must be an array")?;
     calls
@@ -133,9 +133,7 @@ fn history_call(call: &Value, string_arguments: bool) -> Result<Value, String> {
         .ok_or("tool call function needs a non-empty string \"name\"")?;
     let arguments = match function.get("arguments") {
         Some(Value::String(text)) if !string_arguments => serde_json::from_str::<Value>(text)
-            .ok()
-            .filter(Value::is_object)
-            .unwrap_or_else(|| Value::String(text.clone())),
+            .unwrap_or_else(|_| Value::String(text.clone())),
         Some(value @ (Value::String(_) | Value::Object(_))) => value.clone(),
         _ => return Err("tool call arguments must be a string or an object".into()),
     };
@@ -500,6 +498,16 @@ mod tests {
         assert_eq!(arguments(&body("{\"x\":1}").messages_for(true).unwrap()[0]), json!("{\"x\":1}"));
         assert_eq!(arguments(&body("{\"x\":1}").messages_for(false).unwrap()[0]), json!({"x": 1}));
         assert_eq!(arguments(&body("{\"x\":").messages_for(false).unwrap()[0]), json!("{\"x\":"));
+    }
+
+    #[test]
+    fn valid_json_arguments_of_any_type_are_not_double_encoded() {
+        for (text, parsed) in [("[1,2]", json!([1, 2])), ("5", json!(5)), ("\"x\"", json!("x"))] {
+            let request = chat(json!({"messages": [{"role": "assistant", "content": "", "tool_calls": [
+                {"id": "1", "type": "function", "function": {"name": "a", "arguments": text}}]}]}));
+            let messages = request.messages_for(false).unwrap();
+            assert_eq!(messages[0].tool_calls.as_ref().unwrap()[0]["function"]["arguments"], parsed);
+        }
     }
 
     #[test]

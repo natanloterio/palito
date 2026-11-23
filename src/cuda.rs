@@ -1334,8 +1334,11 @@ impl CudaBackend {
             for name in [
                 "embedding_decode",
                 "rotary_decode",
+                "rotary_factored_decode",
                 "cache_kv_decode",
                 "attention_fused_decode",
+                "gemma_attention_scores_decode",
+                "gemma_attention_values_decode",
                 "greedy_partials",
                 "greedy_finish",
             ] {
@@ -1353,7 +1356,7 @@ impl CudaBackend {
         let s = &weights.spec;
         if matches!(
             s.info.architecture.as_str(),
-            "gpt2" | "starcoder2" | "bloom" | "gptneox" | "olmo" | "olmo2" | "olmoe"
+            "gpt2" | "starcoder2" | "bloom" | "gptneox" | "olmo"
         ) && (options.decode_graph || options.matmul != CudaMatmul::F32)
         {
             return Err(invalid(format!(
@@ -1361,19 +1364,8 @@ impl CudaBackend {
                 s.info.architecture
             )));
         }
-        if s.info.architecture == "qwen2"
-            && (options.decode_graph || options.matmul != CudaMatmul::F32)
-        {
-            return Err(invalid(
-                "qwen2 CUDA requires f32 matmul without a decode graph",
-            ));
-        }
-        if s.info.tensor_types.iter().any(|kind| kind == "Q5_K")
-            && (s.experts != 0 || options.decode_graph || options.matmul != CudaMatmul::F32)
-        {
-            return Err(invalid(
-                "Q5_K CUDA requires dense f32 matmul without a decode graph",
-            ));
+        if s.info.tensor_types.iter().any(|kind| kind == "Q5_K") && s.experts != 0 {
+            return Err(invalid("Q5_K CUDA currently supports dense models only"));
         }
         if s.info.tensor_types.iter().any(|kind| {
             matches!(
@@ -1393,26 +1385,8 @@ impl CudaBackend {
                 "BF16 CUDA requires dense f32 matmul without a decode graph",
             ));
         }
-        if s.info.architecture == "phi3"
-            && (options.decode_graph || options.matmul != CudaMatmul::F32)
-        {
-            return Err(invalid(
-                "phi3 CUDA requires f32 matmul without a decode graph",
-            ));
-        }
-        if weights.rope_factors.is_some()
-            && (options.decode_graph || options.matmul != CudaMatmul::F32)
-        {
-            return Err(invalid(
-                "factored RoPE CUDA requires f32 matmul without a decode graph",
-            ));
-        }
-        if weights.gemma.is_some() && (options.decode_graph || options.matmul != CudaMatmul::F32) {
-            return Err(invalid(
-                "Gemma CUDA requires f32 matmul without a decode graph",
-            ));
-        }
         if options.decode_graph
+            && weights.gemma.is_none()
             && !fused_attention_supported(s)
             && !split_attention_supported(s, options.matmul)
         {
@@ -1795,18 +1769,15 @@ impl CudaBackend {
                         launch!(self, "rotary_partial_neox", grid;
                             256, vector, &size, &dim, &pos, &rope_base, &rotary_dim);
                     } else if let Some(factors) = &self.weights.rope_factors {
-                        launch!(
+                        launch_position!(
                             self,
+                            device_state,
                             "rotary_factored",
+                            "rotary_factored_decode",
                             grid,
-                            vector,
-                            &size,
-                            &dim,
+                            [vector, &size, &dim],
                             &pos,
-                            &rope_base,
-                            &neox,
-                            &factors.bytes,
-                            &s.rope_attn_factor
+                            [&rope_base, &neox, &factors.bytes, &s.rope_attn_factor]
                         );
                     } else {
                         launch_position!(
@@ -1841,19 +1812,59 @@ impl CudaBackend {
             if embedding_norm.is_some() {
                 alibi_attention!(self, index, heads, kv_heads, dim, context, count, 1);
             } else if let Some((window, _, scale)) = gemma_attention {
-                gemma_attention!(
-                    self,
-                    index,
-                    heads,
-                    kv_heads,
-                    dim,
-                    context,
-                    count,
-                    1,
-                    window,
-                    scale,
-                    gemma.unwrap().attention_softcap
-                );
+                let softcap = gemma.unwrap().attention_softcap;
+                if device_state {
+                    let control = &self
+                        .decode
+                        .as_ref()
+                        .ok_or_else(|| failure("decode control missing"))?
+                        .control;
+                    let chunks = (context as u32).min(256);
+                    launch!(
+                        self,
+                        "gemma_attention_scores_decode",
+                        (heads as u32, chunks, 1),
+                        &self.work.q,
+                        &self.keys[index],
+                        &mut self.work.scores,
+                        &dim,
+                        &heads,
+                        &kv_heads,
+                        &context,
+                        control,
+                        &window,
+                        &scale,
+                        &softcap
+                    );
+                    launch!(
+                        self,
+                        "gemma_attention_values_decode",
+                        (heads as u32, 1, 1),
+                        &mut self.work.scores,
+                        &self.values[index],
+                        &mut self.work.attended,
+                        &dim,
+                        &heads,
+                        &kv_heads,
+                        &context,
+                        control,
+                        &window
+                    );
+                } else {
+                    gemma_attention!(
+                        self,
+                        index,
+                        heads,
+                        kv_heads,
+                        dim,
+                        context,
+                        count,
+                        1,
+                        window,
+                        scale,
+                        softcap
+                    );
+                }
             } else if let Some(partials) = &mut self.work.attention_partials {
                 let splits = attention_splits(s) as i32;
                 let control = match &self.decode {

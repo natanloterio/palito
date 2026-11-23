@@ -5,11 +5,11 @@
 # Secrets (Settings > Secrets and variables > Actions):
 #   CARGO_REGISTRY_TOKEN                          crates.io token (publish-new, publish-update)
 #   NPM_TOKEN                                     npm granular token with publish rights
-#   NUGET_API_KEY                                 NuGet key, Push scope, glob Palito*
 #   MAVEN_CENTRAL_USERNAME, MAVEN_CENTRAL_PASSWORD Central Portal user token
 #   GPG_PRIVATE_KEY, GPG_PASSPHRASE               ASCII-armored signing key for Maven Central
-# PyPI needs no secret: it uses a trusted publisher (workflow release.yml,
-# environment pypi).
+# PyPI and NuGet need no secret: they use trusted publishing (workflow
+# release.yml, environments pypi and nuget; NuGet policy palito-release for
+# user natanloterio).
 #
 # The GitHub release with the CUDA bundle stays manual (scripts/package-linux.sh
 # needs a local NVRTC 13).
@@ -125,6 +125,10 @@ jobs:
   nuget:
     needs: version
     runs-on: ubuntu-latest
+    environment: nuget
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -132,11 +136,18 @@ jobs:
           dotnet-version: "8.0.x"
       - name: Pack
         run: dotnet pack bindings/csharp/Palito/Palito.csproj -c Release -o nupkg
+      # Trusted publishing: the OIDC token buys a short-lived API key.
+      - name: NuGet login
+        id: login
+        if: env.PUBLISH == 'true'
+        uses: NuGet/login@v1
+        with:
+          user: natanloterio
       - name: Push
         if: env.PUBLISH == 'true'
         run: >-
           dotnet nuget push "nupkg/*.nupkg"
-          --api-key "${{ secrets.NUGET_API_KEY }}"
+          --api-key "${{ steps.login.outputs.NUGET_API_KEY }}"
           --source https://api.nuget.org/v3/index.json
           --skip-duplicate
 

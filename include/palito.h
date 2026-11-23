@@ -93,7 +93,7 @@ void palito_close(palito_engine *engine);
 
 /* Context tokens actually opened (may be below the requested context). */
 uint32_t palito_context_tokens(const palito_engine *engine);
-/* "cpu", "int8-fast", "f32-tiled" or "f32"; static string. */
+/* "cpu", "metal", "vulkan", "int8-fast", "int8-prefill", "f32-tiled" or "f32"; static string. */
 const char *palito_profile(const palito_engine *engine);
 
 /*

@@ -71,6 +71,53 @@ fn capped(max_tokens: u32) -> GenerationOptions {
     GenerationOptions { max_tokens: Some(max_tokens), ..GenerationOptions::default() }
 }
 
+fn case_message(value: &Value, string_arguments: bool) -> Message {
+    let mut message = Message::new(
+        value["role"].as_str().unwrap(),
+        value["content"].as_str().unwrap_or_default(),
+    );
+    message.tool_call_id = value["tool_call_id"].as_str().map(str::to_owned);
+    message.tool_calls = value.get("tool_calls").cloned().map(|mut calls| {
+        for call in calls.as_array_mut().unwrap() {
+            let arguments = &mut call["function"]["arguments"];
+            if let (false, Some(text)) = (string_arguments, arguments.as_str()) {
+                *arguments = serde_json::from_str(text).unwrap();
+            }
+        }
+        calls
+    });
+    message
+}
+
+/// For scripts/compare_tool_prompts.py: reads cases from PALITO_PROMPT_CASES
+/// and writes the prompt token IDs of each to PALITO_PROMPT_IDS.
+#[test]
+#[ignore = "run by scripts/compare_tool_prompts.py"]
+fn dump_prompt_ids() {
+    let cases: Vec<Value> =
+        serde_json::from_slice(&std::fs::read(std::env::var("PALITO_PROMPT_CASES").unwrap()).unwrap())
+            .unwrap();
+    let _gpu = gpu_lock();
+    let options = EngineOptions { context_tokens: Some(2048), ..EngineOptions::default() };
+    let engine = Engine::open(&model(), &options).unwrap();
+    let string_arguments = engine.tool_format().unwrap().string_arguments;
+    let ids: Vec<Vec<i32>> = cases
+        .iter()
+        .map(|case| {
+            let messages: Vec<Message> = case["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| case_message(message, string_arguments))
+                .collect();
+            let spec = ToolSpec::parse(case["tools"].as_array().unwrap(), None, None).unwrap();
+            let prompt = engine.render_chat_tools(&messages, &spec, true).unwrap();
+            engine.tokenize(&prompt).unwrap()
+        })
+        .collect();
+    std::fs::write(std::env::var("PALITO_PROMPT_IDS").unwrap(), json!(ids).to_string()).unwrap();
+}
+
 #[test]
 #[ignore = "requires a GPU and a Qwen3 GGUF"]
 fn required_produces_a_valid_call() {

@@ -4,6 +4,8 @@
 //! Python string methods, `raise_exception` and `strftime_now`. The rendered text
 //! is then tokenized normally, so embedded control tokens become their IDs.
 
+mod tojson;
+
 use crate::{
     Error, Result,
     gguf::{Gguf, Value},
@@ -79,6 +81,7 @@ impl ChatTemplate {
             .map_err(template_error)?;
         env.set_syntax(syntax);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        env.add_filter("tojson", tojson::tojson);
         env.add_function("raise_exception", |message: String| {
             Err::<String, _>(minijinja::Error::new(ErrorKind::InvalidOperation, message))
         });
@@ -460,6 +463,30 @@ mod tests {
         with.reasoning_content = Some("r".into());
         let prompt = template.render_tools(&[Message::assistant("a"), with], None, true).unwrap();
         assert_eq!(prompt, "unsetset");
+    }
+
+    #[test]
+    fn tool_json_keeps_the_key_order_the_client_sent() {
+        let template = ChatTemplate::new("{{ tools[0] | tojson }}", "", "").unwrap();
+        let tool = serde_json::json!({"type": "function", "function": {"name": "a", "description": "b"}});
+        let prompt = template.render_tools(&[], Some(&[tool]), true).unwrap();
+        assert_eq!(prompt, r#"{"type": "function", "function": {"name": "a", "description": "b"}}"#);
+    }
+
+    #[test]
+    fn tool_json_is_not_html_escaped() {
+        let template = ChatTemplate::new("{{ tools[0] | tojson }}", "", "").unwrap();
+        let tool = serde_json::json!({"a": "<b>&'ç😊\"\n", "n": [1, 2.5, null, true]});
+        let prompt = template.render_tools(&[], Some(&[tool]), true).unwrap();
+        assert_eq!(prompt, r#"{"a": "<b>&'ç😊\"\n", "n": [1, 2.5, null, true]}"#);
+    }
+
+    #[test]
+    fn tojson_with_options_still_works() {
+        let template = ChatTemplate::new("{{ tools[0] | tojson(indent=2) }}", "", "").unwrap();
+        let tool = serde_json::json!({"a": 1});
+        let prompt = template.render_tools(&[], Some(&[tool]), true).unwrap();
+        assert_eq!(prompt, "{\n  \"a\": 1\n}");
     }
 
     #[test]

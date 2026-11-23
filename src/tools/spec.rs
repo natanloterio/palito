@@ -52,7 +52,7 @@ pub struct ToolDef {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolSpec {
-    /// Definitions as the client sent them, for the chat template.
+    /// Definitions for the chat template, in llama.cpp's canonical shape.
     pub raw: Vec<Value>,
     pub defs: Vec<ToolDef>,
     pub mode: ToolMode,
@@ -81,8 +81,9 @@ impl ToolSpec {
             defs.push(ToolDef { name: name.to_owned(), parameters });
         }
         let mode = tool_mode(choice, &names)?;
+        let raw = tools.iter().map(template_definition).collect::<Result<_, _>>()?;
         Ok(Self {
-            raw: tools.to_vec(),
+            raw,
             defs,
             mode,
             parallel: parallel.unwrap_or(true),
@@ -105,6 +106,29 @@ impl ToolSpec {
     pub fn template_tools(&self) -> Option<&[Value]> {
         (self.mode != ToolMode::Forbidden && !self.raw.is_empty()).then_some(self.raw.as_slice())
     }
+}
+
+/// One validated `tools` entry as llama.cpp gives it to the template: only
+/// `name`, `description`, `parameters` and a true `defer_loading`, in this order.
+fn template_definition(tool: &Value) -> Result<Value, String> {
+    let function = &tool["function"];
+    let description = match function.get("description") {
+        None => "",
+        Some(Value::String(text)) => text,
+        Some(_) => return Err("tool function \"description\" must be a string".into()),
+    };
+    let parameters = function.get("parameters").cloned().unwrap_or_else(|| json!({}));
+    let mut definition = json!({
+        "name": function["name"],
+        "description": description,
+        "parameters": parameters,
+    });
+    match function.get("defer_loading").or_else(|| tool.get("defer_loading")) {
+        None | Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => definition["defer_loading"] = json!(true),
+        Some(_) => return Err("\"defer_loading\" must be a boolean".into()),
+    }
+    Ok(json!({"type": "function", "function": definition}))
 }
 
 /// (name, parameters with an object shape) of one `tools` entry.
@@ -215,6 +239,39 @@ mod tests {
 
     fn tool(name: &str, parameters: Value) -> Value {
         json!({"type": "function", "function": {"name": name, "parameters": parameters}})
+    }
+
+    fn template_json(tool: Value) -> String {
+        let spec = ToolSpec::parse(&[tool], None, None).unwrap();
+        serde_json::to_string(&spec.template_tools().unwrap()[0]).unwrap()
+    }
+
+    #[test]
+    fn template_definitions_match_llama_cpp() {
+        assert_eq!(
+            template_json(json!({"function": {"parameters": {"type": "object"}, "strict": true,
+                "description": "d", "name": "a"}, "type": "function", "extra": 1})),
+            r#"{"type":"function","function":{"name":"a","description":"d","parameters":{"type":"object"}}}"#
+        );
+        assert_eq!(
+            template_json(json!({"type": "function", "function": {"name": "a"}})),
+            r#"{"type":"function","function":{"name":"a","description":"","parameters":{}}}"#
+        );
+        assert_eq!(
+            template_json(json!({"type": "function", "defer_loading": true, "function": {"name": "a"}})),
+            r#"{"type":"function","function":{"name":"a","description":"","parameters":{},"defer_loading":true}}"#
+        );
+    }
+
+    #[test]
+    fn template_definitions_reject_what_llama_cpp_rejects() {
+        for function in [
+            json!({"name": "a", "description": 1}),
+            json!({"name": "a", "defer_loading": "yes"}),
+        ] {
+            let tool = json!({"type": "function", "function": function});
+            assert!(ToolSpec::parse(&[tool], None, None).is_err());
+        }
     }
 
     #[test]

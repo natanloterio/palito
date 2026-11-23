@@ -861,6 +861,7 @@ mod decode;
 #[cfg(test)]
 mod grouped_bench;
 mod kv;
+pub(crate) mod nvrtc;
 #[cfg(test)]
 mod model_quality;
 #[cfg(test)]
@@ -959,15 +960,7 @@ impl CudaBackend {
                 "CUDA requires a positive device budget and context <= 65535",
             ));
         }
-        // cudarc's lazy loader panics for missing libraries; make that a normal configuration error.
-        for name in ["libcuda.so.1", "libnvrtc.so.13"] {
-            // These are fixed CUDA libraries, not user-supplied executable paths.
-            unsafe { libloading::Library::new(name) }.map_err(|e| {
-                failure(format!(
-                    "{name}: {e}; set LD_LIBRARY_PATH to CUDA 13 libraries"
-                ))
-            })?;
-        }
+        nvrtc::ensure_libraries().map_err(failure)?;
         let context = CudaContext::new(options.device).map_err(failure)?;
         let major = context
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)

@@ -1,6 +1,6 @@
 [package]
 name = "palito"
-version = "0.7.2"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.87"
 description = "Independent Rust GGUF inference engine with external-reference benchmarks"

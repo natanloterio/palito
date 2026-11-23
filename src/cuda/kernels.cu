@@ -467,6 +467,30 @@ __device__ __forceinline__ int matvec_warps_per_row(int kind, int rows, int sele
     return warps;
 }
 
+// Q8_0 row part: 8 lanes per 32-element block (4 values/lane), so one warp
+// processes 4 blocks (128 elements) per step with float4 loads on x.
+__device__ __forceinline__ float q8_0_row_part(const u8 *w, const float *x, u64 offset,
+                                               int width, int lane, int part, int warps) {
+    int num_blocks = width / 32;
+    const u8 *row_ptr = w + (offset / 32) * 34;
+    int sub = lane >> 3;
+    int elem = (lane & 7) * 4;
+    float acc = 0.0f;
+    for (int b = part * 4 + sub; b < num_blocks; b += warps * 4) {
+        const u8 *p = row_ptr + (u64)b * 34;
+        float d = half_value(p);
+        unsigned short lo = *(const unsigned short *)(p + 2 + elem);
+        unsigned short hi = *(const unsigned short *)(p + 4 + elem);
+        float4 xv = *(const float4 *)(x + b * 32 + elem);
+        float q0 = (float)(signed char)(lo & 0xff);
+        float q1 = (float)(signed char)(lo >> 8);
+        float q2 = (float)(signed char)(hi & 0xff);
+        float q3 = (float)(signed char)(hi >> 8);
+        acc += d * (q0 * xv.x + q1 * xv.y + q2 * xv.z + q3 * xv.w);
+    }
+    return warp_sum(acc);
+}
+
 // block=(256, 1, 1). F32 arithmetic; only the reduction order differs from matvec.
 extern "C" __global__ void matvec_packed_rows(const u8 *w, int kind, const float *x, float *y,
                                              int width, int rows, const int *ids,
@@ -485,6 +509,8 @@ extern "C" __global__ void matvec_packed_rows(const u8 *w, int kind, const float
         } else if (kind == 14 && width % 256 == 0) {
             int start = part * 256, step = warps * 256;
             sum = warp_sum(packed_lane_span<14>(w, input, offset, width, lane, start, step));
+        } else if (kind == 8 && width % 32 == 0) {
+            sum = q8_0_row_part(w, input, offset, width, lane, part, warps);
         } else {
             switch (kind) {
 #define SCALAR_ROW(K) warp_scalar_row<K>(w, input, offset, width, lane, part, warps)
@@ -896,6 +922,12 @@ extern "C" __global__ void rotary_decode(float *x, int n, int dim, const int *co
     rotary_impl(x, n, dim, control[1], base, neox, nullptr, 1.0f);
 }
 
+extern "C" __global__ void rotary_factored_decode(float *x, int n, int dim, const int *control,
+                                                  float base, int neox, const float *factors,
+                                                  float magnitude) {
+    rotary_impl(x, n, dim, control[1], base, neox, factors, magnitude);
+}
+
 template<typename KV>
 __device__ __forceinline__ void cache_kv_impl(const float *k, const float *v,
                                               KV *keys, KV *values, int width, int position) {
@@ -980,6 +1012,38 @@ extern "C" __global__ void gemma_attention_scores(const float *q, const float *k
     attention_scores_impl<true>(q, keys, scores, dim, heads, kv_heads, context, count, window, scale, softcap);
 }
 
+template<typename KV = float>
+__device__ __forceinline__ void gemma_attention_scores_decode_impl(const float *q, const KV *keys,
+    float *scores, int dim, int heads, int kv_heads, int context, const int *control, int window,
+    float scale, float softcap) {
+    int head = blockIdx.x;
+    int count = control[1] + 1;
+    int start = (window > 0 && count > window) ? (count - window) : 0;
+    int kv_head = head / (heads / kv_heads);
+    for (int time = start + blockIdx.y; time < count; time += gridDim.y) {
+        float sum = 0.0f;
+        for (int i = threadIdx.x; i < dim; i += blockDim.x)
+            sum += (q[(u64)head * dim + i] * scale)
+                 * kv_load(keys, ((u64)time * kv_heads + kv_head) * dim + i);
+        sum = sum_block(sum);
+        if (threadIdx.x == 0) {
+            float score = sum;
+            if (softcap > 0.0f)
+                score = isfinite(score) ? softcap * tanhf(score * (1.0f / softcap))
+                                        : __int_as_float(0x7fffffff);
+            scores[(u64)head * context + time] = score;
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void gemma_attention_scores_decode(const float *q, const float *keys,
+    float *scores, int dim, int heads, int kv_heads, int context, const int *control, int window,
+    float scale, float softcap) {
+    gemma_attention_scores_decode_impl(q, keys, scores, dim, heads, kv_heads, context, control,
+                                       window, scale, softcap);
+}
+
 template<bool Gemma, typename KV = float>
 __device__ __forceinline__ void attention_values_impl(float *scores, const KV *values,
     float *output, int dim, int heads, int kv_heads, int context, int count, int window) {
@@ -1024,6 +1088,12 @@ extern "C" __global__ void gemma_attention_values(float *scores, const float *va
     attention_values_impl<true>(scores, values, output, dim, heads, kv_heads, context, count, window);
 }
 
+extern "C" __global__ void gemma_attention_values_decode(float *scores, const float *values,
+    float *output, int dim, int heads, int kv_heads, int context, const int *control, int window) {
+    attention_values_impl<true>(scores, values, output, dim, heads, kv_heads, context,
+                                control[1] + 1, window);
+}
+
 #ifdef CUDA_KV_F16
 extern "C" __global__ void attention_scores_f16(const float *q, const kv_f16 *keys,
     float *scores, int dim, int heads, int kv_heads, int context, int count) {
@@ -1034,6 +1104,31 @@ extern "C" __global__ void attention_scores_f16(const float *q, const kv_f16 *ke
 extern "C" __global__ void attention_values_f16(float *scores, const kv_f16 *values,
     float *output, int dim, int heads, int kv_heads, int context, int count) {
     attention_values_impl<false>(scores, values, output, dim, heads, kv_heads, context, count, 0);
+}
+
+extern "C" __global__ void gemma_attention_scores_f16(const float *q, const kv_f16 *keys,
+    float *scores, int dim, int heads, int kv_heads, int context, int count, int window,
+    float scale, float softcap) {
+    attention_scores_impl<true>(q, keys, scores, dim, heads, kv_heads, context, count, window,
+                                scale, softcap);
+}
+
+extern "C" __global__ void gemma_attention_values_f16(float *scores, const kv_f16 *values,
+    float *output, int dim, int heads, int kv_heads, int context, int count, int window) {
+    attention_values_impl<true>(scores, values, output, dim, heads, kv_heads, context, count, window);
+}
+
+extern "C" __global__ void gemma_attention_scores_decode_f16(const float *q, const kv_f16 *keys,
+    float *scores, int dim, int heads, int kv_heads, int context, const int *control, int window,
+    float scale, float softcap) {
+    gemma_attention_scores_decode_impl(q, keys, scores, dim, heads, kv_heads, context, control,
+                                       window, scale, softcap);
+}
+
+extern "C" __global__ void gemma_attention_values_decode_f16(float *scores, const kv_f16 *values,
+    float *output, int dim, int heads, int kv_heads, int context, const int *control, int window) {
+    attention_values_impl<true>(scores, values, output, dim, heads, kv_heads, context,
+                                control[1] + 1, window);
 }
 #endif
 

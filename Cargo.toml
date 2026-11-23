@@ -18,6 +18,7 @@ include = ["/src/**", "/include/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", 
 default = []
 ktransformers = ["dep:reqwest"]
 cuda = ["dep:cudarc", "dep:libloading", "dep:sha2"]
+vulkan = ["dep:ash", "dep:naga"]
 cuda-parallel-grouping-research = ["cuda"]
 cuda-packed-reduction-research = ["cuda"]
 cuda-packed-down-research = ["cuda-packed-reduction-research"]
@@ -74,6 +75,8 @@ half = "2"
 rayon = "1"
 fancy-regex = "0.16"
 cudarc = { version = "0.18", default-features = false, features = ["driver", "nvrtc", "dynamic-loading", "cuda-13000", "std"], optional = true }
+ash = { version = "0.38", default-features = false, features = ["loaded"], optional = true }
+naga = { version = "25", default-features = false, features = ["wgsl-in", "spv-out"], optional = true }
 libloading = { version = "0.8", optional = true }
 unicode-normalization = "0.1"
 sha2 = { version = "0.10", optional = true }

@@ -10,13 +10,15 @@ pub mod stream;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(feature = "vulkan")]
+pub mod vulkan;
 mod gguf;
 mod kernels;
 #[cfg(feature = "ktransformers")]
 pub mod ktransformers;
 pub mod tokenizer;
 pub mod tools;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "vulkan"))]
 mod transformer;
 
 use backend::{Backend, ModelInfo};

@@ -41,6 +41,7 @@ const DEFAULT_THREADS: u32 = 4;
 pub enum Device {
     Cpu,
     Cuda,
+    Vulkan,
 }
 
 #[derive(Clone, Debug)]

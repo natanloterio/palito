@@ -550,7 +550,7 @@ extern "C" __global__ void __launch_bounds__(256, 1) \
 Name(const u8 *weights, int kind, const signed char *values, const float *scales, \
      const int *sums, float *output, int width, int rows, int tokens, const int *groups, \
      int used, int grouped, int assignment_major, int *status) { \
-    MMQ_PIPE_BODY_DYNAMIC(BN, KQ, KS, SK, false) \
+    MMQ_PIPE_BODY_DYNAMIC(BN, KQ, KS, SK, true) \
 }
 #define MMQ_PIPE_KERNEL_BLOCKS(Name, BN, KQ, KS, SK, Blocks, PF) \
 extern "C" __global__ void __launch_bounds__(256, Blocks) \

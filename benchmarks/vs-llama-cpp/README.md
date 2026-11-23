@@ -26,8 +26,8 @@ Raw samples: [olmoe-1b-7b.json](./olmoe-1b-7b.json)
 
 | Prompt tokens | Palito TTFT ms | llama.cpp `fa-on` TTFT ms | Palito decode tok/s | llama.cpp `fa-on` decode tok/s |
 |---:|---:|---:|---:|---:|
-| 512 | **14** (tied) | **14** | 794.7 | **927.5** |
-| 2,912 | **55** (-25%) | 73 | 682.2 | **779.4** |
+| 512 | **14** (tied) | **14** | **990.7** (+9.0%) | 908.8 |
+| 2,912 | **56** (-22%) | 72 | **819.3** (+6.5%) | 769.2 |
 
 ## Phi-3-mini-128k Q4_K_M (2.4 GB dense, context 4,096)
 
@@ -35,8 +35,8 @@ Raw samples: [phi3-mini-128k.json](./phi3-mini-128k.json)
 
 | Prompt tokens | Palito TTFT ms | llama.cpp `fa-on` TTFT ms | Palito decode tok/s | llama.cpp `fa-on` decode tok/s |
 |---:|---:|---:|---:|---:|
-| 501 | 33 | **23** | 361.6 | **403.1** |
-| 2,901 | 155 | **135** | 298.8 | **317.0** |
+| 501 | 32 | **24** | **390.5** (+0.6%) | 388.2 |
+| 2,901 | 149 | **134** | 311.4 | **313.6** |
 
 ## Reproduce
 

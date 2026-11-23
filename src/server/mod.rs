@@ -42,6 +42,7 @@ const BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 enum ServeBackend {
     Cpu,
     Cuda,
+    Vulkan,
 }
 
 #[derive(Args)]
@@ -110,6 +111,7 @@ pub(crate) fn run(args: ServeArgs) -> palito::Result<()> {
         device: match args.backend {
             Some(ServeBackend::Cpu) => Device::Cpu,
             Some(ServeBackend::Cuda) => Device::Cuda,
+            Some(ServeBackend::Vulkan) => Device::Vulkan,
             None => EngineOptions::default().device,
         },
         context_tokens: args.context,

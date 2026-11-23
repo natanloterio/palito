@@ -83,6 +83,8 @@ enum LocalBackend {
     Cpu,
     #[cfg(feature = "cuda")]
     Cuda,
+    #[cfg(feature = "vulkan")]
+    Vulkan,
     /// Slow independent packed CPU oracle for the CUDA model layouts.
     #[cfg(feature = "cuda")]
     Reference,
@@ -337,8 +339,16 @@ impl RuntimeArgs {
                         )?,
                     ));
                 }
+                #[cfg(feature = "vulkan")]
+                LocalBackend::Vulkan => {}
                 LocalBackend::Cpu => {}
             }
+        }
+        #[cfg(feature = "vulkan")]
+        if self.backend == LocalBackend::Vulkan {
+            self.check_cpu_policy()?;
+            let options = palito::vulkan::VulkanOptions::default();
+            return palito::vulkan::open_backend(&self.model, &self.config(), options);
         }
         Ok(Box::new(CpuBackend::open_with_options(
             &self.model,
@@ -372,7 +382,7 @@ impl RuntimeArgs {
         self.cuda_matmul.unwrap_or_default()
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "vulkan"))]
     fn check_cpu_policy(&self) -> Result<()> {
         if self.backend != LocalBackend::Cpu
             && (self.f32_weights
@@ -492,7 +502,19 @@ impl RuntimeArgs {
             LocalBackend::Reference => {
                 return json!({"backend": "cpu-reference", "prefill": "sequential token steps"});
             }
+            #[cfg(feature = "vulkan")]
+            LocalBackend::Vulkan => {}
             LocalBackend::Cpu => {}
+        }
+        #[cfg(feature = "vulkan")]
+        if self.backend == LocalBackend::Vulkan {
+            return json!({
+                "backend": "vulkan",
+                "options": palito::vulkan::VulkanOptions::default(),
+                "expert_residency": "all weights GPU-resident",
+                "prefill": "sequential token steps",
+                "kv_precision": "f32",
+            });
         }
         json!(self.options())
     }

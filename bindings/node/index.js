@@ -8,8 +8,10 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-// The prebuilt package, not `koffi`: its install script makes pnpm's default install fail.
-const koffi = require('@koromix/koffi-linux-x64');
+const { loadKoffi } = require('./koffi.js');
+
+// Loaded on first use, so installing on a platform without a prebuilt never fails.
+let koffi = null;
 
 const DEVICES = { default: 0, cpu: 1, cuda: 2 };
 const FINISH_REASONS = ['stop', 'length', 'context_full', 'cancelled'];
@@ -44,6 +46,7 @@ function load() {
   const file = libraryPath();
   let lib;
   try {
+    koffi = koffi || loadKoffi();
     lib = koffi.load(file);
   } catch (error) {
     throw new PalitoError(`cannot load ${file}: ${error.message}. Install Palito or set PALITO_LIBRARY`);

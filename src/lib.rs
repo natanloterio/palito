@@ -4,6 +4,7 @@ pub mod engine;
 pub mod grammar;
 pub mod ffi;
 pub mod sampling;
+pub mod slots;
 pub mod stop;
 pub mod stream;
 pub mod cpu;

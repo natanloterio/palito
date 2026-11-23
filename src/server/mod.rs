@@ -76,6 +76,14 @@ pub(crate) struct ServeArgs {
     /// Requests allowed to wait while one is running; more get 503.
     #[arg(long, default_value_t = 16)]
     queue: usize,
+    /// Requests served at the same time (`-np`). The context is split between them.
+    #[arg(
+        long,
+        env = "PALITO_PARALLEL",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..=i64::from(palito::slots::MAX_SLOTS))
+    )]
+    parallel: u32,
     /// Model id reported by /v1/models [default: the GGUF file name without extension].
     #[arg(long)]
     model_name: Option<String>,
@@ -95,6 +103,11 @@ struct AppState {
 }
 
 pub(crate) fn run(args: ServeArgs) -> palito::Result<()> {
+    if args.parallel > 1 {
+        return Err(palito::Error::Invalid(
+            "--parallel above 1 is not available yet".into(),
+        ));
+    }
     let options = EngineOptions {
         device: match args.backend {
             Some(ServeBackend::Cpu) => Device::Cpu,

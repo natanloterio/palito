@@ -1,6 +1,6 @@
 {
   "name": "palito",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Run GGUF LLMs locally from Node.js and TypeScript with custom CUDA kernels, token streaming, and structured JSON output — no llama.cpp required.",
   "keywords": ["llm", "gguf", "inference", "cuda", "ai", "local-llm", "qwen", "llama"],
   "license": "MIT",

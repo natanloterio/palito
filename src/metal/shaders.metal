@@ -265,8 +265,9 @@ kernel void matvec(
     device const int *buf_i [[buffer(5)]],
     constant Params &pc [[buffer(6)]],
     uint2 wg [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]])
+    uint2 tid_xy [[thread_position_in_threadgroup]])
 {
+    uint tid = tid_xy.x;
     uint warp = tid >> 5u, lane = tid & 31u;
     uint row = wg.x * 8u + warp;
     uint selected = wg.y;
@@ -287,8 +288,9 @@ kernel void matmul_batch(
     device float *buf_c [[buffer(3)]],
     constant Params &pc [[buffer(6)]],
     uint2 wg [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]])
+    uint2 tid_xy [[thread_position_in_threadgroup]])
 {
+    uint tid = tid_xy.x;
     uint warp = tid >> 5u, lane = tid & 31u;
     uint row = wg.x * 8u + warp;
     uint t0 = wg.y * 4u;
@@ -393,8 +395,9 @@ kernel void head_norm_batch(
     device float *buf_c [[buffer(3)]],
     constant Params &pc [[buffer(6)]],
     uint2 wg [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]])
+    uint2 tid_xy [[thread_position_in_threadgroup]])
 {
+    uint tid = tid_xy.x;
     threadgroup float sh[8];
     uint dim = pc.p[0];
     ulong base = ulong(wg.y) * pc.p[1] + ulong(wg.x) * dim;
@@ -522,8 +525,9 @@ kernel void attention_batch(
     device float *attended [[buffer(3)]],
     constant Params &pc [[buffer(6)]],
     uint2 wg [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]])
+    uint2 tid_xy [[thread_position_in_threadgroup]])
 {
+    uint tid = tid_xy.x;
     threadgroup float sh[8];
     uint head = wg.x, tok = wg.y;
     uint dim = pc.p[0], heads = pc.p[1], kv_heads = pc.p[2];

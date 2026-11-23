@@ -6,71 +6,70 @@ use crate::{
     tokenizer::Tokenizer,
     transformer::invalid,
 };
-pub(in crate::cuda) mod device;
 
-struct Dense {
-    qg: Tensor,
-    k: Tensor,
-    v: Tensor,
-    q_norm: Tensor,
-    k_norm: Tensor,
-    output: Tensor,
-    keys: Vec<f32>,
-    values: Vec<f32>,
+pub(crate) struct Dense {
+    pub(crate) qg: Tensor,
+    pub(crate) k: Tensor,
+    pub(crate) v: Tensor,
+    pub(crate) q_norm: Tensor,
+    pub(crate) k_norm: Tensor,
+    pub(crate) output: Tensor,
+    pub(crate) keys: Vec<f32>,
+    pub(crate) values: Vec<f32>,
 }
 
-struct Delta {
-    qkv: Tensor,
-    z: Tensor,
-    beta: Tensor,
-    alpha: Tensor,
-    dt: Tensor,
-    decay: Tensor,
-    conv: Tensor,
-    norm: Tensor,
-    output: Tensor,
-    history: Vec<f32>,
-    state: Vec<f32>,
+pub(crate) struct Delta {
+    pub(crate) qkv: Tensor,
+    pub(crate) z: Tensor,
+    pub(crate) beta: Tensor,
+    pub(crate) alpha: Tensor,
+    pub(crate) dt: Tensor,
+    pub(crate) decay: Tensor,
+    pub(crate) conv: Tensor,
+    pub(crate) norm: Tensor,
+    pub(crate) output: Tensor,
+    pub(crate) history: Vec<f32>,
+    pub(crate) state: Vec<f32>,
 }
 
-enum Attention {
+pub(crate) enum Attention {
     Dense(Dense),
     Delta(Delta),
 }
 
-struct Layer {
-    attention: Attention,
-    input_norm: Tensor,
-    ffn_norm: Tensor,
-    gate: Tensor,
-    up: Tensor,
-    down: Tensor,
+pub(crate) struct Layer {
+    pub(crate) attention: Attention,
+    pub(crate) input_norm: Tensor,
+    pub(crate) ffn_norm: Tensor,
+    pub(crate) gate: Tensor,
+    pub(crate) up: Tensor,
+    pub(crate) down: Tensor,
 }
 
-pub(super) struct Qwen35 {
+pub(crate) struct Qwen35 {
     pub info: ModelInfo,
     pub tokenizer: Result<Tokenizer>,
     pub eog: Vec<i32>,
-    width: usize,
-    hidden: usize,
-    epsilon: f32,
-    base: f32,
-    embedding: Tensor,
-    output_norm: Tensor,
-    layers: Vec<Layer>,
+    pub(crate) width: usize,
+    pub(crate) hidden: usize,
+    pub(crate) epsilon: f32,
+    pub(crate) base: f32,
+    pub(crate) embedding: Tensor,
+    pub(crate) output_norm: Tensor,
+    pub(crate) layers: Vec<Layer>,
 }
 
 // Only the measured 0.8B text layout is admitted. Other schedules and
 // multimodal position streams require separate validation.
-const HEADS: usize = 8;
-const KV_HEADS: usize = 2;
-const HEAD_DIM: usize = 256;
-const ROTARY: usize = 64;
-const GROUPS: usize = 16;
-const STATE_DIM: usize = 128;
-const INNER: usize = GROUPS * STATE_DIM;
-const CHANNELS: usize = 3 * INNER;
-const KERNEL: usize = 4;
+pub(crate) const HEADS: usize = 8;
+pub(crate) const KV_HEADS: usize = 2;
+pub(crate) const HEAD_DIM: usize = 256;
+pub(crate) const ROTARY: usize = 64;
+pub(crate) const GROUPS: usize = 16;
+pub(crate) const STATE_DIM: usize = 128;
+pub(crate) const INNER: usize = GROUPS * STATE_DIM;
+pub(crate) const CHANNELS: usize = 3 * INNER;
+pub(crate) const KERNEL: usize = 4;
 
 impl Qwen35 {
     pub fn load(mut gguf: Gguf, config: &Config, host_state: bool) -> Result<Self> {

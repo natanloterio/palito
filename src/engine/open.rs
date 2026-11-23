@@ -84,9 +84,13 @@ fn open_cpu(path: &Path, options: &EngineOptions, trained: u32) -> Result<Opened
         prefill_chunk: options.prefill_chunk.unwrap_or(CPU_PREFILL_CHUNK.min(batch)),
         threads: options.threads,
     };
-    let backend = CpuBackend::open_with_options(path, &config, CpuOptions::default())?;
+    let backend: Box<dyn Backend> = if crate::cpu::has_fast_path(path)? {
+        Box::new(CpuBackend::open_with_options(path, &config, CpuOptions::default())?)
+    } else {
+        Box::new(crate::reference::ReferenceBackend::open(path, &config)?)
+    };
     Ok(Opened {
-        backend: Box::new(backend),
+        backend,
         config,
         profile: "cpu",
         notices: Vec::new(),

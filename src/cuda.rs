@@ -20,6 +20,8 @@ use std::{
     sync::Arc,
 };
 
+use crate::reference::state::{State, greedy};
+
 fn failure(error: impl std::fmt::Display) -> Error {
     Error::Backend(format!("CUDA: {error}"))
 }
@@ -146,64 +148,6 @@ impl Default for CudaOptions {
             slots: 1,
         }
     }
-}
-
-#[derive(Default)]
-struct State {
-    position: usize,
-    valid: bool,
-    failed: bool,
-}
-
-impl State {
-    fn begin(&mut self, tokens: &[i32], position: u32, info: &ModelInfo) -> Result<()> {
-        if self.failed {
-            return Err(failure("failed request must be reset"));
-        }
-        if tokens.is_empty()
-            || tokens.len() > info.batch_tokens as usize
-            || position as usize != self.position
-            || self
-                .position
-                .checked_add(tokens.len())
-                .is_none_or(|n| n > info.context_tokens as usize)
-            || tokens
-                .iter()
-                .any(|&id| id < 0 || id as u32 >= info.vocab_tokens)
-        {
-            return Err(invalid("invalid IDs, batch, position, or context capacity"));
-        }
-        self.valid = false;
-        // A driver/numerical error at any point leaves the request poisoned.
-        self.failed = true;
-        Ok(())
-    }
-
-    fn finish(&mut self, count: usize) {
-        self.position += count;
-        self.valid = true;
-        self.failed = false;
-    }
-
-    fn logits<'a>(&self, logits: &'a [f32]) -> Result<&'a [f32]> {
-        if !self.valid || self.failed {
-            return Err(failure("no valid next-token logits"));
-        }
-        Ok(logits)
-    }
-}
-
-fn greedy(logits: &[f32]) -> Result<i32> {
-    if logits.is_empty() || logits.iter().any(|x| !x.is_finite()) {
-        return Err(failure("invalid logits"));
-    }
-    let mut best = 0;
-    for i in 1..logits.len() {
-        if logits[i] > logits[best] {
-            best = i;
-        }
-    }
-    Ok(best as i32)
 }
 
 struct DeviceTensor {
@@ -882,7 +826,8 @@ mod packed_decode;
 #[cfg(test)]
 mod prefill;
 mod prefix;
-pub mod reference;
+pub use crate::reference;
+mod qwen35_device;
 #[cfg(test)]
 mod residual;
 #[cfg(test)]
@@ -960,7 +905,7 @@ pub fn open_backend(
     let metadata = crate::gguf::Gguf::read_metadata(path)?;
     if matches!(metadata.get("general.architecture"), Some(crate::gguf::Value::Text(arch)) if arch == "qwen35")
     {
-        return reference::qwen35::device::open(path, config, options);
+        return qwen35_device::open(path, config, options);
     }
     Ok(Box::new(CudaBackend::open(path, config, options)?))
 }

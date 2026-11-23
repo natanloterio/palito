@@ -1,7 +1,15 @@
-use super::*;
+use crate::reference::qwen35::*;
+use crate::{
+    Config, Result,
+    backend::ModelInfo,
+    gguf::{Gguf, Tensor},
+    tokenizer::Tokenizer,
+    transformer::invalid,
+};
+use crate::reference::state::{State, greedy};
 use crate::cuda::{
     Backend, CompileOptions, CudaContext, CudaFunction, CudaMatmul, CudaOptions, CudaSlice,
-    CudaStream, DeviceTensor, HashMap, LaunchConfig, PushKernelArg, State, cache, failure, greedy,
+    CudaStream, DeviceTensor, HashMap, LaunchConfig, PushKernelArg, cache, failure,
     sys,
 };
 use std::{path::Path, sync::Arc};
@@ -128,13 +136,13 @@ pub(in crate::cuda) fn open(
     let ptx = cache::compile(
         options.kernel_cache_dir.as_deref(),
         concat!(
-            include_str!("../../kernels.cu"),
+            include_str!("kernels.cu"),
             "\n#define CUDA_REGISTER_PREFILL 1\n#define QWEN35_HYBRID\n",
-            include_str!("../../prefill.cu"),
+            include_str!("prefill.cu"),
             "\n#define CUDA_NORMALIZED_ATTENTION 1\n",
-            include_str!("../../attention.cu"),
+            include_str!("attention.cu"),
             "\n",
-            include_str!("../../qwen35_delta.cu")
+            include_str!("qwen35_delta.cu")
         ),
         CompileOptions {
             fmad: Some(false),

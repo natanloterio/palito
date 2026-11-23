@@ -306,6 +306,16 @@ pub(crate) fn attend_with_divisor(
     }
 }
 
+/// Whether the fast packed CPU path can run this model. Other layouts use the
+/// slower reference backend.
+pub(crate) fn has_fast_path(path: &Path) -> Result<bool> {
+    let (metadata, tensors) = Gguf::read_layout(path)?;
+    Ok(
+        matches!(metadata.get("general.architecture"), Some(crate::gguf::Value::Text(arch)) if arch == "llama")
+            && !tensors.iter().any(|name| name == "rope_freqs.weight"),
+    )
+}
+
 impl CpuBackend {
     pub fn open(path: &Path, config: &Config) -> Result<Self> {
         Self::open_with_options(path, config, CpuOptions::default())

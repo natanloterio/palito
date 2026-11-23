@@ -122,7 +122,8 @@ jobs:
           if [ "$PUBLISH" = true ]; then
             npm publish --access public
           else
-            npm publish --access public --dry-run
+            # npm 11's publish --dry-run refuses versions already on npm.
+            npm pack --dry-run
           fi
 
   nuget:

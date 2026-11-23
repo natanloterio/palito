@@ -29,6 +29,6 @@ One version for everything: `Cargo.toml` `[package] version`. The bindings follo
    gh release create vX.Y.Z target/dist/palito-X.Y.Z-linux-x86_64.tar.gz --title "Palito X.Y.Z"
    ```
 
-**Dry run:** Actions > release > Run workflow, with "dry_run" ticked (the default). Every package is built and checked (`cargo publish --dry-run`, `twine check`, `npm publish --dry-run`, `dotnet pack`, `mvn -P release verify`), and nothing is uploaded.
+**Dry run:** Actions > release > Run workflow, with "dry_run" ticked (the default). Every package is built and checked (`cargo publish --dry-run`, `twine check`, `npm pack --dry-run`, `dotnet pack`, `mvn -P release verify`), and nothing is uploaded.
 
 The crates.io package holds only the library, the CLI, the C header and the CUDA kernels (`include` in `Cargo.toml`). The bindings load `libpalito` at run time from `$PALITO_LIBRARY` or the installed bundle, so their packages do not include it.

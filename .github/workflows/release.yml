@@ -4,12 +4,11 @@
 #
 # Secrets (Settings > Secrets and variables > Actions):
 #   CARGO_REGISTRY_TOKEN                          crates.io token (publish-new, publish-update)
-#   NPM_TOKEN                                     npm granular token with publish rights
 #   MAVEN_CENTRAL_USERNAME, MAVEN_CENTRAL_PASSWORD Central Portal user token
 #   GPG_PRIVATE_KEY, GPG_PASSPHRASE               ASCII-armored signing key for Maven Central
-# PyPI and NuGet need no secret: they use trusted publishing (workflow
-# release.yml, environments pypi and nuget; NuGet policy palito-release for
-# user natanloterio).
+# PyPI, npm and NuGet need no secret: they use trusted publishing (workflow
+# release.yml; environments pypi and nuget; NuGet policy palito-release for
+# user natanloterio). npm adds provenance on its own.
 #
 # The GitHub release with the CUDA bundle stays manual (scripts/package-linux.sh
 # needs a local NVRTC 13).
@@ -101,6 +100,9 @@ jobs:
   npm:
     needs: version
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     defaults:
       run:
         working-directory: bindings/node
@@ -110,16 +112,18 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+      # Trusted publishing (OIDC) needs npm 11.5.1 or newer.
+      - name: npm with trusted publishing
+        run: npm install -g npm@11.6.2
       - name: Include the license
         run: cp ../../LICENSE .
       - name: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           if [ "$PUBLISH" = true ]; then
             npm publish --access public
           else
-            npm publish --access public --dry-run
+            # npm 11's publish --dry-run refuses versions already on npm.
+            npm pack --dry-run
           fi
 
   nuget:

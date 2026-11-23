@@ -15,7 +15,7 @@ One version for everything: `Cargo.toml` `[package] version`. The bindings follo
    |---|---|---|
    | crates.io | `palito` | `CARGO_REGISTRY_TOKEN` |
    | PyPI | `palito` | trusted publisher (workflow `release.yml`, environment `pypi`) |
-   | npm | `palito` (maintained by the `gaiahub` org) | `NPM_TOKEN` (granular token; move to trusted publishing after the first release) |
+   | npm | `palito` (maintained by the `gaiahub` org) | trusted publishing (workflow `release.yml`), with provenance |
    | NuGet | `Palito` | trusted publishing (policy `palito-release`: workflow `release.yml`, environment `nuget`) |
    | Maven Central | `io.github.natanloterio:palito` | `MAVEN_CENTRAL_USERNAME`, `MAVEN_CENTRAL_PASSWORD`, `GPG_PRIVATE_KEY`, `GPG_PASSPHRASE` |
    | Go | `github.com/natanloterio/palito/bindings/go` | none: the workflow pushes the tag `bindings/go/vX.Y.Z` |
@@ -29,6 +29,6 @@ One version for everything: `Cargo.toml` `[package] version`. The bindings follo
    gh release create vX.Y.Z target/dist/palito-X.Y.Z-linux-x86_64.tar.gz --title "Palito X.Y.Z"
    ```
 
-**Dry run:** Actions > release > Run workflow, with "dry_run" ticked (the default). Every package is built and checked (`cargo publish --dry-run`, `twine check`, `npm publish --dry-run`, `dotnet pack`, `mvn -P release verify`), and nothing is uploaded.
+**Dry run:** Actions > release > Run workflow, with "dry_run" ticked (the default). Every package is built and checked (`cargo publish --dry-run`, `twine check`, `npm pack --dry-run`, `dotnet pack`, `mvn -P release verify`), and nothing is uploaded.
 
 The crates.io package holds only the library, the CLI, the C header and the CUDA kernels (`include` in `Cargo.toml`). The bindings load `libpalito` at run time from `$PALITO_LIBRARY` or the installed bundle, so their packages do not include it.

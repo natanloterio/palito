@@ -3,7 +3,7 @@
 Java binding for [Palito](../../README.md). It uses the Foreign Function & Memory API (Java 22+), so it needs no JNI and no dependencies.
 
 ```sh
-mvn -f bindings/java/pom.xml install   # io.github.natanloterio:palito:0.5.0
+mvn -f bindings/java/pom.xml install   # io.github.natanloterio:palito:0.7.0
 ```
 
 ```java

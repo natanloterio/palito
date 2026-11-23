@@ -172,6 +172,43 @@ fn queue_limit_is_exact_with_all_slots_busy() {
     assert!(response.to_lowercase().contains("retry-after"));
 }
 
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a GPU and PALITO_SLOT_MODEL"]
+fn burst_up_to_slots_plus_queue_all_succeed() {
+    let server = slot_server(18474, "4096", &["--parallel", "8", "--queue", "1"]);
+    let port = server.port;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+    let body = json!({"prompt": "The capital of France is", "max_tokens": 4}).to_string();
+    let handles: Vec<_> = (0..9)
+        .map(|_| {
+            let barrier = barrier.clone();
+            let body = body.clone();
+            std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
+                barrier.wait();
+                write!(
+                    stream,
+                    "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).unwrap();
+                let status: u16 = response[9..12].parse().unwrap();
+                (status, response)
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let statuses: Vec<u16> = results.iter().map(|(s, _)| *s).collect();
+    assert!(
+        statuses.iter().all(|&s| s == 200),
+        "expected all 9 burst requests to return 200, got {statuses:?}"
+    );
+}
+
 fn chunked_body(raw: &str) -> String {
     // Decode HTTP chunked transfer encoding.
     let mut out = String::new();

@@ -21,10 +21,16 @@ use super::{
 };
 use std::{
     path::PathBuf,
-    sync::mpsc::{SyncSender, TrySendError, sync_channel},
+    sync::{
+        Arc,
+        mpsc::{SyncSender, TrySendError, sync_channel},
+    },
     thread,
 };
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{
+    OwnedSemaphorePermit, Semaphore,
+    mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+};
 
 pub enum Prompt {
     Chat(Vec<Message>),
@@ -63,6 +69,7 @@ pub(super) struct Job {
     pub(super) options: GenerationOptions,
     pub(super) split_reasoning: bool,
     pub(super) events: UnboundedSender<Event>,
+    pub(super) permit: Option<OwnedSemaphorePermit>,
 }
 
 /// What the worker reports once the model is open.
@@ -80,6 +87,8 @@ pub struct ModelReport {
 #[derive(Clone)]
 pub struct Worker {
     jobs: SyncSender<Job>,
+    /// Caps active + queued requests at `slots + queue` when `--parallel > 1`.
+    permits: Option<Arc<Semaphore>>,
 }
 
 pub enum SubmitError {
@@ -97,7 +106,13 @@ impl Worker {
         queue: usize,
         parallel: u32,
     ) -> palito::Result<(Self, ModelReport)> {
-        let (jobs, inbox) = sync_channel::<Job>(queue);
+        let (capacity, permits) = if parallel > 1 {
+            let capacity = (parallel as usize).saturating_add(queue);
+            (capacity, Some(Arc::new(Semaphore::new(capacity))))
+        } else {
+            (queue, None)
+        };
+        let (jobs, inbox) = sync_channel::<Job>(capacity);
         let (ready, opened) = sync_channel(1);
         thread::Builder::new()
             .name("palito-engine".into())
@@ -128,7 +143,7 @@ impl Worker {
         let report = opened
             .recv()
             .map_err(|_| Error::Backend("engine thread exited while opening".into()))??;
-        Ok((Self { jobs }, report))
+        Ok((Self { jobs, permits }, report))
     }
 
     /// `split_reasoning` applies to chat prompts only.
@@ -138,12 +153,20 @@ impl Worker {
         options: GenerationOptions,
         split_reasoning: bool,
     ) -> Result<UnboundedReceiver<Event>, SubmitError> {
+        let permit = match &self.permits {
+            Some(permits) => match permits.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => return Err(SubmitError::Busy),
+            },
+            None => None,
+        };
         let (events, receiver) = unbounded_channel();
         let job = Job {
             prompt,
             options,
             split_reasoning,
             events,
+            permit,
         };
         match self.jobs.try_send(job) {
             Ok(()) => Ok(receiver),

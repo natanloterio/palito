@@ -20,7 +20,7 @@ use std::{
     rc::Rc,
     sync::mpsc::{Receiver, TryRecvError},
 };
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{OwnedSemaphorePermit, mpsc::UnboundedSender};
 
 const DEVICE_LOST: &str = "the GPU stopped responding; restart the server";
 
@@ -36,6 +36,7 @@ struct ServerTask {
     shared: Rc<RefCell<JobEvents>>,
     events: UnboundedSender<Event>,
     opened: Option<bool>,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl ServerTask {
@@ -60,7 +61,7 @@ impl SlotTask for ServerTask {
     }
 
     fn complete(self) {
-        let Self { run, shared, events, opened } = self;
+        let Self { run, shared, events, opened, permit } = self;
         // The reply's last text reaches the splitter here, so it is flushed after.
         let reply = run.into_reply();
         let ids = {
@@ -81,12 +82,15 @@ impl SlotTask for ServerTask {
                 build_reply(done.completion, opened, calls.collect())
             }
         });
+        drop(permit);
         let _ = events.send(Event::Done(reply));
     }
 
     fn fail(self, error: String) {
         self.flush();
-        let _ = self.events.send(Event::Done(Err(error)));
+        let Self { events, permit, .. } = self;
+        drop(permit);
+        let _ = events.send(Event::Done(Err(error)));
     }
 }
 
@@ -122,7 +126,7 @@ fn tool_callback(shared: &Rc<RefCell<JobEvents>>) -> Box<dyn FnMut(ToolEvent) ->
 
 /// Builds the request's run. A request error is answered here, without a slot.
 fn prepare(engine: &mut SlotEngine, job: Job) -> Option<ServerTask> {
-    let Job { prompt, options, split_reasoning, events } = job;
+    let Job { prompt, options, split_reasoning, events, permit } = job;
     let opened = match (&prompt, split_reasoning) {
         (Prompt::Chat(messages), true) => Some(opens_reasoning(engine, messages, &options)),
         (Prompt::ChatTools(messages, spec), true) => Some(
@@ -145,8 +149,9 @@ fn prepare(engine: &mut SlotEngine, job: Job) -> Option<ServerTask> {
         Prompt::Text(text) => engine.prepare_complete(text, &options, text_callback(&shared)),
     };
     match run {
-        Ok(run) => Some(ServerTask { run, shared, events, opened }),
+        Ok(run) => Some(ServerTask { run, shared, events, opened, permit }),
         Err(error) => {
+            drop(permit);
             let _ = events.send(Event::Done(Err(error.to_string())));
             None
         }
@@ -198,6 +203,7 @@ pub(super) fn serve_slots(mut engine: SlotEngine, inbox: Receiver<Job>) {
         if scheduler.round(engine.backend_mut()) == Round::DeviceLost {
             scheduler.fail_all(DEVICE_LOST);
             for job in inbox {
+                drop(job.permit);
                 let _ = job.events.send(Event::Done(Err(DEVICE_LOST.into())));
             }
             return;
@@ -219,6 +225,7 @@ mod tests {
             options: GenerationOptions::default(),
             split_reasoning: false,
             events,
+            permit: None,
         };
         (job, receiver)
     }

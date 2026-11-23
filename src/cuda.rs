@@ -327,7 +327,8 @@ fn prefill_capacity(spec: &Spec) -> usize {
 /// Must match the branch order in batched_prefill (ALiBi/BLOOM and Gemma first).
 fn flash_prefill_attention(spec: &Spec, matmul: CudaMatmul) -> bool {
     matmul.f32_tiled()
-        && spec.dim == 128
+        && spec.dim <= 128
+        && spec.dim % 4 == 0
         && spec.kv_heads > 0
         && spec.heads % spec.kv_heads == 0
         && spec.heads / spec.kv_heads <= 8
@@ -353,7 +354,14 @@ fn split_attention_supported(spec: &Spec, matmul: CudaMatmul) -> bool {
 /// and never fewer than keep a full-context chunk within ATTENTION_TILE_MAX (128)
 /// keys for the one-head-per-block pass.
 fn attention_chunks(spec: &Spec) -> usize {
-    (spec.info.context_tokens as usize).div_ceil(128).max(128)
+    let min_chunks = if spec.kv_heads == spec.heads && spec.heads >= 16 {
+        // MHA with many heads already fills the GPU with 32 chunks per head
+        // (512-1024 blocks), avoiding 4x excess partial-buffer traffic.
+        32
+    } else {
+        128
+    };
+    (spec.info.context_tokens as usize).div_ceil(128).max(min_chunks)
 }
 
 /// Warp chunks of `attention_decode_mma` (FP16 KV): at most the 16-key split count
@@ -911,7 +919,7 @@ pub struct CudaBackend {
 /// Block-aligned Q4_K rows use the wide layout (one warp step covers 4 blocks).
 fn matvec_warps_per_row(kind: i32, rows: u32, selections: u32, width: u32) -> u32 {
     let blocks = (width / 256).max(1);
-    if kind == 12 && width % 256 == 0 {
+    if matches!(kind, 12 | 13) && width % 256 == 0 {
         let mut warps = (blocks / 8).clamp(1, 8);
         while warps < 8 && warps * 4 < blocks && rows * selections * warps < 2048 {
             warps *= 2;
@@ -1205,6 +1213,8 @@ impl CudaBackend {
                 "prefill_matmul_ref2x16",
                 "matvec_packed_gate_up_rows",
                 "router_warp128",
+                "router_warp64_full_softmax",
+                "olmoe_qk_norm_rope_cache_decode",
                 "attention_split",
                 "attention_split_decode",
                 "attention_combine",
@@ -1217,6 +1227,7 @@ impl CudaBackend {
                 "attention_split_group",
                 "attention_split_group_decode",
                 "attention_prefill_flash4",
+                "attention_prefill_flash4_dim",
                 "gemm_packed_dense",
                 "gemm_packed_grouped",
                 "group_experts_fast32",
@@ -1255,6 +1266,8 @@ impl CudaBackend {
                     "group_experts_mixed",
                     "attention_prefill_mma_fast_f16",
                     "attention_prefill_mma_fast4_f16",
+                    "attention_prefill_mma_fast_mha_f16",
+                    "attention_prefill_mma_fast_mha96_f16",
                     "attention_decode_mma_f16",
                     "attention_decode_mma_decode_f16",
                     "attention_combine_rows",
@@ -1335,6 +1348,7 @@ impl CudaBackend {
                 "embedding_decode",
                 "rotary_decode",
                 "rotary_factored_decode",
+                "rotary_factored_cache_kv_decode",
                 "cache_kv_decode",
                 "attention_fused_decode",
                 "gemma_attention_scores_decode",
@@ -1641,9 +1655,9 @@ impl CudaBackend {
                 && l.q.width == l.k.width
                 && l.k.width == l.v.width
                 && l.q.width % 256 == 0
-                && matches!(l.q.kind, 12 | 14)
-                && matches!(l.k.kind, 12 | 14)
-                && matches!(l.v.kind, 12 | 14)
+                && matches!(l.q.kind, 12 | 13 | 14)
+                && matches!(l.k.kind, 12 | 13 | 14)
+                && matches!(l.v.kind, 12 | 13 | 14)
             {
                 launch!(
                     self,
@@ -1742,6 +1756,76 @@ impl CudaBackend {
                     ],
                     &pos,
                     [&s.rope_base, &neox]
+                );
+            } else if device_state
+                && self.matmul.f32_tiled()
+                && olmoe
+                && s.rotary_dim == s.dim
+                && self.weights.rope_factors.is_none()
+                && qw <= 4096
+                && kw <= 4096
+                && l.q_norm.is_some()
+                && l.k_norm.is_some()
+            {
+                let qn = l.q_norm.as_ref().unwrap();
+                let kn = l.k_norm.as_ref().unwrap();
+                let control = &self
+                    .decode
+                    .as_ref()
+                    .ok_or_else(|| failure("decode control missing"))?
+                    .control;
+                launch!(
+                    self,
+                    "olmoe_qk_norm_rope_cache_decode",
+                    (2, 1, 1); 1024,
+                    &mut self.work.q,
+                    &qn.bytes,
+                    &qw,
+                    &mut self.work.k,
+                    &kn.bytes,
+                    &self.work.v,
+                    &mut self.keys[index],
+                    &mut self.values[index],
+                    &kw,
+                    &dim,
+                    control,
+                    &rope_base,
+                    &neox,
+                    &s.epsilon
+                );
+            } else if device_state
+                && self.matmul.f32_tiled()
+                && l.q_norm.is_none()
+                && l.k_norm.is_none()
+                && position_embedding.is_none()
+                && embedding_norm.is_none()
+                && s.rotary_dim == s.dim
+                && self.weights.rope_factors.is_some()
+            {
+                let factors = self.weights.rope_factors.as_ref().unwrap();
+                let control = &self
+                    .decode
+                    .as_ref()
+                    .ok_or_else(|| failure("decode control missing"))?
+                    .control;
+                let total_pairs = ((qw / 2 + kw / 2) as u32).div_ceil(256);
+                launch!(
+                    self,
+                    "rotary_factored_cache_kv_decode",
+                    (total_pairs, 1, 1),
+                    &mut self.work.q,
+                    &qw,
+                    &mut self.work.k,
+                    &self.work.v,
+                    &mut self.keys[index],
+                    &mut self.values[index],
+                    &kw,
+                    &dim,
+                    control,
+                    &rope_base,
+                    &neox,
+                    &factors.bytes,
+                    &s.rope_attn_factor
                 );
             } else {
                 for (norm, vector, size) in [
@@ -2114,6 +2198,17 @@ impl CudaBackend {
                         &mut self.work.probabilities,
                         &mut self.work.status
                     );
+                } else if self.matmul.f32_tiled() && olmoe && experts == 64 && used <= 32 {
+                    launch!(
+                        self,
+                        "router_warp64_full_softmax",
+                        (1, 1, 1); 32,
+                        &self.work.router,
+                        &used,
+                        &mut self.work.ids,
+                        &mut self.work.probabilities,
+                        &mut self.work.status
+                    );
                 } else {
                     launch!(
                         self,
@@ -2157,13 +2252,12 @@ impl CudaBackend {
                     &self.work.ids
                 );
             } else if self.matmul.f32_tiled()
-                && moe != 0
                 && gemma.is_none()
                 && gate.width == l.up.width
                 && gate.rows == l.up.rows
                 && gate.width % 256 == 0
-                && matches!(gate.kind, 12 | 14)
-                && matches!(l.up.kind, 12 | 14)
+                && matches!(gate.kind, 12 | 13 | 14)
+                && matches!(l.up.kind, 12 | 13 | 14)
             {
                 launch!(
                     self,
@@ -2177,7 +2271,8 @@ impl CudaBackend {
                     &mut self.work.gate,
                     &gate.width,
                     &gate.rows,
-                    &self.work.ids
+                    &self.work.ids,
+                    &moe
                 );
             } else {
                 for (t, out) in [(gate, &mut self.work.gate), (&l.up, &mut self.work.up)] {

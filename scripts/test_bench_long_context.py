@@ -1,6 +1,14 @@
 import unittest
 
-from bench_long_context import flatten, medians, palito_input, parse_args, parse_palito_stats, table
+from bench_long_context import (
+    flatten,
+    medians,
+    palito_input,
+    parse_args,
+    parse_palito_stats,
+    parse_sse_metrics,
+    table,
+)
 
 
 class BenchLongContextTests(unittest.TestCase):
@@ -32,7 +40,25 @@ class BenchLongContextTests(unittest.TestCase):
         args = parse_args([])
         self.assertEqual(args.sizes, [500, 2900, 10000, 40000])
         self.assertEqual(args.runs, 3)
+        self.assertEqual(args.palito_mode, "serve")
         self.assertIn("fa-on-q8kv", args.llama_configs)
+
+    def test_parse_sse_metrics(self):
+        lines = [
+            'data: {"choices":[{"delta":{"role":"assistant"}}]}\n',
+            'data: {"choices":[{"delta":{"content":"Hi"}}]}\n',
+            'data: {"choices":[{"delta":{"content":" there"}}]}\n',
+            'data: {"choices":[],"usage":{"prompt_tokens":512,"completion_tokens":101}}\n',
+            'data: [DONE]\n',
+        ]
+        timestamps = [10.01, 10.10, 10.60, 11.10, 11.10]
+        got = parse_sse_metrics(lines, started=10.00, timestamps=timestamps)
+        self.assertEqual(got, {
+            "generated": 101,
+            "ttft_ms": 100.0,
+            "decode_tps": 100.0,
+            "prompt_tokens": 512,
+        })
 
 
 if __name__ == "__main__":

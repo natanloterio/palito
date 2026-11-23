@@ -93,6 +93,8 @@ pub(super) struct TextOutput<S: TextSink> {
     clock: TokenClock,
     generated: Vec<i32>,
     cancelled: bool,
+    /// Chat replies are returned trimmed.
+    trim: bool,
 }
 
 impl<S: TextSink> TextOutput<S> {
@@ -106,7 +108,12 @@ impl<S: TextSink> TextOutput<S> {
             clock: TokenClock::new(),
             generated: Vec::new(),
             cancelled: false,
+            trim: false,
         }
+    }
+
+    pub(super) fn trimmed(self) -> Self {
+        Self { trim: true, ..self }
     }
 
     pub(super) fn complete(mut self, stats: Option<RunStats>) -> Result<Completion> {
@@ -114,6 +121,9 @@ impl<S: TextSink> TextOutput<S> {
         let mut text = self.plan.tokenizer.detokenize(&self.generated)?;
         if let Some(index) = stop::find(&text, &self.stop_list) {
             text.truncate(index);
+        }
+        if self.trim {
+            text = text.trim().to_owned();
         }
         let reason =
             self.plan.finish_reason(&self.generated, self.cancelled, self.stops.stopped());

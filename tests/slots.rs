@@ -5,8 +5,12 @@
 use palito::{
     Config, Error, GenerationMode,
     backend::Backend,
+    chat::Message,
     cuda::{CudaBackend, CudaMatmul, CudaOptions, open_slot_backend},
-    slots::SlotBackend,
+    engine::{
+        Completion, Device, Engine, EngineOptions, GenerationOptions, SlotEngine, SlotReply,
+    },
+    slots::{Advance, SlotBackend, SlotRun},
 };
 use std::path::PathBuf;
 
@@ -158,4 +162,75 @@ fn reservation_counts_every_slot() {
     let one = open(1).memory_usage().unwrap().numerical_reservation_bytes;
     let two = open(2).memory_usage().unwrap().numerical_reservation_bytes;
     assert!(one < two);
+}
+
+fn engine_options(context: Option<u32>) -> EngineOptions {
+    EngineOptions { context_tokens: context, ..EngineOptions::default() }
+}
+
+fn text_sink() -> Box<dyn FnMut(&str) -> bool> {
+    Box::new(|_| true)
+}
+
+fn finish(engine: &mut SlotEngine, mut run: SlotRun) -> Completion {
+    loop {
+        match run.advance(engine.backend_mut(), true).unwrap() {
+            Advance::Working => {}
+            Advance::Finished => break,
+        }
+    }
+    match run.into_reply().unwrap() {
+        SlotReply::Text(completion) => completion,
+        SlotReply::Tools(_) => panic!("expected a text reply"),
+    }
+}
+
+#[test]
+fn cpu_refuses_several_slots() {
+    let options = EngineOptions { device: Device::Cpu, ..EngineOptions::default() };
+    let error = SlotEngine::open_slots(&model(), &options, 2).err().unwrap();
+    assert!(error.to_string().contains("--parallel"));
+}
+
+#[test]
+#[ignore = "requires a GPU and PALITO_SLOT_MODEL"]
+fn context_is_split_between_slots() {
+    let engine = SlotEngine::open_slots(&model(), &engine_options(Some(4096)), 4).unwrap();
+    assert_eq!(engine.context_tokens(), 1024);
+    assert_eq!(engine.slots(), 4);
+}
+
+#[test]
+#[ignore = "requires a GPU and PALITO_SLOT_MODEL"]
+fn prompt_over_the_slot_context_is_refused() {
+    let mut engine = SlotEngine::open_slots(&model(), &engine_options(Some(1024)), 4).unwrap();
+    let options = GenerationOptions::default();
+    let error = engine
+        .prepare_complete(&"word ".repeat(600), &options, text_sink())
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("256-token context"), "{error}");
+}
+
+#[test]
+#[ignore = "requires a GPU and PALITO_SLOT_MODEL"]
+fn stepped_chat_matches_engine_chat_for_short_prompts() {
+    let messages = [Message::user("Name three colors.")];
+    let options = GenerationOptions {
+        max_tokens: Some(48),
+        stop: vec!["blue".into()],
+        enable_thinking: false,
+        ..GenerationOptions::default()
+    };
+    let expected = {
+        let mut engine = Engine::open(&model(), &engine_options(Some(1024))).unwrap();
+        engine.chat(&messages, &options, |_| true).unwrap()
+    };
+    let mut engine = SlotEngine::open_slots(&model(), &engine_options(Some(2048)), 2).unwrap();
+    engine.backend_mut().select_slot(0).unwrap();
+    let run = engine.prepare_chat(&messages, &options, text_sink()).unwrap();
+    let completion = finish(&mut engine, run);
+    assert_eq!(completion.text, expected.text);
+    assert_eq!(completion.finish_reason, expected.finish_reason);
+    assert_eq!(completion.generated_tokens, expected.generated_tokens);
 }

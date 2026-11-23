@@ -8,10 +8,12 @@
 
 mod open;
 mod output;
+mod slots;
 mod text;
 mod tools;
 
 pub use output::SlotReply;
+pub use slots::SlotEngine;
 pub use tools::ToolCompletion;
 
 pub(crate) use output::{ReplyOutput, RunStats};
@@ -20,7 +22,7 @@ use crate::{
     Config, Error, Executor, GenerationMode, Result, Sample,
     backend::Backend,
     chat::{ChatTemplate, Message},
-    grammar::{JsonDecoder, JsonSchema, LogitConstraint},
+    grammar::{Constraint, JsonDecoder, JsonSchema, LogitConstraint},
     sampling::{Sampler, Sampling},
     stop,
     tokenizer::Tokenizer,
@@ -158,8 +160,8 @@ pub struct Completion {
     pub tokens_per_second: f64,
 }
 
-pub struct Engine {
-    executor: Executor<Box<dyn Backend>>,
+pub struct Engine<B: Backend + ?Sized = dyn Backend> {
+    executor: Executor<Box<B>>,
     tokenizer: Arc<Tokenizer>,
     /// End-of-generation token IDs.
     eog: Arc<[i32]>,
@@ -192,6 +194,18 @@ impl Engine {
     pub fn from_backend(
         path: &Path,
         backend: Box<dyn Backend>,
+        config: Config,
+        profile: &'static str,
+        chat_template: Option<&str>,
+    ) -> Result<Self> {
+        Self::wrap(path, backend, config, profile, chat_template)
+    }
+}
+
+impl<B: Backend + ?Sized> Engine<B> {
+    fn wrap(
+        path: &Path,
+        backend: Box<B>,
         config: Config,
         profile: &'static str,
         chat_template: Option<&str>,
@@ -291,15 +305,11 @@ impl Engine {
             .ok_or_else(|| Error::Backend("JSON decoder missing".into()))
     }
 
-    fn generate(
-        &mut self,
-        prompt: &str,
-        options: &GenerationOptions,
-        sink: impl TextSink,
-    ) -> Result<Completion> {
+    /// Validates a text request and works out its tokens and budget.
+    fn text_request(&mut self, prompt: &str, options: &GenerationOptions) -> Result<TextRequest> {
         stop::validate(&options.stop)?;
-        let mut sampler = Sampler::new(options.sampling)?;
-        let mut constraint = match &options.json_schema {
+        let sampler = Sampler::new(options.sampling)?;
+        let constraint = match &options.json_schema {
             Some(schema) => Some(self.json_decoder()?.constraint(schema)?),
             None => None,
         };
@@ -316,6 +326,17 @@ impl Engine {
         if budget == 0 {
             return Err(Error::Invalid("max_tokens must be positive".into()));
         }
+        Ok(TextRequest { tokens, budget, room, sampler, constraint })
+    }
+
+    fn generate(
+        &mut self,
+        prompt: &str,
+        options: &GenerationOptions,
+        sink: impl TextSink,
+    ) -> Result<Completion> {
+        let TextRequest { tokens, budget, room, mut sampler, mut constraint } =
+            self.text_request(prompt, options)?;
         let plan = self.reply_plan(tokens.len(), budget, room);
         let mut output = TextOutput::new(plan, &options.stop, sink);
         let mode = GenerationMode::UntilEog;
@@ -352,6 +373,14 @@ impl Engine {
             room,
         }
     }
+}
+
+struct TextRequest {
+    tokens: Vec<i32>,
+    budget: u32,
+    room: u32,
+    sampler: Sampler,
+    constraint: Option<Constraint>,
 }
 
 fn run_stats(sample: &Sample) -> RunStats {

@@ -8,6 +8,7 @@ use super::{
 };
 use crate::{
     Error, GenerationMode, Result,
+    backend::Backend,
     chat::{Message, ToolFormat},
     grammar::{Constraint, LogitConstraint},
     sampling::Sampler,
@@ -33,7 +34,7 @@ pub struct ToolCompletion {
 
 /// Publishes each token's role to the token callback, which runs while the
 /// executor holds the gate.
-struct RoleGate {
+pub(super) struct RoleGate {
     gate: ToolGate,
     role: Rc<Cell<TokenRole>>,
 }
@@ -50,7 +51,18 @@ impl LogitConstraint for RoleGate {
     }
 }
 
-impl Engine {
+/// A validated request with tools.
+pub(super) struct ToolRequest {
+    pub tokens: Vec<i32>,
+    pub budget: u32,
+    pub room: u32,
+    pub sampler: Sampler,
+    pub gate: RoleGate,
+    pub role: Rc<Cell<TokenRole>>,
+    pub applies_stops: bool,
+}
+
+impl<B: Backend + ?Sized> Engine<B> {
     /// The model's tool call format, when Palito can generate it.
     pub fn tool_format(&self) -> Option<ToolFormat> {
         let format = self.template.as_ref()?.tool_format()?;
@@ -85,20 +97,8 @@ impl Engine {
         options: &GenerationOptions,
         on_event: impl FnMut(ToolEvent) -> bool,
     ) -> Result<ToolCompletion> {
-        if options.json_schema.is_some() {
-            return Err(Error::Invalid("tools cannot be combined with JSON output".into()));
-        }
-        stop::validate(&options.stop)?;
-        let mut sampler = Sampler::new(options.sampling)?;
-        let prompt = self.render_chat_tools(messages, spec, options.enable_thinking)?;
-        let tokens = self.executor.tokenize(&prompt)?;
-        let (budget, room) = self.reply_budget(tokens.len(), options.max_tokens)?;
-        let role = Rc::new(Cell::new(TokenRole::Text));
-        let mut gate = RoleGate { gate: self.tool_gate(spec, &prompt)?, role: role.clone() };
-        for warning in &spec.warnings {
-            eprintln!("warning: {warning}");
-        }
-        let applies_stops = matches!(spec.mode, ToolMode::Auto | ToolMode::Forbidden);
+        let ToolRequest { tokens, budget, room, mut sampler, mut gate, role, applies_stops } =
+            self.tool_request(messages, spec, options)?;
         let plan = self.reply_plan(tokens.len(), budget, room);
         let stops = applies_stops.then_some(options.stop.as_slice());
         let mut output = ToolOutput::new(plan, role, stops, on_event);
@@ -119,6 +119,29 @@ impl Engine {
             output.drain()?;
         }
         output.complete(sample.as_ref().map(run_stats))
+    }
+
+    pub(super) fn tool_request(
+        &mut self,
+        messages: &[Message],
+        spec: &ToolSpec,
+        options: &GenerationOptions,
+    ) -> Result<ToolRequest> {
+        if options.json_schema.is_some() {
+            return Err(Error::Invalid("tools cannot be combined with JSON output".into()));
+        }
+        stop::validate(&options.stop)?;
+        let sampler = Sampler::new(options.sampling)?;
+        let prompt = self.render_chat_tools(messages, spec, options.enable_thinking)?;
+        let tokens = self.executor.tokenize(&prompt)?;
+        let (budget, room) = self.reply_budget(tokens.len(), options.max_tokens)?;
+        let role = Rc::new(Cell::new(TokenRole::Text));
+        let gate = RoleGate { gate: self.tool_gate(spec, &prompt)?, role: role.clone() };
+        for warning in &spec.warnings {
+            eprintln!("warning: {warning}");
+        }
+        let applies_stops = matches!(spec.mode, ToolMode::Auto | ToolMode::Forbidden);
+        Ok(ToolRequest { tokens, budget, room, sampler, gate, role, applies_stops })
     }
 
     fn reply_budget(&self, prompt: usize, max_tokens: Option<u32>) -> Result<(u32, u32)> {

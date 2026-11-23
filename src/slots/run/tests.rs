@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     Config, Error, Executor, GenerationMode,
-    backend::{Capabilities, ModelInfo},
+    backend::{Backend, Capabilities, ModelInfo},
     engine::{Completion, FinishReason, ReplyOutput, RunStats, SlotReply},
     sampling::{Sampler, Sampling},
 };

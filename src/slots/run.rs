@@ -5,7 +5,6 @@
 use super::{PROMPT_TURN_TOKENS, SOLO_BURST_TOKENS, SlotBackend};
 use crate::{
     Error, GenerationMode, Result,
-    backend::Backend,
     engine::{ReplyOutput, RunStats, SlotReply},
     grammar::LogitConstraint,
     sampling::Sampler,

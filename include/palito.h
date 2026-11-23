@@ -28,9 +28,11 @@ extern "C" {
 typedef struct palito_engine palito_engine;
 
 enum {
-    PALITO_DEVICE_DEFAULT = 0, /* CUDA when built with it, else CPU */
+    PALITO_DEVICE_DEFAULT = 0, /* CUDA/Metal when built with it, else CPU */
     PALITO_DEVICE_CPU = 1,
-    PALITO_DEVICE_CUDA = 2
+    PALITO_DEVICE_CUDA = 2,
+    PALITO_DEVICE_VULKAN = 3,
+    PALITO_DEVICE_METAL = 4
 };
 
 enum {

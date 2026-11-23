@@ -2,11 +2,13 @@
 //!
 //! Routes: POST /v1/chat/completions, POST /v1/completions (both with
 //! `"stream": true` as server-sent events), GET /v1/models and GET /health.
-//! The model is opened once and runs one request at a time on a worker thread;
-//! other requests wait in a bounded queue (503 when full).
+//! The model is opened once on a worker thread. It serves `--parallel` requests
+//! at a time, taking turns on the device; others wait in a bounded queue (503
+//! when full).
 
 mod openai;
 mod reasoning;
+mod slot_worker;
 mod stream;
 mod worker;
 
@@ -54,7 +56,8 @@ pub(crate) struct ServeArgs {
     /// [default: cuda when built with CUDA, else cpu]
     #[arg(long, env = "PALITO_BACKEND", value_enum)]
     backend: Option<ServeBackend>,
-    /// Context tokens [default: the model's trained context, fitted to GPU memory].
+    /// Total context tokens, split between the --parallel slots [default: the
+    /// model's trained context, fitted to GPU memory].
     #[arg(long)]
     context: Option<u32>,
     #[arg(long, default_value_t = 4)]
@@ -73,9 +76,17 @@ pub(crate) struct ServeArgs {
     /// request's KV cache for a shared prompt start (CUDA).
     #[arg(long)]
     no_prefix_cache: bool,
-    /// Requests allowed to wait while one is running; more get 503.
+    /// Requests allowed to wait while every slot is busy; more get 503.
     #[arg(long, default_value_t = 16)]
     queue: usize,
+    /// Requests served at the same time (`-np`). The context is split between them.
+    #[arg(
+        long,
+        env = "PALITO_PARALLEL",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..=i64::from(palito::slots::MAX_SLOTS))
+    )]
+    parallel: u32,
     /// Model id reported by /v1/models [default: the GGUF file name without extension].
     #[arg(long)]
     model_name: Option<String>,
@@ -117,11 +128,12 @@ pub(crate) fn run(args: ServeArgs) -> palito::Result<()> {
             .map_or("model".into(), |stem| stem.to_string_lossy().into_owned())
     });
     let start = Instant::now();
-    let (worker, report) = Worker::start(args.model.clone(), options, args.queue.max(1))?;
+    let (worker, report) = Worker::start(args.model.clone(), options, args.queue.max(1), args.parallel)?;
     eprintln!(
-        "Loaded {model} in {:.1}s ({}, context {} tokens).",
+        "Loaded {model} in {:.1}s ({}, {} slot(s), context {} tokens per slot).",
         start.elapsed().as_secs_f64(),
         report.profile,
+        report.slots,
         report.context_tokens
     );
     let api_key = args.api_key.filter(|key| !key.is_empty());
@@ -194,6 +206,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "model": &*state.model,
         "profile": state.report.profile,
         "context_tokens": state.report.context_tokens,
+        "slots": state.report.slots,
     }))
 }
 

@@ -1,0 +1,30 @@
+{
+  "model": "Qwen3-30B-A3B-Q4_K_M",
+  "master_commit": "6773356",
+  "master_tokens_per_second": [
+    357.0182641439833,
+    353.4233575710783,
+    358.2712907924055
+  ],
+  "parallel_1_tokens_per_second": [
+    351.86704560116874,
+    356.4901982828999,
+    355.3973444520207
+  ],
+  "median_change_percent": -0.4540159019172374,
+  "same_text_parallel_1_vs_4_by_prompt": {
+    "greedy": [
+      true,
+      true,
+      true,
+      true
+    ],
+    "seeded": [
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "prompt_3_has_over_512_tokens": true
+}

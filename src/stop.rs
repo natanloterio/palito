@@ -28,17 +28,17 @@ pub fn find(text: &str, stops: &[String]) -> Option<usize> {
     stops.iter().filter_map(|stop| text.find(stop.as_str())).min()
 }
 
-pub struct StopFilter<'a> {
-    stops: &'a [String],
+pub struct StopFilter {
+    stops: Vec<String>,
     /// Text received but not yet released.
     held: String,
     stopped: bool,
 }
 
-impl<'a> StopFilter<'a> {
-    pub fn new(stops: &'a [String]) -> Self {
+impl StopFilter {
+    pub fn new(stops: &[String]) -> Self {
         Self {
-            stops,
+            stops: stops.to_vec(),
             held: String::new(),
             stopped: false,
         }
@@ -55,7 +55,7 @@ impl<'a> StopFilter<'a> {
             return String::new();
         }
         self.held.push_str(piece);
-        if let Some(index) = find(&self.held, self.stops) {
+        if let Some(index) = find(&self.held, &self.stops) {
             self.stopped = true;
             self.held.truncate(index);
             return std::mem::take(&mut self.held);
@@ -98,6 +98,16 @@ mod tests {
         out.push(filter.finish());
         let joined = out.concat();
         (out, stopped, joined)
+    }
+
+    #[test]
+    fn filter_outlives_the_stop_list() {
+        let mut filter = {
+            let stops = vec!["END".to_owned()];
+            StopFilter::new(&stops)
+        };
+        assert_eq!(filter.push("abEND"), "ab");
+        assert!(filter.stopped());
     }
 
     #[test]

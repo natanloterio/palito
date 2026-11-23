@@ -1,25 +1,36 @@
 //! The model lives on one worker thread; HTTP handlers queue jobs to it.
 //!
-//! The engine runs one request at a time (one sequence on the device), so jobs
-//! wait in a bounded FIFO queue. Generated text is sent back as it is produced;
-//! when the client goes away its receiver is dropped and generation stops.
+//! With one slot the engine runs one request at a time; with `--parallel`,
+//! `slot_worker` alternates between several. Jobs wait in a bounded FIFO queue.
+//! Generated text is sent back as it is produced; when the client goes away its
+//! receiver is dropped and generation stops.
 
 use palito::{
     Error,
+    backend::Backend,
     chat::{Message, ToolFormat},
-    engine::{Completion, Engine, EngineOptions, FinishReason, GenerationOptions},
+    engine::{
+        Completion, Engine, EngineOptions, FinishReason, GenerationOptions, SlotEngine,
+    },
     tools::{ToolEvent, ToolSpec},
 };
 use super::{
     openai,
     reasoning::{self, Part, ReasoningSplitter},
+    slot_worker,
 };
 use std::{
     path::PathBuf,
-    sync::mpsc::{SyncSender, TrySendError, sync_channel},
+    sync::{
+        Arc,
+        mpsc::{SyncSender, TrySendError, sync_channel},
+    },
     thread,
 };
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{
+    OwnedSemaphorePermit, Semaphore,
+    mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+};
 
 pub enum Prompt {
     Chat(Vec<Message>),
@@ -53,17 +64,20 @@ pub struct ReplyCall {
     pub complete: bool,
 }
 
-struct Job {
-    prompt: Prompt,
-    options: GenerationOptions,
-    split_reasoning: bool,
-    events: UnboundedSender<Event>,
+pub(super) struct Job {
+    pub(super) prompt: Prompt,
+    pub(super) options: GenerationOptions,
+    pub(super) split_reasoning: bool,
+    pub(super) events: UnboundedSender<Event>,
+    pub(super) permit: Option<OwnedSemaphorePermit>,
 }
 
 /// What the worker reports once the model is open.
 #[derive(Clone, Debug)]
 pub struct ModelReport {
+    /// Per slot.
     pub context_tokens: u32,
+    pub slots: u32,
     pub profile: &'static str,
     pub has_chat_template: bool,
     /// None when the template has no tool call format Palito can generate.
@@ -73,6 +87,8 @@ pub struct ModelReport {
 #[derive(Clone)]
 pub struct Worker {
     jobs: SyncSender<Job>,
+    /// Caps active + queued requests at `slots + queue` when `--parallel > 1`.
+    permits: Option<Arc<Semaphore>>,
 }
 
 pub enum SubmitError {
@@ -88,12 +104,30 @@ impl Worker {
         path: PathBuf,
         options: EngineOptions,
         queue: usize,
+        parallel: u32,
     ) -> palito::Result<(Self, ModelReport)> {
-        let (jobs, inbox) = sync_channel::<Job>(queue);
+        let (capacity, permits) = if parallel > 1 {
+            let capacity = (parallel as usize).saturating_add(queue);
+            (capacity, Some(Arc::new(Semaphore::new(capacity))))
+        } else {
+            (queue, None)
+        };
+        let (jobs, inbox) = sync_channel::<Job>(capacity);
         let (ready, opened) = sync_channel(1);
         thread::Builder::new()
             .name("palito-engine".into())
             .spawn(move || {
+                if parallel > 1 {
+                    let engine = match SlotEngine::open_slots(&path, &options, parallel) {
+                        Ok(engine) => engine,
+                        Err(error) => {
+                            let _ = ready.send(Err(error));
+                            return;
+                        }
+                    };
+                    let _ = ready.send(Ok(report(&engine, parallel)));
+                    return slot_worker::serve_slots(engine, inbox);
+                }
                 let mut engine = match Engine::open(&path, &options) {
                     Ok(engine) => engine,
                     Err(error) => {
@@ -101,15 +135,7 @@ impl Worker {
                         return;
                     }
                 };
-                for notice in engine.notices() {
-                    eprintln!("({notice})");
-                }
-                let _ = ready.send(Ok(ModelReport {
-                    context_tokens: engine.context_tokens(),
-                    profile: engine.profile(),
-                    has_chat_template: engine.has_chat_template(),
-                    tool_format: engine.tool_format(),
-                }));
+                let _ = ready.send(Ok(report(&engine, 1)));
                 for job in inbox {
                     run(&mut engine, job);
                 }
@@ -117,7 +143,7 @@ impl Worker {
         let report = opened
             .recv()
             .map_err(|_| Error::Backend("engine thread exited while opening".into()))??;
-        Ok((Self { jobs }, report))
+        Ok((Self { jobs, permits }, report))
     }
 
     /// `split_reasoning` applies to chat prompts only.
@@ -127,18 +153,39 @@ impl Worker {
         options: GenerationOptions,
         split_reasoning: bool,
     ) -> Result<UnboundedReceiver<Event>, SubmitError> {
+        let permit = match &self.permits {
+            Some(permits) => match permits.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => return Err(SubmitError::Busy),
+            },
+            None => None,
+        };
         let (events, receiver) = unbounded_channel();
         let job = Job {
             prompt,
             options,
             split_reasoning,
             events,
+            permit,
         };
         match self.jobs.try_send(job) {
             Ok(()) => Ok(receiver),
             Err(TrySendError::Full(_)) => Err(SubmitError::Busy),
             Err(TrySendError::Disconnected(_)) => Err(SubmitError::Stopped),
         }
+    }
+}
+
+fn report<B: Backend + ?Sized>(engine: &Engine<B>, slots: u32) -> ModelReport {
+    for notice in engine.notices() {
+        eprintln!("({notice})");
+    }
+    ModelReport {
+        context_tokens: engine.context_tokens(),
+        slots,
+        profile: engine.profile(),
+        has_chat_template: engine.has_chat_template(),
+        tool_format: engine.tool_format(),
     }
 }
 
@@ -212,7 +259,7 @@ fn run_tools(engine: &mut Engine, job: &Job, messages: &[Message], spec: &ToolSp
     let _ = events.send(Event::Done(reply));
 }
 
-fn send_text(
+pub(super) fn send_text(
     events: &UnboundedSender<Event>,
     splitter: &mut Option<ReasoningSplitter>,
     piece: &str,
@@ -225,7 +272,7 @@ fn send_text(
     }
 }
 
-fn flush_text(events: &UnboundedSender<Event>, splitter: &mut Option<ReasoningSplitter>) -> bool {
+pub(super) fn flush_text(events: &UnboundedSender<Event>, splitter: &mut Option<ReasoningSplitter>) -> bool {
     splitter.as_mut().is_none_or(|splitter| {
         splitter.finish().into_iter().all(|(part, text)| send_part(events, part, text))
     })
@@ -235,7 +282,7 @@ fn send_part(events: &UnboundedSender<Event>, part: Part, text: String) -> bool 
     events.send(Event::Text { reasoning: part == Part::Reasoning, text }).is_ok()
 }
 
-fn build_reply(completion: Completion, opened: Option<bool>, tool_calls: Vec<ReplyCall>) -> Reply {
+pub(super) fn build_reply(completion: Completion, opened: Option<bool>, tool_calls: Vec<ReplyCall>) -> Reply {
     if completion.finish_reason == FinishReason::Cancelled {
         eprintln!(
             "request cancelled by the client after {} tokens",
@@ -258,7 +305,11 @@ fn build_reply(completion: Completion, opened: Option<bool>, tool_calls: Vec<Rep
 }
 
 /// Whether the rendered prompt already opens a `<think>` block.
-fn opens_reasoning(engine: &Engine, messages: &[Message], options: &GenerationOptions) -> bool {
+pub(super) fn opens_reasoning<B: Backend + ?Sized>(
+    engine: &Engine<B>,
+    messages: &[Message],
+    options: &GenerationOptions,
+) -> bool {
     engine
         .render_chat(messages, options.thinking())
         .is_ok_and(|prompt| prompt.trim_end().ends_with("<think>"))

@@ -1,0 +1,55 @@
+{
+  "short_beats_long": {
+    "pass": true,
+    "first_token_s": 0.032176034001167864,
+    "long_was_running": true
+  },
+  "isolation": {
+    "pass": true,
+    "greedy": {
+      "alone": [
+        " Paris. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of Germany is Berlin. The capital of the United Kingdom is London. The capital of the United States is Washington, D.C. The capital of Brazil",
+        "The rain is a gentle whisper, \nSoftly falling from the sky, \nIt dances on the windowpane, \nA symphony of sighs and sighs. \n\nThe world is wrapped in silver threads, \nAs every leaf and",
+        "    if n <= 0:\n        return 0\n    elif n == 1:\n        return 1\n    else:\n        return fibonacci(n-1) + fibonacci(n-2)\n\n# Example usage:\nn = 1",
+        " the state of the shelf.  The shelf has 160 items.  The items are numbered from 1 to 160.  Each item is on the shelf.  The shelf is in a room.  The"
+      ],
+      "same": true
+    },
+    "seeded": {
+      "alone": [
+        " Paris, and the capital of Italy is Rome. So, the capital of Spain is?\n\nThe capital of Spain is Madrid. This is a well-known fact. However, if you were trying to deduce it based on the previous information,",
+        "With a gentle touch, it falls from the sky, \nA symphony of droplets, lulling the world into a hush. \nIt whispers secrets to the earth, a tender embrace, \nAs the clouds release their silver threads",
+        "    if n == 1 or n == 0:\n        return n\n    else:\n        return fibonacci(n-1) + fibonacci(n-2)\n\nprint(fibonacci(10))\n\n# Disadvantage: it",
+        " the state of a system with 159 items, where each item is on the shelf. Consider a scenario where a person goes through this list and removes every third item. This process is repeated until there are no items left. What"
+      ],
+      "same": true
+    }
+  },
+  "throughput": {
+    "pass": true,
+    "one": {
+      "tokens": 600,
+      "seconds": 1.695108441002958,
+      "tokens_per_second": 353.9596556105834
+    },
+    "four": {
+      "tokens": 2400,
+      "seconds": 6.756780685002013,
+      "tokens_per_second": 355.19874210617286
+    },
+    "ratio": 1.003500643296344,
+    "target": 0.8,
+    "target_missed": false
+  },
+  "disconnect": {
+    "pass": true,
+    "survivor_tokens": 200,
+    "next_requests_s": 0.09251810400019167
+  },
+  "features": {
+    "pass": true,
+    "json": true,
+    "tools": true,
+    "stop": true
+  }
+}

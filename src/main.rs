@@ -6,7 +6,7 @@ use palito::{
     tokenizer::Tokenizer,
 };
 use serde_json::json;
-use std::{fs, io::Write, path::PathBuf, time::Instant};
+use std::{ffi::OsString, fs, io::Write, path::PathBuf, time::Instant};
 
 mod chat_repl;
 mod server;
@@ -516,8 +516,26 @@ impl ModelArgs {
     }
 }
 
+/// Rewrites llama-server's `-np` for `serve`: clap has no two-letter short flags.
+fn normalize_args(args: impl Iterator<Item = OsString>) -> Vec<OsString> {
+    let args: Vec<OsString> = args.collect();
+    if args.get(1).is_none_or(|command| command != "serve") {
+        return args;
+    }
+    args.into_iter()
+        .map(|arg| match arg.to_str() {
+            Some("-np") => "--parallel".into(),
+            Some(text) => match text.strip_prefix("-np=") {
+                Some(value) => format!("--parallel={value}").into(),
+                None => arg,
+            },
+            None => arg,
+        })
+        .collect()
+}
+
 fn execute() -> Result<()> {
-    match Cli::parse().command {
+    match Cli::parse_from(normalize_args(std::env::args_os())).command {
         #[cfg(feature = "ktransformers")]
         Command::Remote { args } => remote(args)?,
         Command::Chat { args } => chat_repl::run(args)?,
@@ -660,6 +678,31 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn np_is_an_alias_of_parallel() {
+        let parsed = |a: &[&str]| normalize_args(a.iter().map(OsString::from));
+        assert_eq!(
+            parsed(&["palito", "serve", "-np", "4"]),
+            ["palito", "serve", "--parallel", "4"]
+        );
+        assert_eq!(
+            parsed(&["palito", "serve", "-np=4"]),
+            ["palito", "serve", "--parallel=4"]
+        );
+        assert_eq!(
+            parsed(&["palito", "chat", "-np", "4"]),
+            ["palito", "chat", "-np", "4"]
+        );
+    }
+
+    #[test]
+    fn parallel_is_limited_to_64() {
+        let base = ["palito", "serve", "--model", "m.gguf", "--parallel"];
+        assert!(Cli::try_parse_from([&base[..], &["64"]].concat()).is_ok());
+        assert!(Cli::try_parse_from([&base[..], &["0"]].concat()).is_err());
+        assert!(Cli::try_parse_from([&base[..], &["65"]].concat()).is_err());
+    }
 
     #[test]
     fn model_commands_require_exactly_one_input_source() {

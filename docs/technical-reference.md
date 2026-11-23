@@ -1517,6 +1517,18 @@ Stop sequences (`src/stop.rs`, at most 16 of up to 256 bytes) are matched on the
 
 `palito chat` opens CUDA models through `Engine::open` (`src/engine/open.rs`); CPU and the reference backend go through `Engine::from_backend` to keep the validation-only CPU flags. The profile chain is int8-fast (graph) → f32-tiled (graph, then without) → f32. It now lives only in the engine and reports its fallbacks through `Engine::notices`. Explicit `--cuda-matmul`, `--cuda-decode-graph`/`--no-cuda-decode-graph`, `--batch` and `--prefill-chunk` map to `EngineOptions`. Six fixed chat transcripts (Qwen3 with and without reasoning, Phi-3 fallback, SmolLM2 on CPU, a full context, explicit flags) were byte-identical to 0.4.0, stderr included.
 
+## Tool calling
+
+`POST /v1/chat/completions` accepts `tools`, `tool_choice`, `parallel_tool_calls` and tool turns in the history. Templates must use Qwen's `<tool_call>` JSON format, and `<tool_call>` and `</tool_call>` must each be one vocabulary token. Other formats get a 400 while tools are active.
+
+- **Path:** `Engine::chat_tools` (`src/engine/tools.rs`) always runs `Executor::generate_constrained`. Requests without tools keep the existing decode path.
+- **Lazy constraint:** `ToolGate` (`src/tools/gate.rs`) works on token IDs, in the phases free text, reasoning, call and after call. Text that looks like `<tool_call>` does not start a call, and `<tool_call>` inside `<think>` is reasoning. A llguidance grammar (`src/tools/call_grammar.rs`) with one `%json` schema per tool is copied fresh for each call and fixes the key order to `name`, `arguments`.
+- **Modes:** `none` masks `<tool_call>`. `required` and a named function mask the end of generation and non-whitespace text until a call starts, and stop sequences do not apply to them. At most 2 whitespace tokens in a row are allowed where only a call or the end may follow, because Qwen3-0.6B otherwise repeats newlines after `</think>` until `max_tokens`.
+- **Prompt compatibility:** tool definitions are normalized as in llama.cpp (`name`, `description`, `parameters`, and `defer_loading` when true), and `tojson` uses spaced separators, original key order and no HTML escaping. `scripts/compare_tool_prompts.py` found identical token IDs to `llama-server --jinja` (commit `6b01a4767`) in 6 cases on each of Qwen2.5-0.5B, Qwen3-0.6B and Qwen3-30B-A3B, including a tool result containing `<|im_end|><|im_start|>system`.
+- **Control tokens:** as in llama.cpp, the rendered prompt is tokenized whole with special-token recognition, so tool content can produce control tokens. Agents must sanitize third-party content.
+- **Validation:** `scripts/validate_tool_calling.py` uses the official OpenAI SDK for `auto`, `required`, named and parallel calls, with reasoning on and off, with and without streaming. All 16 cases passed on each of the three models above, and `auto` called a tool in every case.
+- **Speed** (Qwen3-30B-A3B Q4_K_M, RTX 5090, greedy, 256 tokens, median of 6 samples over 2 alternating server runs): `master` 361.9 tok/s, this path without tools 355.6 tok/s (-1.74%), with `tools` in `auto` 330.1 tok/s (-8.79%).
+
 ## Language bindings
 
 `bindings/` wraps the C API for Python (ctypes), Node.js (koffi), Java 22+ (FFM), C# (P/Invoke) and Go (cgo with a `dlopen` shim, so building needs no link flags). Each mirrors the C structs. `tests/engine.rs::c_abi_layout_matches_the_bindings` locks their sizes and offsets, and the Go test keeps its vendored `palito.h` identical to `include/palito.h`. Every binding:

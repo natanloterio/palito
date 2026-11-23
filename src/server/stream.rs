@@ -124,10 +124,21 @@ pub fn sse(
                     let piece = vec![chunks.chunk(Some((&text, reasoning)), false, None)];
                     return Some((data(piece), (chunks, events, Phase::Body)));
                 }
+                Some(Event::CallStart { index, id, name }) => {
+                    let mut chunk = call_start_chunk(index, &id, &name);
+                    let piece = vec![chunks.envelope(chunk["choices"].take())];
+                    return Some((data(piece), (chunks, events, Phase::Body)));
+                }
+                Some(Event::CallArguments { index, text }) => {
+                    let mut chunk = call_arguments_chunk(index, &text);
+                    let piece = vec![chunks.envelope(chunk["choices"].take())];
+                    return Some((data(piece), (chunks, events, Phase::Body)));
+                }
                 Some(Event::Done(Ok(reply))) => {
+                    let finish =
+                        openai::finish_reason_with_calls(reply.completion.finish_reason, &reply.tool_calls);
                     let completion = reply.completion;
                     super::log(chunks.kind, &completion);
-                    let finish = openai::finish_reason(completion.finish_reason);
                     let mut out = vec![chunks.chunk(None, false, Some(finish))];
                     if include_usage {
                         let usage = Usage::new(completion.prompt_tokens, completion.generated_tokens);
@@ -153,9 +164,51 @@ pub fn sse(
         .into_response()
 }
 
+fn call_start_chunk(index: usize, id: &str, name: &str) -> Value {
+    call_chunk(json!({
+        "index": index,
+        "id": id,
+        "type": "function",
+        "function": {"name": name, "arguments": ""},
+    }))
+}
+
+fn call_arguments_chunk(index: usize, text: &str) -> Value {
+    call_chunk(json!({"index": index, "function": {"arguments": text}}))
+}
+
+fn call_chunk(call: Value) -> Value {
+    json!({"choices": [{
+        "index": 0,
+        "delta": {"tool_calls": [call]},
+        "finish_reason": null,
+        "logprobs": null,
+    }]})
+}
+
 fn data(values: Vec<Value>) -> Vec<Result<SseEvent, Infallible>> {
     values
         .into_iter()
         .map(|value| Ok(SseEvent::default().data(value.to_string())))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn call_chunks_follow_the_openai_delta_shape() {
+        let start = call_start_chunk(0, "call_1", "weather");
+        assert_eq!(
+            start["choices"][0]["delta"]["tool_calls"][0],
+            json!({"index": 0, "id": "call_1", "type": "function",
+                "function": {"name": "weather", "arguments": ""}})
+        );
+        let delta = call_arguments_chunk(0, "{\"c");
+        assert_eq!(
+            delta["choices"][0]["delta"]["tool_calls"][0],
+            json!({"index": 0, "function": {"arguments": "{\"c"}})
+        );
+    }
 }

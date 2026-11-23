@@ -14,6 +14,7 @@ mod kernels;
 #[cfg(feature = "ktransformers")]
 pub mod ktransformers;
 pub mod tokenizer;
+pub mod tools;
 #[cfg(feature = "cuda")]
 mod transformer;
 
@@ -227,7 +228,7 @@ impl<B: Backend> Executor<B> {
         max_tokens: u32,
         mode: GenerationMode,
         sampler: &mut sampling::Sampler,
-        mut constraint: Option<&mut grammar::Constraint>,
+        mut constraint: Option<&mut (dyn grammar::LogitConstraint + '_)>,
         mut on_token: impl FnMut(i32) -> Result<()>,
     ) -> Result<Sample> {
         self.check_request(prompt, max_tokens)?;
@@ -265,7 +266,7 @@ impl<B: Backend> Executor<B> {
     fn draw(
         &mut self,
         sampler: &mut sampling::Sampler,
-        constraint: Option<&mut grammar::Constraint>,
+        constraint: Option<&mut (dyn grammar::LogitConstraint + '_)>,
     ) -> Result<i32> {
         let logits = self.backend.logits()?;
         if logits.len() != self.info().vocab_tokens as usize {
@@ -273,7 +274,7 @@ impl<B: Backend> Executor<B> {
         }
         match constraint {
             None => sampler.sample(logits),
-            Some(constraint) => constraint.sample(logits, |masked| sampler.sample(masked)),
+            Some(constraint) => constraint.sample(logits, &mut |masked| sampler.sample(masked)),
         }
     }
 

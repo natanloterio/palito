@@ -107,6 +107,71 @@ fn client_disconnect_during_a_call_frees_the_engine() {
     assert!(started.elapsed() < Duration::from_secs(30));
 }
 
+#[test]
+fn parallel_on_cpu_fails_at_startup() {
+    let output = Command::new(env!("CARGO_BIN_EXE_palito"))
+        .args(["serve", "--backend", "cpu", "--model", "unused.gguf", "--parallel", "2"])
+        .env_remove("PALITO_API_KEY")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(message.contains("requires the CUDA backend"), "{message}");
+}
+
+#[cfg(feature = "cuda")]
+fn slot_server(port: u16, context: &str, extra: &[&str]) -> Server {
+    let model = std::env::var("PALITO_SLOT_MODEL").unwrap_or_else(|_| {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/models/compat-qwen3/Qwen3-0.6B-Q4_K_M.gguf").into()
+    });
+    launch(port, &["--backend", "cuda", "--context", context, "--model", &model], extra)
+}
+
+/// Sends a request and returns the open connection without reading the reply.
+#[cfg(feature = "cuda")]
+fn send_only(server: &Server, body: &Value) -> TcpStream {
+    let body = body.to_string();
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    write!(
+        stream,
+        "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    stream
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a GPU and PALITO_SLOT_MODEL"]
+fn health_reports_slots_and_slot_context() {
+    let server = slot_server(18472, "4096", &["--parallel", "4"]);
+    let (_, body) = request(&server, "GET", "/health", None, None);
+    let health: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(health["slots"], 4);
+    assert_eq!(health["context_tokens"], 1024);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a GPU and PALITO_SLOT_MODEL"]
+fn queue_limit_is_exact_with_all_slots_busy() {
+    let server = slot_server(18473, "8192", &["--parallel", "2", "--queue", "1"]);
+    let counting: String = (1..40).map(|n| format!("{n}, ")).collect();
+    let long = json!({"prompt": counting, "max_tokens": 3000, "stream": true});
+    let mut accepted = Vec::new();
+    for _ in 0..3 {
+        accepted.push(send_only(&server, &long));
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    let mut refused = send_only(&server, &long);
+    let mut response = String::new();
+    refused.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    assert!(response.to_lowercase().contains("retry-after"));
+}
+
 fn chunked_body(raw: &str) -> String {
     // Decode HTTP chunked transfer encoding.
     let mut out = String::new();

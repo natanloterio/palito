@@ -7,7 +7,8 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <PackageId>Palito</PackageId>
     <Version>0.9.0</Version>
-    <Description>C# binding for Palito, fast local LLM inference for GGUF models</Description>
+    <Description>Run GGUF LLMs locally from C# and .NET with custom CUDA kernels, token streaming, and structured JSON output — no llama.cpp required.</Description>
+    <PackageTags>llm;gguf;inference;cuda;ai;local-llm;qwen;llama</PackageTags>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/natanloterio/palito</PackageProjectUrl>

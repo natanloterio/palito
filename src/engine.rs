@@ -42,6 +42,7 @@ pub enum Device {
     Cpu,
     Cuda,
     Vulkan,
+    Metal,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +79,8 @@ impl Default for EngineOptions {
         Self {
             device: if cfg!(feature = "cuda") {
                 Device::Cuda
+            } else if cfg!(all(feature = "metal", target_os = "macos")) {
+                Device::Metal
             } else {
                 Device::Cpu
             },

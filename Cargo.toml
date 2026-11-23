@@ -19,6 +19,7 @@ default = []
 ktransformers = ["dep:reqwest"]
 cuda = ["dep:cudarc", "dep:libloading", "dep:sha2"]
 vulkan = ["dep:ash", "dep:naga"]
+metal = ["dep:metal"]
 cuda-parallel-grouping-research = ["cuda"]
 cuda-packed-reduction-research = ["cuda"]
 cuda-packed-down-research = ["cuda-packed-reduction-research"]
@@ -89,3 +90,6 @@ llguidance = "1.9.1"
 
 [dev-dependencies]
 jsonschema = { version = "0.29", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.32", optional = true }

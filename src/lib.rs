@@ -12,13 +12,15 @@ pub mod cpu;
 pub mod cuda;
 #[cfg(feature = "vulkan")]
 pub mod vulkan;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal;
 mod gguf;
 mod kernels;
 #[cfg(feature = "ktransformers")]
 pub mod ktransformers;
 pub mod tokenizer;
 pub mod tools;
-#[cfg(any(feature = "cuda", feature = "vulkan"))]
+#[cfg(any(feature = "cuda", feature = "vulkan", all(feature = "metal", target_os = "macos")))]
 mod transformer;
 
 use backend::{Backend, ModelInfo};

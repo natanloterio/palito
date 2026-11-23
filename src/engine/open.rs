@@ -31,6 +31,7 @@ pub(super) fn open(path: &Path, options: &EngineOptions) -> Result<Opened> {
         Device::Cpu => open_cpu(path, options, trained),
         Device::Cuda => open_cuda(path, options, trained),
         Device::Vulkan => open_vulkan(path, options, trained),
+        Device::Metal => open_metal(path, options, trained),
     }
 }
 
@@ -313,6 +314,38 @@ fn open_vulkan(path: &Path, options: &EngineOptions, trained: u32) -> Result<Ope
         backend,
         config,
         profile: "vulkan",
+        notices: Vec::new(),
+    })
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn open_metal(_: &Path, _: &EngineOptions, _: u32) -> Result<Opened> {
+    Err(Error::Invalid(
+        "Metal backend requires macOS and building with --features metal".into(),
+    ))
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn open_metal(path: &Path, options: &EngineOptions, trained: u32) -> Result<Opened> {
+    const CONTEXT_MAX: u32 = 65535;
+    let context = options.context_tokens.unwrap_or(trained.min(CONTEXT_MAX));
+    let batch = options.batch_tokens.unwrap_or(CPU_BATCH_TOKENS).min(context);
+    let chunk = options.prefill_chunk.unwrap_or(CPU_PREFILL_CHUNK).min(batch);
+    let config = Config {
+        context_tokens: context,
+        batch_tokens: batch,
+        prefill_chunk: chunk,
+        threads: options.threads,
+    };
+    let mtl = crate::metal::MetalOptions {
+        device: options.gpu_device,
+        memory_limit_bytes: options.gpu_memory_limit_bytes.unwrap_or(u64::MAX),
+    };
+    let backend = crate::metal::open_backend(path, &config, mtl)?;
+    Ok(Opened {
+        backend,
+        config,
+        profile: "metal",
         notices: Vec::new(),
     })
 }

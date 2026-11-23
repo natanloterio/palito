@@ -30,7 +30,7 @@ pub(crate) enum Storage {
     Packed { kind: u32, bytes: Vec<u8> },
 }
 
-#[cfg(any(feature = "cuda", feature = "vulkan", test))]
+#[cfg(any(feature = "cuda", feature = "vulkan", all(feature = "metal", target_os = "macos"), test))]
 impl Tensor {
     pub fn split_vector(mut self, count: usize) -> Result<(Self, Self)> {
         let [total] = self.dims[..] else {

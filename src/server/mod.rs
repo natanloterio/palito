@@ -43,6 +43,7 @@ enum ServeBackend {
     Cpu,
     Cuda,
     Vulkan,
+    Metal,
 }
 
 #[derive(Args)]
@@ -112,6 +113,7 @@ pub(crate) fn run(args: ServeArgs) -> palito::Result<()> {
             Some(ServeBackend::Cpu) => Device::Cpu,
             Some(ServeBackend::Cuda) => Device::Cuda,
             Some(ServeBackend::Vulkan) => Device::Vulkan,
+            Some(ServeBackend::Metal) => Device::Metal,
             None => EngineOptions::default().device,
         },
         context_tokens: args.context,

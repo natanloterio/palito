@@ -85,6 +85,8 @@ enum LocalBackend {
     Cuda,
     #[cfg(feature = "vulkan")]
     Vulkan,
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    Metal,
     /// Slow independent packed CPU oracle for the CUDA model layouts.
     #[cfg(feature = "cuda")]
     Reference,
@@ -341,6 +343,8 @@ impl RuntimeArgs {
                 }
                 #[cfg(feature = "vulkan")]
                 LocalBackend::Vulkan => {}
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                LocalBackend::Metal => {}
                 LocalBackend::Cpu => {}
             }
         }
@@ -349,6 +353,12 @@ impl RuntimeArgs {
             self.check_cpu_policy()?;
             let options = palito::vulkan::VulkanOptions::default();
             return palito::vulkan::open_backend(&self.model, &self.config(), options);
+        }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if self.backend == LocalBackend::Metal {
+            self.check_cpu_policy()?;
+            let options = palito::metal::MetalOptions::default();
+            return palito::metal::open_backend(&self.model, &self.config(), options);
         }
         Ok(Box::new(CpuBackend::open_with_options(
             &self.model,
@@ -382,7 +392,7 @@ impl RuntimeArgs {
         self.cuda_matmul.unwrap_or_default()
     }
 
-    #[cfg(any(feature = "cuda", feature = "vulkan"))]
+    #[cfg(any(feature = "cuda", feature = "vulkan", all(feature = "metal", target_os = "macos")))]
     fn check_cpu_policy(&self) -> Result<()> {
         if self.backend != LocalBackend::Cpu
             && (self.f32_weights
@@ -504,6 +514,8 @@ impl RuntimeArgs {
             }
             #[cfg(feature = "vulkan")]
             LocalBackend::Vulkan => {}
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            LocalBackend::Metal => {}
             LocalBackend::Cpu => {}
         }
         #[cfg(feature = "vulkan")]
@@ -512,7 +524,17 @@ impl RuntimeArgs {
                 "backend": "vulkan",
                 "options": palito::vulkan::VulkanOptions::default(),
                 "expert_residency": "all weights GPU-resident",
-                "prefill": "sequential token steps",
+                "prefill": "layer-wise batched (internal capacity <=64)",
+                "kv_precision": "f32",
+            });
+        }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if self.backend == LocalBackend::Metal {
+            return json!({
+                "backend": "metal",
+                "options": palito::metal::MetalOptions::default(),
+                "expert_residency": "Apple Silicon unified memory (StorageModeShared)",
+                "prefill": "layer-wise batched (internal capacity <=64)",
                 "kv_precision": "f32",
             });
         }

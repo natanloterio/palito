@@ -234,6 +234,7 @@ Continuing a conversation is faster: with ~9.7k tokens of history, the next turn
 
 - [Technical reference](docs/technical-reference.md): precision profiles (`--cuda-matmul`), validation, benchmarks against llama.cpp, tests.
 - [Architecture](docs/architecture.md)
+- [Releasing](docs/releasing.md): version alignment and publishing to crates.io, PyPI, npm, NuGet, Maven Central and Go
 - [Performance report, in Portuguese](docs/relatorio-desempenho-decode-cuda.md)
 
-License: MIT.
+License: MIT (see [LICENSE](LICENSE)).

@@ -6,6 +6,13 @@ rust-version = "1.87"
 description = "Independent Rust GGUF inference engine with external-reference benchmarks"
 default-run = "palito"
 license = "MIT"
+repository = "https://github.com/natanloterio/palito"
+homepage = "https://github.com/natanloterio/palito"
+readme = "README.md"
+keywords = ["llm", "gguf", "inference", "cuda", "qwen"]
+categories = ["science", "command-line-utilities"]
+# crates.io package: the library, the CLI, the C header and kernels only.
+include = ["/src/**", "/include/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
 
 [features]
 default = []

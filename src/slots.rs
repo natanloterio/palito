@@ -1,8 +1,10 @@
 //! Server slots: several sequences taking turns on one device.
 
 mod run;
+mod scheduler;
 
 pub use run::{Advance, SlotRun};
+pub use scheduler::{Round, Scheduler, SlotTask};
 
 use crate::{Error, Result, backend::Backend};
 
@@ -57,10 +59,12 @@ pub struct SlotCandidate {
     pub last_used: u64,
 }
 
-/// The slot restoring the most tokens; on a tie, the least recently used.
+/// The slot restoring the most tokens; on a tie, the least recently used, then
+/// the lowest index.
 pub fn pick_slot(free: &[SlotCandidate]) -> Option<usize> {
+    use std::cmp::Reverse;
     free.iter()
-        .max_by_key(|c| (c.restorable, std::cmp::Reverse(c.last_used)))
+        .max_by_key(|c| (c.restorable, Reverse(c.last_used), Reverse(c.slot)))
         .map(|c| c.slot)
 }
 

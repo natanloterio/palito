@@ -300,6 +300,24 @@ impl VkContext {
         )
     }
 
+    pub(super) fn write_mapped_i32(&self, staging: &Buffer, src: &[i32]) -> Result<()> {
+        let bytes = (src.len() * 4) as u64;
+        if bytes == 0 {
+            return Ok(());
+        }
+        unsafe {
+            let ptr = self
+                .inner
+                .device
+                .map_memory(staging.memory, 0, bytes, vk::MemoryMapFlags::empty())
+                .map_err(|e| failure(format!("vkMapMemory failed: {e}")))?
+                as *mut i32;
+            std::ptr::copy_nonoverlapping(src.as_ptr(), ptr, src.len());
+            self.inner.device.unmap_memory(staging.memory);
+        }
+        Ok(())
+    }
+
     pub(super) fn read_mapped_f32(&self, staging: &Buffer, dst: &mut [f32]) -> Result<()> {
         let bytes = (dst.len() * 4) as u64;
         if bytes == 0 {

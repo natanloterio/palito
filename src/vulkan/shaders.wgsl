@@ -137,6 +137,188 @@ fn workgroup_sum(tid: u32, val: f32) -> f32 {
     return shared_f32[0];
 }
 
+// 32-lane sub-group sum inside a 256-thread workgroup (8 independent rows).
+fn lane32_sum(tid: u32, lane: u32, val: f32) -> f32 {
+    shared_f32[tid] = val;
+    workgroupBarrier();
+    if (lane < 16u) { shared_f32[tid] = shared_f32[tid] + shared_f32[tid + 16u]; }
+    workgroupBarrier();
+    if (lane < 8u) { shared_f32[tid] = shared_f32[tid] + shared_f32[tid + 8u]; }
+    workgroupBarrier();
+    if (lane < 4u) { shared_f32[tid] = shared_f32[tid] + shared_f32[tid + 4u]; }
+    workgroupBarrier();
+    if (lane < 2u) { shared_f32[tid] = shared_f32[tid] + shared_f32[tid + 2u]; }
+    workgroupBarrier();
+    if (lane == 0u) { shared_f32[tid] = shared_f32[tid] + shared_f32[tid + 1u]; }
+    workgroupBarrier();
+    return shared_f32[tid & ~31u];
+}
+
+fn read_u32_unaligned(byte_off: u32) -> u32 {
+    let shift = (byte_off & 3u) * 8u;
+    let idx = byte_off >> 2u;
+    if (shift == 0u) {
+        return buf_w[idx];
+    }
+    return (buf_w[idx] >> shift) | (buf_w[idx + 1u] << (32u - shift));
+}
+
+// Fast packed row dot product for 32 lanes (1 warp) over a single row.
+fn packed_row_dot(kind: u32, row_elem: u32, width: u32, x_base: u32, lane: u32) -> f32 {
+    var acc = 0.0;
+    if (kind == 12u && (width & 255u) == 0u) {
+        // Q4_K: 32 lanes process one 256-element block per step (8 elements/lane).
+        let chunk = lane >> 3u;
+        let sub = lane & 7u;
+        let g_lo = chunk * 2u;
+        let g_hi = g_lo + 1u;
+        let num_blocks = width >> 8u;
+        let row_blk = row_elem >> 8u;
+        for (var b = 0u; b < num_blocks; b = b + 1u) {
+            let base = (row_blk + b) * 144u;
+            let dd = buf_w[base >> 2u];
+            let d = half_to_f32(dd & 0xffffu);
+            let dm = half_to_f32(dd >> 16u);
+            let s0 = buf_w[(base >> 2u) + 1u];
+            let s1 = buf_w[(base >> 2u) + 2u];
+            let s2 = buf_w[(base >> 2u) + 3u];
+            let sh_lo = (g_lo & 3u) * 8u;
+            let lo0 = (s0 >> sh_lo) & 255u;
+            let mid0 = (s1 >> sh_lo) & 255u;
+            let hi0 = (s2 >> sh_lo) & 255u;
+            let sc0 = select((hi0 & 15u) | ((lo0 >> 6u) << 4u), lo0 & 63u, g_lo < 4u);
+            let mn0 = select((hi0 >> 4u) | ((mid0 >> 6u) << 4u), mid0 & 63u, g_lo < 4u);
+            let sh_hi = (g_hi & 3u) * 8u;
+            let lo1 = (s0 >> sh_hi) & 255u;
+            let mid1 = (s1 >> sh_hi) & 255u;
+            let hi1 = (s2 >> sh_hi) & 255u;
+            let sc1 = select((hi1 & 15u) | ((lo1 >> 6u) << 4u), lo1 & 63u, g_hi < 4u);
+            let mn1 = select((hi1 >> 4u) | ((mid1 >> 6u) << 4u), mid1 & 63u, g_hi < 4u);
+            let ds0 = d * f32(sc0);
+            let ms0 = dm * f32(mn0);
+            let ds1 = d * f32(sc1);
+            let ms1 = dm * f32(mn1);
+            let qw = buf_w[(base + 16u + chunk * 32u + sub * 4u) >> 2u];
+            let xb0 = x_base + (b << 8u) + g_lo * 32u + sub * 4u;
+            let xb1 = x_base + (b << 8u) + g_hi * 32u + sub * 4u;
+            for (var k = 0u; k < 4u; k = k + 1u) {
+                let byte_v = (qw >> (k * 8u)) & 255u;
+                acc = acc + (ds0 * f32(byte_v & 15u) - ms0) * buf_a[xb0 + k];
+                acc = acc + (ds1 * f32(byte_v >> 4u) - ms1) * buf_a[xb1 + k];
+            }
+        }
+        return acc;
+    }
+    if (kind == 13u && (width & 255u) == 0u) {
+        // Q5_K: 32 lanes process one 256-element block per step (8 elements/lane).
+        let chunk = lane >> 3u;
+        let sub = lane & 7u;
+        let g_lo = chunk * 2u;
+        let g_hi = g_lo + 1u;
+        let num_blocks = width >> 8u;
+        let row_blk = row_elem >> 8u;
+        for (var b = 0u; b < num_blocks; b = b + 1u) {
+            let base = (row_blk + b) * 176u;
+            let dd = buf_w[base >> 2u];
+            let d = half_to_f32(dd & 0xffffu);
+            let dm = half_to_f32(dd >> 16u);
+            let s0 = buf_w[(base >> 2u) + 1u];
+            let s1 = buf_w[(base >> 2u) + 2u];
+            let s2 = buf_w[(base >> 2u) + 3u];
+            let sh_lo = (g_lo & 3u) * 8u;
+            let lo0 = (s0 >> sh_lo) & 255u;
+            let mid0 = (s1 >> sh_lo) & 255u;
+            let hi0 = (s2 >> sh_lo) & 255u;
+            let sc0 = select((hi0 & 15u) | ((lo0 >> 6u) << 4u), lo0 & 63u, g_lo < 4u);
+            let mn0 = select((hi0 >> 4u) | ((mid0 >> 6u) << 4u), mid0 & 63u, g_lo < 4u);
+            let sh_hi = (g_hi & 3u) * 8u;
+            let lo1 = (s0 >> sh_hi) & 255u;
+            let mid1 = (s1 >> sh_hi) & 255u;
+            let hi1 = (s2 >> sh_hi) & 255u;
+            let sc1 = select((hi1 & 15u) | ((lo1 >> 6u) << 4u), lo1 & 63u, g_hi < 4u);
+            let mn1 = select((hi1 >> 4u) | ((mid1 >> 6u) << 4u), mid1 & 63u, g_hi < 4u);
+            let ds0 = d * f32(sc0);
+            let ms0 = dm * f32(mn0);
+            let ds1 = d * f32(sc1);
+            let ms1 = dm * f32(mn1);
+            let qw = buf_w[(base + 48u + chunk * 32u + sub * 4u) >> 2u];
+            let qhw = buf_w[(base + 16u + sub * 4u) >> 2u];
+            let xb0 = x_base + (b << 8u) + g_lo * 32u + sub * 4u;
+            let xb1 = x_base + (b << 8u) + g_hi * 32u + sub * 4u;
+            for (var k = 0u; k < 4u; k = k + 1u) {
+                let byte_v = (qw >> (k * 8u)) & 255u;
+                let h_byte = (qhw >> (k * 8u)) & 255u;
+                let q0 = (byte_v & 15u) | (((h_byte >> g_lo) & 1u) << 4u);
+                let q1 = (byte_v >> 4u) | (((h_byte >> g_hi) & 1u) << 4u);
+                acc = acc + (ds0 * f32(q0) - ms0) * buf_a[xb0 + k];
+                acc = acc + (ds1 * f32(q1) - ms1) * buf_a[xb1 + k];
+            }
+        }
+        return acc;
+    }
+    if (kind == 14u && (width & 255u) == 0u) {
+        // Q6_K: 32 lanes process one 256-element block per step (8 elements/lane).
+        let h = lane >> 4u;
+        let col = (lane & 15u) * 2u;
+        let num_blocks = width >> 8u;
+        let row_blk = row_elem >> 8u;
+        for (var b = 0u; b < num_blocks; b = b + 1u) {
+            let base = (row_blk + b) * 210u;
+            let d = half_to_f32(read_u16(base + 208u));
+            let lo0 = read_u16(base + h * 64u + col);
+            let lo1 = read_u16(base + h * 64u + 32u + col);
+            let hi = read_u16(base + 128u + h * 32u + col);
+            let xb = x_base + (b << 8u) + h * 128u + col;
+            for (var quarter = 0u; quarter < 4u; quarter = quarter + 1u) {
+                let low = select(lo0, lo1, (quarter & 1u) != 0u);
+                let grp = h * 8u + quarter * 2u + (col >> 4u);
+                let ds = d * f32(read_i8(base + 192u + grp));
+                let lsh = (quarter >> 1u) * 4u;
+                let hsh = quarter * 2u;
+                let q0 = i32(((low >> lsh) & 15u) | (((hi >> hsh) & 3u) << 4u)) - 32;
+                let q1 = i32(((low >> (8u + lsh)) & 15u) | (((hi >> (8u + hsh)) & 3u) << 4u)) - 32;
+                acc = acc + ds * f32(q0) * buf_a[xb + quarter * 32u];
+                acc = acc + ds * f32(q1) * buf_a[xb + quarter * 32u + 1u];
+            }
+        }
+        return acc;
+    }
+    if (kind == 8u && (width & 31u) == 0u) {
+        // Q8_0: 8 lanes per 32-element block (4 values/lane), so 32 lanes process
+        // 4 blocks (128 elements) per step.
+        let num_blocks = width >> 5u;
+        let row_blk = row_elem >> 5u;
+        let sub = lane >> 3u;
+        let elem = (lane & 7u) * 4u;
+        var b = sub;
+        loop {
+            if (b >= num_blocks) { break; }
+            let base = (row_blk + b) * 34u;
+            let d = half_to_f32(read_u16(base));
+            let xb = x_base + (b << 5u) + elem;
+            let q0 = read_i8(base + 2u + elem);
+            let q1 = read_i8(base + 3u + elem);
+            let q2 = read_i8(base + 4u + elem);
+            let q3 = read_i8(base + 5u + elem);
+            acc = acc + d * (
+                f32(q0) * buf_a[xb]
+                + f32(q1) * buf_a[xb + 1u]
+                + f32(q2) * buf_a[xb + 2u]
+                + f32(q3) * buf_a[xb + 3u]
+            );
+            b = b + 4u;
+        }
+        return acc;
+    }
+    var i = lane;
+    loop {
+        if (i >= width) { break; }
+        acc = acc + decode_weight(kind, row_elem + i) * buf_a[x_base + i];
+        i = i + 32u;
+    }
+    return acc;
+}
+
 // p0 = token_id, p1 = width, p2 = kind
 @compute @workgroup_size(256)
 fn embedding(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -171,32 +353,31 @@ fn rmsnorm(@builtin(local_invocation_id) lid: vec3<u32>) {
 }
 
 // buf_w = weight, buf_a = x, buf_c = y, buf_i = expert ids
-// workgroup_id.x = row, workgroup_id.y = selected
+// 8 rows per 256-thread workgroup (32 lanes per row).
+// workgroup_id.x = row / 8, workgroup_id.y = selected
 // p0 = kind, p1 = width, p2 = rows, p3 = moe, p4 = batched
 @compute @workgroup_size(256)
 fn matvec(
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-    let row = wg.x;
-    let selected = wg.y;
     let tid = lid.x;
+    let warp = tid >> 5u;
+    let lane = tid & 31u;
+    let row = wg.x * 8u + warp;
+    let selected = wg.y;
     let kind = pc.p0;
     let width = pc.p1;
     let rows = pc.p2;
-    if (row >= rows) { return; }
     let expert = select(0u, u32(buf_i[selected]), pc.p3 != 0u);
-    let row_elem = (expert * rows + row) * width;
     let x_base = select(0u, selected * width, pc.p4 != 0u);
     var sum = 0.0;
-    var i = tid;
-    loop {
-        if (i >= width) { break; }
-        sum = sum + decode_weight(kind, row_elem + i) * buf_a[x_base + i];
-        i = i + 256u;
+    if (row < rows) {
+        let row_elem = (expert * rows + row) * width;
+        sum = packed_row_dot(kind, row_elem, width, x_base, lane);
     }
-    let total = workgroup_sum(tid, sum);
-    if (tid == 0u) {
+    let total = lane32_sum(tid, lane, sum);
+    if (lane == 0u && row < rows) {
         buf_c[selected * rows + row] = total;
     }
 }
@@ -427,6 +608,281 @@ fn router(@builtin(local_invocation_id) lid: vec3<u32>) {
         for (var s = 0u; s < used; s = s + 1u) {
             buf_c[s] = buf_c[s] / denom;
         }
+    }
+}
+
+// Batched token embedding: buf_i[0..n] = token IDs, buf_c[t * width + i] = embedding.
+// grid = (ceil(width / 256), n, 1); p0 = width, p1 = kind
+@compute @workgroup_size(256)
+fn embedding_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let t = gid.y;
+    let width = pc.p0;
+    if (i < width) {
+        let tok = u32(buf_i[t]);
+        buf_c[t * width + i] = decode_weight(pc.p1, tok * width + i);
+    }
+}
+
+// Batched RMSNorm: grid = (n, 1, 1); p0 = width, f0 = epsilon
+@compute @workgroup_size(256)
+fn rmsnorm_batch(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let tid = lid.x;
+    let width = pc.p0;
+    let base = wg.x * width;
+    var sum = 0.0;
+    var i = tid;
+    loop {
+        if (i >= width) { break; }
+        let v = buf_a[base + i];
+        sum = sum + v * v;
+        i = i + 256u;
+    }
+    let total = workgroup_sum(tid, sum);
+    let inv = inverseSqrt(total / f32(width) + pc.f0);
+    i = tid;
+    loop {
+        if (i >= width) { break; }
+        buf_c[base + i] = buf_a[base + i] * inv * bitcast<f32>(buf_w[i]);
+        i = i + 256u;
+    }
+}
+
+// Batched matmul: 8 rows x 4 tokens per workgroup (reads each weight block ONCE for 4 tokens).
+// grid = (ceil(rows / 8), ceil(tokens / 4), 1)
+// p0 = kind, p1 = width, p2 = rows, p3 = tokens
+@compute @workgroup_size(256)
+fn matmul_batch(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let tid = lid.x;
+    let warp = tid >> 5u;
+    let lane = tid & 31u;
+    let row = wg.x * 8u + warp;
+    let t0 = wg.y * 4u;
+    let kind = pc.p0;
+    let width = pc.p1;
+    let rows = pc.p2;
+    let tokens = pc.p3;
+    let n = min(4u, tokens - t0);
+    var acc0 = 0.0;
+    var acc1 = 0.0;
+    var acc2 = 0.0;
+    var acc3 = 0.0;
+    if (row < rows) {
+        let row_elem = row * width;
+        let x0 = t0 * width;
+        let x1 = select(x0, (t0 + 1u) * width, n > 1u);
+        let x2 = select(x0, (t0 + 2u) * width, n > 2u);
+        let x3 = select(x0, (t0 + 3u) * width, n > 3u);
+        if (kind == 12u && (width & 255u) == 0u) {
+            let chunk = lane >> 3u;
+            let sub = lane & 7u;
+            let g_lo = chunk * 2u;
+            let g_hi = g_lo + 1u;
+            let num_blocks = width >> 8u;
+            let row_blk = row_elem >> 8u;
+            for (var b = 0u; b < num_blocks; b = b + 1u) {
+                let base = (row_blk + b) * 144u;
+                let dd = buf_w[base >> 2u];
+                let d = half_to_f32(dd & 0xffffu);
+                let dm = half_to_f32(dd >> 16u);
+                let s0 = buf_w[(base >> 2u) + 1u];
+                let s1 = buf_w[(base >> 2u) + 2u];
+                let s2 = buf_w[(base >> 2u) + 3u];
+                let sh_lo = (g_lo & 3u) * 8u;
+                let lo0 = (s0 >> sh_lo) & 255u;
+                let mid0 = (s1 >> sh_lo) & 255u;
+                let hi0 = (s2 >> sh_lo) & 255u;
+                let sc0 = select((hi0 & 15u) | ((lo0 >> 6u) << 4u), lo0 & 63u, g_lo < 4u);
+                let mn0 = select((hi0 >> 4u) | ((mid0 >> 6u) << 4u), mid0 & 63u, g_lo < 4u);
+                let sh_hi = (g_hi & 3u) * 8u;
+                let lo1 = (s0 >> sh_hi) & 255u;
+                let mid1 = (s1 >> sh_hi) & 255u;
+                let hi1 = (s2 >> sh_hi) & 255u;
+                let sc1 = select((hi1 & 15u) | ((lo1 >> 6u) << 4u), lo1 & 63u, g_hi < 4u);
+                let mn1 = select((hi1 >> 4u) | ((mid1 >> 6u) << 4u), mid1 & 63u, g_hi < 4u);
+                let ds0 = d * f32(sc0);
+                let ms0 = dm * f32(mn0);
+                let ds1 = d * f32(sc1);
+                let ms1 = dm * f32(mn1);
+                let qw = buf_w[(base + 16u + chunk * 32u + sub * 4u) >> 2u];
+                let off0 = (b << 8u) + g_lo * 32u + sub * 4u;
+                let off1 = (b << 8u) + g_hi * 32u + sub * 4u;
+                for (var k = 0u; k < 4u; k = k + 1u) {
+                    let byte_v = (qw >> (k * 8u)) & 255u;
+                    let w0 = ds0 * f32(byte_v & 15u) - ms0;
+                    let w1 = ds1 * f32(byte_v >> 4u) - ms1;
+                    acc0 = acc0 + w0 * buf_a[x0 + off0 + k] + w1 * buf_a[x0 + off1 + k];
+                    acc1 = acc1 + w0 * buf_a[x1 + off0 + k] + w1 * buf_a[x1 + off1 + k];
+                    acc2 = acc2 + w0 * buf_a[x2 + off0 + k] + w1 * buf_a[x2 + off1 + k];
+                    acc3 = acc3 + w0 * buf_a[x3 + off0 + k] + w1 * buf_a[x3 + off1 + k];
+                }
+            }
+        } else {
+            var i = lane;
+            loop {
+                if (i >= width) { break; }
+                let wv = decode_weight(kind, row_elem + i);
+                acc0 = acc0 + wv * buf_a[x0 + i];
+                acc1 = acc1 + wv * buf_a[x1 + i];
+                acc2 = acc2 + wv * buf_a[x2 + i];
+                acc3 = acc3 + wv * buf_a[x3 + i];
+                i = i + 32u;
+            }
+        }
+    }
+    let s0 = lane32_sum(tid, lane, acc0);
+    let s1 = lane32_sum(tid, lane, acc1);
+    let s2 = lane32_sum(tid, lane, acc2);
+    let s3 = lane32_sum(tid, lane, acc3);
+    if (lane == 0u && row < rows) {
+        buf_c[t0 * rows + row] = s0;
+        if (n > 1u) { buf_c[(t0 + 1u) * rows + row] = s1; }
+        if (n > 2u) { buf_c[(t0 + 2u) * rows + row] = s2; }
+        if (n > 3u) { buf_c[(t0 + 3u) * rows + row] = s3; }
+    }
+}
+
+// Batched row bias: grid = (ceil(width / 256), n, 1); p0 = width
+@compute @workgroup_size(256)
+fn add_row_bias_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let t = gid.y;
+    let w = pc.p0;
+    if (i < w) {
+        buf_c[t * w + i] = buf_c[t * w + i] + bitcast<f32>(buf_w[i]);
+    }
+}
+
+// Batched head_norm: grid = (heads_per_token, n, 1); p0 = norm_width, p1 = total_size
+@compute @workgroup_size(256)
+fn head_norm_batch(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let tid = lid.x;
+    let dim = pc.p0;
+    let base = wg.y * pc.p1 + wg.x * dim;
+    var sum = 0.0;
+    var i = tid;
+    loop {
+        if (i >= dim) { break; }
+        let v = buf_c[base + i];
+        sum = sum + v * v;
+        i = i + 256u;
+    }
+    let total = workgroup_sum(tid, sum);
+    let inv = inverseSqrt(total / f32(dim) + pc.f0);
+    i = tid;
+    loop {
+        if (i >= dim) { break; }
+        buf_c[base + i] = buf_c[base + i] * inv * bitcast<f32>(buf_w[i]);
+        i = i + 256u;
+    }
+}
+
+// Batched RoPE: grid = (ceil(pairs / 256), n, 1)
+// p0 = size, p1 = dim, p2 = base_position, p3 = neox, p4 = rotary_dim, p5 = has_factors
+@compute @workgroup_size(256)
+fn rotary_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = gid.x;
+    let t = gid.y;
+    let size = pc.p0;
+    let dim = pc.p1;
+    let rotated = pc.p4;
+    let half = rotated >> 1u;
+    let num_heads = size / dim;
+    if (p >= num_heads * half) { return; }
+    let pair = p % half;
+    let head = p / half;
+    let base = t * size + head * dim;
+    let a = base + select(2u * pair, pair, pc.p3 != 0u);
+    let b = select(a + 1u, a + half, pc.p3 != 0u);
+    var angle = f32(pc.p2 + t) * pow(pc.f0, -f32(2u * pair) / f32(rotated));
+    if (pc.p5 != 0u) {
+        angle = angle / buf_b[pair];
+    }
+    let s = sin(angle) * pc.f1;
+    let c = cos(angle) * pc.f1;
+    let u = buf_c[a];
+    let v = buf_c[b];
+    buf_c[a] = u * c - v * s;
+    buf_c[b] = u * s + v * c;
+}
+
+// Batched KV cache write: grid = (ceil(kw / 256), n, 1); p0 = kw, p1 = base_position
+@compute @workgroup_size(256)
+fn cache_kv_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let t = gid.y;
+    let kw = pc.p0;
+    if (i < kw) {
+        let src = t * kw + i;
+        let dst = (pc.p1 + t) * kw + i;
+        buf_c[dst] = buf_a[src];
+        buf_d[dst] = buf_b[src];
+    }
+}
+
+// Batched causal attention: grid = (heads, n, 1)
+// p0 = dim, p1 = heads, p2 = kv_heads, p3 = base_count, p4 = window
+@compute @workgroup_size(256)
+fn attention_batch(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let head = wg.x;
+    let tok = wg.y;
+    let tid = lid.x;
+    let dim = pc.p0;
+    let heads = pc.p1;
+    let kv_heads = pc.p2;
+    let count = pc.p3 + tok;
+    let window = pc.p4;
+    let kv_head = head / (heads / kv_heads);
+    let q_off = (tok * heads + head) * dim;
+    let q_val = select(0.0, buf_a[q_off + tid] * pc.f0, tid < dim);
+    let start = select(0u, count - window, window > 0u && count > window);
+
+    var max_score = -3.402823466e+38;
+    var sum_exp = 0.0;
+    var acc = 0.0;
+    var t = start;
+    loop {
+        if (t >= count) { break; }
+        let kv_base = (t * kv_heads + kv_head) * dim;
+        let k_val = select(0.0, buf_b[kv_base + tid], tid < dim);
+        var score = workgroup_sum(tid, q_val * k_val);
+        if (pc.f1 > 0.0) {
+            score = pc.f1 * tanh(score / pc.f1);
+        }
+        let new_max = max(max_score, score);
+        let rescale = exp(max_score - new_max);
+        let p = exp(score - new_max);
+        sum_exp = sum_exp * rescale + p;
+        let v_val = select(0.0, bitcast<f32>(buf_w[kv_base + tid]), tid < dim);
+        acc = acc * rescale + p * v_val;
+        max_score = new_max;
+        workgroupBarrier();
+        t = t + 1u;
+    }
+    if (tid < dim) {
+        buf_c[q_off + tid] = acc / sum_exp;
+    }
+}
+
+// Copy last token's hidden state buf_a[(n-1)*width + i] -> buf_c[i]; p0 = width, p1 = n - 1
+@compute @workgroup_size(256)
+fn copy_last_token(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let w = pc.p0;
+    if (i < w) {
+        buf_c[i] = buf_a[pc.p1 * w + i];
     }
 }
 

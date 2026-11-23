@@ -9,19 +9,28 @@ const SHADER_SOURCE: &str = include_str!("shaders.wgsl");
 
 const ENTRY_POINTS: &[&str] = &[
     "embedding",
+    "embedding_batch",
     "rmsnorm",
+    "rmsnorm_batch",
     "matvec",
+    "matmul_batch",
     "add_row_bias",
+    "add_row_bias_batch",
     "head_norm",
+    "head_norm_batch",
     "rotary",
+    "rotary_batch",
     "cache_kv",
+    "cache_kv_batch",
     "attention",
+    "attention_batch",
     "swiglu",
     "residual",
     "scale_vec",
     "softcap",
     "router",
     "combine_experts",
+    "copy_last_token",
 ];
 
 #[repr(C)]

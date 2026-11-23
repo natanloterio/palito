@@ -1,4 +1,5 @@
 use super::*;
+use crate::tools::{ToolDef, ToolMode, call_grammar::call_grammar};
 use serde_json::json;
 
 /// Bytes 0..=255, a few multi-byte pieces, one control and two EOG tokens.
@@ -28,6 +29,96 @@ fn bytes(id: usize) -> Option<&'static [u8]> {
 
 fn decoder() -> JsonDecoder {
     JsonDecoder::new(VOCAB, bytes, |id| EOG.contains(&(id as usize))).unwrap()
+}
+
+/// Whether the grammar accepts `text` byte by byte and is complete after it.
+fn accepts(grammar: &str, text: &str) -> bool {
+    let mut constraint = decoder().lark_constraint(grammar).unwrap();
+    feed(&mut constraint, text) && constraint.is_complete()
+}
+
+fn feed(constraint: &mut Constraint, text: &str) -> bool {
+    let logits = vec![0.0; VOCAB];
+    for byte in text.bytes() {
+        constraint.mask_logits(&logits).unwrap();
+        if !constraint.allowed(i32::from(byte)) {
+            return false;
+        }
+        constraint.accept(i32::from(byte)).unwrap();
+    }
+    true
+}
+
+fn weather() -> ToolDef {
+    ToolDef {
+        name: "weather".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+#[test]
+fn call_grammar_fixes_key_order_names_and_schema() {
+    let grammar = call_grammar(&[weather()], &ToolMode::Auto);
+    assert!(accepts(&grammar, "\n{\"name\": \"weather\", \"arguments\": {\"city\": \"Rio\"}}\n"));
+    assert!(accepts(&grammar, "{\"name\": \"weather\", \"arguments\": {\"city\": \"Rio\"}}"));
+    assert!(!accepts(&grammar, "{\"arguments\": {\"city\": \"Rio\"}, \"name\": \"weather\"}"));
+    assert!(!accepts(&grammar, "{\"name\": \"other\", \"arguments\": {\"city\": \"Rio\"}}"));
+    assert!(!accepts(&grammar, "{\"name\": \"weather\", \"arguments\": {\"city\": 1}}"));
+    assert!(!accepts(&grammar, "{\"name\": \"weather\", \"arguments\": {\"city\": \"Rio\"}"));
+}
+
+#[test]
+fn call_grammar_escapes_any_tool_name() {
+    let name = "a\"b\\ç";
+    let defs = [ToolDef { name: name.into(), parameters: json!({"type": "object"}) }];
+    let text = format!("{{\"name\": {}, \"arguments\": {{}}}}", serde_json::to_string(name).unwrap());
+    assert!(accepts(&call_grammar(&defs, &ToolMode::Auto), &text));
+}
+
+#[test]
+fn call_grammar_keeps_schema_text_with_braces_and_quotes() {
+    let defs = [ToolDef {
+        name: "t".into(),
+        parameters: json!({
+            "type": "object",
+            "description": "use } and \" and %json",
+            "properties": {"a": {"enum": ["}", "\""]}},
+            "required": ["a"]
+        }),
+    }];
+    let grammar = call_grammar(&defs, &ToolMode::Auto);
+    assert!(accepts(&grammar, "{\"name\": \"t\", \"arguments\": {\"a\": \"}\"}}"));
+}
+
+#[test]
+fn named_mode_allows_only_that_tool() {
+    let object = json!({"type": "object"});
+    let defs = [
+        ToolDef { name: "a".into(), parameters: object.clone() },
+        ToolDef { name: "b".into(), parameters: object },
+    ];
+    let grammar = call_grammar(&defs, &ToolMode::Named("b".into()));
+    assert!(accepts(&grammar, "{\"name\": \"b\", \"arguments\": {}}"));
+    assert!(!accepts(&grammar, "{\"name\": \"a\", \"arguments\": {}}"));
+    let any = call_grammar(&defs, &ToolMode::Required);
+    assert!(accepts(&any, "{\"name\": \"a\", \"arguments\": {}}"));
+    assert!(accepts(&any, "{\"name\": \"b\", \"arguments\": {}}"));
+}
+
+#[test]
+fn fresh_constraint_is_independent_of_the_original() {
+    let grammar = call_grammar(&[weather()], &ToolMode::Auto);
+    let original = decoder().lark_constraint(&grammar).unwrap();
+    let mut used = original.fresh();
+    assert!(feed(&mut used, "{\"name\": \"weather\", "));
+    let mut other = original.fresh();
+    assert!(feed(&mut other, "{\"name\": \"weather\", \"arguments\": {\"city\": \"Rio\"}}"));
+    assert!(other.is_complete() && !used.is_complete());
 }
 
 /// SplitMix64, for reproducible random logits.

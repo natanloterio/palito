@@ -79,13 +79,7 @@ impl JsonSchema {
     fn grammar(&self) -> TopLevelGrammar {
         let mut schema = self.0.clone();
         if let Some(object) = schema.as_object_mut() {
-            let options = JsonCompileOptions {
-                whitespace_pattern: Some(format!("[\\x20\\x0A\\x0D\\x09]{{1,{MAX_WHITESPACE}}}")),
-                ..JsonCompileOptions::default()
-            };
-            if let Ok(options) = serde_json::to_value(options) {
-                object.insert(OPTIONS_KEYWORD.into(), options);
-            }
+            object.insert(OPTIONS_KEYWORD.into(), json_compile_options());
         }
         TopLevelGrammar::from_json_schema(schema)
     }
@@ -100,6 +94,15 @@ impl JsonSchema {
             None => Ok(matcher),
         }
     }
+}
+
+/// llguidance options for JSON: bounded whitespace between tokens.
+pub(crate) fn json_compile_options() -> Value {
+    let options = JsonCompileOptions {
+        whitespace_pattern: Some(format!("[\\x20\\x0A\\x0D\\x09]{{1,{MAX_WHITESPACE}}}")),
+        ..JsonCompileOptions::default()
+    };
+    serde_json::to_value(options).unwrap_or_else(|_| json!({}))
 }
 
 /// Schema errors do not depend on the vocabulary: a byte-level one checks
@@ -158,6 +161,24 @@ impl JsonDecoder {
             masked: Vec::new(),
         })
     }
+
+    /// A constraint from a Lark grammar.
+    pub(crate) fn lark_constraint(&self, grammar: &str) -> Result<Constraint> {
+        let parser = self
+            .factory
+            .create_parser(TopLevelGrammar::from_lark(grammar.to_owned()))
+            .map_err(|error| invalid(format!("tool call grammar: {error}")))?;
+        let matcher = Matcher::new(Ok(parser));
+        if let Some(error) = matcher.get_error() {
+            return Err(invalid(format!("tool call grammar: {error}")));
+        }
+        Ok(Constraint {
+            matcher,
+            eog: self.eog.clone(),
+            mask: SimpleVob::new(),
+            masked: Vec::new(),
+        })
+    }
 }
 
 /// Trie bytes for one token. End-of-generation tokens get the special-token
@@ -198,6 +219,16 @@ pub struct Constraint {
 }
 
 impl Constraint {
+    /// An independent copy in the current state.
+    pub(crate) fn fresh(&self) -> Self {
+        Self {
+            matcher: self.matcher.deep_clone(),
+            eog: self.eog.clone(),
+            mask: SimpleVob::new(),
+            masked: Vec::new(),
+        }
+    }
+
     /// Draws the next token with `pick` over `logits` restricted to the grammar,
     /// then advances the grammar past it.
     pub fn sample(

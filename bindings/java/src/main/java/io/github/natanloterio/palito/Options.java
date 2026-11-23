@@ -4,7 +4,7 @@ import java.nio.file.Path;
 
 /** Settings for {@link Palito#open}; the defaults are Palito's. */
 public final class Options {
-    public enum Device { DEFAULT, CPU, CUDA }
+    public enum Device { DEFAULT, CPU, CUDA, VULKAN, METAL }
 
     Device device = Device.DEFAULT;
     int contextTokens;

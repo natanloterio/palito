@@ -9,6 +9,10 @@ public enum Device
     Cpu = 1,
     /// <summary>NVIDIA GPU.</summary>
     Cuda = 2,
+    /// <summary>Vulkan GPU (AMD, Intel, NVIDIA).</summary>
+    Vulkan = 3,
+    /// <summary>Apple Silicon GPU (macOS Metal).</summary>
+    Metal = 4,
 }
 
 /// <summary>Why generation ended.</summary>

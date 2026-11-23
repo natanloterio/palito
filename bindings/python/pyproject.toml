@@ -19,3 +19,6 @@ Source = "https://github.com/natanloterio/palito/tree/master/bindings/python"
 
 [tool.setuptools]
 packages = ["palito"]
+
+[tool.setuptools.package-data]
+palito = ["_lib/*/*"]

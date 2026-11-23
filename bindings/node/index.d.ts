@@ -1,4 +1,4 @@
-export type Device = 'default' | 'cpu' | 'cuda';
+export type Device = 'default' | 'cpu' | 'cuda' | 'vulkan' | 'metal';
 export type FinishReason = 'stop' | 'length' | 'context_full' | 'cancelled';
 
 export interface OpenOptions {

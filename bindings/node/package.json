@@ -8,7 +8,7 @@
   "repository": { "type": "git", "url": "git+https://github.com/natanloterio/palito.git", "directory": "bindings/node" },
   "main": "index.js",
   "types": "index.d.ts",
-  "files": ["index.js", "index.d.ts", "koffi.js", "README.md"],
+  "files": ["index.js", "index.d.ts", "koffi.js", "lib", "README.md"],
   "engines": { "node": ">=18" },
   "scripts": { "test": "node --test test/*.test.js" },
   "optionalDependencies": {

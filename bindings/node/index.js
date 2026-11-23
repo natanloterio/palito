@@ -13,7 +13,7 @@ const { loadKoffi } = require('./koffi.js');
 // Loaded on first use, so installing on a platform without a prebuilt never fails.
 let koffi = null;
 
-const DEVICES = { default: 0, cpu: 1, cuda: 2 };
+const DEVICES = { default: 0, cpu: 1, cuda: 2, vulkan: 3, metal: 4 };
 const FINISH_REASONS = ['stop', 'length', 'context_full', 'cancelled'];
 const LIBRARY_NAME = { darwin: 'libpalito.dylib', win32: 'palito.dll' }[process.platform] || 'libpalito.so';
 
@@ -26,6 +26,12 @@ class PalitoError extends Error {
 
 function libraryPath() {
   if (process.env.PALITO_LIBRARY) return process.env.PALITO_LIBRARY;
+  const packaged = path.join(__dirname, 'lib', `${process.platform}-${process.arch}`, LIBRARY_NAME);
+  try {
+    if (fs.statSync(packaged).isFile()) return packaged;
+  } catch {
+    // fall through to PATH / system loader
+  }
   const separator = process.platform === 'win32' ? ';' : ':';
   for (const dir of (process.env.PATH || '').split(separator)) {
     const command = path.join(dir, 'palito');

@@ -8,6 +8,9 @@
 
 mod open;
 mod text;
+mod tools;
+
+pub use tools::ToolCompletion;
 
 use crate::{
     Config, Error, Executor, GenerationMode, Result, Sample,
@@ -159,6 +162,8 @@ pub struct Engine {
     notices: Vec<String>,
     /// Built on the first JSON-constrained request.
     json_decoder: Option<JsonDecoder>,
+    /// Built on the first request with tools.
+    tool_tokens: Option<crate::tools::ToolTokens>,
 }
 
 impl Engine {
@@ -198,6 +203,7 @@ impl Engine {
             profile,
             notices: Vec::new(),
             json_decoder: None,
+            tool_tokens: None,
         })
     }
 

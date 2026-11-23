@@ -9,6 +9,10 @@ use crate::{
     grammar::{Constraint, LogitConstraint, MASKED_LOGIT},
 };
 
+/// Whitespace tokens allowed in a row where only a call or the end may follow.
+/// Without a limit, a model can emit newlines until the budget runs out.
+const MAX_GAP_TOKENS: u8 = 2;
+
 /// The vocabulary entries the gate needs.
 #[derive(Clone, Debug)]
 pub struct ToolTokens {
@@ -50,6 +54,8 @@ pub struct ToolGate {
     started: bool,
     /// Only whitespace so far, so `<think>` can still open the reasoning.
     leading: bool,
+    /// Whitespace tokens since the last other token.
+    gap: u8,
     masked: Vec<f32>,
 }
 
@@ -72,6 +78,7 @@ impl ToolGate {
             role: TokenRole::Text,
             started: false,
             leading: !prompt_opens_reasoning,
+            gap: 0,
             masked: Vec::new(),
         }
     }
@@ -98,6 +105,10 @@ impl ToolGate {
             .unwrap_or(false)
     }
 
+    fn gap_allows(&self, token: i32) -> bool {
+        self.gap < MAX_GAP_TOKENS && self.is_space(token)
+    }
+
     /// Whether `token` may come next, outside a call.
     fn allows(&self, token: i32) -> bool {
         let tokens = &self.tokens;
@@ -109,12 +120,12 @@ impl ToolGate {
             GatePhase::Reasoning => !(must_call && tokens.eog.contains(&token)),
             GatePhase::Free if must_call => {
                 token == tokens.call_open
-                    || self.is_space(token)
+                    || self.gap_allows(token)
                     || (self.leading && Some(token) == tokens.think_open)
             }
             GatePhase::Free => true,
             GatePhase::AfterCall => {
-                self.is_space(token)
+                self.gap_allows(token)
                     || tokens.eog.contains(&token)
                     || (self.parallel && token == tokens.call_open)
             }
@@ -151,6 +162,7 @@ impl ToolGate {
 
     fn advance(&mut self, token: i32) -> Result<()> {
         self.role = TokenRole::Text;
+        self.gap = if self.is_space(token) { self.gap.saturating_add(1) } else { 0 };
         match self.phase {
             GatePhase::Reasoning => {
                 if Some(token) == self.tokens.think_close {
@@ -198,6 +210,7 @@ impl ToolGate {
         let (token, closed) = active.sample_call(logits, close, pick)?;
         if closed {
             self.active = None;
+            self.gap = 0;
             self.phase = GatePhase::AfterCall;
             self.role = TokenRole::CallClose;
         } else {
@@ -383,6 +396,26 @@ mod tests {
         let after = allowed(&gate);
         assert!(after.contains(&CALL_OPEN) && !after.contains(&EOG) && !after.contains(&WORD));
         assert!(!after.contains(&THINK_OPEN));
+    }
+
+    #[test]
+    fn required_cannot_loop_on_whitespace_before_the_call() {
+        let mut gate = gate(ToolMode::Required, true);
+        feed(&mut gate, THINK_OPEN);
+        feed(&mut gate, WORD);
+        feed(&mut gate, THINK_CLOSE);
+        feed(&mut gate, NEWLINE);
+        assert!(allowed(&gate).contains(&NEWLINE));
+        feed(&mut gate, NEWLINE);
+        assert_eq!(allowed(&gate), vec![CALL_OPEN]);
+    }
+
+    #[test]
+    fn whitespace_after_a_call_is_limited() {
+        let mut gate = gate_after_one_call(ToolMode::Auto, true);
+        feed(&mut gate, NEWLINE);
+        feed(&mut gate, NEWLINE);
+        assert_eq!(allowed(&gate), vec![CALL_OPEN, EOG]);
     }
 
     #[test]

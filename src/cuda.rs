@@ -129,6 +129,8 @@ pub struct CudaOptions {
     /// prompt sharing its start at the latest prefill-chunk boundary before the
     /// divergence (greedy output unchanged; see `prefix`).
     pub prefix_cache: bool,
+    /// Sequences held at once, each with the full context (see `slots`).
+    pub slots: u32,
 }
 
 impl Default for CudaOptions {
@@ -141,6 +143,7 @@ impl Default for CudaOptions {
             decode_graph: false,
             fit_context: false,
             prefix_cache: false,
+            slots: 1,
         }
     }
 }
@@ -877,10 +880,15 @@ mod residual;
 #[cfg(test)]
 mod residual_precise;
 mod shared;
+mod slots;
 
 pub struct CudaBackend {
     // Destroy captured references before their buffers and modules.
     decode: Option<decode::DecodeState>,
+    /// One entry per slot; the active slot's entry is empty (its state is in
+    /// the fields of this struct).
+    parked: Vec<Option<slots::ParkedSlot>>,
+    active_slot: usize,
     weights: Weights<DeviceTensor>,
     stream: Arc<CudaStream>,
     functions: HashMap<&'static str, CudaFunction>,
@@ -949,9 +957,30 @@ pub fn open_backend(
     Ok(Box::new(CudaBackend::open(path, config, options)?))
 }
 
+/// A backend holding `options.slots` sequences. The Qwen3.5 reference backend
+/// has one sequence and is refused.
+pub fn open_slot_backend(
+    path: &Path,
+    config: &Config,
+    options: CudaOptions,
+) -> Result<Box<dyn crate::slots::SlotBackend>> {
+    let metadata = crate::gguf::Gguf::read_metadata(path)?;
+    if matches!(metadata.get("general.architecture"), Some(crate::gguf::Value::Text(arch)) if arch == "qwen35")
+    {
+        return Err(invalid("--parallel above 1 is not supported for this model"));
+    }
+    Ok(Box::new(CudaBackend::open(path, config, options)?))
+}
+
 impl CudaBackend {
     pub fn open(path: &Path, config: &Config, options: CudaOptions) -> Result<Self> {
         config.validate()?;
+        if options.slots == 0 || options.slots > crate::slots::MAX_SLOTS {
+            return Err(invalid(format!(
+                "slots must be between 1 and {}",
+                crate::slots::MAX_SLOTS
+            )));
+        }
         if !cfg!(target_os = "linux") {
             return Err(invalid("CUDA backend currently supports Linux only"));
         }
@@ -1412,7 +1441,16 @@ impl CudaBackend {
             logits_bytes,
             reservation,
         } = device_reservation(&weights, &options)?;
-        admit(reservation, options.memory_limit_bytes, free as u64)?;
+        admit(reservation, options.memory_limit_bytes, free as u64).map_err(|error| {
+            if options.slots > 1 {
+                invalid(format!(
+                    "--parallel {} with {} context tokens per slot does not fit: {error}",
+                    options.slots, s.info.context_tokens
+                ))
+            } else {
+                error
+            }
+        })?;
         let memory = MemoryUsage {
             allocation_domain: "cuda",
             weights_allocated_bytes: weight_bytes,
@@ -1421,7 +1459,7 @@ impl CudaBackend {
             workspace_allocated_bytes: workspace_bytes,
             logits_allocated_bytes: logits_bytes,
             token_state_allocated_bytes: if options.decode_graph {
-                decode::DecodeState::bytes(s.info.vocab_tokens as usize)
+                decode::DecodeState::bytes(s.info.vocab_tokens as usize) * u64::from(options.slots)
             } else {
                 0
             },
@@ -1455,6 +1493,18 @@ impl CudaBackend {
             values.push(kv::KvBuffer::zeros(&stream, kv_elements as usize, options.matmul)?);
         }
         let logits = vec![0.0; s.info.vocab_tokens as usize];
+        let parked = slots::park_slots(
+            &stream,
+            &slots::SlotShape {
+                slots: options.slots as usize,
+                layers: weights.layers.len(),
+                kv_elements: kv_elements as usize,
+                vocabulary: s.info.vocab_tokens as usize,
+                matmul: options.matmul,
+                decode_graph: options.decode_graph,
+                prefix_cache: options.prefix_cache,
+            },
+        )?;
         let mut weights = weights.map(|t| DeviceTensor::upload(t, &stream))?;
         weights.spec.info.backend = format!(
             "rust-cuda-packed:device{}:{}",
@@ -1464,6 +1514,8 @@ impl CudaBackend {
         stream.synchronize().map_err(failure)?;
         let mut backend = Self {
             decode,
+            parked,
+            active_slot: 0,
             weights,
             stream,
             functions,
@@ -2316,10 +2368,11 @@ fn device_reservation(weights: &Weights<Tensor>, options: &CudaOptions) -> Resul
         .checked_mul(s.dim as u64)
         .and_then(|n| n.checked_mul(u64::from(s.info.context_tokens)))
         .ok_or_else(|| invalid("KV overflow"))?;
-    // Keys and values, per layer.
+    // Keys and values, per layer and slot.
     let kv_bytes = kv_elements
         .checked_mul(weights.layers.len() as u64)
         .and_then(|n| n.checked_mul(2 * options.matmul.kv_element_bytes()))
+        .and_then(|n| n.checked_mul(u64::from(options.slots)))
         .ok_or_else(|| invalid("KV byte overflow"))?;
     let routing = routing_elements(s)? as u64;
     let groups = group_workspace_elements(s, options.matmul)? as u64;
@@ -2349,7 +2402,7 @@ fn device_reservation(weights: &Weights<Tensor>, options: &CudaOptions) -> Resul
         .and_then(|n| n.checked_add(logits_bytes))
         .and_then(|n| {
             n.checked_add(if options.decode_graph {
-                decode::DecodeState::bytes(s.info.vocab_tokens as usize)
+                decode::DecodeState::bytes(s.info.vocab_tokens as usize) * u64::from(options.slots)
             } else {
                 0
             })

@@ -5,14 +5,17 @@ use crate::{
     Config, Error, Result,
     backend::Backend,
     cpu::{CpuBackend, CpuOptions},
+    slots::SlotBackend,
 };
+#[cfg(feature = "cuda")]
+use crate::slots::{PROMPT_TURN_TOKENS, slot_context};
 use std::path::Path;
 
 pub(super) const CPU_BATCH_TOKENS: u32 = 128;
 pub(super) const CPU_PREFILL_CHUNK: u32 = 64;
 
-pub(super) struct Opened {
-    pub backend: Box<dyn Backend>,
+pub(super) struct Opened<B: Backend + ?Sized = dyn Backend> {
+    pub backend: Box<B>,
     pub config: Config,
     pub profile: &'static str,
     /// Fallbacks and context shrinking worth telling the user about.
@@ -28,6 +31,46 @@ pub(super) fn open(path: &Path, options: &EngineOptions) -> Result<Opened> {
         Device::Cpu => open_cpu(path, options, trained),
         Device::Cuda => open_cuda(path, options, trained),
     }
+}
+
+/// Opens a backend holding `slots` sequences. Only CUDA supports it.
+pub(super) fn open_slots(
+    path: &Path,
+    options: &EngineOptions,
+    slots: u32,
+) -> Result<Opened<dyn SlotBackend>> {
+    if options.device != Device::Cuda {
+        return Err(Error::Invalid("--parallel above 1 requires the CUDA backend".into()));
+    }
+    if options.threads == 0 {
+        return Err(Error::Invalid("threads must be positive".into()));
+    }
+    open_cuda_slots(path, options, crate::model_context_tokens(path)?, slots)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn open_cuda_slots(
+    _: &Path,
+    _: &EngineOptions,
+    _: u32,
+    _: u32,
+) -> Result<Opened<dyn SlotBackend>> {
+    Err(Error::Invalid("--parallel above 1 requires the CUDA backend".into()))
+}
+
+#[cfg(feature = "cuda")]
+fn open_cuda_slots(
+    path: &Path,
+    options: &EngineOptions,
+    trained: u32,
+    slots: u32,
+) -> Result<Opened<dyn SlotBackend>> {
+    const CONTEXT_MAX: u32 = 65535;
+    let (context, fit) = match options.context_tokens {
+        Some(total) => (slot_context(total, slots)?, false),
+        None => (slot_context(trained, slots)?.min(CONTEXT_MAX), true),
+    };
+    open_cuda_profiles(path, options, context, fit, slots, crate::cuda::open_slot_backend)
 }
 
 fn open_cpu(path: &Path, options: &EngineOptions, trained: u32) -> Result<Opened> {
@@ -57,17 +100,30 @@ fn open_cuda(_: &Path, _: &EngineOptions, _: u32) -> Result<Opened> {
 
 #[cfg(feature = "cuda")]
 fn open_cuda(path: &Path, options: &EngineOptions, trained: u32) -> Result<Opened> {
-    use crate::cuda::{CudaMatmul, CudaOptions, open_backend};
     const CONTEXT_MAX: u32 = 65535;
     let (context, fit) = match options.context_tokens {
         Some(context) => (context, false),
         None => (trained.min(CONTEXT_MAX), true),
     };
+    open_cuda_profiles(path, options, context, fit, 1, crate::cuda::open_backend)
+}
+
+/// Tries each CUDA profile until `open_backend` succeeds.
+#[cfg(feature = "cuda")]
+fn open_cuda_profiles<B: Backend + ?Sized>(
+    path: &Path,
+    options: &EngineOptions,
+    context: u32,
+    fit: bool,
+    slots: u32,
+    open_backend: impl Fn(&Path, &Config, crate::cuda::CudaOptions) -> Result<Box<B>>,
+) -> Result<Opened<B>> {
+    use crate::cuda::{CudaMatmul, CudaOptions};
     let attempts = cuda_attempts(options);
     let mut notices = Vec::new();
     let mut first_error = None;
     for (index, &(matmul, graph)) in attempts.iter().enumerate() {
-        let config = cuda_config(options, context, matmul);
+        let config = cuda_config(options, context, matmul, slots);
         let cuda = CudaOptions {
             device: options.gpu_device,
             memory_limit_bytes: options.gpu_memory_limit_bytes.unwrap_or(u64::MAX),
@@ -79,6 +135,7 @@ fn open_cuda(path: &Path, options: &EngineOptions, trained: u32) -> Result<Opene
             decode_graph: graph,
             fit_context: fit,
             prefix_cache: options.prefix_cache,
+            slots,
         };
         let error = match open_backend(path, &config, cuda) {
             Ok(backend) => {
@@ -170,7 +227,12 @@ fn fast_decode(matmul: crate::cuda::CudaMatmul) -> bool {
 /// Prefill batch/chunk: 4096 tokens with the tiled kernels (one chunk covers a
 /// 4k prompt), else 128/64.
 #[cfg(feature = "cuda")]
-fn cuda_config(options: &EngineOptions, context: u32, matmul: crate::cuda::CudaMatmul) -> Config {
+fn cuda_config(
+    options: &EngineOptions,
+    context: u32,
+    matmul: crate::cuda::CudaMatmul,
+    slots: u32,
+) -> Config {
     const FAST_PREFILL_TOKENS: u32 = 4096;
     let fast = fast_decode(matmul);
     let batch = options.batch_tokens.unwrap_or(if fast {
@@ -183,10 +245,12 @@ fn cuda_config(options: &EngineOptions, context: u32, matmul: crate::cuda::CudaM
     } else {
         CPU_PREFILL_CHUNK.min(batch)
     });
+    // Slots evaluate prompts in turns, so a larger batch would only cost memory.
+    let limit = if slots > 1 { PROMPT_TURN_TOKENS } else { u32::MAX };
     Config {
         context_tokens: context,
-        batch_tokens: batch,
-        prefill_chunk: chunk,
+        batch_tokens: batch.min(limit),
+        prefill_chunk: chunk.min(limit),
         threads: options.threads,
     }
 }

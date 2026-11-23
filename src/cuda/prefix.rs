@@ -26,6 +26,14 @@ impl PrefixCache {
     /// (its logits are not kept). Drops everything after it and starts recording
     /// the new prompt's chunks.
     pub(super) fn restore(&mut self, prompt: &[i32]) -> usize {
+        let restored = self.restorable(prompt);
+        self.truncate(restored);
+        self.recording = true;
+        restored
+    }
+
+    /// What `restore` would return, leaving the cache as it is.
+    pub(super) fn restorable(&self, prompt: &[i32]) -> usize {
         let shared = self
             .tokens
             .iter()
@@ -33,16 +41,12 @@ impl PrefixCache {
             .take_while(|(cached, token)| cached == token)
             .count()
             .min(prompt.len().saturating_sub(1));
-        let restored = self
-            .starts
+        self.starts
             .iter()
             .rev()
             .copied()
             .find(|&start| start <= shared)
-            .unwrap_or(0);
-        self.truncate(restored);
-        self.recording = true;
-        restored
+            .unwrap_or(0)
     }
 
     /// Before evaluating at `position`: its K/V is about to be overwritten.
@@ -110,6 +114,16 @@ mod tests {
 
     fn ids(range: std::ops::Range<i32>) -> Vec<i32> {
         range.collect()
+    }
+
+    #[test]
+    fn restorable_matches_restore_without_changing_the_cache() {
+        let mut cache = PrefixCache::default();
+        prefill(&mut cache, &ids(0..20), 8);
+        let prompt = ids(0..18);
+        let peeked = cache.restorable(&prompt);
+        assert_eq!(cache.cached_tokens(), 20);
+        assert_eq!(cache.restore(&prompt), peeked);
     }
 
     #[test]

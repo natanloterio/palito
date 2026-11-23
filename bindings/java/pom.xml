@@ -5,7 +5,7 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>io.github.natanloterio</groupId>
   <artifactId>palito</artifactId>
-  <version>0.7.0</version>
+  <version>0.7.1</version>
   <name>Palito</name>
   <description>Java binding for Palito, fast local LLM inference for GGUF models (Java 22+ FFM)</description>
   <url>https://github.com/natanloterio/palito</url>

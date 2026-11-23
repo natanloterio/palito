@@ -14,6 +14,7 @@ use palito::{
     sampling::Sampling,
     tools::{ToolMode, ToolSpec},
 };
+use super::worker::ReplyCall;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -336,6 +337,15 @@ pub fn finish_reason(reason: FinishReason) -> &'static str {
     }
 }
 
+/// `tool_calls` only when the reply ended normally with complete calls.
+pub fn finish_reason_with_calls(reason: FinishReason, calls: &[ReplyCall]) -> &'static str {
+    if reason == FinishReason::Stop && !calls.is_empty() && calls.iter().all(|call| call.complete) {
+        "tool_calls"
+    } else {
+        finish_reason(reason)
+    }
+}
+
 #[derive(Serialize, Clone, Copy)]
 pub struct Usage {
     pub prompt_tokens: usize,
@@ -428,6 +438,20 @@ mod tests {
         assert!(chat(json!({"messages": []})).messages().is_err());
         let prompt: CompletionRequest = serde_json::from_value(json!({"prompt": ["a", "b"]})).unwrap();
         assert!(prompt.prompt().is_err());
+    }
+
+    #[test]
+    fn finish_reason_reports_tool_calls_only_for_complete_calls_on_stop() {
+        let complete = [ReplyCall {
+            id: "c".into(),
+            name: "a".into(),
+            arguments: "{}".into(),
+            complete: true,
+        }];
+        let partial = [ReplyCall { complete: false, ..complete[0].clone() }];
+        assert_eq!(finish_reason_with_calls(FinishReason::Stop, &complete), "tool_calls");
+        assert_eq!(finish_reason_with_calls(FinishReason::Length, &partial), "length");
+        assert_eq!(finish_reason_with_calls(FinishReason::Stop, &[]), "stop");
     }
 
     #[test]

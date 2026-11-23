@@ -31,7 +31,7 @@ use palito::{
 use serde_json::{Value, json};
 use std::{net::IpAddr, path::PathBuf, sync::Arc, time::Instant};
 use stream::Kind;
-use worker::{Event, ModelReport, Prompt, Reply, SubmitError, Worker};
+use worker::{Event, ModelReport, Prompt, Reply, ReplyCall, SubmitError, Worker};
 
 /// Request bodies above this are refused (a 65k-token prompt is well below it).
 const BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
@@ -234,9 +234,10 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         Ok(parsed) => parsed,
         Err(message) => return invalid(&message),
     };
-    if tools.is_some() {
-        return invalid("tool call responses are not available yet");
-    }
+    let prompt = match tools {
+        Some(spec) => Prompt::ChatTools(messages, spec),
+        None => Prompt::Chat(messages),
+    };
     let options = GenerationOptions {
         max_tokens: request.max_tokens(),
         enable_thinking: request.enable_thinking(),
@@ -250,7 +251,7 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         include_usage: request.stream_options.as_ref().is_some_and(|o| o.include_usage),
         split_reasoning: request.split_reasoning(),
     };
-    respond(state, reply, Prompt::Chat(messages), options).await
+    respond(state, reply, prompt, options).await
 }
 
 /// The messages, and the tool spec when generation must go through the gate.
@@ -351,8 +352,8 @@ async fn respond(
     }
     let reply = loop {
         match events.recv().await {
-            Some(Event::Text { .. }) => continue,
             Some(Event::Done(result)) => break result,
+            Some(_) => continue,
             None => break Err("engine stopped".into()),
         }
     };
@@ -367,12 +368,17 @@ async fn respond(
 
 fn final_body(kind: Kind, id: &str, model: &str, reply: &Reply) -> Value {
     let completion = &reply.completion;
-    let finish = openai::finish_reason(completion.finish_reason);
+    let finish = openai::finish_reason_with_calls(completion.finish_reason, &reply.tool_calls);
     let choice = match kind {
         Kind::Chat => {
-            let mut message = json!({"role": "assistant", "content": reply.content});
+            let has_calls = !reply.tool_calls.is_empty();
+            let content = (!has_calls || !reply.content.is_empty()).then_some(&reply.content);
+            let mut message = json!({"role": "assistant", "content": content});
             if let Some(reasoning) = &reply.reasoning {
                 message["reasoning_content"] = json!(reasoning);
+            }
+            if has_calls {
+                message["tool_calls"] = reply.tool_calls.iter().map(call_json).collect();
             }
             json!({
                 "index": 0,
@@ -396,6 +402,14 @@ fn final_body(kind: Kind, id: &str, model: &str, reply: &Reply) -> Value {
         "choices": [choice],
         "usage": Usage::new(completion.prompt_tokens, completion.generated_tokens),
         "timings": timings(completion),
+    })
+}
+
+fn call_json(call: &ReplyCall) -> Value {
+    json!({
+        "id": call.id,
+        "type": "function",
+        "function": {"name": call.name, "arguments": call.arguments},
     })
 }
 
@@ -433,4 +447,48 @@ fn failure(status: StatusCode, message: &str, kind: &str) -> Response {
         header::HeaderValue::from_static("application/json"),
     );
     (status, headers, error_body(message, kind).to_string()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use palito::engine::FinishReason;
+
+    fn reply_with_call(content: &str) -> Reply {
+        Reply {
+            completion: Completion {
+                text: content.to_owned(),
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                cached_tokens: 0,
+                generated_tokens: 1,
+                ttft_ns: 0,
+                tokens_per_second: 0.0,
+            },
+            reasoning: None,
+            content: content.to_owned(),
+            tool_calls: vec![ReplyCall {
+                id: "call_1".into(),
+                name: "weather".into(),
+                arguments: "{\"city\": \"Rio\"}".into(),
+                complete: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn final_body_has_null_content_and_string_arguments() {
+        let body = final_body(Kind::Chat, "id", "m", &reply_with_call(""));
+        let message = &body["choices"][0]["message"];
+        assert!(message["content"].is_null());
+        assert_eq!(message["tool_calls"][0]["type"], "function");
+        assert!(message["tool_calls"][0]["function"]["arguments"].is_string());
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn final_body_keeps_text_next_to_a_call() {
+        let body = final_body(Kind::Chat, "id", "m", &reply_with_call("Vou ver."));
+        assert_eq!(body["choices"][0]["message"]["content"], "Vou ver.");
+    }
 }

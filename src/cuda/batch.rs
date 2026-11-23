@@ -25,7 +25,9 @@ fn packed_gemm_shape(matmul: CudaMatmul, tensor: &DeviceTensor, tokens: i32) -> 
 fn residual_projection(matmul: CudaMatmul, tensor: &DeviceTensor, tokens: i32) -> bool {
     matmul.residual_components() > 0
         && tokens >= matmul.residual_min_tokens() as i32
-        && matches!(tensor.kind, 12 | 14)
+        && (matches!(tensor.kind, 12 | 14)
+            || (matches!(matmul, CudaMatmul::Int8Prefill | CudaMatmul::Int8Fast)
+                && tensor.kind == 13))
         && tensor.width % 256 == 0
 }
 
@@ -687,43 +689,73 @@ impl CudaBackend {
                     &stride
                 );
             } else if self.matmul.f32_tiled()
-                && dim == 128
+                && dim <= 128
+                && dim % 4 == 0
                 && kv_heads > 0
                 && heads % kv_heads == 0
                 && heads / kv_heads <= 8
             {
-                // Tiled profile: flash-style prefill attention, K/V tiles shared by
-                // 4 tokens x the GQA group (PREFILL_TOKENS in attention.cu).
-                // 4 warps per token (2 query rows each) measured fastest: 369 -> 260 ms
-                // of attention at 2.9k tokens with 512-token chunks.
-                // FP16 hi/lo tensor-core attention (int8-prefill) needs GQA group 8.
-                let (name, grid_y, threads) = if self.matmul.kv_f16() && heads == 8 * kv_heads {
-                    // int8-fast: single FP16 attention straight from the FP16 K/V
-                    // cache, 16 tokens x 8 heads per block; 8 tokens while that leaves
-                    // fewer than ATTENTION_FAST_BLOCKS blocks.
-                    if kv_heads as u32 * (n as u32).div_ceil(16) >= ATTENTION_FAST_BLOCKS {
-                        ("attention_prefill_mma_fast_f16", (n as u32).div_ceil(16), 256)
+                if dim == 128 {
+                    let (name, grid_y, threads) = if self.matmul.kv_f16() && heads == 8 * kv_heads {
+                        // int8-fast: single FP16 attention straight from the FP16 K/V
+                        // cache, 16 tokens x 8 heads per block; 8 tokens while that leaves
+                        // fewer than ATTENTION_FAST_BLOCKS blocks.
+                        if kv_heads as u32 * (n as u32).div_ceil(16) >= ATTENTION_FAST_BLOCKS {
+                            ("attention_prefill_mma_fast_f16", (n as u32).div_ceil(16), 256)
+                        } else {
+                            ("attention_prefill_mma_fast4_f16", (n as u32).div_ceil(8), 128)
+                        }
+                    } else if self.matmul.kv_f16() && heads == kv_heads {
+                        // MHA (heads == kv_heads): 64 tokens per block on FP16 tensor cores.
+                        ("attention_prefill_mma_fast_mha_f16", (n as u32).div_ceil(64), 128)
+                    } else if self.matmul.tensor_prefill() && heads == 8 * kv_heads {
+                        ("attention_prefill_mma", (n as u32).div_ceil(8), 128)
                     } else {
-                        ("attention_prefill_mma_fast4_f16", (n as u32).div_ceil(8), 128)
-                    }
-                } else if self.matmul.tensor_prefill() && heads == 8 * kv_heads {
-                    ("attention_prefill_mma", (n as u32).div_ceil(8), 128)
+                        ("attention_prefill_flash4", (n as u32).div_ceil(4), 512)
+                    };
+                    launch!(
+                        self,
+                        name,
+                        (kv_heads as u32, grid_y, 1); threads,
+                        &self.work.q,
+                        &self.keys[index],
+                        &self.values[index],
+                        &mut self.work.attended,
+                        &heads,
+                        &kv_heads,
+                        &n,
+                        &count
+                    );
+                } else if self.matmul.kv_f16() && dim == 96 && heads == kv_heads {
+                    launch!(
+                        self,
+                        "attention_prefill_mma_fast_mha96_f16",
+                        (kv_heads as u32, (n as u32).div_ceil(64), 1); 128,
+                        &self.work.q,
+                        &self.keys[index],
+                        &self.values[index],
+                        &mut self.work.attended,
+                        &heads,
+                        &kv_heads,
+                        &n,
+                        &count
+                    );
                 } else {
-                    ("attention_prefill_flash4", (n as u32).div_ceil(4), 512)
-                };
-                launch!(
-                    self,
-                    name,
-                    (kv_heads as u32, grid_y, 1); threads,
-                    &self.work.q,
-                    &self.keys[index],
-                    &self.values[index],
-                    &mut self.work.attended,
-                    &heads,
-                    &kv_heads,
-                    &n,
-                    &count
-                );
+                    launch!(
+                        self,
+                        "attention_prefill_flash4_dim",
+                        (kv_heads as u32, (n as u32).div_ceil(4), 1); 512,
+                        &self.work.q,
+                        &self.keys[index],
+                        &self.values[index],
+                        &mut self.work.attended,
+                        &dim,
+                        &heads,
+                        &kv_heads,
+                        &n,
+                        &count
+                    );
+                }
             } else if fused_attention_supported(s) {
                 launch!(
                     self,

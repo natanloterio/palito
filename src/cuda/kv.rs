@@ -13,6 +13,14 @@ use std::sync::Arc;
 pub(super) const F16_KERNELS: &[(&str, &str)] = &[
     ("cache_kv", "cache_kv_f16"),
     ("cache_kv_decode", "cache_kv_decode_f16"),
+    (
+        "rotary_factored_cache_kv_decode",
+        "rotary_factored_cache_kv_decode_f16",
+    ),
+    (
+        "olmoe_qk_norm_rope_cache_decode",
+        "olmoe_qk_norm_rope_cache_decode_f16",
+    ),
     ("qkv_head_norm_rope_cache", "qkv_head_norm_rope_cache_f16"),
     (
         "qkv_head_norm_rope_cache_decode",
@@ -44,6 +52,10 @@ pub(super) const F16_KERNELS: &[(&str, &str)] = &[
         "attention_split_group_decode_f16",
     ),
     ("attention_prefill_flash4", "attention_prefill_flash4_f16"),
+    (
+        "attention_prefill_flash4_dim",
+        "attention_prefill_flash4_dim_f16",
+    ),
 ];
 
 impl CudaMatmul {

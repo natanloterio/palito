@@ -5,10 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "palito"
 version = "0.9.0"
-description = "Python binding for Palito, fast local LLM inference for GGUF models"
+description = "Run GGUF LLMs locally from Python with custom CUDA kernels, token streaming, and structured JSON output — no llama.cpp or Python ML stack required."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
+keywords = ["llm", "gguf", "inference", "cuda", "ai", "local-llm", "qwen", "llama"]
 classifiers = ["Programming Language :: Python :: 3"]
 dependencies = []
 

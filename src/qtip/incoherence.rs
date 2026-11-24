@@ -6,10 +6,15 @@
 //! spreading outliers until the entries look Gaussian.
 
 use crate::{Error, Result};
+use rayon::prelude::*;
+use std::ops::{Add, Mul, Sub};
 
 /// In-place normalized fast Walsh-Hadamard transform. `values.len()` must be
 /// a power of two. The normalized transform is its own inverse.
-fn fwht(values: &mut [f32]) {
+fn fwht<T>(values: &mut [T])
+where
+    T: Copy + Add<Output = T> + Sub<Output = T> + Mul<Output = T> + From<f32>,
+{
     let n = values.len();
     let mut span = 1;
     while span < n {
@@ -22,8 +27,8 @@ fn fwht(values: &mut [f32]) {
         }
         span *= 2;
     }
-    let norm = (n as f32).sqrt().recip();
-    values.iter_mut().for_each(|v| *v *= norm);
+    let norm = T::from((n as f32).sqrt().recip());
+    values.iter_mut().for_each(|v| *v = *v * norm);
 }
 
 /// Deterministic random signs (SplitMix64), so encoder and decoder agree on a seed.
@@ -102,6 +107,28 @@ impl Incoherence {
         out
     }
 
+    /// The input Hessian seen by the rotated matrix. Inputs become
+    /// `X' = X S_c H_c`, so `H' = H_c S_c H S_c H_c` (`cols x cols`).
+    pub fn transform_hessian(&self, h: &[f64]) -> Vec<f64> {
+        let n = self.cols;
+        assert_eq!(h.len(), n * n, "Hessian shape");
+        // Right-multiplies every row by S_c H_c.
+        let right = |m: &mut [f64]| {
+            m.par_chunks_mut(n).for_each(|row| {
+                row.iter_mut()
+                    .zip(&self.col_signs)
+                    .for_each(|(v, &s)| *v *= f64::from(s));
+                fwht(row);
+            });
+        };
+        let mut a = h.to_vec();
+        right(&mut a);
+        // H' = H_c S_c A = (A^T S_c H_c)^T, and H' is symmetric.
+        let mut t: Vec<f64> = (0..n * n).map(|e| a[(e % n) * n + e / n]).collect();
+        right(&mut t);
+        t
+    }
+
     /// `W = S_r H_r W' H_c S_c`: undoes `forward` (both factors are symmetric
     /// and orthogonal, so each is its own inverse).
     pub fn inverse(&self, matrix: &[f32]) -> Vec<f32> {
@@ -118,7 +145,9 @@ mod tests {
     use super::*;
 
     fn matrix(rows: usize, cols: usize) -> Vec<f32> {
-        (0..rows * cols).map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0).collect()
+        (0..rows * cols)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
+            .collect()
     }
 
     fn norm(values: &[f32]) -> f64 {
@@ -155,6 +184,46 @@ mod tests {
         let peak = rotated.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         let rms = (norm(&rotated) / rotated.len() as f64).sqrt() as f32;
         assert!(peak / rms < 1.2, "peak/rms {}", peak / rms);
+    }
+
+    #[test]
+    fn transformed_hessian_keeps_the_proxy_loss() {
+        let (rows, cols) = (8, 16);
+        let e = matrix(rows, cols);
+        let x: Vec<f64> = (0..cols * 40)
+            .map(|i| ((i * 53 % 97) as f64 - 48.0) / 30.0)
+            .collect();
+        let mut h = vec![0.0; cols * cols];
+        for sample in x.chunks_exact(cols) {
+            for i in 0..cols {
+                for j in 0..cols {
+                    h[i * cols + j] += sample[i] * sample[j];
+                }
+            }
+        }
+        let loss = |e: &[f32], h: &[f64]| -> f64 {
+            e.chunks_exact(cols)
+                .map(|row| {
+                    (0..cols)
+                        .map(|i| {
+                            (0..cols)
+                                .map(|j| f64::from(row[i]) * h[i * cols + j] * f64::from(row[j]))
+                                .sum::<f64>()
+                        })
+                        .sum::<f64>()
+                })
+                .sum()
+        };
+        let rht = Incoherence::new(rows, cols, 3).unwrap();
+        let rotated_h = rht.transform_hessian(&h);
+        let (before, after) = (loss(&e, &h), loss(&rht.forward(&e), &rotated_h));
+        assert!(
+            (before - after).abs() < 1e-4 * before,
+            "{before} vs {after}"
+        );
+        assert!((0..cols).all(|i| {
+            (0..cols).all(|j| (rotated_h[i * cols + j] - rotated_h[j * cols + i]).abs() < 1e-9)
+        }));
     }
 
     #[test]

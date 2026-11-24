@@ -5,8 +5,10 @@
 //! compressed format.
 
 use super::{
+    hessian::Hessians,
     incoherence::Incoherence,
-    matrix::{distortion, scalar_reconstruct, trellis_reconstruct},
+    ldlq::{block_feedback, cholesky_upper, ldlq, proxy_error},
+    matrix::{distortion, rms, scalar_reconstruct, trellis_reconstruct},
     trellis::Trellis,
 };
 use crate::{
@@ -36,6 +38,13 @@ const QUANTIZED_SUFFIXES: [&str; 7] = [
 pub enum Method {
     /// Random Hadamard incoherence, then a bitshift trellis.
     Trellis { state_bits: u32, symbol_bits: u32 },
+    /// Random Hadamard incoherence, then BlockLDLQ with the trellis on
+    /// 16 x 16 tiles. Needs Hessians; `damping` is relative to mean(diag H).
+    TrellisLdlq {
+        state_bits: u32,
+        symbol_bits: u32,
+        damping: f32,
+    },
     /// Random Hadamard incoherence, then the 2-bit Lloyd-Max scalar quantizer.
     Scalar2Bit,
     /// Diagnostic: rotate and rotate back without quantizing.
@@ -66,7 +75,12 @@ fn gaussian(count: usize, seed: u64) -> Vec<f32> {
 pub struct TensorReport {
     pub name: String,
     pub relative_error: f64,
+    /// `tr(E H E^T) / tr(W H W^T)`, when Hessians were given.
+    pub proxy_error: Option<f64>,
 }
+
+/// Default Hessian damping when only the proxy loss is reported.
+const REPORT_DAMPING: f64 = 0.01;
 
 /// Row-major `rows x cols` floats of a matrix (cols = GGUF dims[0]).
 pub(crate) fn matrix(tensor: &Tensor) -> (Vec<f32>, usize, usize) {
@@ -79,14 +93,49 @@ pub(crate) fn matrix(tensor: &Tensor) -> (Vec<f32>, usize, usize) {
 }
 
 fn is_quantized(name: &str) -> bool {
-    name.starts_with("blk.") && QUANTIZED_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+    name.starts_with("blk.")
+        && QUANTIZED_SUFFIXES
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
 }
 
-fn reconstruct(weights: &[f32], rows: usize, cols: usize, method: Method, seed: u64) -> Result<Vec<f32>> {
+/// BlockLDLQ in the rotated domain: `h` is the original-domain Hessian.
+fn ldlq_reconstruct(
+    rotated: &[f32],
+    rows: usize,
+    cols: usize,
+    h: &[f64],
+    rht: &Incoherence,
+    trellis: &Trellis,
+) -> Result<Vec<f32>> {
+    let u = block_feedback(&cholesky_upper(&rht.transform_hessian(h), cols)?, cols)?;
+    let sigma = rms(rotated);
+    ldlq(rotated, rows, cols, &u, |tile| {
+        let normalized: Vec<f32> = tile.iter().map(|&v| v / sigma).collect();
+        trellis
+            .decode(&trellis.quantize(&normalized))
+            .into_iter()
+            .map(|v| v * sigma)
+            .collect()
+    })
+}
+
+fn reconstruct(
+    weights: &[f32],
+    rows: usize,
+    cols: usize,
+    method: Method,
+    seed: u64,
+    h: Option<&[f64]>,
+) -> Result<Vec<f32>> {
     if let Method::Noise { relative } = method {
         let sigma = super::matrix::rms(weights) * relative.sqrt();
         let noise = gaussian(weights.len(), seed);
-        return Ok(weights.iter().zip(noise).map(|(w, n)| w + sigma * n).collect());
+        return Ok(weights
+            .iter()
+            .zip(noise)
+            .map(|(w, n)| w + sigma * n)
+            .collect());
     }
     let rht = Incoherence::new(rows, cols, seed)?;
     let rotated = rht.forward(weights);
@@ -94,7 +143,26 @@ fn reconstruct(weights: &[f32], rows: usize, cols: usize, method: Method, seed: 
         Method::Trellis {
             state_bits,
             symbol_bits,
-        } => trellis_reconstruct(&rotated, &Trellis::new(state_bits, symbol_bits, 1.0)?, BLOCK),
+        } => trellis_reconstruct(
+            &rotated,
+            &Trellis::new(state_bits, symbol_bits, 1.0)?,
+            BLOCK,
+        ),
+        Method::TrellisLdlq {
+            state_bits,
+            symbol_bits,
+            ..
+        } => {
+            let h = h.ok_or_else(|| Error::Invalid("LDLQ needs Hessians".into()))?;
+            ldlq_reconstruct(
+                &rotated,
+                rows,
+                cols,
+                h,
+                &rht,
+                &Trellis::new(state_bits, symbol_bits, 1.0)?,
+            )?
+        }
         Method::Scalar2Bit => scalar_reconstruct(&rotated),
         Method::RotationOnly => rotated,
         Method::Noise { .. } => unreachable!("handled above"),
@@ -103,22 +171,34 @@ fn reconstruct(weights: &[f32], rows: usize, cols: usize, method: Method, seed: 
 }
 
 /// Quantizes every attention and MLP matrix of `input` (all F16) into a new
-/// file `output`. `progress` sees each tensor as it finishes.
+/// file `output`. With `hessians`, each report also carries the proxy loss.
+/// `progress` sees each tensor as it finishes.
 pub fn quantize_gguf(
     input: &Path,
     output: &Path,
     method: Method,
     seed: u64,
+    hessians: Option<&Hessians>,
     mut progress: impl FnMut(&TensorReport, usize, usize),
 ) -> Result<Vec<TensorReport>> {
     if output.exists() {
-        return Err(Error::Invalid(format!("{} already exists", output.display())));
+        return Err(Error::Invalid(format!(
+            "{} already exists",
+            output.display()
+        )));
     }
     let model = Gguf::open(input, false)?;
     let mut names: Vec<&String> = model.tensors.keys().filter(|n| is_quantized(n)).collect();
     names.sort();
+    if matches!(method, Method::TrellisLdlq { .. }) && hessians.is_none() {
+        return Err(Error::Invalid(
+            "--method trellis-ldlq needs --hessians".into(),
+        ));
+    }
     if names.is_empty() {
-        return Err(Error::Invalid("no attention or MLP matrices to quantize".into()));
+        return Err(Error::Invalid(
+            "no attention or MLP matrices to quantize".into(),
+        ));
     }
     for name in &names {
         if model.data_locations[*name].1 != F16_KIND || model.tensors[*name].dims.len() != 2 {
@@ -132,7 +212,14 @@ pub fn quantize_gguf(
     for (index, name) in names.iter().enumerate() {
         let (weights, rows, cols) = matrix(&model.tensors[*name]);
         let tensor_seed = seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let reconstructed = reconstruct(&weights, rows, cols, method, tensor_seed)?;
+        let damping = match method {
+            Method::TrellisLdlq { damping, .. } => f64::from(damping),
+            _ => REPORT_DAMPING,
+        };
+        let h = hessians
+            .map(|set| set.load(name, cols, damping))
+            .transpose()?;
+        let reconstructed = reconstruct(&weights, rows, cols, method, tensor_seed, h.as_deref())?;
         let bytes: Vec<u8> = reconstructed
             .iter()
             .flat_map(|&v| f16::from_f32(v).to_bits().to_le_bytes())
@@ -142,6 +229,9 @@ pub fn quantize_gguf(
         let report = TensorReport {
             name: (*name).clone(),
             relative_error: distortion(&weights, &reconstructed).relative,
+            proxy_error: h
+                .as_deref()
+                .map(|h| proxy_error(&weights, &reconstructed, rows, cols, h)),
         };
         progress(&report, index + 1, names.len());
         reports.push(report);
@@ -170,7 +260,11 @@ mod tests {
             header.extend((*rows as u64).to_le_bytes());
             header.extend(F16_KIND.to_le_bytes());
             header.extend((data.len() as u64).to_le_bytes());
-            data.extend(values.iter().flat_map(|&v| f16::from_f32(v).to_bits().to_le_bytes()));
+            data.extend(
+                values
+                    .iter()
+                    .flat_map(|&v| f16::from_f32(v).to_bits().to_le_bytes()),
+            );
             data.resize(data.len().div_ceil(32) * 32, 0);
         }
         header.extend(string("output_norm.weight"));
@@ -184,7 +278,9 @@ mod tests {
     }
 
     fn values(count: usize) -> Vec<f32> {
-        (0..count).map(|i| ((i * 7919 % 1000) as f32 - 500.0) / 400.0).collect()
+        (0..count)
+            .map(|i| ((i * 7919 % 1000) as f32 - 500.0) / 400.0)
+            .collect()
     }
 
     #[test]
@@ -197,23 +293,33 @@ mod tests {
         let embedding = values(16 * 64);
         write_gguf(
             &input,
-            &[("blk.0.attn_q.weight", 32, 64, q.clone()), ("token_embd.weight", 16, 64, embedding)],
+            &[
+                ("blk.0.attn_q.weight", 32, 64, q.clone()),
+                ("token_embd.weight", 16, 64, embedding),
+            ],
         );
-        let method = Method::Trellis { state_bits: 8, symbol_bits: 2 };
-        let reports = quantize_gguf(&input, &output, method, 1, |_, _, _| {}).unwrap();
+        let method = Method::Trellis {
+            state_bits: 8,
+            symbol_bits: 2,
+        };
+        let reports = quantize_gguf(&input, &output, method, 1, None, |_, _, _| {}).unwrap();
         assert_eq!(reports.len(), 1);
         assert!(reports[0].relative_error > 0.0 && reports[0].relative_error < 0.2);
 
         let before = Gguf::open(&input, false).unwrap();
         let after = Gguf::open(&output, false).unwrap();
-        let unchanged = |name: &str| matrix(&before.tensors[name]).0 == matrix(&after.tensors[name]).0;
+        let unchanged =
+            |name: &str| matrix(&before.tensors[name]).0 == matrix(&after.tensors[name]).0;
         assert!(unchanged("token_embd.weight"));
-        assert_eq!(before.tensors["output_norm.weight"].floats(), after.tensors["output_norm.weight"].floats());
+        assert_eq!(
+            before.tensors["output_norm.weight"].floats(),
+            after.tensors["output_norm.weight"].floats()
+        );
         assert!(!unchanged("blk.0.attn_q.weight"));
         let written = matrix(&after.tensors["blk.0.attn_q.weight"]).0;
         assert!((distortion(&q, &written).relative - reports[0].relative_error).abs() < 1e-3);
 
-        assert!(quantize_gguf(&input, &output, method, 1, |_, _, _| {}).is_err());
+        assert!(quantize_gguf(&input, &output, method, 1, None, |_, _, _| {}).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

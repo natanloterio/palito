@@ -4,10 +4,13 @@
 //! search and checked on synthetic Gaussian blocks against the optimal 2-bit
 //! scalar quantizer. Step 2: random Hadamard incoherence, checked on real
 //! Llama layers. Step 3: whole-model GGUFs with reconstructed weights, for
-//! perplexity. Tail-biting and GPU decoding come later.
+//! perplexity. Step 4: BlockLDLQ with input Hessians collected by
+//! `scripts/qtip/collect_hessians.py`. Tail-biting and GPU decoding come later.
 
 pub mod codebook;
+pub mod hessian;
 pub mod incoherence;
+pub mod ldlq;
 pub mod matrix;
 pub mod model;
 pub mod scalar;

@@ -226,8 +226,40 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// QTIP3 research tensor (feature `qtip-research`): 16 x 16 trellis tiles
+/// (L = 12, K = 3, 25 words each, layout in qtip::packed) in row-group order,
+/// for a rotated matrix with 256-blocks of Hadamard on both sides. Its bytes
+/// are followed in memory by its companion `<name>.qtip` F32 vector
+/// `[sigma, row signs.., column signs..]`, which `parse` folds into it.
+pub(crate) const QTIP3_KIND: u32 = 200;
+pub(crate) const QTIP3_TILE_BYTES: usize = 100;
+/// Suffix of the companion vector of a QTIP3 tensor.
+pub(crate) const QTIP3_COMPANION: &str = ".qtip";
+
+/// Projection matrices that may be QTIP3.
+fn qtip3_allowed(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("blk.") else {
+        return false;
+    };
+    let Some((layer, suffix)) = rest.split_once('.') else {
+        return false;
+    };
+    layer.parse::<usize>().is_ok()
+        && matches!(
+            suffix,
+            "attn_q.weight"
+                | "attn_k.weight"
+                | "attn_v.weight"
+                | "attn_output.weight"
+                | "ffn_gate.weight"
+                | "ffn_up.weight"
+                | "ffn_down.weight"
+        )
+}
+
 pub(crate) fn layout(kind: u32) -> Result<(usize, usize, &'static str)> {
     match kind {
+        QTIP3_KIND if cfg!(feature = "qtip-research") => Ok((256, QTIP3_TILE_BYTES, "QTIP3")),
         0 => Ok((1, 4, "F32")),
         1 => Ok((1, 2, "F16")),
         2 => Ok((32, 18, "Q4_0")),
@@ -252,6 +284,10 @@ pub(crate) fn half(bytes: &[u8], offset: usize) -> f32 {
 }
 
 fn finite_packed(kind: u32, bytes: &[u8]) -> bool {
+    if kind == QTIP3_KIND {
+        // Trellis bits only; the scale is checked with the companion vector.
+        return true;
+    }
     if kind == 30 {
         return bf16(bytes).is_finite();
     }
@@ -401,7 +437,192 @@ pub(crate) fn decode(kind: u32, bytes: &[u8], output: &mut [f32]) {
     }
 }
 
+/// Appends each QTIP3 tensor's companion `[sigma, row signs, column signs]`
+/// (little-endian f32) to its bytes and drops the companion entry.
+fn fold_qtip3_companions(tensors: &mut HashMap<String, Tensor>) -> Result<()> {
+    let names: Vec<String> = tensors
+        .iter()
+        .filter(|(_, t)| {
+            matches!(
+                t.storage,
+                Storage::Packed {
+                    kind: QTIP3_KIND,
+                    ..
+                }
+            )
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in names {
+        let companion = tensors
+            .remove(&format!("{name}{QTIP3_COMPANION}"))
+            .ok_or_else(|| invalid(format!("{name}: missing QTIP3 companion vector")))?;
+        let tensor = tensors.get_mut(&name).expect("listed above");
+        let (cols, rows) = (tensor.dims[0], tensor.dims[1]);
+        let Storage::F32(values) = companion.storage else {
+            return Err(invalid(format!("{name}: QTIP3 companion must be F32")));
+        };
+        let sigma = values.first().copied().unwrap_or(0.0);
+        if values.len() != 1 + rows + cols
+            || !(sigma.is_finite() && sigma > 0.0)
+            || values[1..].iter().any(|&v| v != 1.0 && v != -1.0)
+        {
+            return Err(invalid(format!("{name}: invalid QTIP3 companion vector")));
+        }
+        let Storage::Packed { bytes, .. } = &mut tensor.storage else {
+            unreachable!("filtered on packed QTIP3");
+        };
+        bytes.extend(values.iter().flat_map(|v| v.to_le_bytes()));
+    }
+    if let Some(orphan) = tensors.keys().find(|n| n.ends_with(QTIP3_COMPANION)) {
+        return Err(invalid(format!(
+            "{orphan}: QTIP3 companion without its tensor"
+        )));
+    }
+    Ok(())
+}
+
+/// A tensor's entry in a GGUF directory, with its absolute data range.
+#[cfg(feature = "qtip-research")]
+pub(crate) struct DirectoryEntry {
+    pub name: String,
+    pub dims: Vec<usize>,
+    pub kind: u32,
+    pub data: std::ops::Range<usize>,
+}
+
+/// The raw layout of a GGUF file, so a tool can rewrite its tensors and keep
+/// the metadata bytes verbatim.
+#[cfg(feature = "qtip-research")]
+pub(crate) struct Directory {
+    pub metadata_count: u64,
+    /// Byte range of the metadata key-value section.
+    pub metadata: std::ops::Range<usize>,
+    pub alignment: usize,
+    pub tensors: Vec<DirectoryEntry>,
+}
+
+#[cfg(feature = "qtip-research")]
+impl Directory {
+    pub fn read(bytes: &[u8]) -> Result<Self> {
+        let mut reader = Reader { bytes, position: 0 };
+        let (tensor_count, metadata) = reader.header()?;
+        let metadata_count = u64::from_le_bytes(bytes[16..24].try_into().expect("header read"));
+        let metadata_range = 24..reader.position;
+        let alignment = match metadata.get("general.alignment") {
+            Some(Value::Integer(value)) => *value as usize,
+            _ => 32,
+        };
+        if !alignment.is_power_of_two() {
+            return Err(invalid("alignment must be a positive power of two"));
+        }
+        let mut raw = Vec::with_capacity(tensor_count);
+        for _ in 0..tensor_count {
+            let name = reader.string()?;
+            let rank = reader.integer(4)?;
+            if !(1..=3).contains(&rank) {
+                return Err(invalid(
+                    "only vectors, matrices, and expert stacks are supported",
+                ));
+            }
+            let dims = (0..rank)
+                .map(|_| reader.count())
+                .collect::<Result<Vec<_>>>()?;
+            let kind = reader.integer(4)? as u32;
+            let offset = reader.count()?;
+            raw.push((name, dims, kind, offset));
+        }
+        let start = (reader.position + alignment - 1) & !(alignment - 1);
+        let tensors = raw
+            .into_iter()
+            .map(|(name, dims, kind, offset)| {
+                let (block, size, _) = layout(kind)?;
+                let elements: usize = dims.iter().product();
+                let begin = start + offset;
+                let end = begin + elements / block * size;
+                if end > bytes.len() {
+                    return Err(invalid(format!("{name} extends beyond file")));
+                }
+                Ok(DirectoryEntry {
+                    name,
+                    dims,
+                    kind,
+                    data: begin..end,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            metadata_count,
+            metadata: metadata_range,
+            alignment,
+            tensors,
+        })
+    }
+}
+
+/// Writes a GGUF v3 file with `original`'s metadata bytes and the given
+/// tensors (name, dims, type, data) in order.
+#[cfg(feature = "qtip-research")]
+pub(crate) fn write_gguf(
+    path: &Path,
+    original: &[u8],
+    directory: &Directory,
+    tensors: &[(String, Vec<usize>, u32, &[u8])],
+) -> Result<()> {
+    use std::io::Write;
+    let align = |n: usize| (n + directory.alignment - 1) & !(directory.alignment - 1);
+    let mut header = b"GGUF".to_vec();
+    header.extend(3u32.to_le_bytes());
+    header.extend((tensors.len() as u64).to_le_bytes());
+    header.extend(directory.metadata_count.to_le_bytes());
+    header.extend(&original[directory.metadata.clone()]);
+    let mut offset = 0usize;
+    for (name, dims, kind, data) in tensors {
+        let (block, size, _) = layout(*kind)?;
+        if dims.iter().product::<usize>() / block * size != data.len() {
+            return Err(invalid(format!(
+                "{name}: data size does not match its shape"
+            )));
+        }
+        header.extend((name.len() as u64).to_le_bytes());
+        header.extend(name.as_bytes());
+        header.extend((dims.len() as u32).to_le_bytes());
+        dims.iter()
+            .for_each(|&d| header.extend((d as u64).to_le_bytes()));
+        header.extend(kind.to_le_bytes());
+        header.extend((offset as u64).to_le_bytes());
+        offset = align(offset + data.len());
+    }
+    header.resize(align(header.len()), 0);
+    let mut file = std::io::BufWriter::new(
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?,
+    );
+    file.write_all(&header)?;
+    for (_, _, _, data) in tensors {
+        file.write_all(data)?;
+        file.write_all(&vec![0u8; align(data.len()) - data.len()])?;
+    }
+    file.flush()?;
+    Ok(())
+}
+
 impl Gguf {
+    /// Whether any tensor is QTIP3, which only the CUDA backend executes.
+    pub fn has_qtip3(&self) -> bool {
+        self.tensors.values().any(|t| {
+            matches!(
+                t.storage,
+                Storage::Packed {
+                    kind: QTIP3_KIND,
+                    ..
+                }
+            )
+        })
+    }
+
     pub fn open(path: &Path, expand: bool) -> Result<Self> {
         Self::parse(&fs::read(path)?, expand)
     }
@@ -503,6 +724,13 @@ impl Gguf {
             if dims[0] % block != 0 || offset % alignment != 0 {
                 return Err(invalid("unaligned tensor or quantization block"));
             }
+            if kind == QTIP3_KIND
+                && (expand || dims.len() != 2 || dims[1] % 256 != 0 || !qtip3_allowed(&name))
+            {
+                return Err(invalid(format!(
+                    "{name}: QTIP3 needs a 256-aligned projection matrix and packed weights"
+                )));
+            }
             let length = (elements / block)
                 .checked_mul(size)
                 .ok_or_else(|| invalid("tensor size overflow"))?;
@@ -573,6 +801,7 @@ impl Gguf {
                 },
             );
         }
+        fold_qtip3_companions(&mut tensors)?;
         tensor_types.sort();
         tensor_types.dedup();
         Ok(Self {
@@ -659,6 +888,69 @@ mod tests {
             Some(Value::Integer(8192))
         ));
         assert!(truncated.is_err());
+    }
+
+    #[cfg(feature = "qtip-research")]
+    fn qtip3_file(name: &str, companion: &[f32]) -> Result<Gguf> {
+        let empty = Directory {
+            metadata_count: 0,
+            metadata: 24..24,
+            alignment: 32,
+            tensors: Vec::new(),
+        };
+        let tiles = vec![7u8; 256 * 512 / 256 * QTIP3_TILE_BYTES];
+        let companion: Vec<u8> = companion.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let path = std::env::temp_dir().join(format!(
+            "li-qtip3-{}-{}.gguf",
+            std::process::id(),
+            name.len() + companion.len()
+        ));
+        let _ = fs::remove_file(&path);
+        write_gguf(
+            &path,
+            &[0; 24],
+            &empty,
+            &[
+                (name.into(), vec![256, 512], QTIP3_KIND, &tiles),
+                (
+                    format!("{name}{QTIP3_COMPANION}"),
+                    vec![companion.len() / 4],
+                    0,
+                    &companion,
+                ),
+            ],
+        )?;
+        let parsed = Gguf::open(&path, false);
+        fs::remove_file(&path)?;
+        parsed
+    }
+
+    #[cfg(feature = "qtip-research")]
+    #[test]
+    fn qtip3_folds_its_companion_and_rejects_bad_ones() {
+        let mut companion = vec![0.5f32];
+        companion.extend((0..512 + 256).map(|i| if i % 3 == 0 { -1.0 } else { 1.0 }));
+        let model = qtip3_file("blk.0.attn_q.weight", &companion).unwrap();
+        assert!(model.has_qtip3());
+        assert_eq!(model.tensors.len(), 1);
+        let Storage::Packed { kind, bytes } = &model.tensors["blk.0.attn_q.weight"].storage else {
+            panic!("QTIP3 stays packed");
+        };
+        assert_eq!(*kind, QTIP3_KIND);
+        let tiles = 256 * 512 / 256 * QTIP3_TILE_BYTES;
+        assert_eq!(bytes.len(), tiles + 4 * companion.len());
+        assert_eq!(bytes[tiles..tiles + 4], 0.5f32.to_le_bytes());
+        // Wrong length, a non-sign entry, a bad scale, a non-projection name.
+        let mut bad = companion.clone();
+        bad.pop();
+        assert!(qtip3_file("blk.0.attn_q.weight", &bad).is_err());
+        let mut bad = companion.clone();
+        bad[3] = 0.5;
+        assert!(qtip3_file("blk.0.attn_q.weight", &bad).is_err());
+        let mut bad = companion.clone();
+        bad[0] = f32::NAN;
+        assert!(qtip3_file("blk.0.attn_q.weight", &bad).is_err());
+        assert!(qtip3_file("token_embd.weight", &companion).is_err());
     }
 
     #[test]

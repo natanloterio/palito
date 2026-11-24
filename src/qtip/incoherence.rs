@@ -96,6 +96,16 @@ impl Incoherence {
         })
     }
 
+    /// `S_r` as `+-1` values.
+    pub fn row_signs(&self) -> &[f32] {
+        &self.row_signs
+    }
+
+    /// `S_c` as `+-1` values.
+    pub fn col_signs(&self) -> &[f32] {
+        &self.col_signs
+    }
+
     fn check(&self, matrix: &[f32]) {
         assert_eq!(matrix.len(), self.rows * self.cols, "matrix shape");
     }

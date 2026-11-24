@@ -7,13 +7,14 @@
 use super::{
     hessian::Hessians,
     incoherence::Incoherence,
-    ldlq::{block_feedback, cholesky_upper, ldlq, proxy_error},
+    ldlq::{block_feedback, cholesky_upper, ldlq, ldlq_with, proxy_error},
     matrix::{distortion, rms, scalar_reconstruct, trellis_reconstruct},
+    packed::pack_tile,
     trellis::Trellis,
 };
 use crate::{
     Error, Result,
-    gguf::{Gguf, Tensor},
+    gguf::{Directory, Gguf, QTIP3_COMPANION, QTIP3_KIND, Tensor, write_gguf},
 };
 use half::f16;
 use std::{
@@ -247,6 +248,134 @@ pub fn quantize_gguf(
         reports.push(report);
     }
     file.sync_all()?;
+    fs::rename(&partial, output)?;
+    Ok(reports)
+}
+
+/// Trellis bits of the QTIP3 tensor type (`gguf::QTIP3_KIND`).
+const QTIP3_TRELLIS: (u32, u32) = (12, 3);
+/// Hadamard block of the QTIP3 tensor type.
+const QTIP3_BLOCK: usize = 256;
+
+/// One matrix as QTIP3: the packed tiles (little-endian words, row-group
+/// order), the companion `[sigma, row signs, column signs]`, and the dense
+/// reconstruction for the report.
+fn qtip3_matrix(
+    weights: &[f32],
+    rows: usize,
+    cols: usize,
+    seed: u64,
+    h: &[f64],
+) -> Result<(Vec<u8>, Vec<f32>, Vec<f32>)> {
+    let (state_bits, symbol_bits) = QTIP3_TRELLIS;
+    let rht = Incoherence::with_block(rows, cols, seed, Some(QTIP3_BLOCK))?;
+    let rotated = rht.forward(weights);
+    let trellis = Trellis::new(state_bits, symbol_bits, 1.0)?;
+    let u = block_feedback(&cholesky_upper(&rht.transform_hessian(h), cols)?, cols)?;
+    let sigma = rms(&rotated);
+    let (quantized, tiles) = ldlq_with(&rotated, rows, cols, &u, |tile| {
+        let normalized: Vec<f32> = tile.iter().map(|&v| v / sigma).collect();
+        let encoded = trellis.quantize(&normalized);
+        let words = pack_tile(&encoded, state_bits, symbol_bits);
+        let values = trellis
+            .decode(&encoded)
+            .into_iter()
+            .map(|v| v * sigma)
+            .collect();
+        (values, words)
+    })?;
+    let bytes = tiles
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .concat()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let companion = std::iter::once(sigma)
+        .chain(rht.row_signs().iter().copied())
+        .chain(rht.col_signs().iter().copied())
+        .collect();
+    Ok((bytes, companion, rht.inverse(&quantized)))
+}
+
+/// Writes `output` with every attention and MLP matrix of `input` (F16) as a
+/// QTIP3 tensor (BlockLDLQ, L12 K3, 256-block Hadamards) plus its F32
+/// companion vector; other tensors and all metadata are copied unchanged.
+/// Only Palito's CUDA backend with `qtip-research` reads the result.
+pub fn quantize_gguf_qtip3(
+    input: &Path,
+    output: &Path,
+    seed: u64,
+    hessians: &Hessians,
+    damping: f32,
+    mut progress: impl FnMut(&TensorReport, usize, usize),
+) -> Result<Vec<TensorReport>> {
+    if output.exists() {
+        return Err(Error::Invalid(format!(
+            "{} already exists",
+            output.display()
+        )));
+    }
+    let original = fs::read(input)?;
+    let directory = Directory::read(&original)?;
+    let model = Gguf::open(input, false)?;
+    let mut names: Vec<&String> = model.tensors.keys().filter(|n| is_quantized(n)).collect();
+    names.sort();
+    if names.is_empty() {
+        return Err(Error::Invalid(
+            "no attention or MLP matrices to quantize".into(),
+        ));
+    }
+    let mut packed = std::collections::HashMap::new();
+    let mut reports = Vec::with_capacity(names.len());
+    for (index, name) in names.iter().enumerate() {
+        let tensor = &model.tensors[*name];
+        if model.data_locations[*name].1 != F16_KIND || tensor.dims.len() != 2 {
+            return Err(Error::Invalid(format!("{name} must be an F16 matrix")));
+        }
+        let (weights, rows, cols) = matrix(tensor);
+        if rows % QTIP3_BLOCK != 0 || cols % QTIP3_BLOCK != 0 {
+            return Err(Error::Invalid(format!(
+                "{name}: QTIP3 needs 256-aligned shapes"
+            )));
+        }
+        // Same per-tensor seed as quantize_gguf, so the probe and this file match.
+        let tensor_seed = seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let h = hessians.load(name, cols, f64::from(damping))?;
+        let (bytes, companion, reconstructed) =
+            qtip3_matrix(&weights, rows, cols, tensor_seed, &h)?;
+        let report = TensorReport {
+            name: (*name).clone(),
+            relative_error: distortion(&weights, &reconstructed).relative,
+            proxy_error: Some(proxy_error(&weights, &reconstructed, rows, cols, &h)),
+        };
+        progress(&report, index + 1, names.len());
+        reports.push(report);
+        let companion: Vec<u8> = companion.iter().flat_map(|v| v.to_le_bytes()).collect();
+        packed.insert((*name).clone(), (bytes, companion));
+    }
+    let mut tensors: Vec<(String, Vec<usize>, u32, &[u8])> = Vec::new();
+    for entry in &directory.tensors {
+        if let Some((bytes, companion)) = packed.get(&entry.name) {
+            tensors.push((entry.name.clone(), entry.dims.clone(), QTIP3_KIND, bytes));
+            let length = companion.len() / 4;
+            tensors.push((
+                format!("{}{QTIP3_COMPANION}", entry.name),
+                vec![length],
+                0,
+                companion,
+            ));
+        } else {
+            tensors.push((
+                entry.name.clone(),
+                entry.dims.clone(),
+                entry.kind,
+                &original[entry.data.clone()],
+            ));
+        }
+    }
+    let partial = output.with_extension("partial");
+    write_gguf(&partial, &original, &directory, &tensors)?;
     fs::rename(&partial, output)?;
     Ok(reports)
 }

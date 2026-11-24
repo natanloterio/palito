@@ -155,20 +155,36 @@ struct DeviceTensor {
     kind: i32,
     width: i32,
     rows: i32,
+    #[cfg(feature = "qtip-research")]
+    qtip: Option<qtip::QtipTensor>,
 }
 
 impl DeviceTensor {
     fn upload(tensor: Tensor, stream: &Arc<CudaStream>) -> Result<Self> {
-        let (kind, bytes) = match tensor.storage {
+        #[cfg_attr(not(feature = "qtip-research"), allow(unused_mut))]
+        let (kind, mut bytes) = match tensor.storage {
             Storage::Packed { kind, bytes } => (kind as i32, bytes),
             Storage::F32(values) => (0, values.into_iter().flat_map(f32::to_le_bytes).collect()),
         };
+        let width = tensor.dims[0];
+        let rows = tensor.dims.get(1).copied().unwrap_or(1);
+        #[cfg(feature = "qtip-research")]
+        let qtip = (kind == crate::gguf::QTIP3_KIND as i32)
+            .then(|| qtip::QtipTensor::upload(&mut bytes, width, rows, stream))
+            .transpose()?;
         Ok(Self {
             bytes: stream.clone_htod(&bytes).map_err(failure)?,
             kind,
-            width: tensor.dims[0] as i32,
-            rows: tensor.dims.get(1).copied().unwrap_or(1) as i32,
+            width: width as i32,
+            rows: rows as i32,
+            #[cfg(feature = "qtip-research")]
+            qtip,
         })
+    }
+
+    /// Whether this projection is QTIP3 (always false without the feature).
+    fn is_qtip(&self) -> bool {
+        cfg!(feature = "qtip-research") && self.kind == 200
     }
 }
 
@@ -577,6 +593,21 @@ macro_rules! launch {
     }};
 }
 
+/// A QTIP3 projection `y = W x` (feature `qtip-research`; callers check
+/// `DeviceTensor::is_qtip`, which is false without it).
+macro_rules! qtip_matvec {
+    ($backend:ident, $tensor:expr, $x:expr, $y:expr) => {{
+        #[cfg(feature = "qtip-research")]
+        $backend
+            .qtip
+            .as_ref()
+            .ok_or_else(|| invalid("QTIP3 kernel not loaded"))?
+            .matvec(&$backend.stream, $tensor, $x, $y)?;
+        #[cfg(not(feature = "qtip-research"))]
+        let _ = ($tensor, $x, $y);
+    }};
+}
+
 /// launch! with the kernel's dynamic shared memory (shared::configure), if any.
 macro_rules! launch_shared {
     ($backend:ident, $name:expr, $grid:expr; $threads:expr, $($arg:expr),+ $(,)?) => {{
@@ -826,6 +857,8 @@ mod packed_decode;
 #[cfg(test)]
 mod prefill;
 mod prefix;
+#[cfg(feature = "qtip-research")]
+mod qtip;
 pub use crate::reference;
 mod qwen35_device;
 #[cfg(test)]
@@ -857,6 +890,9 @@ pub struct CudaBackend {
     diagnostic: Option<diagnostics::Capture>,
     /// None: prefix cache disabled.
     prefix: Option<prefix::PrefixCache>,
+    /// Fused trellis matvec, when the model has QTIP3 projections.
+    #[cfg(feature = "qtip-research")]
+    qtip: Option<qtip::QtipKernel>,
 }
 
 /// Warps sharing one output row in `matvec_packed_rows` (mirrors the device
@@ -1311,8 +1347,15 @@ impl CudaBackend {
                 }
             }
         }
+        #[cfg(feature = "qtip-research")]
+        let mut weights = Weights::open_qtip3(path, config)?;
+        #[cfg(not(feature = "qtip-research"))]
         let mut weights = Weights::open(path, config)?;
         let s = &weights.spec;
+        let has_qtip = s.info.tensor_types.iter().any(|kind| kind == "QTIP3");
+        if has_qtip && !matches!(options.matmul, CudaMatmul::F32 | CudaMatmul::F32Tiled) {
+            return Err(invalid("QTIP3 CUDA requires --cuda-matmul f32 or f32-tiled"));
+        }
         if matches!(
             s.info.architecture.as_str(),
             "gpt2" | "starcoder2" | "bloom" | "gptneox" | "olmo"
@@ -1462,7 +1505,24 @@ impl CudaBackend {
             matmul: options.matmul,
             diagnostic: None,
             prefix: options.prefix_cache.then(prefix::PrefixCache::default),
+            #[cfg(feature = "qtip-research")]
+            qtip: None,
         };
+        #[cfg(feature = "qtip-research")]
+        if has_qtip {
+            let layers = &backend.weights.layers;
+            let tensors = layers.iter().flat_map(|l| {
+                [&l.q, &l.k, &l.v, &l.output, &l.up, &l.down]
+                    .into_iter()
+                    .chain(l.gate.as_ref())
+            });
+            backend.qtip = Some(qtip::QtipKernel::load(
+                &context,
+                (major, minor),
+                options.kernel_cache_dir.as_deref(),
+                tensors,
+            )?);
+        }
         if options.decode_graph {
             backend.capture_decode_graph()?;
         }
@@ -1629,6 +1689,10 @@ impl CudaBackend {
                     (&l.k, &mut self.work.k),
                     (&l.v, &mut self.work.v),
                 ] {
+                    if tensor.is_qtip() {
+                        qtip_matvec!(self, tensor, &self.work.normalized, output);
+                        continue;
+                    }
                     launch!(
                         self,
                         "matvec",
@@ -2030,20 +2094,24 @@ impl CudaBackend {
                 );
             }
             let t = &l.output;
-            launch!(
-                self,
-                "matvec",
-                matvec_grid(self.matmul, t.kind, t.rows, 1, t.width),
-                &t.bytes,
-                &t.kind,
-                &self.work.attended,
-                &mut self.work.projected,
-                &t.width,
-                &t.rows,
-                &self.work.ids,
-                &0i32,
-                &0i32
-            );
+            if t.is_qtip() {
+                qtip_matvec!(self, t, &self.work.attended, &mut self.work.projected);
+            } else {
+                launch!(
+                    self,
+                    "matvec",
+                    matvec_grid(self.matmul, t.kind, t.rows, 1, t.width),
+                    &t.bytes,
+                    &t.kind,
+                    &self.work.attended,
+                    &mut self.work.projected,
+                    &t.width,
+                    &t.rows,
+                    &self.work.ids,
+                    &0i32,
+                    &0i32
+                );
+            }
             if let Some(b) = affine {
                 launch!(
                     self,
@@ -2221,6 +2289,10 @@ impl CudaBackend {
                 );
             } else {
                 for (t, out) in [(gate, &mut self.work.gate), (&l.up, &mut self.work.up)] {
+                    if t.is_qtip() && moe == 0 {
+                        qtip_matvec!(self, t, &self.work.normalized, out);
+                        continue;
+                    }
                     launch!(
                         self,
                         "matvec",
@@ -2268,6 +2340,8 @@ impl CudaBackend {
                     &t.rows,
                     &self.work.ids
                 );
+            } else if t.is_qtip() && moe == 0 {
+                qtip_matvec!(self, t, &self.work.gate, &mut self.work.down);
             } else {
                 launch!(
                     self,
@@ -2612,6 +2686,13 @@ impl Backend for CudaBackend {
 }
 
 impl CudaBackend {
+    fn has_qtip(&self) -> bool {
+        #[cfg(feature = "qtip-research")]
+        return self.qtip.is_some();
+        #[cfg(not(feature = "qtip-research"))]
+        false
+    }
+
     fn evaluate_inner(&mut self, tokens: &[i32], position: u32, host_logits: bool) -> Result<()> {
         self.state
             .begin(tokens, position, &self.weights.spec.info)?;
@@ -2628,7 +2709,13 @@ impl CudaBackend {
         for (index, chunk) in tokens.chunks(capacity).enumerate() {
             let offset = index * capacity;
             let output_logits = offset + chunk.len() == tokens.len();
-            if chunk.len() > 1 {
+            if chunk.len() > 1 && self.has_qtip() {
+                // No batched QTIP3 projection: prefill one token at a time.
+                for (i, &token) in chunk.iter().enumerate() {
+                    let last = output_logits && i + 1 == chunk.len();
+                    self.step(token, position as usize + offset + i, last, false)?;
+                }
+            } else if chunk.len() > 1 {
                 self.batched_prefill(chunk, position as usize + offset, output_logits)?;
             } else if self.decode.is_some() && output_logits {
                 self.replay_decode(chunk[0], position as usize + offset)?;

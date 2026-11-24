@@ -10,7 +10,7 @@
 use clap::{Parser, ValueEnum};
 use palito::qtip::{
     hessian::Hessians,
-    model::{Method, quantize_gguf},
+    model::{Method, quantize_gguf, quantize_gguf_qtip3},
 };
 use std::{path::PathBuf, time::Instant};
 
@@ -49,6 +49,10 @@ struct Args {
     hadamard_block: Option<usize>,
     #[arg(long, default_value_t = 0x5EED)]
     seed: u64,
+    /// Write the compressed QTIP3 format (trellis-ldlq, L12 K3, 256-block
+    /// Hadamards) instead of an F16 probe; only Palito CUDA reads it.
+    #[arg(long)]
+    packed: bool,
 }
 
 fn main() -> palito::Result<()> {
@@ -71,25 +75,49 @@ fn main() -> palito::Result<()> {
     };
     let started = Instant::now();
     let hessians = args.hessians.as_deref().map(Hessians::open).transpose()?;
-    let reports = quantize_gguf(
-        &args.input,
-        &args.output,
-        method,
-        args.seed,
-        hessians.as_ref(),
-        args.hadamard_block,
-        |report, done, total| {
-            let proxy = report
-                .proxy_error
-                .map_or(String::new(), |p| format!(", proxy {p:.4}"));
-            eprintln!(
-                "[{done}/{total}] {} relative error {:.4}{proxy} ({:.0}s)",
-                report.name,
-                report.relative_error,
-                started.elapsed().as_secs_f64()
-            );
-        },
-    )?;
+    let progress = |report: &palito::qtip::model::TensorReport, done, total| {
+        let proxy = report
+            .proxy_error
+            .map_or(String::new(), |p| format!(", proxy {p:.4}"));
+        eprintln!(
+            "[{done}/{total}] {} relative error {:.4}{proxy} ({:.0}s)",
+            report.name,
+            report.relative_error,
+            started.elapsed().as_secs_f64()
+        );
+    };
+    let reports = if args.packed {
+        let hessians = hessians
+            .as_ref()
+            .filter(|_| matches!(args.method, MethodArg::TrellisLdlq))
+            .filter(|_| (args.state_bits, args.symbol_bits) == (12, 3))
+            .filter(|_| args.hadamard_block.is_none_or(|b| b == 256))
+            .ok_or_else(|| {
+                palito::Error::Invalid(
+                    "--packed needs --method trellis-ldlq --hessians --symbol-bits 3 \
+                     (state bits 12, Hadamard block 256)"
+                        .into(),
+                )
+            })?;
+        quantize_gguf_qtip3(
+            &args.input,
+            &args.output,
+            args.seed,
+            hessians,
+            args.damping,
+            progress,
+        )?
+    } else {
+        quantize_gguf(
+            &args.input,
+            &args.output,
+            method,
+            args.seed,
+            hessians.as_ref(),
+            args.hadamard_block,
+            progress,
+        )?
+    };
     let count = reports.len() as f64;
     let mean = reports.iter().map(|r| r.relative_error).sum::<f64>() / count;
     let proxy = reports

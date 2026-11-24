@@ -172,6 +172,19 @@ pub fn ldlq(
     u: &[f64],
     quantize_tile: impl Fn(&[f32]) -> Vec<f32> + Sync,
 ) -> Result<Vec<f32>> {
+    Ok(ldlq_with(w, rows, cols, u, |tile| (quantize_tile(tile), ()))?.0)
+}
+
+/// [`ldlq`] whose tile quantizer also returns a code (for example the packed
+/// trellis bits); codes come back in row-group order, tile `(g, k)` at
+/// `g * cols / TILE + k`.
+pub fn ldlq_with<T: Send>(
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    u: &[f64],
+    quantize_tile: impl Fn(&[f32]) -> (Vec<f32>, T) + Sync,
+) -> Result<(Vec<f32>, Vec<T>)> {
     if !rows.is_multiple_of(TILE)
         || !cols.is_multiple_of(TILE)
         || w.len() != rows * cols
@@ -184,16 +197,19 @@ pub fn ldlq(
     let mut w_hat = vec![0.0f32; rows * cols];
     // W - W_hat; columns at or after the current block are still zero.
     let mut error = vec![0.0f32; rows * cols];
+    let col_tiles = cols / TILE;
+    // codes[k][g]: filled one column block at a time.
+    let mut codes: Vec<Vec<T>> = Vec::with_capacity(col_tiles);
     for start in (0..cols).step_by(TILE) {
         // coefficients[c * start + j] = U[j, start + c] for the earlier columns j.
         let coefficients: Vec<f32> = (0..TILE)
             .flat_map(|c| (0..start).map(move |j| u[j * cols + start + c] as f32))
             .collect();
-        w_hat
+        let block_codes: Vec<T> = w_hat
             .par_chunks_mut(TILE * cols)
             .zip(error.par_chunks_mut(TILE * cols))
             .enumerate()
-            .for_each(|(group, (hat_rows, error_rows))| {
+            .map(|(group, (hat_rows, error_rows))| {
                 let mut tile = [0.0f32; TILE * TILE];
                 for r in 0..TILE {
                     let row = (group * TILE + r) * cols;
@@ -203,7 +219,7 @@ pub fn ldlq(
                         tile[r * TILE + c] = w[row + start + c] + feedback;
                     }
                 }
-                let quantized = quantize_tile(&tile);
+                let (quantized, code) = quantize_tile(&tile);
                 assert_eq!(quantized.len(), TILE * TILE, "tile quantizer output");
                 for r in 0..TILE {
                     let row = (group * TILE + r) * cols;
@@ -213,9 +229,21 @@ pub fn ldlq(
                         error_rows[r * cols + start + c] = w[row + start + c] - q;
                     }
                 }
-            });
+                code
+            })
+            .collect();
+        codes.push(block_codes);
     }
-    Ok(w_hat)
+    // Transpose to row-group order.
+    let groups = rows / TILE;
+    let mut columns: Vec<std::vec::IntoIter<T>> = codes.into_iter().map(Vec::into_iter).collect();
+    let mut ordered = Vec::with_capacity(groups * col_tiles);
+    for _ in 0..groups {
+        for column in columns.iter_mut() {
+            ordered.push(column.next().expect("one code per row group"));
+        }
+    }
+    Ok((w_hat, ordered))
 }
 
 /// Relative proxy loss `tr(E H E^T) / tr(W H W^T)`.

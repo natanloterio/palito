@@ -77,19 +77,26 @@ impl Trellis {
         let error = |weight: f32, state: usize| f64::from(weight - values[state]).powi(2);
         let mut cost: Vec<f64> = (0..states).map(|s| error(weights[0], s)).collect();
         let mut next = vec![0.0; states];
-        // back[t][s]: the high bits that, shifted in front of s, give its best predecessor.
-        let mut back = vec![0u8; (weights.len() - 1) * states];
+        // A state's predecessors depend only on its tail (state >> K), so the
+        // 2^K states sharing a tail share one minimum. back[t][tail] holds the
+        // high bits that, shifted in front of the tail, give that predecessor.
+        let tails = states >> self.symbol_bits;
+        let fan = 1usize << self.symbol_bits;
+        let mut back = vec![0u8; (weights.len() - 1) * tails];
+        let mut tail_cost = vec![0.0; tails];
         let shift = self.state_bits - self.symbol_bits;
         for (step, &weight) in weights.iter().enumerate().skip(1) {
-            let row = &mut back[(step - 1) * states..step * states];
-            for state in 0..states {
-                let tail = state >> self.symbol_bits;
-                let (high, best) = (0..1usize << self.symbol_bits)
+            let row = &mut back[(step - 1) * tails..step * tails];
+            for (tail, (best, high_out)) in tail_cost.iter_mut().zip(row.iter_mut()).enumerate() {
+                let (high, value) = (0..fan)
                     .map(|high| (high, cost[tail | (high << shift)]))
                     .min_by(|a, b| a.1.total_cmp(&b.1))
                     .expect("at least one predecessor");
-                next[state] = best + error(weight, state);
-                row[state] = high as u8;
+                *best = value;
+                *high_out = high as u8;
+            }
+            for (state, slot) in next.iter_mut().enumerate() {
+                *slot = tail_cost[state >> self.symbol_bits] + error(weight, state);
             }
             std::mem::swap(&mut cost, &mut next);
         }
@@ -103,7 +110,7 @@ impl Trellis {
         let mut symbols = vec![0u8; weights.len() - 1];
         for step in (1..weights.len()).rev() {
             symbols[step - 1] = (state & symbol_mask) as u8;
-            let high = usize::from(back[(step - 1) * states + state]);
+            let high = usize::from(back[(step - 1) * tails + (state >> self.symbol_bits)]);
             state = (state >> self.symbol_bits) | (high << shift);
         }
         Encoded {

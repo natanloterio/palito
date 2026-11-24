@@ -93,6 +93,9 @@ pub(crate) struct Gguf {
     pub tensor_types: Vec<String>,
     pub file_bytes: u64,
     pub parameters: u64,
+    /// Absolute file offset and GGUF type of each tensor's data.
+    #[cfg_attr(not(feature = "qtip-research"), allow(dead_code))]
+    pub data_locations: HashMap<String, (usize, u32)>,
 }
 
 struct Reader<'a> {
@@ -533,7 +536,9 @@ impl Gguf {
         }
         let mut tensors = HashMap::new();
         let mut tensor_types = Vec::new();
+        let mut data_locations = HashMap::new();
         for (name, dims, elements, kind, offset, length, label) in entries {
+            data_locations.insert(name.clone(), (start + offset, kind));
             let (block, size, _) = layout(kind)?;
             let input = &bytes[start + offset..start + offset + length];
             let storage = if expand || kind == 0 || dims.len() == 1 {
@@ -576,6 +581,7 @@ impl Gguf {
             tensor_types,
             file_bytes: bytes.len() as u64,
             parameters,
+            data_locations,
         })
     }
 

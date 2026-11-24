@@ -17,15 +17,8 @@ const TENSORS: [&str; 4] = [
     "blk.15.ffn_gate.weight",
 ];
 
-/// Row-major `rows x cols` floats of one tensor (cols = GGUF dims[0]).
 fn load(model: &Gguf, name: &str) -> (Vec<f32>, usize, usize) {
-    let tensor = &model.tensors[name];
-    let (cols, rows) = (tensor.dims[0], tensor.dims[1]);
-    let mut values = vec![0.0; rows * cols];
-    for (r, row) in values.chunks_exact_mut(cols).enumerate() {
-        tensor.row(r, row);
-    }
-    (values, rows, cols)
+    super::model::matrix(&model.tensors[name])
 }
 
 #[test]

@@ -48,6 +48,15 @@ path = "src/bin/ktransformers.rs"
 required-features = ["ktransformers"]
 
 [[example]]
+name = "qtip-quantize"
+path = "examples/qtip_quantize.rs"
+required-features = ["qtip-research"]
+
+[[example]]
+name = "perplexity"
+path = "examples/perplexity.rs"
+
+[[example]]
 name = "trace-reference"
 path = "examples/trace_reference.rs"
 required-features = ["cuda"]

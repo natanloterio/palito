@@ -472,6 +472,8 @@ fn fold_qtip3_companions(tensors: &mut HashMap<String, Tensor>) -> Result<()> {
         let Storage::Packed { bytes, .. } = &mut tensor.storage else {
             unreachable!("filtered on packed QTIP3");
         };
+        // Exact capacity: device budgets count Vec capacity.
+        bytes.reserve_exact(4 * values.len());
         bytes.extend(values.iter().flat_map(|v| v.to_le_bytes()));
     }
     if let Some(orphan) = tensors.keys().find(|n| n.ends_with(QTIP3_COMPANION)) {

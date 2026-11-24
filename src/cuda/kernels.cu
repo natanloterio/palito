@@ -574,6 +574,27 @@ __device__ __forceinline__ float q8_0_row_part(const u8 *w, const float *x, u64 
     return warp_sum(acc);
 }
 
+// F16 row part: each lane converts 8 consecutive halves from one 16-byte load
+// (exact in F32), so a warp step covers 256 values. width % 256 == 0.
+__device__ __forceinline__ float f16_wide_row_part(const u8 *w, const float *x, u64 offset,
+                                                   int width, int lane, int part, int warps) {
+    const uint4 *row = (const uint4 *)(w + offset * 2);
+    float acc = 0.0f;
+    for (int i = part * 256 + lane * 8; i < width; i += warps * 256) {
+        uint4 packed = __ldg(row + i / 8);
+        float4 xa = *(const float4 *)(x + i);
+        float4 xb = *(const float4 *)(x + i + 4);
+        unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
+        float xs[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            acc += half_value_bits(words[j] & 0xffff) * xs[2 * j];
+            acc += half_value_bits(words[j] >> 16) * xs[2 * j + 1];
+        }
+    }
+    return warp_sum(acc);
+}
+
 // block=(256, 1, 1). F32 arithmetic; only the reduction order differs from matvec.
 extern "C" __global__ void matvec_packed_rows(const u8 *w, int kind, const float *x, float *y,
                                              int width, int rows, const int *ids,
@@ -595,6 +616,8 @@ extern "C" __global__ void matvec_packed_rows(const u8 *w, int kind, const float
             sum = q6k_wide_row_part(w, input, offset, width, lane, part, warps);
         } else if (kind == 8 && width % 32 == 0) {
             sum = q8_0_row_part(w, input, offset, width, lane, part, warps);
+        } else if (kind == 1 && width % 256 == 0) {
+            sum = f16_wide_row_part(w, input, offset, width, lane, part, warps);
         } else {
             switch (kind) {
 #define SCALAR_ROW(K) warp_scalar_row<K>(w, input, offset, width, lane, part, warps)

@@ -31,6 +31,14 @@ where
     values.iter_mut().for_each(|v| *v = *v * norm);
 }
 
+/// `fwht` on consecutive chunks of `block` values: `I (x) H_block`.
+fn blocked_fwht<T>(values: &mut [T], block: usize)
+where
+    T: Copy + Add<Output = T> + Sub<Output = T> + Mul<Output = T> + From<f32>,
+{
+    values.chunks_exact_mut(block).for_each(fwht);
+}
+
 /// Deterministic random signs (SplitMix64), so encoder and decoder agree on a seed.
 fn signs(count: usize, seed: u64) -> Vec<f32> {
     let mut state = seed;
@@ -45,24 +53,44 @@ fn signs(count: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-/// A two-sided RHT for a row-major `rows x cols` matrix.
+/// A two-sided RHT for a row-major `rows x cols` matrix. The Hadamard factors
+/// may be block-diagonal (`I (x) H_b`), which a GPU kernel can apply inside
+/// its own tile of the product instead of in separate passes.
 pub struct Incoherence {
     rows: usize,
     cols: usize,
+    row_block: usize,
+    col_block: usize,
     row_signs: Vec<f32>,
     col_signs: Vec<f32>,
 }
 
 impl Incoherence {
     pub fn new(rows: usize, cols: usize, seed: u64) -> Result<Self> {
+        Self::with_block(rows, cols, seed, None)
+    }
+
+    /// `block`: Hadamard block size (a power of two of at least 2), capped at
+    /// each dimension; `None` transforms whole rows and columns.
+    pub fn with_block(rows: usize, cols: usize, seed: u64, block: Option<usize>) -> Result<Self> {
         if !rows.is_power_of_two() || !cols.is_power_of_two() {
             return Err(Error::Invalid(format!(
                 "Hadamard incoherence needs power-of-two dimensions, got {rows} x {cols}"
             )));
         }
+        if let Some(b) = block
+            && (b < 2 || !b.is_power_of_two())
+        {
+            return Err(Error::Invalid(format!(
+                "Hadamard block must be a power of two >= 2, got {b}"
+            )));
+        }
+        let block = block.unwrap_or(usize::MAX);
         Ok(Self {
             rows,
             cols,
+            row_block: block.min(rows),
+            col_block: block.min(cols),
             row_signs: signs(rows, seed),
             col_signs: signs(cols, seed ^ 0xA5A5_A5A5_A5A5_A5A5),
         })
@@ -83,14 +111,16 @@ impl Incoherence {
 
     /// `M -> H_r M H_c`. Left and right multiplications commute.
     fn apply_hadamards(&self, matrix: &mut [f32]) {
-        matrix.chunks_exact_mut(self.cols).for_each(fwht);
+        matrix
+            .chunks_exact_mut(self.cols)
+            .for_each(|row| blocked_fwht(row, self.col_block));
         let mut column = vec![0.0; self.rows];
         for c in 0..self.cols {
             column
                 .iter_mut()
                 .enumerate()
                 .for_each(|(r, v)| *v = matrix[r * self.cols + c]);
-            fwht(&mut column);
+            blocked_fwht(&mut column, self.row_block);
             column
                 .iter()
                 .enumerate()
@@ -118,7 +148,7 @@ impl Incoherence {
                 row.iter_mut()
                     .zip(&self.col_signs)
                     .for_each(|(v, &s)| *v *= f64::from(s));
-                fwht(row);
+                blocked_fwht(row, self.col_block);
             });
         };
         let mut a = h.to_vec();
@@ -224,6 +254,38 @@ mod tests {
         assert!((0..cols).all(|i| {
             (0..cols).all(|j| (rotated_h[i * cols + j] - rotated_h[j * cols + i]).abs() < 1e-9)
         }));
+    }
+
+    #[test]
+    fn blocked_transform_inverts_keeps_the_proxy_loss_and_stays_in_blocks() {
+        let (rows, cols) = (8, 16);
+        let w = matrix(rows, cols);
+        let rht = Incoherence::with_block(rows, cols, 3, Some(4)).unwrap();
+        let back = rht.inverse(&rht.forward(&w));
+        assert!(w.iter().zip(&back).all(|(a, b)| (a - b).abs() < 1e-4));
+        // A unit vector in column 5 only spreads within columns 4..8.
+        let mut e = vec![0.0f64; cols * cols];
+        e[5 * cols + 5] = 1.0;
+        let h = rht.transform_hessian(&e);
+        for i in 0..cols {
+            for j in 0..cols {
+                if h[i * cols + j] != 0.0 {
+                    assert!((4..8).contains(&i) && (4..8).contains(&j), "({i}, {j})");
+                }
+            }
+        }
+        assert_ne!(
+            rht.forward(&w),
+            Incoherence::new(rows, cols, 3).unwrap().forward(&w)
+        );
+        assert!(Incoherence::with_block(rows, cols, 3, Some(3)).is_err());
+        // A block of at least the dimension is the full transform.
+        assert_eq!(
+            Incoherence::with_block(rows, cols, 3, Some(64))
+                .unwrap()
+                .forward(&w),
+            Incoherence::new(rows, cols, 3).unwrap().forward(&w)
+        );
     }
 
     #[test]

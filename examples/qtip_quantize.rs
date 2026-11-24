@@ -44,6 +44,9 @@ struct Args {
     /// LDLQ damping, relative to the mean of diag(H).
     #[arg(long, default_value_t = 0.01)]
     damping: f32,
+    /// Block-diagonal Hadamard of this size (power of two); default: whole rows/columns.
+    #[arg(long)]
+    hadamard_block: Option<usize>,
     #[arg(long, default_value_t = 0x5EED)]
     seed: u64,
 }
@@ -74,6 +77,7 @@ fn main() -> palito::Result<()> {
         method,
         args.seed,
         hessians.as_ref(),
+        args.hadamard_block,
         |report, done, total| {
             let proxy = report
                 .proxy_error

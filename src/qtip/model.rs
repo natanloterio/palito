@@ -127,6 +127,7 @@ fn reconstruct(
     method: Method,
     seed: u64,
     h: Option<&[f64]>,
+    hadamard_block: Option<usize>,
 ) -> Result<Vec<f32>> {
     if let Method::Noise { relative } = method {
         let sigma = super::matrix::rms(weights) * relative.sqrt();
@@ -137,7 +138,7 @@ fn reconstruct(
             .map(|(w, n)| w + sigma * n)
             .collect());
     }
-    let rht = Incoherence::new(rows, cols, seed)?;
+    let rht = Incoherence::with_block(rows, cols, seed, hadamard_block)?;
     let rotated = rht.forward(weights);
     let quantized = match method {
         Method::Trellis {
@@ -179,6 +180,7 @@ pub fn quantize_gguf(
     method: Method,
     seed: u64,
     hessians: Option<&Hessians>,
+    hadamard_block: Option<usize>,
     mut progress: impl FnMut(&TensorReport, usize, usize),
 ) -> Result<Vec<TensorReport>> {
     if output.exists() {
@@ -219,7 +221,15 @@ pub fn quantize_gguf(
         let h = hessians
             .map(|set| set.load(name, cols, damping))
             .transpose()?;
-        let reconstructed = reconstruct(&weights, rows, cols, method, tensor_seed, h.as_deref())?;
+        let reconstructed = reconstruct(
+            &weights,
+            rows,
+            cols,
+            method,
+            tensor_seed,
+            h.as_deref(),
+            hadamard_block,
+        )?;
         let bytes: Vec<u8> = reconstructed
             .iter()
             .flat_map(|&v| f16::from_f32(v).to_bits().to_le_bytes())
@@ -302,7 +312,7 @@ mod tests {
             state_bits: 8,
             symbol_bits: 2,
         };
-        let reports = quantize_gguf(&input, &output, method, 1, None, |_, _, _| {}).unwrap();
+        let reports = quantize_gguf(&input, &output, method, 1, None, None, |_, _, _| {}).unwrap();
         assert_eq!(reports.len(), 1);
         assert!(reports[0].relative_error > 0.0 && reports[0].relative_error < 0.2);
 
@@ -319,7 +329,7 @@ mod tests {
         let written = matrix(&after.tensors["blk.0.attn_q.weight"]).0;
         assert!((distortion(&q, &written).relative - reports[0].relative_error).abs() < 1e-3);
 
-        assert!(quantize_gguf(&input, &output, method, 1, None, |_, _, _| {}).is_err());
+        assert!(quantize_gguf(&input, &output, method, 1, None, None, |_, _, _| {}).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

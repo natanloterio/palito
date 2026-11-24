@@ -753,6 +753,21 @@ impl CudaBackend {
                         &n,
                         &count
                     );
+                } else if self.matmul.kv_f16() && dim == 64 && heads == 4 * kv_heads {
+                    // int8-fast GQA group 4, head_dim 64: 16 tokens x 4 heads per block.
+                    launch!(
+                        self,
+                        "attention_prefill_mma_fast_g4d64_f16",
+                        (kv_heads as u32, (n as u32).div_ceil(16), 1); 128,
+                        &self.work.q,
+                        &self.keys[index],
+                        &self.values[index],
+                        &mut self.work.attended,
+                        &heads,
+                        &kv_heads,
+                        &n,
+                        &count
+                    );
                 } else if self.matmul.kv_f16() && dim == 96 && heads == kv_heads {
                     launch!(
                         self,

@@ -1273,6 +1273,7 @@ impl CudaBackend {
                     "attention_prefill_mma_fast4_f16",
                     "attention_prefill_mma_fast_mha_f16",
                     "attention_prefill_mma_fast_mha96_f16",
+                    "attention_prefill_mma_fast_g4d64_f16",
                     "attention_decode_mma_f16",
                     "attention_decode_mma_decode_f16",
                     "attention_combine_rows",

@@ -1377,8 +1377,15 @@ impl CudaBackend {
         let mut weights = Weights::open(path, config)?;
         let s = &weights.spec;
         let has_qtip = s.info.tensor_types.iter().any(|kind| kind == "QTIP3");
-        if has_qtip && !matches!(options.matmul, CudaMatmul::F32 | CudaMatmul::F32Tiled) {
-            return Err(invalid("QTIP3 CUDA requires --cuda-matmul f32 or f32-tiled"));
+        if has_qtip
+            && !matches!(
+                options.matmul,
+                CudaMatmul::F32 | CudaMatmul::F32Tiled | CudaMatmul::Int8Fast
+            )
+        {
+            return Err(invalid(
+                "QTIP3 CUDA requires --cuda-matmul f32, f32-tiled or int8-fast",
+            ));
         }
         if matches!(
             s.info.architecture.as_str(),

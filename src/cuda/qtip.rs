@@ -99,6 +99,12 @@ const MATMUL_TOKENS: usize = 128;
 const MATMUL_STEP_TILES: usize = 2;
 /// Warps (16 rows each) per `qtip_matmul_mma` block (QTIP_MMA_WARPS).
 const MATMUL_WARPS: usize = 4;
+/// `qtip_matmul_i8`: tokens and warps per block (QTIP_I8_TOKENS,
+/// QTIP_I8_WARPS), and the widest input `qtip_rotate_input_i8` holds in
+/// registers (QTIP_I8_MAX_CHUNKS 256-chunks).
+const MATMUL_I8_TOKENS: usize = 128;
+const MATMUL_I8_WARPS: usize = 4;
+const MATMUL_I8_MAX_CHUNKS: usize = 32;
 /// Prefill matmul blocks the K split aims for, and the scratch it may use.
 const MATMUL_TARGET_BLOCKS: usize = 1024;
 const MATMUL_SCRATCH_FLOATS: usize = 16 << 20;
@@ -130,11 +136,36 @@ pub(super) struct QtipKernel {
     multi_swiglu: CudaFunction,
     rotate_input: CudaFunction,
     rotate_output: CudaFunction,
-    mma: CudaFunction,
+    product: CudaFunction,
     /// Prefill scratch, grown on demand: rotated FP16 inputs and the rotated
     /// F32 product.
     rotated_input: Option<CudaSlice<u16>>,
-    rotated_output: Option<CudaSlice<f32>>,
+    partial_output: Option<CudaSlice<f32>>,
+    rotate_input_i8: CudaFunction,
+    product_i8: CudaFunction,
+    quantized_input: Option<CudaSlice<i8>>,
+    input_scales: Option<CudaSlice<f32>>,
+}
+
+/// `slot`, reallocated (zeroed) when shorter than `len`.
+fn grown<'a, T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+    slot: &'a mut Option<CudaSlice<T>>,
+    len: usize,
+    stream: &Arc<CudaStream>,
+) -> Result<&'a mut CudaSlice<T>> {
+    if slot.as_ref().is_none_or(|b| b.len() < len) {
+        *slot = Some(stream.alloc_zeros(len).map_err(failure)?);
+    }
+    Ok(slot.as_mut().expect("allocated above"))
+}
+
+/// One warp per 256-chunk of each token row, eight warps per block.
+fn rotate_config(width: usize, tokens: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((width / CHUNK).div_ceil(8) as u32, tokens as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    }
 }
 
 impl QtipKernel {
@@ -174,7 +205,11 @@ impl QtipKernel {
         let rotate_output = module
             .load_function("qtip_rotate_output")
             .map_err(failure)?;
-        let mma = module.load_function("qtip_matmul_mma").map_err(failure)?;
+        let product = module.load_function("qtip_matmul_mma").map_err(failure)?;
+        let rotate_input_i8 = module
+            .load_function("qtip_rotate_input_i8")
+            .map_err(failure)?;
+        let product_i8 = module.load_function("qtip_matmul_i8").map_err(failure)?;
         let tensors: Vec<&DeviceTensor> = tensors.filter(|t| t.qtip.is_some()).collect();
         let shared = tensors
             .iter()
@@ -207,9 +242,13 @@ impl QtipKernel {
             multi_swiglu,
             rotate_input,
             rotate_output,
-            mma,
+            product,
             rotated_input: None,
-            rotated_output: None,
+            partial_output: None,
+            rotate_input_i8,
+            product_i8,
+            quantized_input: None,
+            input_scales: None,
         })
     }
 
@@ -325,9 +364,13 @@ impl QtipKernel {
         Ok(())
     }
 
-    /// `y[t * rows + r] = (W x_t)[r]` for `tokens` token-major inputs (prefill),
-    /// on FP16 tensor cores: the inputs are rounded to FP16 after rotation,
-    /// the weights are exact, sums are F32. Needs sm_80+ and rows % 64 == 0.
+    /// `y[t * rows + r] = (W x_t)[r]` for `tokens` token-major inputs
+    /// (prefill) on tensor cores (`src/qtip/matmul.cu`). Exact weights and
+    /// FP16 inputs after rotation (about 2e-4 from the decode matvec), or
+    /// with `fast` (int8-fast) int8 weights round(code / 4) and int8 inputs
+    /// (about 1.2%, twice as fast). Needs sm_80+, rows % 64 == 0 and, with
+    /// `fast`, at most 8192 columns.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn matmul(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -335,89 +378,90 @@ impl QtipKernel {
         x: &CudaSlice<f32>,
         y: &mut CudaSlice<f32>,
         tokens: usize,
+        fast: bool,
     ) -> Result<()> {
         let q = tensor
             .qtip
             .as_ref()
             .ok_or_else(|| invalid("QTIP3 matmul needs a QTIP3 tensor"))?;
         let (rows, cols) = (tensor.rows as usize, tensor.width as usize);
-        if rows % 64 != 0 || cols % CHUNK != 0 {
+        let (warps, block_tokens) = if fast {
+            (MATMUL_I8_WARPS, MATMUL_I8_TOKENS)
+        } else {
+            (MATMUL_WARPS, MATMUL_TOKENS)
+        };
+        let row_block = 16 * warps;
+        if !rows.is_multiple_of(row_block) || !cols.is_multiple_of(CHUNK) {
             return Err(invalid("QTIP3 matmul needs rows % 64 and cols % 256 == 0"));
+        }
+        if fast && cols / CHUNK > MATMUL_I8_MAX_CHUNKS {
+            return Err(invalid("QTIP3 int8 matmul supports up to 8192 columns"));
         }
         if x.len() < tokens * cols || y.len() < tokens * rows {
             return Err(invalid("QTIP3 matmul buffers are too small"));
         }
         let col_tiles = cols / TILE;
-        let row_block = 16 * MATMUL_WARPS;
-        if rows % row_block != 0 {
-            return Err(invalid(
-                "QTIP3 matmul rows must be a multiple of the row block",
-            ));
-        }
-        let blocks = (rows / row_block) * tokens.div_ceil(MATMUL_TOKENS);
+        let blocks = (rows / row_block) * tokens.div_ceil(block_tokens);
         let split_tiles = matmul_split_tiles(col_tiles, blocks, tokens * rows);
         let splits = col_tiles.div_ceil(split_tiles);
-        let grow = |len: usize, need: usize| len < need;
-        if self
-            .rotated_input
-            .as_ref()
-            .is_none_or(|b| grow(b.len(), tokens * cols))
-        {
-            self.rotated_input = Some(stream.alloc_zeros(tokens * cols).map_err(failure)?);
-        }
-        let planes = splits * tokens * rows;
-        if self
-            .rotated_output
-            .as_ref()
-            .is_none_or(|b| grow(b.len(), planes))
-        {
-            self.rotated_output = Some(stream.alloc_zeros(planes).map_err(failure)?);
-        }
-        let (xr, yr) = (
-            self.rotated_input.as_mut().unwrap(),
-            self.rotated_output.as_mut().unwrap(),
-        );
-        let col_signs = q.signs.slice(rows..);
+        let partial = grown(&mut self.partial_output, splits * tokens * rows, stream)?;
         let (cols_i, rows_i, tokens_i) = (cols as i32, rows as i32, tokens as i32);
-        let chunks = |n: usize| (n / CHUNK).div_ceil(8) as u32;
-        let rotate = |n: usize| LaunchConfig {
-            grid_dim: (chunks(n), tokens as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut args = stream.launch_builder(&self.rotate_input);
-        args.arg(x).arg(&col_signs).arg(&mut *xr).arg(&cols_i);
-        // Bounds checked above; x and xr hold tokens * cols values.
-        unsafe { args.launch(rotate(cols)) }.map_err(failure)?;
-        let mut args = stream.launch_builder(&self.mma);
-        args.arg(&tensor.bytes).arg(&*xr).arg(&mut *yr);
         let (split_tiles_i, splits_i) = (split_tiles as i32, splits as i32);
-        args.arg(&cols_i)
-            .arg(&rows_i)
-            .arg(&tokens_i)
-            .arg(&split_tiles_i);
-        let config = LaunchConfig {
+        let col_signs = q.signs.slice(rows..);
+        let product = LaunchConfig {
             grid_dim: (
                 (rows / row_block) as u32,
-                tokens.div_ceil(MATMUL_TOKENS) as u32,
+                tokens.div_ceil(block_tokens) as u32,
                 splits as u32,
             ),
-            block_dim: (32 * MATMUL_WARPS as u32, 1, 1),
+            block_dim: (32 * warps as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        // tensor.bytes holds rows / 16 row groups of cols / 16 tiles; yr
-        // holds `splits` planes of tokens * rows values.
-        unsafe { args.launch(config) }.map_err(failure)?;
-        let scale16 = q.scale * 16.0;
+        // Launch bounds: x holds tokens * cols values and y tokens * rows
+        // (checked); tensor.bytes holds rows / 16 row groups of cols / 16
+        // tiles; `partial` holds `splits` planes of tokens * rows values and
+        // split_tiles is a multiple of both kernels' tiles per step.
+        let output_scale = if fast {
+            let quantized = grown(&mut self.quantized_input, tokens * cols, stream)?;
+            let scales = grown(&mut self.input_scales, tokens, stream)?;
+            let mut args = stream.launch_builder(&self.rotate_input_i8);
+            args.arg(x)
+                .arg(&col_signs)
+                .arg(&mut *quantized)
+                .arg(&mut *scales);
+            args.arg(&cols_i);
+            let config = LaunchConfig {
+                grid_dim: (tokens as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(config) }.map_err(failure)?;
+            let mut args = stream.launch_builder(&self.product_i8);
+            args.arg(&tensor.bytes).arg(&*quantized).arg(&*scales);
+            args.arg(&mut *partial).arg(&cols_i).arg(&rows_i);
+            args.arg(&tokens_i).arg(&split_tiles_i);
+            unsafe { args.launch(product) }.map_err(failure)?;
+            q.scale
+        } else {
+            let rotated = grown(&mut self.rotated_input, tokens * cols, stream)?;
+            let mut args = stream.launch_builder(&self.rotate_input);
+            args.arg(x).arg(&col_signs).arg(&mut *rotated).arg(&cols_i);
+            unsafe { args.launch(rotate_config(cols, tokens)) }.map_err(failure)?;
+            let mut args = stream.launch_builder(&self.product);
+            args.arg(&tensor.bytes).arg(&*rotated).arg(&mut *partial);
+            args.arg(&cols_i)
+                .arg(&rows_i)
+                .arg(&tokens_i)
+                .arg(&split_tiles_i);
+            unsafe { args.launch(product) }.map_err(failure)?;
+            // X' was divided by 16 to stay well inside the FP16 range.
+            q.scale * 16.0
+        };
         let mut args = stream.launch_builder(&self.rotate_output);
-        args.arg(&*yr)
-            .arg(&q.signs)
-            .arg(y)
-            .arg(&rows_i)
-            .arg(&scale16);
-        args.arg(&splits_i).arg(&tokens_i);
-        // Bounds checked above; row signs are the first rows values.
-        unsafe { args.launch(rotate(rows)) }.map_err(failure)?;
+        args.arg(&*partial).arg(&q.signs).arg(y).arg(&rows_i);
+        args.arg(&output_scale).arg(&splits_i).arg(&tokens_i);
+        // Row signs are the first `rows` values of q.signs.
+        unsafe { args.launch(rotate_config(rows, tokens)) }.map_err(failure)?;
         Ok(())
     }
 
@@ -520,14 +564,20 @@ mod tests {
             .map(|(i, &(c, r))| random_tensor(c, r, i as u64 + 1, &stream))
             .collect();
         let mut kernel = QtipKernel::load(&context, (major, minor), None, tensors.iter())?;
-        for (tensor, &(cols, rows)) in tensors.iter().zip(&shapes) {
+        // Exact path, then int8-fast (looser bound).
+        let cases = [(false, 1e-3), (true, 0.02)];
+        for ((tensor, &(cols, rows)), &(fast, bound)) in tensors
+            .iter()
+            .zip(&shapes)
+            .flat_map(|t| cases.iter().map(move |c| (t, c)))
+        {
             for tokens in [3, 130] {
                 let host: Vec<f32> = (0..tokens * cols)
                     .map(|i| ((i * 7919 % 2003) as f32 - 1001.0) / 500.0)
                     .collect();
                 let x = stream.clone_htod(&host).map_err(failure)?;
                 let mut y = stream.alloc_zeros::<f32>(tokens * rows).map_err(failure)?;
-                kernel.matmul(&stream, tensor, &x, &mut y, tokens)?;
+                kernel.matmul(&stream, tensor, &x, &mut y, tokens, fast)?;
                 let batched = stream.clone_dtoh(&y).map_err(failure)?;
                 let (mut error, mut norm) = (0.0f64, 0.0f64);
                 for t in 0..tokens {
@@ -542,11 +592,11 @@ mod tests {
                         norm += f64::from(*b).powi(2);
                     }
                 }
-                // FP16 inputs after rotation, exact weights: about 2e-4.
+                // About 2e-4 exact, 1.2% int8-fast.
                 let relative = (error / norm).sqrt();
                 assert!(
-                    relative < 1e-3,
-                    "{cols}x{rows}, {tokens} tokens: {relative}"
+                    relative < bound,
+                    "{cols}x{rows}, {tokens} tokens, fast {fast}: {relative}"
                 );
             }
         }

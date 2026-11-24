@@ -242,3 +242,187 @@ qtip_matmul_mma(const unsigned* __restrict__ tiles, const qtip_f16* __restrict__
         }
     }
 }
+
+// ---- int8-fast profile -----------------------------------------------------
+// The llama.cpp-precision variant (--cuda-matmul int8-fast): weights
+// round(code / 4) in int8, inputs X' = H D_c X quantized per token,
+// q = round(X' / s_t) with s_t = max|X'_t| / 127; Y' = 4 s_t (W8 q) exact in
+// int32. About 1.2% from the exact product (the code / 4 rounding and the
+// int8 inputs about equally); measured +0.6% wiki perplexity with half the
+// FP16 kernel's time. Same three steps, with qtip_rotate_output taking
+// scale (not 16 scale): X' is not divided by 16 here.
+
+#define QTIP_I8_MAX_CHUNKS 32
+#define QTIP_I8_TOKENS 128
+#define QTIP_I8_WARPS 4
+
+// grid tokens, block 256 (8 warps; warp w rotates chunks w, w + 8, ...):
+// xq[t * cols + c] int8, scales[t] = s_t.
+extern "C" __global__ void __launch_bounds__(256)
+qtip_rotate_input_i8(const float* __restrict__ x, const float* __restrict__ col_signs,
+                     signed char* __restrict__ xq, float* __restrict__ scales, int cols) {
+    __shared__ float maxima[8];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int chunks = cols / QTIP_CHUNK;
+    const size_t row = (size_t)blockIdx.x * cols;
+    float v[QTIP_I8_MAX_CHUNKS / 8][8];
+    float peak = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QTIP_I8_MAX_CHUNKS / 8; ++i) {
+        const int chunk = warp + 8 * i;
+        if (chunk < chunks) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int c = chunk * QTIP_CHUNK + lane + 32 * e;
+                v[i][e] = x[row + c] * col_signs[c];
+            }
+            qtip_fwht256_warp(v[i]);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                peak = fmaxf(peak, fabsf(v[i][e]));
+            }
+        }
+    }
+#pragma unroll
+    for (int span = 16; span > 0; span >>= 1) {
+        peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, span));
+    }
+    if (lane == 0) {
+        maxima[warp] = peak;
+    }
+    __syncthreads();
+    peak = maxima[0];
+#pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        peak = fmaxf(peak, maxima[w]);
+    }
+    const float scale = peak / 127.0f;
+    const float inverse = peak > 0.0f ? 127.0f / peak : 0.0f;
+    if (threadIdx.x == 0) {
+        scales[blockIdx.x] = scale;
+    }
+#pragma unroll
+    for (int i = 0; i < QTIP_I8_MAX_CHUNKS / 8; ++i) {
+        const int chunk = warp + 8 * i;
+        if (chunk < chunks) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                xq[row + chunk * QTIP_CHUNK + lane + 32 * e] =
+                    (signed char)__float2int_rn(v[i][e] * inverse);
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ void qtip_mma_i8(int (&c)[4], const unsigned (&a)[4], unsigned b0,
+                                            unsigned b1) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
+}
+
+// Eight int8 weights round(code / 4) of one lane's half tile row, packed.
+__device__ __forceinline__ uint2 qtip_decode_i8(unsigned word, int hi_word, int lo_word,
+                                                int shift) {
+    const unsigned hi = __shfl_sync(0xffffffffu, word, hi_word);
+    const unsigned lo = __shfl_sync(0xffffffffu, word, lo_word);
+    const unsigned top = __funnelshift_l(lo, hi, shift);
+    const unsigned low = lo << shift;
+    unsigned packed[2] = {0u, 0u};
+#pragma unroll
+    for (int j = 0; j < QTIP_PER_LANE; ++j) {
+        const int end = QTIP_K * j + QTIP_L;
+        const unsigned field =
+            end <= 32 ? (top >> (32 - end)) : __funnelshift_l(low, top, end - 32);
+        const int q = min(__float2int_rn(qtip_code(field & ((1u << QTIP_L) - 1u)) * 0.25f), 127);
+        packed[j / 4] |= (unsigned)(q & 0xff) << (8 * (j % 4));
+    }
+    return make_uint2(packed[0], packed[1]);
+}
+
+// grid (rows / 64, ceil(tokens / 128), splits), block 128, split_tiles even:
+// as qtip_matmul_mma on int8. Each step covers two column tiles (32 columns,
+// one mma.m16n8k32 per 8 tokens); plane z of yr gets 4 s_t (W8 q).
+extern "C" __global__ void __launch_bounds__(QTIP_I8_WARPS * 32)
+qtip_matmul_i8(const unsigned* __restrict__ tiles, const signed char* __restrict__ xq,
+               const float* __restrict__ scales, float* __restrict__ yr, int cols, int rows,
+               int tokens, int split_tiles) {
+    // 32 bytes per row plus 16 of padding: conflict-free ldmatrix.
+    constexpr int stride = 48;
+    __shared__ __align__(16) signed char xs[2][QTIP_I8_TOKENS][stride];
+    __shared__ __align__(16) signed char ws[2][QTIP_I8_WARPS][QTIP_TILE][stride];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int col_tiles = cols / QTIP_TILE;
+    const int group = blockIdx.x * QTIP_I8_WARPS + warp;
+    const int token0 = blockIdx.y * QTIP_I8_TOKENS;
+    const int k0 = blockIdx.z * split_tiles;
+    const int steps = (min(k0 + split_tiles, col_tiles) - k0) / 2;
+    const unsigned* base = tiles + ((size_t)group * col_tiles + k0) * QTIP_WORDS;
+    yr += (size_t)blockIdx.z * tokens * rows;
+    const int first = lane * QTIP_PER_LANE;
+    const int bit = first * QTIP_K;
+    const int hi_word = bit / 32, shift = bit % 32;
+    const int lo_word = min(hi_word + 1, 31);
+    const int w_row = first / QTIP_TILE, w_col = first % QTIP_TILE;
+    const int x_token = threadIdx.x;
+    const bool x_valid = token0 + x_token < tokens;
+    const uint4* x_src =
+        reinterpret_cast<const uint4*>(xq + (size_t)(token0 + x_token) * cols + k0 * QTIP_TILE);
+    const int m = lane / 8, r = lane % 8;
+    const int a_row = r + (m % 2) * 8, a_col = (m / 2) * 16;
+    const int b_token = (m / 2) * 8 + r, b_col = (m % 2) * 16;
+
+    int c[QTIP_I8_TOKENS / 8][4] = {};
+    const uint4 zero = make_uint4(0, 0, 0, 0);
+    const bool loads = lane < QTIP_WORDS;
+    unsigned w0 = loads ? __ldg(base + lane) : 0u;
+    unsigned w1 = loads ? __ldg(base + QTIP_WORDS + lane) : 0u;
+    uint4 x_lo = x_valid ? x_src[0] : zero, x_hi = x_valid ? x_src[1] : zero;
+    for (int k = 0; k < steps; ++k) {
+        const int b = k & 1;
+        *reinterpret_cast<uint4*>(&xs[b][x_token][0]) = x_lo;
+        *reinterpret_cast<uint4*>(&xs[b][x_token][16]) = x_hi;
+        const unsigned u0 = w0, u1 = w1;
+        if (k + 1 < steps) {
+            const unsigned* next = base + (size_t)(2 * k + 2) * QTIP_WORDS;
+            w0 = loads ? __ldg(next + lane) : 0u;
+            w1 = loads ? __ldg(next + QTIP_WORDS + lane) : 0u;
+            x_lo = x_valid ? x_src[2 * (k + 1)] : zero;
+            x_hi = x_valid ? x_src[2 * (k + 1) + 1] : zero;
+        }
+        *reinterpret_cast<uint2*>(&ws[b][warp][w_row][w_col]) =
+            qtip_decode_i8(u0, hi_word, lo_word, shift);
+        *reinterpret_cast<uint2*>(&ws[b][warp][w_row][16 + w_col]) =
+            qtip_decode_i8(u1, hi_word, lo_word, shift);
+        __syncthreads();
+        unsigned a[4];
+        qtip_ldmatrix4(a, &ws[b][warp][a_row][a_col]);
+#pragma unroll
+        for (int n = 0; n < QTIP_I8_TOKENS / 8; n += 2) {
+            unsigned bf[4];
+            qtip_ldmatrix4(bf, &xs[b][n * 8 + b_token][b_col]);
+            qtip_mma_i8(c[n], a, bf[0], bf[1]);
+            qtip_mma_i8(c[n + 1], a, bf[2], bf[3]);
+        }
+    }
+    const int g = lane / 4, t = lane % 4;
+    const int row = group * QTIP_TILE + g;
+#pragma unroll
+    for (int n = 0; n < QTIP_I8_TOKENS / 8; ++n) {
+        const int token = token0 + n * 8 + 2 * t;
+        if (token < tokens) {
+            const float s = 4.0f * scales[token];
+            yr[(size_t)token * rows + row] = (float)c[n][0] * s;
+            yr[(size_t)token * rows + row + 8] = (float)c[n][2] * s;
+        }
+        if (token + 1 < tokens) {
+            const float s = 4.0f * scales[token + 1];
+            yr[(size_t)(token + 1) * rows + row] = (float)c[n][1] * s;
+            yr[(size_t)(token + 1) * rows + row + 8] = (float)c[n][3] * s;
+        }
+    }
+}

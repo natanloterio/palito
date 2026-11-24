@@ -13,7 +13,10 @@
  *  - Strings are UTF-8. Text passed to callbacks is not NUL-terminated.
  *  - A palito_engine must not be used from two threads at the same time.
  *    Separate engines are independent.
- *  - ABI: struct layouts never change; new options come as new functions.
+ *  - ABI: existing struct fields never move. Since 0.5.0, palito_generation
+ *    has new fields appended (min_p ... logit_bias_count), so programs built
+ *    against an older header must be rebuilt: palito_generation_init fills
+ *    the whole current struct.
  */
 #ifndef PALITO_H
 #define PALITO_H
@@ -55,6 +58,16 @@ typedef struct {
 } palito_message;
 
 typedef struct {
+    int32_t token;            /* token id, below the vocabulary size */
+    float bias;               /* added to the token's logit; -INFINITY bans it */
+} palito_logit_bias;
+
+/*
+ * Sampling runs in llama.cpp's order: logit bias, penalties, top_k, top_p,
+ * min_p, temperature. Penalties or biases make even greedy decoding copy the
+ * logits to the host each token (slower than plain greedy on CUDA).
+ */
+typedef struct {
     uint32_t max_tokens;      /* 0: until end of turn or a full context */
     int enable_thinking;      /* nonzero: reasoning on (Qwen3-style templates) */
     float temperature;        /* 0: greedy (default) */
@@ -63,6 +76,13 @@ typedef struct {
     int64_t seed;             /* negative: a different seed every call */
     const char *const *stop;  /* stop sequences; generation ends at the first, */
     size_t stop_count;        /* which is not included in the text (max 16) */
+    float min_p;              /* in [0, 1]: drop tokens below min_p * p(best); 0: off */
+    float repeat_penalty;     /* > 0, llama.cpp repeat penalty; 1: off */
+    uint32_t repeat_last_n;   /* tokens (prompt included) penalized; 0: penalties off (default 64) */
+    float presence_penalty;   /* subtracted once per token in the window; 0: off */
+    float frequency_penalty;  /* subtracted per occurrence in the window; 0: off */
+    const palito_logit_bias *logit_bias; /* added to the logits first */
+    size_t logit_bias_count;
 } palito_generation;
 
 typedef struct {

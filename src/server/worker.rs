@@ -77,6 +77,7 @@ pub(super) struct Job {
 pub struct ModelReport {
     /// Per slot.
     pub context_tokens: u32,
+    pub vocab_tokens: u32,
     pub slots: u32,
     pub profile: &'static str,
     pub has_chat_template: bool,
@@ -182,6 +183,7 @@ fn report<B: Backend + ?Sized>(engine: &Engine<B>, slots: u32) -> ModelReport {
     }
     ModelReport {
         context_tokens: engine.context_tokens(),
+        vocab_tokens: engine.vocab_tokens(),
         slots,
         profile: engine.profile(),
         has_chat_template: engine.has_chat_template(),

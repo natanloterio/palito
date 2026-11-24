@@ -66,6 +66,7 @@ function load() {
     kernel_cache_dir: 'const char *',
   });
   const Message = koffi.struct('palito_message', { role: 'const char *', content: 'const char *' });
+  koffi.struct('palito_logit_bias', { token: 'int32_t', bias: 'float' });
   const Generation = koffi.struct('palito_generation', {
     max_tokens: 'uint32_t',
     enable_thinking: 'int',
@@ -75,6 +76,13 @@ function load() {
     seed: 'int64_t',
     stop: 'const char **',
     stop_count: 'size_t',
+    min_p: 'float',
+    repeat_penalty: 'float',
+    repeat_last_n: 'uint32_t',
+    presence_penalty: 'float',
+    frequency_penalty: 'float',
+    logit_bias: 'const palito_logit_bias *',
+    logit_bias_count: 'size_t',
   });
   const Result = koffi.struct('palito_result', {
     text: 'void *',
@@ -165,7 +173,9 @@ class Palito {
 
   /**
    * Replies to messages ([{role, content}]) with the model's chat template.
-   * options: { maxTokens, thinking (true), temperature (0: greedy), topP, topK, seed,
+   * options: { maxTokens, thinking (true), temperature (0: greedy), topP, topK, minP,
+   *            repeatPenalty, repeatLastN (64), presencePenalty, frequencyPenalty,
+   *            logitBias: { [tokenId]: bias } (-Infinity bans), seed,
    *            stop: string[], onText(text) → return false to stop }
    */
   chat(messages, options = {}) {
@@ -232,12 +242,21 @@ class Palito {
     const generation = {};
     native.generationInit(generation);
     const stop = options.stop || [];
+    const logitBias = Object.entries(options.logitBias || {})
+      .map(([token, bias]) => ({ token: Number(token), bias }));
     Object.assign(generation, {
       max_tokens: options.maxTokens || 0,
       enable_thinking: options.thinking === false ? 0 : 1,
       temperature: options.temperature ?? 0,
       top_p: options.topP ?? 1,
       top_k: options.topK ?? 0,
+      min_p: options.minP ?? generation.min_p,
+      repeat_penalty: options.repeatPenalty ?? generation.repeat_penalty,
+      repeat_last_n: options.repeatLastN ?? generation.repeat_last_n,
+      presence_penalty: options.presencePenalty ?? generation.presence_penalty,
+      frequency_penalty: options.frequencyPenalty ?? generation.frequency_penalty,
+      logit_bias: logitBias.length ? logitBias : null,
+      logit_bias_count: logitBias.length,
       seed: options.seed ?? -1,
       stop: stop.length ? stop : null,
       stop_count: stop.length,

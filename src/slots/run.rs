@@ -46,11 +46,12 @@ impl SlotRun {
     pub(crate) fn new(
         prompt: Vec<i32>,
         budget: u32,
-        sampler: Sampler,
+        mut sampler: Sampler,
         constraint: Option<Box<dyn LogitConstraint>>,
         output: Box<dyn ReplyOutput>,
         eog: Arc<[i32]>,
     ) -> Self {
+        sampler.begin(&prompt);
         Self {
             prompt,
             budget: budget as usize,
@@ -108,7 +109,10 @@ impl SlotRun {
     ) -> Result<Advance> {
         let next = match next {
             Some(next) => next,
-            None => self.restore(backend)?,
+            None => {
+                self.sampler.check_vocabulary(backend.info().vocab_tokens)?;
+                self.restore(backend)?
+            }
         };
         let turn = PROMPT_TURN_TOKENS.min(backend.info().batch_tokens) as usize;
         // Blocks aligned to position 0, so a restored prefix evaluates the same blocks.
@@ -196,10 +200,12 @@ impl SlotRun {
             return Err(Error::Backend("logits do not cover the vocabulary".into()));
         }
         let sampler = &mut self.sampler;
-        match &mut self.constraint {
-            None => sampler.sample(logits),
-            Some(constraint) => constraint.sample(logits, &mut |masked| sampler.sample(masked)),
-        }
+        let token = match &mut self.constraint {
+            None => sampler.sample(logits)?,
+            Some(constraint) => constraint.sample(logits, &mut |masked| sampler.sample(masked))?,
+        };
+        sampler.accept(token);
+        Ok(token)
     }
 
     fn deliver(&mut self, token: i32) -> Result<()> {

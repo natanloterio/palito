@@ -296,7 +296,7 @@ fn stepped_path_matches_the_executor() {
         assert_eq!(*record.tokens.borrow(), greedy.generated_tokens);
 
         let sampling = Sampling { temperature: 0.8, seed: Some(11), ..Sampling::GREEDY };
-        let mut sampler = Sampler::new(sampling).unwrap();
+        let mut sampler = Sampler::new(sampling.clone()).unwrap();
         let mut executor = Executor::new(FakeSlots::new(), config.clone()).unwrap();
         let sampled = executor
             .generate_sampled(&prompt, 20, GenerationMode::UntilEog, &mut sampler, |_| Ok(()))

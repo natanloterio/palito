@@ -61,7 +61,17 @@ public final class Palito implements AutoCloseable {
             MemoryLayout.paddingLayout(4),
             JAVA_LONG.withName("seed"),
             ADDRESS.withName("stop"),
-            JAVA_LONG.withName("stop_count"));
+            JAVA_LONG.withName("stop_count"),
+            JAVA_FLOAT.withName("min_p"),
+            JAVA_FLOAT.withName("repeat_penalty"),
+            JAVA_INT.withName("repeat_last_n"),
+            JAVA_FLOAT.withName("presence_penalty"),
+            JAVA_FLOAT.withName("frequency_penalty"),
+            MemoryLayout.paddingLayout(4),
+            ADDRESS.withName("logit_bias"),
+            JAVA_LONG.withName("logit_bias_count"));
+    private static final StructLayout LOGIT_BIAS = MemoryLayout.structLayout(
+            JAVA_INT.withName("token"), JAVA_FLOAT.withName("bias"));
     private static final StructLayout RESULT = MemoryLayout.structLayout(
             ADDRESS.withName("text"),
             JAVA_INT.withName("finish_reason"),
@@ -175,6 +185,22 @@ public final class Palito implements AutoCloseable {
                     }
                     gen.set(ADDRESS, 32, stops);
                     gen.set(JAVA_LONG, 40, g.stop.size());
+                }
+                gen.set(JAVA_FLOAT, 48, g.minP);
+                gen.set(JAVA_FLOAT, 52, g.repeatPenalty);
+                gen.set(JAVA_INT, 56, g.repeatLastN);
+                gen.set(JAVA_FLOAT, 60, g.presencePenalty);
+                gen.set(JAVA_FLOAT, 64, g.frequencyPenalty);
+                if (!g.logitBias.isEmpty()) {
+                    MemorySegment biases = arena.allocate(LOGIT_BIAS, g.logitBias.size());
+                    long offset = 0;
+                    for (var entry : g.logitBias.entrySet()) {
+                        biases.set(JAVA_INT, offset, entry.getKey());
+                        biases.set(JAVA_FLOAT, offset + 4, entry.getValue());
+                        offset += LOGIT_BIAS.byteSize();
+                    }
+                    gen.set(ADDRESS, 72, biases);
+                    gen.set(JAVA_LONG, 80, g.logitBias.size());
                 }
                 TextSink sink = new TextSink(g.onText);
                 MemorySegment callback = Linker.nativeLinker().upcallStub(

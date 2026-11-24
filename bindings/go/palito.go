@@ -68,6 +68,15 @@ type Generation struct {
 	Temperature float32
 	TopP        float32 // 0 or 1: off
 	TopK        uint32  // 0: off
+	MinP        float32 // in [0, 1]; 0: off
+	// llama.cpp repetition penalties over the last RepeatLastN tokens
+	// (prompt included). RepeatPenalty 0 or 1: off; RepeatLastN 0: 64.
+	RepeatPenalty    float32
+	RepeatLastN      uint32
+	PresencePenalty  float32 // 0: off
+	FrequencyPenalty float32 // 0: off
+	// Token id -> bias added to its logit; math.Inf(-1) bans the token.
+	LogitBias map[int32]float32
 	// nil: a different seed each call.
 	Seed *uint64
 	// Generation ends at the first of these; it is not part of the text.
@@ -255,6 +264,26 @@ func (e *Engine) run(ctx context.Context, generation *Generation, invoke call) (
 		raw.top_p = C.float(generation.TopP)
 	}
 	raw.top_k = C.uint32_t(generation.TopK)
+	raw.min_p = C.float(generation.MinP)
+	if generation.RepeatPenalty != 0 {
+		raw.repeat_penalty = C.float(generation.RepeatPenalty)
+	}
+	if generation.RepeatLastN != 0 {
+		raw.repeat_last_n = C.uint32_t(generation.RepeatLastN)
+	}
+	raw.presence_penalty = C.float(generation.PresencePenalty)
+	raw.frequency_penalty = C.float(generation.FrequencyPenalty)
+	if n := len(generation.LogitBias); n > 0 {
+		biases := (*C.palito_logit_bias)(C.calloc(C.size_t(n), C.size_t(unsafe.Sizeof(C.palito_logit_bias{}))))
+		defer C.free(unsafe.Pointer(biases))
+		items := unsafe.Slice(biases, n)
+		i := 0
+		for token, bias := range generation.LogitBias {
+			items[i] = C.palito_logit_bias{token: C.int32_t(token), bias: C.float(bias)}
+			i++
+		}
+		raw.logit_bias, raw.logit_bias_count = biases, C.size_t(n)
+	}
 	if generation.Seed != nil {
 		raw.seed = C.int64_t(*generation.Seed & (1<<63 - 1))
 	}

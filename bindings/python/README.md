@@ -19,6 +19,6 @@ with palito.Palito("model.gguf") as llm:
         print(text, end="", flush=True)
 ```
 
-- **Generation keywords:** `max_tokens`, `thinking`, `temperature` (0: greedy), `top_p`, `top_k`, `seed`, `stop` and `json_schema` (a dict or JSON string; the reply is JSON matching it, with reasoning off; `{"type": "object"}` for any object).
+- **Generation keywords:** `max_tokens`, `thinking`, `temperature` (0: greedy), `top_p`, `top_k`, `min_p`, `repeat_penalty`, `repeat_last_n`, `presence_penalty`, `frequency_penalty`, `logit_bias` (`{token id: bias}`; `float("-inf")` bans), `seed`, `stop` and `json_schema` (a dict or JSON string; the reply is JSON matching it, with reasoning off; `{"type": "object"}` for any object).
 - **Results:** a `Completion` dataclass.
 - **Errors:** raise `palito.PalitoError`.

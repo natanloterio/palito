@@ -131,7 +131,7 @@ impl<B: Backend + ?Sized> Engine<B> {
             return Err(Error::Invalid("tools cannot be combined with JSON output".into()));
         }
         stop::validate(&options.stop)?;
-        let sampler = Sampler::new(options.sampling)?;
+        let sampler = Sampler::new(options.sampling.clone())?;
         let prompt = self.render_chat_tools(messages, spec, options.enable_thinking)?;
         let tokens = self.executor.tokenize(&prompt)?;
         let (budget, room) = self.reply_budget(tokens.len(), options.max_tokens)?;

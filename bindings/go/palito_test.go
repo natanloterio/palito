@@ -56,6 +56,23 @@ func TestStreamingStopSamplingCancel(t *testing.T) {
 	if a.Text != b.Text {
 		t.Fatalf("seeded sampling differs: %q vs %q", a.Text, b.Text)
 	}
+	ones := "1, 1, 1, 1, 1, 1,"
+	plain, _ := engine.Complete(ctx, ones, &Generation{MaxTokens: 4})
+	penalized, err := engine.Complete(ctx, ones, &Generation{MaxTokens: 4, FrequencyPenalty: 2,
+		PresencePenalty: 0.5, RepeatPenalty: 1.1})
+	if err != nil || !strings.HasPrefix(plain.Text, " 1") || strings.HasPrefix(penalized.Text, " 1") {
+		t.Fatalf("penalties: %q then %q, %v", plain.Text, penalized.Text, err)
+	}
+	minP := &Generation{MaxTokens: 8, Temperature: 1, MinP: 0.05, Seed: Seed(3)}
+	c, _ := engine.Complete(ctx, ones, minP)
+	d, _ := engine.Complete(ctx, ones, minP)
+	if c.Text != d.Text {
+		t.Fatalf("seeded min-p differs: %q vs %q", c.Text, d.Text)
+	}
+	if _, err := engine.Complete(ctx, ones, &Generation{MaxTokens: 2,
+		LogitBias: map[int32]float32{1 << 30: 1}}); err == nil {
+		t.Fatal("out-of-vocabulary logit bias accepted")
+	}
 	cancelled, cancel := context.WithCancel(ctx)
 	got, err := engine.Complete(cancelled, "Once upon a time", &Generation{
 		OnText: func(string) bool { cancel(); return true }})

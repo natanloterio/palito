@@ -8,6 +8,7 @@
 
 mod openai;
 mod reasoning;
+mod sampling;
 mod slot_worker;
 mod stream;
 mod worker;
@@ -92,7 +93,8 @@ pub(crate) struct ServeArgs {
     /// Model id reported by /v1/models [default: the GGUF file name without extension].
     #[arg(long)]
     model_name: Option<String>,
-    /// Defaults for requests that omit temperature, top_p, top_k or seed.
+    /// Defaults for requests that omit a sampling field (temperature, top_p,
+    /// top_k, min_p, the penalties or seed).
     #[command(flatten)]
     sampling: SamplingArgs,
 }
@@ -242,7 +244,7 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         Ok((
             messages,
             tools,
-            request.sampling.resolve(&state.sampling)?,
+            request.sampling.resolve(&state.sampling, state.report.vocab_tokens)?,
             request.stop()?,
             json_schema,
         ))
@@ -301,7 +303,7 @@ async fn completions(State(state): State<AppState>, body: Bytes) -> Response {
     let parsed = request.check_supported().and_then(|()| {
         Ok((
             request.prompt()?,
-            request.sampling.resolve(&state.sampling)?,
+            request.sampling.resolve(&state.sampling, state.report.vocab_tokens)?,
             request.stop()?,
             request.json_schema()?,
         ))

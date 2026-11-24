@@ -255,7 +255,6 @@ impl Tensor {
         self.multiply_columns_at(input, count, columns, 0);
     }
 
-    #[cfg(feature = "cuda")]
     pub fn multiply_expert(&self, expert: usize, input: &[f32], output: &mut [f32]) {
         assert_eq!(self.dims.len(), 3);
         assert!(expert < self.dims[2]);

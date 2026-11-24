@@ -2,12 +2,14 @@
 //!
 //! Routes: POST /v1/chat/completions, POST /v1/completions (both with
 //! `"stream": true` as server-sent events), GET /v1/models and GET /health.
-//! The model is opened once and runs one request at a time on a worker thread;
-//! other requests wait in a bounded queue (503 when full).
+//! The model is opened once on a worker thread. It serves `--parallel` requests
+//! at a time, taking turns on the device; others wait in a bounded queue (503
+//! when full).
 
 mod openai;
 mod reasoning;
 mod sampling;
+mod slot_worker;
 mod stream;
 mod worker;
 
@@ -24,13 +26,15 @@ use crate::chat_repl::SamplingArgs;
 use clap::{Args, ValueEnum};
 use openai::{ChatRequest, CompletionRequest, Usage, error_body};
 use palito::{
+    chat::{Message, ToolFormat},
     engine::{Completion, Device, EngineOptions, GenerationOptions},
     sampling::Sampling,
+    tools::{ToolMode, ToolSpec},
 };
 use serde_json::{Value, json};
 use std::{net::IpAddr, path::PathBuf, sync::Arc, time::Instant};
 use stream::Kind;
-use worker::{Event, ModelReport, Prompt, Reply, SubmitError, Worker};
+use worker::{Event, ModelReport, Prompt, Reply, ReplyCall, SubmitError, Worker};
 
 /// Request bodies above this are refused (a 65k-token prompt is well below it).
 const BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
@@ -39,6 +43,8 @@ const BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 enum ServeBackend {
     Cpu,
     Cuda,
+    Vulkan,
+    Metal,
 }
 
 #[derive(Args)]
@@ -53,7 +59,8 @@ pub(crate) struct ServeArgs {
     /// [default: cuda when built with CUDA, else cpu]
     #[arg(long, env = "PALITO_BACKEND", value_enum)]
     backend: Option<ServeBackend>,
-    /// Context tokens [default: the model's trained context, fitted to GPU memory].
+    /// Total context tokens, split between the --parallel slots [default: the
+    /// model's trained context, fitted to GPU memory].
     #[arg(long)]
     context: Option<u32>,
     #[arg(long, default_value_t = 4)]
@@ -72,9 +79,17 @@ pub(crate) struct ServeArgs {
     /// request's KV cache for a shared prompt start (CUDA).
     #[arg(long)]
     no_prefix_cache: bool,
-    /// Requests allowed to wait while one is running; more get 503.
+    /// Requests allowed to wait while every slot is busy; more get 503.
     #[arg(long, default_value_t = 16)]
     queue: usize,
+    /// Requests served at the same time (`-np`). The context is split between them.
+    #[arg(
+        long,
+        env = "PALITO_PARALLEL",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..=i64::from(palito::slots::MAX_SLOTS))
+    )]
+    parallel: u32,
     /// Model id reported by /v1/models [default: the GGUF file name without extension].
     #[arg(long)]
     model_name: Option<String>,
@@ -99,6 +114,8 @@ pub(crate) fn run(args: ServeArgs) -> palito::Result<()> {
         device: match args.backend {
             Some(ServeBackend::Cpu) => Device::Cpu,
             Some(ServeBackend::Cuda) => Device::Cuda,
+            Some(ServeBackend::Vulkan) => Device::Vulkan,
+            Some(ServeBackend::Metal) => Device::Metal,
             None => EngineOptions::default().device,
         },
         context_tokens: args.context,
@@ -117,11 +134,12 @@ pub(crate) fn run(args: ServeArgs) -> palito::Result<()> {
             .map_or("model".into(), |stem| stem.to_string_lossy().into_owned())
     });
     let start = Instant::now();
-    let (worker, report) = Worker::start(args.model.clone(), options, args.queue.max(1))?;
+    let (worker, report) = Worker::start(args.model.clone(), options, args.queue.max(1), args.parallel)?;
     eprintln!(
-        "Loaded {model} in {:.1}s ({}, context {} tokens).",
+        "Loaded {model} in {:.1}s ({}, {} slot(s), context {} tokens per slot).",
         start.elapsed().as_secs_f64(),
         report.profile,
+        report.slots,
         report.context_tokens
     );
     let api_key = args.api_key.filter(|key| !key.is_empty());
@@ -194,6 +212,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "model": &*state.model,
         "profile": state.report.profile,
         "context_tokens": state.report.context_tokens,
+        "slots": state.report.slots,
     }))
 }
 
@@ -219,16 +238,24 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         return invalid("this model has no chat template; use /v1/completions");
     }
     let parsed = request.check_supported().and_then(|()| {
+        let json_schema = request.json_schema()?;
+        let format = state.report.tool_format.as_ref();
+        let (messages, tools) = chat_route(&request, format, json_schema.is_some())?;
         Ok((
-            request.messages()?,
+            messages,
+            tools,
             request.sampling.resolve(&state.sampling, state.report.vocab_tokens)?,
             request.stop()?,
-            request.json_schema()?,
+            json_schema,
         ))
     });
-    let (messages, sampling, stop, json_schema) = match parsed {
+    let (messages, tools, sampling, stop, json_schema) = match parsed {
         Ok(parsed) => parsed,
         Err(message) => return invalid(&message),
+    };
+    let prompt = match tools {
+        Some(spec) => Prompt::ChatTools(messages, spec),
+        None => Prompt::Chat(messages),
     };
     let options = GenerationOptions {
         max_tokens: request.max_tokens(),
@@ -243,7 +270,29 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         include_usage: request.stream_options.as_ref().is_some_and(|o| o.include_usage),
         split_reasoning: request.split_reasoning(),
     };
-    respond(state, reply, Prompt::Chat(messages), options).await
+    respond(state, reply, prompt, options).await
+}
+
+/// The messages, and the tool spec when generation must go through the gate.
+/// `tool_choice: "none"` with JSON output needs no gate: the grammar already
+/// excludes a call.
+fn chat_route(
+    request: &ChatRequest,
+    format: Option<&ToolFormat>,
+    json_output: bool,
+) -> Result<(Vec<Message>, Option<ToolSpec>), String> {
+    let Some(spec) = request.tool_spec()? else {
+        return Ok((request.messages()?, None));
+    };
+    let forbidden = spec.mode == ToolMode::Forbidden;
+    let Some(format) = format else {
+        if forbidden && !request.has_tool_history() {
+            return Ok((request.messages()?, None));
+        }
+        return Err("this model's chat template has no supported tool call format".into());
+    };
+    let messages = request.messages_for(format.string_arguments)?;
+    Ok((messages, (!(forbidden && json_output)).then_some(spec)))
 }
 
 async fn completions(State(state): State<AppState>, body: Bytes) -> Response {
@@ -322,8 +371,8 @@ async fn respond(
     }
     let reply = loop {
         match events.recv().await {
-            Some(Event::Text { .. }) => continue,
             Some(Event::Done(result)) => break result,
+            Some(_) => continue,
             None => break Err("engine stopped".into()),
         }
     };
@@ -338,12 +387,17 @@ async fn respond(
 
 fn final_body(kind: Kind, id: &str, model: &str, reply: &Reply) -> Value {
     let completion = &reply.completion;
-    let finish = openai::finish_reason(completion.finish_reason);
+    let finish = openai::finish_reason_with_calls(completion.finish_reason, &reply.tool_calls);
     let choice = match kind {
         Kind::Chat => {
-            let mut message = json!({"role": "assistant", "content": reply.content});
+            let has_calls = !reply.tool_calls.is_empty();
+            let content = (!has_calls || !reply.content.is_empty()).then_some(&reply.content);
+            let mut message = json!({"role": "assistant", "content": content});
             if let Some(reasoning) = &reply.reasoning {
                 message["reasoning_content"] = json!(reasoning);
+            }
+            if has_calls {
+                message["tool_calls"] = reply.tool_calls.iter().map(call_json).collect();
             }
             json!({
                 "index": 0,
@@ -367,6 +421,14 @@ fn final_body(kind: Kind, id: &str, model: &str, reply: &Reply) -> Value {
         "choices": [choice],
         "usage": Usage::new(completion.prompt_tokens, completion.generated_tokens),
         "timings": timings(completion),
+    })
+}
+
+fn call_json(call: &ReplyCall) -> Value {
+    json!({
+        "id": call.id,
+        "type": "function",
+        "function": {"name": call.name, "arguments": call.arguments},
     })
 }
 
@@ -404,4 +466,48 @@ fn failure(status: StatusCode, message: &str, kind: &str) -> Response {
         header::HeaderValue::from_static("application/json"),
     );
     (status, headers, error_body(message, kind).to_string()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use palito::engine::FinishReason;
+
+    fn reply_with_call(content: &str) -> Reply {
+        Reply {
+            completion: Completion {
+                text: content.to_owned(),
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                cached_tokens: 0,
+                generated_tokens: 1,
+                ttft_ns: 0,
+                tokens_per_second: 0.0,
+            },
+            reasoning: None,
+            content: content.to_owned(),
+            tool_calls: vec![ReplyCall {
+                id: "call_1".into(),
+                name: "weather".into(),
+                arguments: "{\"city\": \"Rio\"}".into(),
+                complete: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn final_body_has_null_content_and_string_arguments() {
+        let body = final_body(Kind::Chat, "id", "m", &reply_with_call(""));
+        let message = &body["choices"][0]["message"];
+        assert!(message["content"].is_null());
+        assert_eq!(message["tool_calls"][0]["type"], "function");
+        assert!(message["tool_calls"][0]["function"]["arguments"].is_string());
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn final_body_keeps_text_next_to_a_call() {
+        let body = final_body(Kind::Chat, "id", "m", &reply_with_call("Vou ver."));
+        assert_eq!(body["choices"][0]["message"]["content"], "Vou ver.");
+    }
 }

@@ -1,5 +1,5 @@
-// Package palito is the Go binding for Palito: fast local LLM inference for
-// GGUF models.
+// Package palito lets you run GGUF LLMs locally from Go with custom CUDA
+// kernels, token streaming, and structured JSON output — no llama.cpp required.
 //
 //	engine, err := palito.Open("model.gguf", nil)
 //	if err != nil { ... }

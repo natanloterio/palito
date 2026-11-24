@@ -14,11 +14,13 @@ before the lock is released, so the two engines are never loaded at once.
 
 import argparse
 import contextlib
+import datetime
 import fcntl
 import json
 import os
 import re
 import signal
+import socket
 import statistics
 import subprocess
 import sys
@@ -136,7 +138,7 @@ def run_palito(args, prompts):
     results = {}
     for target, prompt in prompts.items():
         command = [args.palito, "chat", "--model", args.model, "--backend", "cuda",
-                   "--tokens", str(args.tokens), "--stats", "--no-stream"]
+                   "--tokens", str(args.tokens), "--stats", "--no-stream", "--no-prefix-cache"]
         with gpu_lock():
             log(f"palito: {target} tokens")
             done = subprocess.run(command, input=palito_input(prompt, args.runs + 1),
@@ -195,6 +197,7 @@ def llama_request(base, prompt, tokens):
 
 @contextlib.contextmanager
 def llama_server(args, flags, log_path):
+    assert_port_free(args.port)
     command = [args.llama_server, "-m", args.model, "-c", str(args.context), "--port", str(args.port),
                *LLAMA_BASE_FLAGS, *flags]
     with open(log_path, "w") as server_log:
@@ -212,6 +215,119 @@ def llama_server(args, flags, log_path):
             process.wait()
 
 
+def parse_sse_metrics(lines, started, timestamps=None):
+    """Parse OpenAI SSE lines and return (first_token_s, end_s, prompt_tokens, generated)."""
+    first = None
+    end = None
+    prompt_tokens = None
+    generated = None
+    chunks = 0
+    for idx, raw in enumerate(lines):
+        line = raw.strip()
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:]
+        now = timestamps[idx] if timestamps is not None else time.perf_counter()
+        if payload == "[DONE]":
+            end = now
+            break
+        event = json.loads(payload)
+        usage = event.get("usage")
+        if isinstance(usage, dict):
+            if usage.get("prompt_tokens") is not None:
+                prompt_tokens = int(usage["prompt_tokens"])
+            if usage.get("completion_tokens") is not None:
+                generated = int(usage["completion_tokens"])
+        choices = event.get("choices") or []
+        if choices:
+            delta = choices[0].get("delta") or {}
+            text = delta.get("content") or delta.get("reasoning_content")
+            if text:
+                if first is None:
+                    first = now
+                chunks += 1
+    if first is None or end is None:
+        raise RuntimeError("incomplete SSE stream (missing first token or [DONE])")
+    if generated is None:
+        generated = chunks
+    ttft_ms = (first - started) * 1000.0
+    decode_s = end - first
+    decode_tps = (max(generated - 1, 1) / decode_s) if decode_s > 0 else 0.0
+    sample = {"generated": generated, "ttft_ms": round(ttft_ms, 2), "decode_tps": round(decode_tps, 2)}
+    if prompt_tokens is not None:
+        sample["prompt_tokens"] = prompt_tokens
+    return sample
+
+
+def stream_chat_request(base, prompt, tokens, extra=None):
+    body = {
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": tokens,
+        "temperature": 0,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    if extra:
+        body.update(extra)
+    request = urllib.request.Request(
+        f"{base}/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    started = time.perf_counter()
+    lines = []
+    timestamps = []
+    with urllib.request.urlopen(request, timeout=900) as response:
+        for raw in response:
+            lines.append(raw.decode("utf-8", errors="replace"))
+            timestamps.append(time.perf_counter())
+    return parse_sse_metrics(lines, started, timestamps)
+
+
+def assert_port_free(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        if sock.connect_ex(("127.0.0.1", port)) == 0:
+            raise RuntimeError(f"port {port} is already in use; stop the existing server before benchmarking")
+
+
+@contextlib.contextmanager
+def palito_server(args, log_path):
+    assert_port_free(args.port)
+    command = [
+        args.palito, "serve",
+        "--model", args.model,
+        "--backend", "cuda",
+        "--context", str(args.context),
+        "--port", str(args.port),
+        "--no-prefix-cache",
+    ]
+    with open(log_path, "w") as server_log:
+        process = subprocess.Popen(command, stdout=server_log,
+                                   stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        wait_healthy(f"http://127.0.0.1:{args.port}", process)
+        yield f"http://127.0.0.1:{args.port}"
+    finally:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+
+
+def run_palito_serve(args, prompts):
+    results = {}
+    with gpu_lock():
+        log_path = Path(args.out_dir) / "palito-serve.log"
+        with palito_server(args, log_path) as base:
+            for target, prompt in prompts.items():
+                log(f"palito serve: {target} tokens")
+                samples = [stream_chat_request(base, prompt, args.tokens) for _ in range(args.runs + 1)]
+                results[target] = samples[1:]
+    return results
+
+
 def run_llama(args, prompts, name, sizes):
     results = {}
     with gpu_lock():
@@ -219,9 +335,44 @@ def run_llama(args, prompts, name, sizes):
         with llama_server(args, LLAMA_CONFIGS[name], log_path) as base:
             for target in sizes:
                 log(f"llama.cpp {name}: {target} tokens")
-                samples = [llama_request(base, prompts[target], args.tokens) for _ in range(args.runs + 1)]
+                if args.palito_mode == "serve":
+                    extra = {"top_k": 1, "cache_prompt": False, "seed": 0}
+                    samples = [stream_chat_request(base, prompts[target], args.tokens, extra)
+                               for _ in range(args.runs + 1)]
+                else:
+                    samples = [llama_request(base, prompts[target], args.tokens)
+                               for _ in range(args.runs + 1)]
                 results[target] = samples[1:]
     return results
+
+
+def probe_cmd(cmd, env=None):
+    try:
+        out = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=15)
+        text = (out.stdout or out.stderr).strip()
+        return text.splitlines()[0] if text else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def collect_metadata(args):
+    model_path = Path(args.model)
+    return {
+        "date_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "gpu": probe_cmd(["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"]),
+        "palito_version": probe_cmd([args.palito, "--version"]),
+        "palito_git_sha": probe_cmd(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"]),
+        "llama_cpp_version": probe_cmd([args.llama_server, "--version"], env=llama_env(args)),
+        "model": model_path.name,
+        "model_bytes": model_path.stat().st_size if model_path.exists() else None,
+        "corpus_rev": CORPUS_REV,
+        "palito_mode": args.palito_mode,
+        "context": args.context,
+        "tokens": args.tokens,
+        "runs": args.runs,
+        "sizes": args.sizes,
+        "llama_configs": args.llama_configs,
+    }
 
 
 def medians(samples):
@@ -264,6 +415,8 @@ def parse_args(argv):
     parser.add_argument("--context", type=int, default=40960, help="llama-server -c")
     parser.add_argument("--port", type=int, default=18093)
     parser.add_argument("--out-dir", default=str(ROOT / "target/bench-long-context"))
+    parser.add_argument("--palito-mode", choices=["serve", "chat"], default="serve",
+                        help="serve measures both engines via identical HTTP SSE streaming; chat uses palito chat CLI")
     parser.add_argument("--skip-palito", action="store_true")
     return parser.parse_args(argv)
 
@@ -276,13 +429,23 @@ def main(argv=None):
     prompts = build_prompts(args.palito, args.model, args.sizes)
     results = {}
     if not args.skip_palito:
-        results["Palito int8-fast"] = run_palito(args, prompts)
+        results["Palito int8-fast"] = (
+            run_palito_serve(args, prompts) if args.palito_mode == "serve" else run_palito(args, prompts)
+        )
     for name in args.llama_configs:
         results[f"llama.cpp {name}"] = run_llama(args, prompts, name, args.sizes)
-    llama_counts = next((r for k, r in results.items() if k.startswith("llama")), None)
-    prompt_tokens = {t: (llama_counts[t][0]["prompt_tokens"] if llama_counts else t) for t in args.sizes}
+    first_with_counts = next(
+        (r for r in results.values() if r and "prompt_tokens" in r[args.sizes[0]][0]),
+        None,
+    )
+    prompt_tokens = {t: (first_with_counts[t][0]["prompt_tokens"] if first_with_counts else t) for t in args.sizes}
     raw = Path(args.out_dir) / "results.json"
-    raw.write_text(json.dumps({"prompt_tokens": prompt_tokens, "results": results}, indent=1))
+    payload = {
+        "metadata": collect_metadata(args),
+        "prompt_tokens": prompt_tokens,
+        "results": results,
+    }
+    raw.write_text(json.dumps(payload, indent=2) + "\n")
     print(table(results, prompt_tokens))
     log(f"raw samples: {raw}")
 

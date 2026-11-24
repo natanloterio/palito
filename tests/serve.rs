@@ -23,8 +23,13 @@ impl Drop for Server {
 
 fn start(port: u16, extra: &[&str]) -> Server {
     let model = concat!(env!("CARGO_MANIFEST_DIR"), "/models/SmolLM2-135M-Instruct-Q4_K_M.gguf");
+    launch(port, &["--backend", "cpu", "--context", "512", "--model", model], extra)
+}
+
+fn launch(port: u16, model_args: &[&str], extra: &[&str]) -> Server {
     let mut child = Command::new(env!("CARGO_BIN_EXE_palito"))
-        .args(["serve", "--backend", "cpu", "--context", "512", "--model", model])
+        .arg("serve")
+        .args(model_args)
         .args(["--port", &port.to_string()])
         .args(extra)
         .env_remove("PALITO_API_KEY")
@@ -60,6 +65,148 @@ fn request(server: &Server, method: &str, path: &str, body: Option<Value>, key: 
     let status = response[9..12].parse().unwrap();
     let body = response.split_once("\r\n\r\n").map_or("", |(_, b)| b).to_owned();
     (status, body)
+}
+
+/// Leaves a tool call stream after its first call delta; the next request
+/// must still be answered.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a GPU and PALITO_TOOL_MODEL (a Qwen3 GGUF)"]
+fn client_disconnect_during_a_call_frees_the_engine() {
+    let model = std::env::var("PALITO_TOOL_MODEL").unwrap_or_else(|_| {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/models/compat-qwen3/Qwen3-0.6B-Q4_K_M.gguf").into()
+    });
+    let server = launch(18471, &["--backend", "cuda", "--context", "4096", "--model", &model], &[]);
+    let tool = json!({"type": "function", "function": {"name": "weather", "parameters": {
+        "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}});
+    let body = json!({
+        "messages": [{"role": "user", "content": "Tempo no Rio?"}],
+        "tools": [tool], "tool_choice": "required", "max_tokens": 2000, "stream": true,
+        "chat_template_kwargs": {"enable_thinking": false},
+    })
+    .to_string();
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    write!(
+        stream,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    while !line.contains("tool_calls") {
+        line.clear();
+        assert!(reader.read_line(&mut line).unwrap() > 0, "stream ended without a call");
+    }
+    drop(reader);
+    let next = json!({"messages": [{"role": "user", "content": "Oi"}], "max_tokens": 4});
+    let started = std::time::Instant::now();
+    let (status, _) = request(&server, "POST", "/v1/chat/completions", Some(next), None);
+    assert_eq!(status, 200);
+    assert!(started.elapsed() < Duration::from_secs(30));
+}
+
+#[test]
+fn parallel_on_cpu_fails_at_startup() {
+    let output = Command::new(env!("CARGO_BIN_EXE_palito"))
+        .args(["serve", "--backend", "cpu", "--model", "unused.gguf", "--parallel", "2"])
+        .env_remove("PALITO_API_KEY")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(message.contains("requires the CUDA backend"), "{message}");
+}
+
+#[cfg(feature = "cuda")]
+fn slot_server(port: u16, context: &str, extra: &[&str]) -> Server {
+    let model = std::env::var("PALITO_SLOT_MODEL").unwrap_or_else(|_| {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/models/compat-qwen3/Qwen3-0.6B-Q4_K_M.gguf").into()
+    });
+    launch(port, &["--backend", "cuda", "--context", context, "--model", &model], extra)
+}
+
+/// Sends a request and returns the open connection without reading the reply.
+#[cfg(feature = "cuda")]
+fn send_only(server: &Server, body: &Value) -> TcpStream {
+    let body = body.to_string();
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    write!(
+        stream,
+        "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    stream
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a GPU and PALITO_SLOT_MODEL"]
+fn health_reports_slots_and_slot_context() {
+    let server = slot_server(18472, "4096", &["--parallel", "4"]);
+    let (_, body) = request(&server, "GET", "/health", None, None);
+    let health: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(health["slots"], 4);
+    assert_eq!(health["context_tokens"], 1024);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a GPU and PALITO_SLOT_MODEL"]
+fn queue_limit_is_exact_with_all_slots_busy() {
+    let server = slot_server(18473, "8192", &["--parallel", "2", "--queue", "1"]);
+    let counting: String = (1..40).map(|n| format!("{n}, ")).collect();
+    let long = json!({"prompt": counting, "max_tokens": 3000, "stream": true});
+    let mut accepted = Vec::new();
+    for _ in 0..3 {
+        accepted.push(send_only(&server, &long));
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    let mut refused = send_only(&server, &long);
+    let mut response = String::new();
+    refused.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    assert!(response.to_lowercase().contains("retry-after"));
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a GPU and PALITO_SLOT_MODEL"]
+fn burst_up_to_slots_plus_queue_all_succeed() {
+    let server = slot_server(18474, "4096", &["--parallel", "8", "--queue", "1"]);
+    let port = server.port;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+    let body = json!({"prompt": "The capital of France is", "max_tokens": 4}).to_string();
+    let handles: Vec<_> = (0..9)
+        .map(|_| {
+            let barrier = barrier.clone();
+            let body = body.clone();
+            std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
+                barrier.wait();
+                write!(
+                    stream,
+                    "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).unwrap();
+                let status: u16 = response[9..12].parse().unwrap();
+                (status, response)
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let statuses: Vec<u16> = results.iter().map(|(s, _)| *s).collect();
+    assert!(
+        statuses.iter().all(|&s| s == 200),
+        "expected all 9 burst requests to return 200, got {statuses:?}"
+    );
 }
 
 fn chunked_body(raw: &str) -> String {

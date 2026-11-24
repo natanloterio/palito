@@ -20,6 +20,8 @@ use std::{
     sync::Arc,
 };
 
+use crate::reference::state::{State, greedy};
+
 fn failure(error: impl std::fmt::Display) -> Error {
     Error::Backend(format!("CUDA: {error}"))
 }
@@ -129,6 +131,8 @@ pub struct CudaOptions {
     /// prompt sharing its start at the latest prefill-chunk boundary before the
     /// divergence (greedy output unchanged; see `prefix`).
     pub prefix_cache: bool,
+    /// Sequences held at once, each with the full context (see `slots`).
+    pub slots: u32,
 }
 
 impl Default for CudaOptions {
@@ -141,66 +145,9 @@ impl Default for CudaOptions {
             decode_graph: false,
             fit_context: false,
             prefix_cache: false,
+            slots: 1,
         }
     }
-}
-
-#[derive(Default)]
-struct State {
-    position: usize,
-    valid: bool,
-    failed: bool,
-}
-
-impl State {
-    fn begin(&mut self, tokens: &[i32], position: u32, info: &ModelInfo) -> Result<()> {
-        if self.failed {
-            return Err(failure("failed request must be reset"));
-        }
-        if tokens.is_empty()
-            || tokens.len() > info.batch_tokens as usize
-            || position as usize != self.position
-            || self
-                .position
-                .checked_add(tokens.len())
-                .is_none_or(|n| n > info.context_tokens as usize)
-            || tokens
-                .iter()
-                .any(|&id| id < 0 || id as u32 >= info.vocab_tokens)
-        {
-            return Err(invalid("invalid IDs, batch, position, or context capacity"));
-        }
-        self.valid = false;
-        // A driver/numerical error at any point leaves the request poisoned.
-        self.failed = true;
-        Ok(())
-    }
-
-    fn finish(&mut self, count: usize) {
-        self.position += count;
-        self.valid = true;
-        self.failed = false;
-    }
-
-    fn logits<'a>(&self, logits: &'a [f32]) -> Result<&'a [f32]> {
-        if !self.valid || self.failed {
-            return Err(failure("no valid next-token logits"));
-        }
-        Ok(logits)
-    }
-}
-
-fn greedy(logits: &[f32]) -> Result<i32> {
-    if logits.is_empty() || logits.iter().any(|x| !x.is_finite()) {
-        return Err(failure("invalid logits"));
-    }
-    let mut best = 0;
-    for i in 1..logits.len() {
-        if logits[i] > logits[best] {
-            best = i;
-        }
-    }
-    Ok(best as i32)
 }
 
 struct DeviceTensor {
@@ -324,7 +271,8 @@ fn prefill_capacity(spec: &Spec) -> usize {
 /// Must match the branch order in batched_prefill (ALiBi/BLOOM and Gemma first).
 fn flash_prefill_attention(spec: &Spec, matmul: CudaMatmul) -> bool {
     matmul.f32_tiled()
-        && spec.dim == 128
+        && spec.dim <= 128
+        && spec.dim % 4 == 0
         && spec.kv_heads > 0
         && spec.heads % spec.kv_heads == 0
         && spec.heads / spec.kv_heads <= 8
@@ -350,8 +298,20 @@ fn split_attention_supported(spec: &Spec, matmul: CudaMatmul) -> bool {
 /// and never fewer than keep a full-context chunk within ATTENTION_TILE_MAX (128)
 /// keys for the one-head-per-block pass.
 fn attention_chunks(spec: &Spec) -> usize {
-    (spec.info.context_tokens as usize).div_ceil(128).max(128)
+    let min_chunks = if spec.kv_heads == spec.heads && spec.heads >= 16 {
+        // MHA with many heads already fills the GPU with 32 chunks per head
+        // (512-1024 blocks), avoiding 4x excess partial-buffer traffic.
+        32
+    } else {
+        128
+    };
+    (spec.info.context_tokens as usize).div_ceil(128).max(min_chunks)
 }
+
+/// Warp chunks of `attention_decode_mma` (FP16 KV): at most the 16-key split count
+/// (partial buffer) and the combine's 1024 weights. Chunks hold a multiple of
+/// ATTENTION_ROW_BATCH (32) keys.
+const ATTENTION_ROW_CHUNKS: i32 = 64;
 
 fn attention_splits(spec: &Spec) -> usize {
     (spec.info.context_tokens as usize).div_ceil(ATTENTION_SPLIT)
@@ -367,9 +327,10 @@ fn attention_half_stride(spec: &Spec) -> usize {
     (spec.info.context_tokens as usize).div_ceil(64) * 64
 }
 
-/// u16 elements of the int8-prefill FP16 hi/lo K/V buffer (4 planes), or 0.
+/// u16 elements of the int8-prefill FP16 hi/lo K/V buffer (4 planes), or 0
+/// (int8-fast reads its FP16 K/V cache directly).
 fn attention_half_elements(spec: &Spec, matmul: CudaMatmul) -> usize {
-    if matmul.tensor_prefill()
+    if matmul == CudaMatmul::Int8Prefill
         && spec.dim == 128
         && spec.kv_heads > 0
         && spec.heads == 8 * spec.kv_heads
@@ -616,6 +577,19 @@ macro_rules! launch {
     }};
 }
 
+/// launch! with the kernel's dynamic shared memory (shared::configure), if any.
+macro_rules! launch_shared {
+    ($backend:ident, $name:expr, $grid:expr; $threads:expr, $($arg:expr),+ $(,)?) => {{
+        let name: &str = $name;
+        let shared_mem_bytes = $backend.dynamic_shared.get(name).copied().unwrap_or(0);
+        let cfg = LaunchConfig { grid_dim: $grid, block_dim: ($threads, 1, 1), shared_mem_bytes };
+        let mut args = $backend.stream.launch_builder(&$backend.functions[name]);
+        $(args.arg($arg);)+
+        // As launch!; the size is the kernel's opted-in dynamic shared memory.
+        unsafe { args.launch(cfg) }.map_err(failure)?;
+    }};
+}
+
 macro_rules! launch_position {
     ($backend:ident, $device:expr, $name:literal, $dynamic:literal, $grid:expr,
      [$($before:expr),*], $value:expr, [$($after:expr),*]) => {{
@@ -841,6 +815,8 @@ mod cache;
 mod decode;
 #[cfg(test)]
 mod grouped_bench;
+mod kv;
+pub(crate) mod nvrtc;
 #[cfg(test)]
 mod model_quality;
 #[cfg(test)]
@@ -850,21 +826,30 @@ mod packed_decode;
 #[cfg(test)]
 mod prefill;
 mod prefix;
-pub mod reference;
+pub use crate::reference;
+mod qwen35_device;
 #[cfg(test)]
 mod residual;
 #[cfg(test)]
 mod residual_precise;
+mod shared;
+mod slots;
 
 pub struct CudaBackend {
     // Destroy captured references before their buffers and modules.
     decode: Option<decode::DecodeState>,
+    /// One entry per slot; the active slot's entry is empty (its state is in
+    /// the fields of this struct).
+    parked: Vec<Option<slots::ParkedSlot>>,
+    active_slot: usize,
     weights: Weights<DeviceTensor>,
     stream: Arc<CudaStream>,
     functions: HashMap<&'static str, CudaFunction>,
+    /// Dynamic shared bytes per kernel (shared::configure); absent means none.
+    dynamic_shared: HashMap<&'static str, u32>,
     work: Workspace,
-    keys: Vec<CudaSlice<f32>>,
-    values: Vec<CudaSlice<f32>>,
+    keys: Vec<kv::KvBuffer>,
+    values: Vec<kv::KvBuffer>,
     logits: Vec<f32>,
     state: State,
     memory: MemoryUsage,
@@ -879,7 +864,7 @@ pub struct CudaBackend {
 /// Block-aligned Q4_K rows use the wide layout (one warp step covers 4 blocks).
 fn matvec_warps_per_row(kind: i32, rows: u32, selections: u32, width: u32) -> u32 {
     let blocks = (width / 256).max(1);
-    if kind == 12 && width % 256 == 0 {
+    if matches!(kind, 12 | 13) && width % 256 == 0 {
         let mut warps = (blocks / 8).clamp(1, 8);
         while warps < 8 && warps * 4 < blocks && rows * selections * warps < 2048 {
             warps *= 2;
@@ -920,7 +905,22 @@ pub fn open_backend(
     let metadata = crate::gguf::Gguf::read_metadata(path)?;
     if matches!(metadata.get("general.architecture"), Some(crate::gguf::Value::Text(arch)) if arch == "qwen35")
     {
-        return reference::qwen35::device::open(path, config, options);
+        return qwen35_device::open(path, config, options);
+    }
+    Ok(Box::new(CudaBackend::open(path, config, options)?))
+}
+
+/// A backend holding `options.slots` sequences. The Qwen3.5 reference backend
+/// has one sequence and is refused.
+pub fn open_slot_backend(
+    path: &Path,
+    config: &Config,
+    options: CudaOptions,
+) -> Result<Box<dyn crate::slots::SlotBackend>> {
+    let metadata = crate::gguf::Gguf::read_metadata(path)?;
+    if matches!(metadata.get("general.architecture"), Some(crate::gguf::Value::Text(arch)) if arch == "qwen35")
+    {
+        return Err(invalid("--parallel above 1 is not supported for this model"));
     }
     Ok(Box::new(CudaBackend::open(path, config, options)?))
 }
@@ -928,6 +928,12 @@ pub fn open_backend(
 impl CudaBackend {
     pub fn open(path: &Path, config: &Config, options: CudaOptions) -> Result<Self> {
         config.validate()?;
+        if options.slots == 0 || options.slots > crate::slots::MAX_SLOTS {
+            return Err(invalid(format!(
+                "slots must be between 1 and {}",
+                crate::slots::MAX_SLOTS
+            )));
+        }
         if !cfg!(target_os = "linux") {
             return Err(invalid("CUDA backend currently supports Linux only"));
         }
@@ -936,15 +942,7 @@ impl CudaBackend {
                 "CUDA requires a positive device budget and context <= 65535",
             ));
         }
-        // cudarc's lazy loader panics for missing libraries; make that a normal configuration error.
-        for name in ["libcuda.so.1", "libnvrtc.so.13"] {
-            // These are fixed CUDA libraries, not user-supplied executable paths.
-            unsafe { libloading::Library::new(name) }.map_err(|e| {
-                failure(format!(
-                    "{name}: {e}; set LD_LIBRARY_PATH to CUDA 13 libraries"
-                ))
-            })?;
-        }
+        nvrtc::ensure_libraries().map_err(failure)?;
         let context = CudaContext::new(options.device).map_err(failure)?;
         let major = context
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
@@ -1056,6 +1054,11 @@ impl CudaBackend {
         } else {
             source
         };
+        let source = if options.matmul.kv_f16() {
+            format!("#define CUDA_KV_F16 1\n{source}")
+        } else {
+            source
+        };
         let source = if cfg!(feature = "cuda-mma3-wide-rows-research")
             && options.matmul == CudaMatmul::ResidualMma3Research
         {
@@ -1099,6 +1102,7 @@ impl CudaBackend {
         )?;
         let module = context.load_module(ptx).map_err(failure)?;
         let mut functions = HashMap::new();
+        let mut dynamic_shared = HashMap::new();
         for name in [
             "embedding",
             "check_finite",
@@ -1154,6 +1158,8 @@ impl CudaBackend {
                 "prefill_matmul_ref2x16",
                 "matvec_packed_gate_up_rows",
                 "router_warp128",
+                "router_warp64_full_softmax",
+                "olmoe_qk_norm_rope_cache_decode",
                 "attention_split",
                 "attention_split_decode",
                 "attention_combine",
@@ -1166,6 +1172,7 @@ impl CudaBackend {
                 "attention_split_group",
                 "attention_split_group_decode",
                 "attention_prefill_flash4",
+                "attention_prefill_flash4_dim",
                 "gemm_packed_dense",
                 "gemm_packed_grouped",
                 "group_experts_fast32",
@@ -1200,13 +1207,20 @@ impl CudaBackend {
                     "mmq_c1_pipe32",
                     "mmq_c1_pipe32_splitk",
                     "router_tf32_tiled",
+                    "router_tf32_small",
                     "group_experts_mixed",
-                    "attention_prefill_mma_fast",
-                    "attention_half_kv",
-                    "attention_prefill_mma_half_fast",
+                    "attention_prefill_mma_fast_f16",
+                    "attention_prefill_mma_fast4_f16",
+                    "attention_prefill_mma_fast_mha_f16",
+                    "attention_prefill_mma_fast_mha96_f16",
+                    "attention_decode_mma_f16",
+                    "attention_decode_mma_decode_f16",
+                    "attention_combine_rows",
+                    "attention_combine_rows_decode",
                 ] {
                     functions.insert(name, module.load_function(name).map_err(failure)?);
                 }
+                dynamic_shared = shared::configure(&context, &module, &functions)?;
             }
             if options.matmul == CudaMatmul::Int8Prefill {
                 for name in [
@@ -1278,19 +1292,30 @@ impl CudaBackend {
             for name in [
                 "embedding_decode",
                 "rotary_decode",
+                "rotary_factored_decode",
+                "rotary_factored_cache_kv_decode",
                 "cache_kv_decode",
                 "attention_fused_decode",
+                "gemma_attention_scores_decode",
+                "gemma_attention_values_decode",
                 "greedy_partials",
                 "greedy_finish",
             ] {
                 functions.insert(name, module.load_function(name).map_err(failure)?);
             }
         }
+        if options.matmul.kv_f16() {
+            for (name, entry) in kv::F16_KERNELS {
+                if functions.contains_key(name) {
+                    functions.insert(name, module.load_function(entry).map_err(failure)?);
+                }
+            }
+        }
         let mut weights = Weights::open(path, config)?;
         let s = &weights.spec;
         if matches!(
             s.info.architecture.as_str(),
-            "gpt2" | "starcoder2" | "bloom" | "gptneox" | "olmo" | "olmo2" | "olmoe"
+            "gpt2" | "starcoder2" | "bloom" | "gptneox" | "olmo"
         ) && (options.decode_graph || options.matmul != CudaMatmul::F32)
         {
             return Err(invalid(format!(
@@ -1298,19 +1323,8 @@ impl CudaBackend {
                 s.info.architecture
             )));
         }
-        if s.info.architecture == "qwen2"
-            && (options.decode_graph || options.matmul != CudaMatmul::F32)
-        {
-            return Err(invalid(
-                "qwen2 CUDA requires f32 matmul without a decode graph",
-            ));
-        }
-        if s.info.tensor_types.iter().any(|kind| kind == "Q5_K")
-            && (s.experts != 0 || options.decode_graph || options.matmul != CudaMatmul::F32)
-        {
-            return Err(invalid(
-                "Q5_K CUDA requires dense f32 matmul without a decode graph",
-            ));
+        if s.info.tensor_types.iter().any(|kind| kind == "Q5_K") && s.experts != 0 {
+            return Err(invalid("Q5_K CUDA currently supports dense models only"));
         }
         if s.info.tensor_types.iter().any(|kind| {
             matches!(
@@ -1330,26 +1344,8 @@ impl CudaBackend {
                 "BF16 CUDA requires dense f32 matmul without a decode graph",
             ));
         }
-        if s.info.architecture == "phi3"
-            && (options.decode_graph || options.matmul != CudaMatmul::F32)
-        {
-            return Err(invalid(
-                "phi3 CUDA requires f32 matmul without a decode graph",
-            ));
-        }
-        if weights.rope_factors.is_some()
-            && (options.decode_graph || options.matmul != CudaMatmul::F32)
-        {
-            return Err(invalid(
-                "factored RoPE CUDA requires f32 matmul without a decode graph",
-            ));
-        }
-        if weights.gemma.is_some() && (options.decode_graph || options.matmul != CudaMatmul::F32) {
-            return Err(invalid(
-                "Gemma CUDA requires f32 matmul without a decode graph",
-            ));
-        }
         if options.decode_graph
+            && weights.gemma.is_none()
             && !fused_attention_supported(s)
             && !split_attention_supported(s, options.matmul)
         {
@@ -1378,7 +1374,16 @@ impl CudaBackend {
             logits_bytes,
             reservation,
         } = device_reservation(&weights, &options)?;
-        admit(reservation, options.memory_limit_bytes, free as u64)?;
+        admit(reservation, options.memory_limit_bytes, free as u64).map_err(|error| {
+            if options.slots > 1 {
+                invalid(format!(
+                    "--parallel {} with {} context tokens per slot does not fit: {error}",
+                    options.slots, s.info.context_tokens
+                ))
+            } else {
+                error
+            }
+        })?;
         let memory = MemoryUsage {
             allocation_domain: "cuda",
             weights_allocated_bytes: weight_bytes,
@@ -1387,7 +1392,7 @@ impl CudaBackend {
             workspace_allocated_bytes: workspace_bytes,
             logits_allocated_bytes: logits_bytes,
             token_state_allocated_bytes: if options.decode_graph {
-                decode::DecodeState::bytes(s.info.vocab_tokens as usize)
+                decode::DecodeState::bytes(s.info.vocab_tokens as usize) * u64::from(options.slots)
             } else {
                 0
             },
@@ -1417,10 +1422,22 @@ impl CudaBackend {
         let mut keys = Vec::new();
         let mut values = Vec::new();
         for _ in &weights.layers {
-            keys.push(stream.alloc_zeros(kv_elements as usize).map_err(failure)?);
-            values.push(stream.alloc_zeros(kv_elements as usize).map_err(failure)?);
+            keys.push(kv::KvBuffer::zeros(&stream, kv_elements as usize, options.matmul)?);
+            values.push(kv::KvBuffer::zeros(&stream, kv_elements as usize, options.matmul)?);
         }
         let logits = vec![0.0; s.info.vocab_tokens as usize];
+        let parked = slots::park_slots(
+            &stream,
+            &slots::SlotShape {
+                slots: options.slots as usize,
+                layers: weights.layers.len(),
+                kv_elements: kv_elements as usize,
+                vocabulary: s.info.vocab_tokens as usize,
+                matmul: options.matmul,
+                decode_graph: options.decode_graph,
+                prefix_cache: options.prefix_cache,
+            },
+        )?;
         let mut weights = weights.map(|t| DeviceTensor::upload(t, &stream))?;
         weights.spec.info.backend = format!(
             "rust-cuda-packed:device{}:{}",
@@ -1430,9 +1447,12 @@ impl CudaBackend {
         stream.synchronize().map_err(failure)?;
         let mut backend = Self {
             decode,
+            parked,
+            active_slot: 0,
             weights,
             stream,
             functions,
+            dynamic_shared,
             work,
             keys,
             values,
@@ -1580,9 +1600,9 @@ impl CudaBackend {
                 && l.q.width == l.k.width
                 && l.k.width == l.v.width
                 && l.q.width % 256 == 0
-                && matches!(l.q.kind, 12 | 14)
-                && matches!(l.k.kind, 12 | 14)
-                && matches!(l.v.kind, 12 | 14)
+                && matches!(l.q.kind, 12 | 13 | 14)
+                && matches!(l.k.kind, 12 | 13 | 14)
+                && matches!(l.v.kind, 12 | 13 | 14)
             {
                 launch!(
                     self,
@@ -1682,6 +1702,76 @@ impl CudaBackend {
                     &pos,
                     [&s.rope_base, &neox]
                 );
+            } else if device_state
+                && self.matmul.f32_tiled()
+                && olmoe
+                && s.rotary_dim == s.dim
+                && self.weights.rope_factors.is_none()
+                && qw <= 4096
+                && kw <= 4096
+                && l.q_norm.is_some()
+                && l.k_norm.is_some()
+            {
+                let qn = l.q_norm.as_ref().unwrap();
+                let kn = l.k_norm.as_ref().unwrap();
+                let control = &self
+                    .decode
+                    .as_ref()
+                    .ok_or_else(|| failure("decode control missing"))?
+                    .control;
+                launch!(
+                    self,
+                    "olmoe_qk_norm_rope_cache_decode",
+                    (2, 1, 1); 1024,
+                    &mut self.work.q,
+                    &qn.bytes,
+                    &qw,
+                    &mut self.work.k,
+                    &kn.bytes,
+                    &self.work.v,
+                    &mut self.keys[index],
+                    &mut self.values[index],
+                    &kw,
+                    &dim,
+                    control,
+                    &rope_base,
+                    &neox,
+                    &s.epsilon
+                );
+            } else if device_state
+                && self.matmul.f32_tiled()
+                && l.q_norm.is_none()
+                && l.k_norm.is_none()
+                && position_embedding.is_none()
+                && embedding_norm.is_none()
+                && s.rotary_dim == s.dim
+                && self.weights.rope_factors.is_some()
+            {
+                let factors = self.weights.rope_factors.as_ref().unwrap();
+                let control = &self
+                    .decode
+                    .as_ref()
+                    .ok_or_else(|| failure("decode control missing"))?
+                    .control;
+                let total_pairs = ((qw / 2 + kw / 2) as u32).div_ceil(256);
+                launch!(
+                    self,
+                    "rotary_factored_cache_kv_decode",
+                    (total_pairs, 1, 1),
+                    &mut self.work.q,
+                    &qw,
+                    &mut self.work.k,
+                    &self.work.v,
+                    &mut self.keys[index],
+                    &mut self.values[index],
+                    &kw,
+                    &dim,
+                    control,
+                    &rope_base,
+                    &neox,
+                    &factors.bytes,
+                    &s.rope_attn_factor
+                );
             } else {
                 for (norm, vector, size) in [
                     (&l.q_norm, &mut self.work.q, qw),
@@ -1708,18 +1798,15 @@ impl CudaBackend {
                         launch!(self, "rotary_partial_neox", grid;
                             256, vector, &size, &dim, &pos, &rope_base, &rotary_dim);
                     } else if let Some(factors) = &self.weights.rope_factors {
-                        launch!(
+                        launch_position!(
                             self,
+                            device_state,
                             "rotary_factored",
+                            "rotary_factored_decode",
                             grid,
-                            vector,
-                            &size,
-                            &dim,
+                            [vector, &size, &dim],
                             &pos,
-                            &rope_base,
-                            &neox,
-                            &factors.bytes,
-                            &s.rope_attn_factor
+                            [&rope_base, &neox, &factors.bytes, &s.rope_attn_factor]
                         );
                     } else {
                         launch_position!(
@@ -1754,19 +1841,59 @@ impl CudaBackend {
             if embedding_norm.is_some() {
                 alibi_attention!(self, index, heads, kv_heads, dim, context, count, 1);
             } else if let Some((window, _, scale)) = gemma_attention {
-                gemma_attention!(
-                    self,
-                    index,
-                    heads,
-                    kv_heads,
-                    dim,
-                    context,
-                    count,
-                    1,
-                    window,
-                    scale,
-                    gemma.unwrap().attention_softcap
-                );
+                let softcap = gemma.unwrap().attention_softcap;
+                if device_state {
+                    let control = &self
+                        .decode
+                        .as_ref()
+                        .ok_or_else(|| failure("decode control missing"))?
+                        .control;
+                    let chunks = (context as u32).min(256);
+                    launch!(
+                        self,
+                        "gemma_attention_scores_decode",
+                        (heads as u32, chunks, 1),
+                        &self.work.q,
+                        &self.keys[index],
+                        &mut self.work.scores,
+                        &dim,
+                        &heads,
+                        &kv_heads,
+                        &context,
+                        control,
+                        &window,
+                        &scale,
+                        &softcap
+                    );
+                    launch!(
+                        self,
+                        "gemma_attention_values_decode",
+                        (heads as u32, 1, 1),
+                        &mut self.work.scores,
+                        &self.values[index],
+                        &mut self.work.attended,
+                        &dim,
+                        &heads,
+                        &kv_heads,
+                        &context,
+                        control,
+                        &window
+                    );
+                } else {
+                    gemma_attention!(
+                        self,
+                        index,
+                        heads,
+                        kv_heads,
+                        dim,
+                        context,
+                        count,
+                        1,
+                        window,
+                        scale,
+                        softcap
+                    );
+                }
             } else if let Some(partials) = &mut self.work.attention_partials {
                 let splits = attention_splits(s) as i32;
                 let control = match &self.decode {
@@ -1784,7 +1911,24 @@ impl CudaBackend {
                 let group = (heads / kv_heads) as u32;
                 let vector = dim <= 128 && dim % 4 == 0 && chunks <= 1024;
                 let mut threads = 256;
-                let (split, combine, grid, blocks) = if vector && (2..=8).contains(&group) {
+                let mut combine_threads = 256;
+                let rows = self.matmul.kv_f16() && dim == 128 && (2..=8).contains(&group);
+                let row_chunks = splits.min(ATTENTION_ROW_CHUNKS);
+                let (split, combine, grid, blocks) = if rows && row_chunks >= 1 {
+                    // FP16 cache: one warp per key range, the group's heads as MMA rows,
+                    // so each K/V row is read once per step (attention_decode_mma).
+                    threads = 32;
+                    combine_threads = 1024;
+                    (
+                        pick(
+                            "attention_decode_mma_decode_f16",
+                            "attention_decode_mma_f16",
+                        ),
+                        pick("attention_combine_rows_decode", "attention_combine_rows"),
+                        (kv_heads as u32, row_chunks as u32, 1),
+                        row_chunks,
+                    )
+                } else if vector && (2..=8).contains(&group) {
                     // Grouped-query attention: one block per KV head and chunk, one warp
                     // per query head, so the group shares each key/value row through L1.
                     threads = 32 * group;
@@ -1830,11 +1974,11 @@ impl CudaBackend {
                 }
                 match control {
                     Some(control) => launch!(
-                        self, combine, (heads as u32, 1, 1), &*partials,
+                        self, combine, (heads as u32, 1, 1); combine_threads, &*partials,
                         &mut self.work.attended, &dim, &blocks, control
                     ),
                     None => launch!(
-                        self, combine, (heads as u32, 1, 1), &*partials,
+                        self, combine, (heads as u32, 1, 1); combine_threads, &*partials,
                         &mut self.work.attended, &dim, &blocks, &count
                     ),
                 }
@@ -1999,6 +2143,17 @@ impl CudaBackend {
                         &mut self.work.probabilities,
                         &mut self.work.status
                     );
+                } else if self.matmul.f32_tiled() && olmoe && experts == 64 && used <= 32 {
+                    launch!(
+                        self,
+                        "router_warp64_full_softmax",
+                        (1, 1, 1); 32,
+                        &self.work.router,
+                        &used,
+                        &mut self.work.ids,
+                        &mut self.work.probabilities,
+                        &mut self.work.status
+                    );
                 } else {
                     launch!(
                         self,
@@ -2042,13 +2197,12 @@ impl CudaBackend {
                     &self.work.ids
                 );
             } else if self.matmul.f32_tiled()
-                && moe != 0
                 && gemma.is_none()
                 && gate.width == l.up.width
                 && gate.rows == l.up.rows
                 && gate.width % 256 == 0
-                && matches!(gate.kind, 12 | 14)
-                && matches!(l.up.kind, 12 | 14)
+                && matches!(gate.kind, 12 | 13 | 14)
+                && matches!(l.up.kind, 12 | 13 | 14)
             {
                 launch!(
                     self,
@@ -2062,7 +2216,8 @@ impl CudaBackend {
                     &mut self.work.gate,
                     &gate.width,
                     &gate.rows,
-                    &self.work.ids
+                    &self.work.ids,
+                    &moe
                 );
             } else {
                 for (t, out) in [(gate, &mut self.work.gate), (&l.up, &mut self.work.up)] {
@@ -2264,9 +2419,11 @@ fn device_reservation(weights: &Weights<Tensor>, options: &CudaOptions) -> Resul
         .checked_mul(s.dim as u64)
         .and_then(|n| n.checked_mul(u64::from(s.info.context_tokens)))
         .ok_or_else(|| invalid("KV overflow"))?;
+    // Keys and values, per layer and slot.
     let kv_bytes = kv_elements
         .checked_mul(weights.layers.len() as u64)
-        .and_then(|n| n.checked_mul(8))
+        .and_then(|n| n.checked_mul(2 * options.matmul.kv_element_bytes()))
+        .and_then(|n| n.checked_mul(u64::from(options.slots)))
         .ok_or_else(|| invalid("KV byte overflow"))?;
     let routing = routing_elements(s)? as u64;
     let groups = group_workspace_elements(s, options.matmul)? as u64;
@@ -2296,7 +2453,7 @@ fn device_reservation(weights: &Weights<Tensor>, options: &CudaOptions) -> Resul
         .and_then(|n| n.checked_add(logits_bytes))
         .and_then(|n| {
             n.checked_add(if options.decode_graph {
-                decode::DecodeState::bytes(s.info.vocab_tokens as usize)
+                decode::DecodeState::bytes(s.info.vocab_tokens as usize) * u64::from(options.slots)
             } else {
                 0
             })

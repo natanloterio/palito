@@ -4,17 +4,23 @@ pub mod engine;
 pub mod grammar;
 pub mod ffi;
 pub mod sampling;
+pub mod slots;
 pub mod stop;
 pub mod stream;
 pub mod cpu;
+pub mod reference;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(feature = "vulkan")]
+pub mod vulkan;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal;
 mod gguf;
 mod kernels;
 #[cfg(feature = "ktransformers")]
 pub mod ktransformers;
 pub mod tokenizer;
-#[cfg(feature = "cuda")]
+pub mod tools;
 mod transformer;
 
 use backend::{Backend, ModelInfo};
@@ -228,7 +234,7 @@ impl<B: Backend> Executor<B> {
         max_tokens: u32,
         mode: GenerationMode,
         sampler: &mut sampling::Sampler,
-        mut constraint: Option<&mut grammar::Constraint>,
+        mut constraint: Option<&mut (dyn grammar::LogitConstraint + '_)>,
         mut on_token: impl FnMut(i32) -> Result<()>,
     ) -> Result<Sample> {
         self.check_request(prompt, max_tokens)?;
@@ -268,7 +274,7 @@ impl<B: Backend> Executor<B> {
     fn draw(
         &mut self,
         sampler: &mut sampling::Sampler,
-        constraint: Option<&mut grammar::Constraint>,
+        constraint: Option<&mut (dyn grammar::LogitConstraint + '_)>,
     ) -> Result<i32> {
         let logits = self.backend.logits()?;
         if logits.len() != self.info().vocab_tokens as usize {
@@ -276,7 +282,7 @@ impl<B: Backend> Executor<B> {
         }
         let token = match constraint {
             None => sampler.sample(logits)?,
-            Some(constraint) => constraint.sample(logits, |masked| sampler.sample(masked))?,
+            Some(constraint) => constraint.sample(logits, &mut |masked| sampler.sample(masked))?,
         };
         sampler.accept(token);
         Ok(token)

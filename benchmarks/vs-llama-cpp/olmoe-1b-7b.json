@@ -1,0 +1,113 @@
+{
+  "metadata": {
+    "date_utc": "2026-11-23T18:12:57Z",
+    "gpu": "NVIDIA GeForce RTX 5090, 615.71.09, 32607 MiB",
+    "palito_version": "palito 0.9.0",
+    "palito_git_sha": "676b3d7",
+    "llama_cpp_version": "version: 1.0.0-dev (build 12434, commit 6b01a4767)",
+    "model": "olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
+    "model_bytes": 4213512672,
+    "corpus_rev": "2ded846",
+    "palito_mode": "serve",
+    "context": 4096,
+    "tokens": 256,
+    "runs": 3,
+    "sizes": [
+      500,
+      2900
+    ],
+    "llama_configs": [
+      "fa-on"
+    ]
+  },
+  "prompt_tokens": {
+    "500": 512,
+    "2900": 2912
+  },
+  "results": {
+    "Palito int8-fast": {
+      "500": [
+        {
+          "generated": 256,
+          "ttft_ms": 14.48,
+          "decode_tps": 983.29,
+          "prompt_tokens": 512
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 13.93,
+          "decode_tps": 992.0,
+          "prompt_tokens": 512
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 13.85,
+          "decode_tps": 990.7,
+          "prompt_tokens": 512
+        }
+      ],
+      "2900": [
+        {
+          "generated": 256,
+          "ttft_ms": 53.9,
+          "decode_tps": 823.95,
+          "prompt_tokens": 2912
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 55.88,
+          "decode_tps": 819.28,
+          "prompt_tokens": 2912
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 55.82,
+          "decode_tps": 819.3,
+          "prompt_tokens": 2912
+        }
+      ]
+    },
+    "llama.cpp fa-on": {
+      "500": [
+        {
+          "generated": 256,
+          "ttft_ms": 14.34,
+          "decode_tps": 908.8,
+          "prompt_tokens": 512
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 14.37,
+          "decode_tps": 909.01,
+          "prompt_tokens": 512
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 14.29,
+          "decode_tps": 895.9,
+          "prompt_tokens": 512
+        }
+      ],
+      "2900": [
+        {
+          "generated": 256,
+          "ttft_ms": 72.23,
+          "decode_tps": 769.25,
+          "prompt_tokens": 2912
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 71.02,
+          "decode_tps": 769.9,
+          "prompt_tokens": 2912
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 72.61,
+          "decode_tps": 768.61,
+          "prompt_tokens": 2912
+        }
+      ]
+    }
+  }
+}

@@ -95,6 +95,7 @@ pub(crate) struct Weights<T> {
 }
 
 impl<T> Weights<T> {
+    #[cfg_attr(not(any(feature = "cuda", feature = "vulkan", all(feature = "metal", target_os = "macos"))), allow(dead_code))]
     pub fn map<U>(self, mut convert: impl FnMut(T) -> Result<U>) -> Result<Weights<U>> {
         let mut layers = Vec::with_capacity(self.layers.len());
         for layer in self.layers {
@@ -152,6 +153,7 @@ impl<T> Weights<T> {
 }
 
 impl Weights<Tensor> {
+    #[cfg_attr(not(any(feature = "cuda", feature = "vulkan", all(feature = "metal", target_os = "macos"))), allow(dead_code))]
     pub fn open(path: &Path, config: &Config) -> Result<Self> {
         config.validate()?;
         Self::from_gguf(Gguf::open(path, false)?, config)
@@ -747,6 +749,7 @@ impl Weights<Tensor> {
         })
     }
 
+    #[cfg_attr(not(any(feature = "cuda", feature = "vulkan", all(feature = "metal", target_os = "macos"))), allow(dead_code))]
     pub fn bytes(&self) -> u64 {
         let mut bytes = self.embedding.allocated_bytes()
             + self

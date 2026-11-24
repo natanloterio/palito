@@ -72,6 +72,11 @@ internal static unsafe class Native
     private static IntPtr Resolve(string name, Assembly assembly, DllImportSearchPath? path)
     {
         if (name != Library) return IntPtr.Zero;
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("PALITO_LIBRARY"))
+            && NativeLibrary.TryLoad(name, assembly, path, out IntPtr packaged))
+        {
+            return packaged;
+        }
         string location = PalitoEngine.LibraryPath();
         try
         {

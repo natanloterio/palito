@@ -1,6 +1,45 @@
 typedef unsigned char u8;
 typedef unsigned long long u64;
 
+// KV cache element access. F32 caches (every profile but int8-fast) load and store
+// floats unchanged; int8-fast stores FP16 bits (round to nearest, the conversion its
+// FP16 prefill attention applies) and every kernel accumulates in F32.
+typedef unsigned short kv_f16;
+
+__device__ __forceinline__ float kv_load(const float *p, u64 i) { return p[i]; }
+
+__device__ __forceinline__ float kv_load(const kv_f16 *p, u64 i) {
+    float value;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(value) : "h"(p[i]));
+    return value;
+}
+
+__device__ __forceinline__ float2 kv_unpack2(unsigned int packed) {
+    float lo, hi;
+    asm("{.reg .f16 l, h; mov.b32 {l, h}, %2; cvt.f32.f16 %0, l; cvt.f32.f16 %1, h;}"
+        : "=f"(lo), "=f"(hi) : "r"(packed));
+    return make_float2(lo, hi);
+}
+
+// Four consecutive elements; i % 4 == 0 (16-byte F32 / 8-byte F16 aligned).
+__device__ __forceinline__ float4 kv_load4(const float *p, u64 i) {
+    return *(const float4 *)(p + i);
+}
+
+__device__ __forceinline__ float4 kv_load4(const kv_f16 *p, u64 i) {
+    uint2 bits = *(const uint2 *)(p + i);
+    float2 a = kv_unpack2(bits.x), b = kv_unpack2(bits.y);
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+
+__device__ __forceinline__ void kv_store(float *p, u64 i, float value) { p[i] = value; }
+
+__device__ __forceinline__ void kv_store(kv_f16 *p, u64 i, float value) {
+    unsigned short bits;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(bits) : "f"(value));
+    p[i] = bits;
+}
+
 __device__ float half_value_bits(unsigned int h) {
 #ifdef CUDA_NATIVE_HALF
     // Preserve legacy reserved-exponent handling; every finite half is exact in F32.
@@ -306,14 +345,13 @@ __device__ __forceinline__ void packed_block_accumulate(const u8 *p, const float
             unsigned int low = (quarter & 1) ? lo1 : lo0;
             int group = h * 8 + quarter * 2 + col / 16;
             float ds = d * (float)((const signed char *)p)[192 + group];
-            #pragma unroll
-            for (int j = 0; j < 2; j++) {
-                int ql = (low >> (j * 8 + (quarter / 2) * 4)) & 15;
-                int qh = (hi >> (j * 8 + quarter * 2)) & 3;
-                float decoded = ds * (small_uint_float(ql | (qh << 4)) - 32.0f);
-                parts[quarter * 2 + j] += decoded
-                    * x[h * 128 + quarter * 32 + col + j];
-            }
+            float2 xv = *(const float2 *)(x + h * 128 + quarter * 32 + col);
+            int ql0 = (low >> ((quarter / 2) * 4)) & 15;
+            int qh0 = (hi >> (quarter * 2)) & 3;
+            int ql1 = (low >> (8 + (quarter / 2) * 4)) & 15;
+            int qh1 = (hi >> (8 + quarter * 2)) & 3;
+            parts[quarter * 2] += ds * (small_uint_float(ql0 | (qh0 << 4)) - 32.0f) * xv.x;
+            parts[quarter * 2 + 1] += ds * (small_uint_float(ql1 | (qh1 << 4)) - 32.0f) * xv.y;
         }
     }
 }
@@ -391,6 +429,90 @@ __device__ __forceinline__ float q4k_wide_row_part(const u8 *w, const float *x, 
     return warp_sum(fold_parts(parts));
 }
 
+// Q5_K with 8 lanes per 256-value block: same layout as q4k_wide_block plus the
+// 32-byte high-bit array `qh` at p + 16.
+__device__ __forceinline__ void q5k_wide_block(const u8 *p, const float *x, int sub,
+                                               float *parts) {
+    uint4 qv = *(const uint4 *)(p + 48 + sub * 16);
+    uint4 qhv = *(const uint4 *)(p + 16 + (sub & 1) * 16);
+    unsigned int dd = *(const unsigned int *)p;
+    float d = half_value_bits(dd & 0xffff), dm = half_value_bits(dd >> 16);
+    const unsigned int *sw = (const unsigned int *)(p + 4);
+    unsigned int s0 = sw[0], s1 = sw[1], s2 = sw[2];
+    unsigned int qw[4] = {qv.x, qv.y, qv.z, qv.w};
+    unsigned int qhw[4] = {qhv.x, qhv.y, qhv.z, qhv.w};
+    int pair = sub >> 1;
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        int group = 2 * pair + half, shift = 8 * (group & 3);
+        unsigned int lo = (s0 >> shift) & 255, mid = (s1 >> shift) & 255;
+        unsigned int hi = (s2 >> shift) & 255;
+        int scale = group < 4 ? lo & 63 : (hi & 15) | ((lo >> 6) << 4);
+        int minimum = group < 4 ? mid & 63 : (hi >> 4) | ((mid >> 6) << 4);
+        float ds = d * (float)scale, ms = dm * (float)minimum;
+        const float *xb = x + 32 * group + (sub & 1) * 16;
+        #pragma unroll
+        for (int word = 0; word < 4; word++) {
+            float4 xv = *(const float4 *)(xb + 4 * word);
+            float xs[4] = {xv.x, xv.y, xv.z, xv.w};
+            #pragma unroll
+            for (int b = 0; b < 4; b++) {
+                unsigned int q = ((qw[word] >> (8 * b + 4 * half)) & 15)
+                    | ((((qhw[word] >> (8 * b)) >> group) & 1) << 4);
+                float decoded = ds * small_uint_float(q) - ms;
+                parts[half * 4 + b] += decoded * xs[b];
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ float q5k_wide_row_part(const u8 *w, const float *x, u64 offset,
+                                                   int width, int lane, int part, int warps) {
+    float parts[8] = {};
+    for (int first = (part * 4 + (lane >> 3)) * 256; first < width; first += warps * 1024)
+        q5k_wide_block(w + ((offset + first) / 256) * 176, x + first, lane & 7, parts);
+    return warp_sum(fold_parts(parts));
+}
+
+// Q6_K with 16 lanes per 256-value block (4 values/lane/quarter, float4 loads on x),
+// so a warp covers 2 blocks (512 elements) per step.
+__device__ __forceinline__ void q6k_wide_block(const u8 *p, const float *x, int sub,
+                                               float *parts) {
+    float d = half_value(p + 208);
+    int h = sub >> 3, col = (sub & 7) * 4;
+    const unsigned short *p_lo0 = (const unsigned short *)(p + h * 64 + col);
+    const unsigned short *p_lo1 = (const unsigned short *)(p + h * 64 + 32 + col);
+    const unsigned short *p_hi = (const unsigned short *)(p + 128 + h * 32 + col);
+    unsigned int lo0 = (unsigned int)p_lo0[0] | ((unsigned int)p_lo0[1] << 16);
+    unsigned int lo1 = (unsigned int)p_lo1[0] | ((unsigned int)p_lo1[1] << 16);
+    unsigned int hi = (unsigned int)p_hi[0] | ((unsigned int)p_hi[1] << 16);
+    #pragma unroll
+    for (int quarter = 0; quarter < 4; quarter++) {
+        unsigned int low = (quarter & 1) ? lo1 : lo0;
+        int group = h * 8 + quarter * 2 + (col >> 4);
+        float ds = d * (float)((const signed char *)p)[192 + group];
+        float4 xv = *(const float4 *)(x + h * 128 + quarter * 32 + col);
+        float xs[4] = {xv.x, xv.y, xv.z, xv.w};
+        int lshift = (quarter >> 1) * 4;
+        int hshift = quarter * 2;
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            int ql = (low >> (8 * b + lshift)) & 15;
+            int qh = (hi >> (8 * b + hshift)) & 3;
+            float decoded = ds * (small_uint_float(ql | (qh << 4)) - 32.0f);
+            parts[(quarter & 1) * 4 + b] += decoded * xs[b];
+        }
+    }
+}
+
+__device__ __forceinline__ float q6k_wide_row_part(const u8 *w, const float *x, u64 offset,
+                                                   int width, int lane, int part, int warps) {
+    float parts[8] = {};
+    for (int first = (part * 2 + (lane >> 4)) * 256; first < width; first += warps * 512)
+        q6k_wide_block(w + ((offset + first) / 256) * 210, x + first, lane & 15, parts);
+    return warp_sum(fold_parts(parts));
+}
+
 template<int Kind>
 __device__ __forceinline__ float packed_matrix_lane(const u8 *w, const float *x,
                                                     u64 offset, int width, int tid) {
@@ -413,7 +535,7 @@ __device__ __forceinline__ float warp_scalar_row(const u8 *w, const float *x, u6
 // cuda.rs, which sizes the grid: grid=(ceil(rows * warps / 8), selections, 1).
 // Block-aligned Q4_K rows use the wide layout, where one warp step covers 4 blocks.
 __device__ __forceinline__ bool q4k_wide(int kind, int width) {
-    return kind == 12 && width % 256 == 0;
+    return (kind == 12 || kind == 13) && width % 256 == 0;
 }
 
 __device__ __forceinline__ int matvec_warps_per_row(int kind, int rows, int selections,
@@ -426,6 +548,30 @@ __device__ __forceinline__ int matvec_warps_per_row(int kind, int rows, int sele
     }
     while (warps < 8 && warps < blocks && rows * selections * warps < 16384) warps *= 2;
     return warps;
+}
+
+// Q8_0 row part: 8 lanes per 32-element block (4 values/lane), so one warp
+// processes 4 blocks (128 elements) per step with float4 loads on x.
+__device__ __forceinline__ float q8_0_row_part(const u8 *w, const float *x, u64 offset,
+                                               int width, int lane, int part, int warps) {
+    int num_blocks = width / 32;
+    const u8 *row_ptr = w + (offset / 32) * 34;
+    int sub = lane >> 3;
+    int elem = (lane & 7) * 4;
+    float acc = 0.0f;
+    for (int b = part * 4 + sub; b < num_blocks; b += warps * 4) {
+        const u8 *p = row_ptr + (u64)b * 34;
+        float d = half_value(p);
+        unsigned short lo = *(const unsigned short *)(p + 2 + elem);
+        unsigned short hi = *(const unsigned short *)(p + 4 + elem);
+        float4 xv = *(const float4 *)(x + b * 32 + elem);
+        float q0 = (float)(signed char)(lo & 0xff);
+        float q1 = (float)(signed char)(lo >> 8);
+        float q2 = (float)(signed char)(hi & 0xff);
+        float q3 = (float)(signed char)(hi >> 8);
+        acc += d * (q0 * xv.x + q1 * xv.y + q2 * xv.z + q3 * xv.w);
+    }
+    return warp_sum(acc);
 }
 
 // block=(256, 1, 1). F32 arithmetic; only the reduction order differs from matvec.
@@ -441,11 +587,14 @@ extern "C" __global__ void matvec_packed_rows(const u8 *w, int kind, const float
         int expert = moe ? ids[selected] : 0;
         u64 offset = ((u64)expert * rows + row) * width;
         const float *input = x + (batched ? (u64)selected * width : 0);
-        if (q4k_wide(kind, width)) {
+        if (kind == 12 && width % 256 == 0) {
             sum = q4k_wide_row_part(w, input, offset, width, lane, part, warps);
+        } else if (kind == 13 && width % 256 == 0) {
+            sum = q5k_wide_row_part(w, input, offset, width, lane, part, warps);
         } else if (kind == 14 && width % 256 == 0) {
-            int start = part * 256, step = warps * 256;
-            sum = warp_sum(packed_lane_span<14>(w, input, offset, width, lane, start, step));
+            sum = q6k_wide_row_part(w, input, offset, width, lane, part, warps);
+        } else if (kind == 8 && width % 32 == 0) {
+            sum = q8_0_row_part(w, input, offset, width, lane, part, warps);
         } else {
             switch (kind) {
 #define SCALAR_ROW(K) warp_scalar_row<K>(w, input, offset, width, lane, part, warps)
@@ -492,6 +641,7 @@ template<int Kind>
 __device__ __forceinline__ float packed_row_part(const u8 *w, const float *x, u64 offset,
                                                  int width, int lane, int part, int warps) {
     if (Kind == 12) return q4k_wide_row_part(w, x, offset, width, lane, part, warps);
+    if (Kind == 14) return q6k_wide_row_part(w, x, offset, width, lane, part, warps);
     return warp_sum(packed_lane_span<Kind>(w, x, offset, width, lane, part * 256, warps * 256));
 }
 
@@ -520,6 +670,7 @@ extern "C" __global__ void matvec_packed_qkv_rows(
     if (row < total) {
         u64 offset = (u64)local * width;
         sum = kind == 12 ? packed_row_part<12>(w, x, offset, width, lane, part, warps)
+            : kind == 13 ? q5k_wide_row_part(w, x, offset, width, lane, part, warps)
                          : packed_row_part<14>(w, x, offset, width, lane, part, warps);
     }
     if (warps > 1) {
@@ -531,22 +682,25 @@ extern "C" __global__ void matvec_packed_qkv_rows(
     if (lane == 0 && row < total) y[local] = sum;
 }
 
-// Fused MoE gate/up projections plus SwiGLU for packed Q4_K/Q6_K experts with
-// block-aligned rows. Same grid as matvec_packed_rows; reads x once per row pair
-// and drops the separate swiglu launch. y = silu(gate . x) * (up . x).
+// Fused gate/up projections plus SwiGLU for packed Q4_K/Q5_K/Q6_K dense or MoE
+// weights with block-aligned rows. Same grid as matvec_packed_rows; reads x once
+// per row pair and drops the separate swiglu launch. y = silu(gate . x) * (up . x).
 extern "C" __global__ void matvec_packed_gate_up_rows(
     const u8 *gate, int gate_kind, const u8 *up, int up_kind, const float *x, float *y,
-    int width, int rows, const int *ids) {
+    int width, int rows, const int *ids, int moe) {
     __shared__ float partial[2][8];
     int lane = threadIdx.x & 31, warp = threadIdx.x / 32, selected = blockIdx.y;
     int warps = matvec_warps_per_row(gate_kind, rows, gridDim.y, width);
     int part = warp % warps, row = blockIdx.x * (8 / warps) + warp / warps;
     float g = 0.0f, u = 0.0f;
     if (row < rows) {
-        u64 offset = ((u64)ids[selected] * rows + row) * width;
+        int expert = moe ? ids[selected] : 0;
+        u64 offset = ((u64)expert * rows + row) * width;
         g = gate_kind == 12 ? packed_row_part<12>(gate, x, offset, width, lane, part, warps)
+          : gate_kind == 13 ? q5k_wide_row_part(gate, x, offset, width, lane, part, warps)
                             : packed_row_part<14>(gate, x, offset, width, lane, part, warps);
         u = up_kind == 12 ? packed_row_part<12>(up, x, offset, width, lane, part, warps)
+          : up_kind == 13 ? q5k_wide_row_part(up, x, offset, width, lane, part, warps)
                           : packed_row_part<14>(up, x, offset, width, lane, part, warps);
     }
     if (warps > 1) {
@@ -857,15 +1011,143 @@ extern "C" __global__ void rotary_decode(float *x, int n, int dim, const int *co
     rotary_impl(x, n, dim, control[1], base, neox, nullptr, 1.0f);
 }
 
+extern "C" __global__ void rotary_factored_decode(float *x, int n, int dim, const int *control,
+                                                  float base, int neox, const float *factors,
+                                                  float magnitude) {
+    rotary_impl(x, n, dim, control[1], base, neox, factors, magnitude);
+}
+
+// Fused factored RoPE (Q and K) + KV cache store for decode graphs (e.g. Phi-3-128k, Llama 3.2).
+// Grid: ceil((q_size/2 + k_size) / 256) blocks, 256 threads.
+template<typename KV>
+__device__ __forceinline__ void rotary_factored_cache_kv_impl(
+    float *q, int q_size, float *k, const float *v, KV *keys, KV *values, int k_size, int dim,
+    int position, float base, int neox, const float *factors, float magnitude) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int q_pairs = q_size / 2;
+    int k_pairs = k_size / 2;
+    if (tid < q_pairs) {
+        int pair = tid % (dim / 2), head = tid / (dim / 2);
+        int a = head * dim + (neox ? pair : 2 * pair);
+        int b = neox ? a + dim / 2 : a + 1;
+        float angle = (float)position * powf(base, -(float)(2 * pair) / (float)dim) / factors[pair];
+        float sine = sinf(angle) * magnitude, cosine = cosf(angle) * magnitude;
+        float u = q[a], w = q[b];
+        q[a] = u * cosine - w * sine;
+        q[b] = u * sine + w * cosine;
+    } else if (tid < q_pairs + k_pairs) {
+        int p = tid - q_pairs;
+        int pair = p % (dim / 2), head = p / (dim / 2);
+        int a = head * dim + (neox ? pair : 2 * pair);
+        int b = neox ? a + dim / 2 : a + 1;
+        float angle = (float)position * powf(base, -(float)(2 * pair) / (float)dim) / factors[pair];
+        float sine = sinf(angle) * magnitude, cosine = cosf(angle) * magnitude;
+        float u = k[a], w = k[b];
+        float ra = u * cosine - w * sine;
+        float rb = u * sine + w * cosine;
+        k[a] = ra;
+        k[b] = rb;
+        u64 base_kv = (u64)position * k_size;
+        kv_store(keys, base_kv + a, ra);
+        kv_store(keys, base_kv + b, rb);
+        kv_store(values, base_kv + a, v[a]);
+        kv_store(values, base_kv + b, v[b]);
+    }
+}
+
+extern "C" __global__ void rotary_factored_cache_kv_decode(
+    float *q, int q_size, float *k, const float *v, float *keys, float *values, int k_size,
+    int dim, const int *control, float base, int neox, const float *factors, float magnitude) {
+    rotary_factored_cache_kv_impl(q, q_size, k, v, keys, values, k_size, dim, control[1], base,
+                                  neox, factors, magnitude);
+}
+
+#ifdef CUDA_KV_F16
+extern "C" __global__ void rotary_factored_cache_kv_decode_f16(
+    float *q, int q_size, float *k, const float *v, kv_f16 *keys, kv_f16 *values, int k_size,
+    int dim, const int *control, float base, int neox, const float *factors, float magnitude) {
+    rotary_factored_cache_kv_impl(q, q_size, k, v, keys, values, k_size, dim, control[1], base,
+                                  neox, factors, magnitude);
+}
+#endif
+
+#ifdef CUDA_PACKED_DECODE
+// Fused full-vector Q/K RMSNorm + RoPE + KV cache store for OLMoE decode (grid=2, block=1024).
+// Block 0 handles Q; block 1 handles K and stores K and V into the KV cache.
+template<typename KV>
+__device__ __forceinline__ void olmoe_qk_norm_rope_cache_impl(
+    float *q, const u8 *qn, int q_size, float *k, const u8 *kn, const float *v, KV *keys,
+    KV *values, int k_size, int dim, int position, float base, int neox, float epsilon) {
+    __shared__ float partial[32];
+    __shared__ float shared_vec[4096];
+    bool is_q = blockIdx.x == 0;
+    float *vec = is_q ? q : k;
+    const float *nw = (const float *)(is_q ? qn : kn);
+    int size = is_q ? q_size : k_size;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < size; i += blockDim.x) {
+        float val = vec[i];
+        shared_vec[i] = val;
+        sum += val * val;
+    }
+    sum = warp_sum(sum);
+    if ((threadIdx.x & 31) == 0) partial[threadIdx.x / 32] = sum;
+    __syncthreads();
+    float total = 0.0f;
+    for (int i = 0; i < (int)blockDim.x / 32; i++) total += partial[i];
+    float inverse = 1.0f / sqrtf(total / (float)size + epsilon);
+    for (int i = threadIdx.x; i < size; i += blockDim.x)
+        shared_vec[i] = shared_vec[i] * inverse * nw[i];
+    __syncthreads();
+    int pairs = size / 2;
+    u64 kv_base = (u64)position * k_size;
+    for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
+        int pair = p % (dim / 2), head = p / (dim / 2);
+        int a = head * dim + (neox ? pair : 2 * pair);
+        int b = neox ? a + dim / 2 : a + 1;
+        float angle = (float)position * powf(base, -(float)(2 * pair) / (float)dim);
+        float sine = sinf(angle), cosine = cosf(angle);
+        float u = shared_vec[a], w = shared_vec[b];
+        float ra = u * cosine - w * sine;
+        float rb = u * sine + w * cosine;
+        vec[a] = ra;
+        vec[b] = rb;
+        if (!is_q) {
+            kv_store(keys, kv_base + a, ra);
+            kv_store(keys, kv_base + b, rb);
+            kv_store(values, kv_base + a, v[a]);
+            kv_store(values, kv_base + b, v[b]);
+        }
+    }
+}
+
+extern "C" __global__ void olmoe_qk_norm_rope_cache_decode(
+    float *q, const u8 *qn, int q_size, float *k, const u8 *kn, const float *v, float *keys,
+    float *values, int k_size, int dim, const int *control, float base, int neox, float epsilon) {
+    olmoe_qk_norm_rope_cache_impl(q, qn, q_size, k, kn, v, keys, values, k_size, dim, control[1],
+                                  base, neox, epsilon);
+}
+
+#ifdef CUDA_KV_F16
+extern "C" __global__ void olmoe_qk_norm_rope_cache_decode_f16(
+    float *q, const u8 *qn, int q_size, float *k, const u8 *kn, const float *v, kv_f16 *keys,
+    kv_f16 *values, int k_size, int dim, const int *control, float base, int neox, float epsilon) {
+    olmoe_qk_norm_rope_cache_impl(q, qn, q_size, k, kn, v, keys, values, k_size, dim, control[1],
+                                  base, neox, epsilon);
+}
+#endif
+#endif
+
+template<typename KV>
 __device__ __forceinline__ void cache_kv_impl(const float *k, const float *v,
-                                              float *keys, float *values, int width, int position) {
+                                              KV *keys, KV *values, int width, int position) {
     k += (u64)blockIdx.y * width;
     v += (u64)blockIdx.y * width;
     position += blockIdx.y;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < width) {
-        keys[(u64)position * width + i] = k[i];
-        values[(u64)position * width + i] = v[i];
+        kv_store(keys, (u64)position * width + i, k[i]);
+        kv_store(values, (u64)position * width + i, v[i]);
     }
 }
 
@@ -880,8 +1162,21 @@ extern "C" __global__ void cache_kv_decode(const float *k, const float *v,
     cache_kv_impl(k, v, keys, values, width, control[1]);
 }
 
-template<bool Gemma, bool Alibi = false>
-__device__ __forceinline__ void attention_scores_impl(const float *q, const float *keys,
+#ifdef CUDA_KV_F16
+extern "C" __global__ void cache_kv_f16(const float *k, const float *v, kv_f16 *keys,
+                                       kv_f16 *values, int width, int position) {
+    cache_kv_impl(k, v, keys, values, width, position);
+}
+
+extern "C" __global__ void cache_kv_decode_f16(const float *k, const float *v,
+                                              kv_f16 *keys, kv_f16 *values, int width,
+                                              const int *control) {
+    cache_kv_impl(k, v, keys, values, width, control[1]);
+}
+#endif
+
+template<bool Gemma, bool Alibi = false, typename KV = float>
+__device__ __forceinline__ void attention_scores_impl(const float *q, const KV *keys,
     float *scores, int dim, int heads, int kv_heads, int context, int count, int window, float scale,
     float softcap) {
     int head = blockIdx.x, time = blockIdx.y;
@@ -893,7 +1188,7 @@ __device__ __forceinline__ void attention_scores_impl(const float *q, const floa
     float sum = 0.0f;
     for (int i = threadIdx.x; i < dim; i += blockDim.x)
         sum += (Gemma ? q[(u64)head * dim + i] * scale : q[(u64)head * dim + i])
-             * keys[((u64)time * kv_heads + kv_head) * dim + i];
+             * kv_load(keys, ((u64)time * kv_heads + kv_head) * dim + i);
     sum = sum_block(sum);
     if (threadIdx.x == 0) {
         float score = Gemma ? sum : sum / sqrtf((float)dim);
@@ -927,8 +1222,40 @@ extern "C" __global__ void gemma_attention_scores(const float *q, const float *k
     attention_scores_impl<true>(q, keys, scores, dim, heads, kv_heads, context, count, window, scale, softcap);
 }
 
-template<bool Gemma>
-__device__ __forceinline__ void attention_values_impl(float *scores, const float *values,
+template<typename KV = float>
+__device__ __forceinline__ void gemma_attention_scores_decode_impl(const float *q, const KV *keys,
+    float *scores, int dim, int heads, int kv_heads, int context, const int *control, int window,
+    float scale, float softcap) {
+    int head = blockIdx.x;
+    int count = control[1] + 1;
+    int start = (window > 0 && count > window) ? (count - window) : 0;
+    int kv_head = head / (heads / kv_heads);
+    for (int time = start + blockIdx.y; time < count; time += gridDim.y) {
+        float sum = 0.0f;
+        for (int i = threadIdx.x; i < dim; i += blockDim.x)
+            sum += (q[(u64)head * dim + i] * scale)
+                 * kv_load(keys, ((u64)time * kv_heads + kv_head) * dim + i);
+        sum = sum_block(sum);
+        if (threadIdx.x == 0) {
+            float score = sum;
+            if (softcap > 0.0f)
+                score = isfinite(score) ? softcap * tanhf(score * (1.0f / softcap))
+                                        : __int_as_float(0x7fffffff);
+            scores[(u64)head * context + time] = score;
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void gemma_attention_scores_decode(const float *q, const float *keys,
+    float *scores, int dim, int heads, int kv_heads, int context, const int *control, int window,
+    float scale, float softcap) {
+    gemma_attention_scores_decode_impl(q, keys, scores, dim, heads, kv_heads, context, control,
+                                       window, scale, softcap);
+}
+
+template<bool Gemma, typename KV = float>
+__device__ __forceinline__ void attention_values_impl(float *scores, const KV *values,
     float *output, int dim, int heads, int kv_heads, int context, int count, int window) {
     count += blockIdx.y;
     int start = Gemma && window > 0 && count > window ? count - window : 0;
@@ -956,7 +1283,7 @@ __device__ __forceinline__ void attention_values_impl(float *scores, const float
     for (int i = lane; i < dim; i += blockDim.x) {
         float value = 0.0f;
         for (int t = start; t < count; t++)
-            value += s[t] / total * values[((u64)t * kv_heads + kv_head) * dim + i];
+            value += s[t] / total * kv_load(values, ((u64)t * kv_heads + kv_head) * dim + i);
         output[(u64)head * dim + i] = value;
     }
 }
@@ -970,6 +1297,50 @@ extern "C" __global__ void gemma_attention_values(float *scores, const float *va
     int dim, int heads, int kv_heads, int context, int count, int window) {
     attention_values_impl<true>(scores, values, output, dim, heads, kv_heads, context, count, window);
 }
+
+extern "C" __global__ void gemma_attention_values_decode(float *scores, const float *values,
+    float *output, int dim, int heads, int kv_heads, int context, const int *control, int window) {
+    attention_values_impl<true>(scores, values, output, dim, heads, kv_heads, context,
+                                control[1] + 1, window);
+}
+
+#ifdef CUDA_KV_F16
+extern "C" __global__ void attention_scores_f16(const float *q, const kv_f16 *keys,
+    float *scores, int dim, int heads, int kv_heads, int context, int count) {
+    attention_scores_impl<false, false>(q, keys, scores, dim, heads, kv_heads, context, count, 0,
+                                        1.0f, 0.0f);
+}
+
+extern "C" __global__ void attention_values_f16(float *scores, const kv_f16 *values,
+    float *output, int dim, int heads, int kv_heads, int context, int count) {
+    attention_values_impl<false>(scores, values, output, dim, heads, kv_heads, context, count, 0);
+}
+
+extern "C" __global__ void gemma_attention_scores_f16(const float *q, const kv_f16 *keys,
+    float *scores, int dim, int heads, int kv_heads, int context, int count, int window,
+    float scale, float softcap) {
+    attention_scores_impl<true>(q, keys, scores, dim, heads, kv_heads, context, count, window,
+                                scale, softcap);
+}
+
+extern "C" __global__ void gemma_attention_values_f16(float *scores, const kv_f16 *values,
+    float *output, int dim, int heads, int kv_heads, int context, int count, int window) {
+    attention_values_impl<true>(scores, values, output, dim, heads, kv_heads, context, count, window);
+}
+
+extern "C" __global__ void gemma_attention_scores_decode_f16(const float *q, const kv_f16 *keys,
+    float *scores, int dim, int heads, int kv_heads, int context, const int *control, int window,
+    float scale, float softcap) {
+    gemma_attention_scores_decode_impl(q, keys, scores, dim, heads, kv_heads, context, control,
+                                       window, scale, softcap);
+}
+
+extern "C" __global__ void gemma_attention_values_decode_f16(float *scores, const kv_f16 *values,
+    float *output, int dim, int heads, int kv_heads, int context, const int *control, int window) {
+    attention_values_impl<true>(scores, values, output, dim, heads, kv_heads, context,
+                                control[1] + 1, window);
+}
+#endif
 
 extern "C" __global__ void gemma_embedding_scale(float *x, int count, float scale) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1075,6 +1446,41 @@ extern "C" __global__ void router_full_softmax(const float *scores, int count, i
                                                int *ids, float *weights, int *status) {
     router_impl<true>(scores, count, used, ids, weights, status);
 }
+
+#ifdef CUDA_PACKED_DECODE
+// One-warp full-softmax top-k router for 64 experts (OLMoE): 2 experts per lane.
+extern "C" __global__ void router_warp64_full_softmax(const float *scores, int used,
+                                                      int *ids, float *weights, int *status) {
+    int lane = threadIdx.x;
+    float v[2] = {scores[lane], scores[lane + 32]};
+    if (!isfinite(v[0]) || !isfinite(v[1])) atomicExch(status, 1);
+    float maximum = fmaxf(v[0], v[1]);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset));
+    float e0 = expf(v[0] - maximum), e1 = expf(v[1] - maximum);
+    float denom = warp_sum(e0 + e1);
+    int idx[2] = {lane, lane + 32};
+    for (int s = 0; s < used; s++) {
+        float bv = -__int_as_float(0x7f800000);
+        int bi = 64;
+        if (v[0] > bv || (v[0] == bv && idx[0] < bi)) { bv = v[0]; bi = idx[0]; }
+        if (v[1] > bv || (v[1] == bv && idx[1] < bi)) { bv = v[1]; bi = idx[1]; }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            float ov = __shfl_xor_sync(0xffffffff, bv, offset);
+            int oi = __shfl_xor_sync(0xffffffff, bi, offset);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) {
+            ids[s] = bi;
+            weights[s] = expf(bv - maximum) / denom;
+        }
+        if (idx[0] == bi) v[0] = -__int_as_float(0x7f800000);
+        if (idx[1] == bi) v[1] = -__int_as_float(0x7f800000);
+    }
+}
+#endif
 #if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_DECODE_FUSION_RESEARCH)
 #define CUDA_ROUTER_WARP128 1
 #endif
@@ -1148,10 +1554,11 @@ extern "C" __global__ void router_warp128(const float *scores, int used,
 #if defined(CUDA_M8_PROTOTYPES) || defined(CUDA_DECODE_FUSION_RESEARCH) || defined(CUDA_PACKED_DECODE)
 // Equals head_norm (256-lane tree) + rotary + cache_kv for dim-128 heads with
 // full, unscaled RoPE; grid=(heads + kv_heads), block=256.
+template<typename KV>
 __device__ __forceinline__ void qkv_head_norm_rope_cache_impl(
     float *q, const u8 *q_norm, int heads,
     float *k, const u8 *k_norm, const float *v,
-    float *keys, float *values, int kv_heads,
+    KV *keys, KV *values, int kv_heads,
     float epsilon, int position, float base, int neox) {
     __shared__ float normed[128];
     int b = blockIdx.x, tid = threadIdx.x;
@@ -1178,14 +1585,14 @@ __device__ __forceinline__ void qkv_head_norm_rope_cache_impl(
         vec[b_idx] = rb;
         if (!is_q) {
             u64 kv_base = ((u64)position * kv_heads + head) * 128;
-            keys[kv_base + a] = ra;
-            keys[kv_base + b_idx] = rb;
+            kv_store(keys, kv_base + a, ra);
+            kv_store(keys, kv_base + b_idx, rb);
         }
     }
     if (!is_q && tid >= 128) {
         int i = tid - 128;
         u64 kv_base = ((u64)position * kv_heads + head) * 128;
-        values[kv_base + i] = v[(u64)head * 128 + i];
+        kv_store(values, kv_base + i, v[(u64)head * 128 + i]);
     }
 }
 
@@ -1206,6 +1613,26 @@ extern "C" __global__ void qkv_head_norm_rope_cache_decode(
     qkv_head_norm_rope_cache_impl(
         q, q_norm, heads, k, k_norm, v, keys, values, kv_heads, epsilon, control[1], base, neox);
 }
+
+#ifdef CUDA_KV_F16
+extern "C" __global__ void qkv_head_norm_rope_cache_f16(
+    float *q, const u8 *q_norm, int heads,
+    float *k, const u8 *k_norm, const float *v,
+    kv_f16 *keys, kv_f16 *values, int kv_heads,
+    float epsilon, int position, float base, int neox) {
+    qkv_head_norm_rope_cache_impl(
+        q, q_norm, heads, k, k_norm, v, keys, values, kv_heads, epsilon, position, base, neox);
+}
+
+extern "C" __global__ void qkv_head_norm_rope_cache_decode_f16(
+    float *q, const u8 *q_norm, int heads,
+    float *k, const u8 *k_norm, const float *v,
+    kv_f16 *keys, kv_f16 *values, int kv_heads,
+    float epsilon, const int *control, float base, int neox) {
+    qkv_head_norm_rope_cache_impl(
+        q, q_norm, heads, k, k_norm, v, keys, values, kv_heads, epsilon, control[1], base, neox);
+}
+#endif
 #endif
 
 #ifdef CUDA_M8_PROTOTYPES

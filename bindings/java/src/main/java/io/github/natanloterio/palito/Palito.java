@@ -321,6 +321,32 @@ public final class Palito implements AutoCloseable {
         return pointer.reinterpret(Long.MAX_VALUE).getString(0, StandardCharsets.UTF_8);
     }
 
+    private static String platformTag() {
+        String os = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
+        String plat = os.contains("mac") || os.contains("darwin") ? "darwin"
+                : os.contains("win") ? "win32" : "linux";
+        String arch = System.getProperty("os.arch", "").toLowerCase(java.util.Locale.ROOT);
+        String cpu = (arch.equals("aarch64") || arch.equals("arm64")) ? "arm64" : "x64";
+        return plat + "-" + cpu;
+    }
+
+    private static Path extractBundled(String name) {
+        String resource = "/native/" + platformTag() + "/" + name;
+        try (java.io.InputStream in = Palito.class.getResourceAsStream(resource)) {
+            if (in == null) {
+                return null;
+            }
+            Path dir = Files.createTempDirectory("palito-native-");
+            Path out = dir.resolve(name);
+            Files.copy(in, out, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            out.toFile().deleteOnExit();
+            dir.toFile().deleteOnExit();
+            return out;
+        } catch (java.io.IOException e) {
+            return null;
+        }
+    }
+
     /** Where libpalito is loaded from. */
     public static String libraryPath() {
         String explicit = System.getenv("PALITO_LIBRARY");
@@ -328,6 +354,10 @@ public final class Palito implements AutoCloseable {
             return explicit;
         }
         String name = System.mapLibraryName("palito");
+        Path bundledJar = extractBundled(name);
+        if (bundledJar != null) {
+            return bundledJar.toString();
+        }
         String path = System.getenv("PATH");
         if (path != null) {
             for (String dir : path.split(java.io.File.pathSeparator)) {

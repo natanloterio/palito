@@ -75,12 +75,13 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
     constexpr int X_ITEMS = (C * BN * PACKS + THREADS - 1) / THREADS;
     constexpr int S_ITEMS = (BN * GROUPS + THREADS - 1) / THREADS;
     constexpr int W_WORDS = Kind == 12 ? 1 : 2;
+    constexpr bool HAS_MIN = Kind == 12 || Kind == 13;
     unsigned int wraw[W_ITEMS][W_WORDS], praw[P_ITEMS][4], xraw[X_ITEMS];
     float sraw[S_ITEMS][SC];
     int mraw[S_ITEMS][SC];
     auto block_of = [&](int row, int k) {
         return weights + (((u64)expert * rows + first_row + row) * width + k) / 256
-            * (Kind == 12 ? 144 : 210);
+            * (Kind == 12 ? 144 : Kind == 13 ? 176 : 210);
     };
     auto fetch = [&](int k) {
         #pragma unroll
@@ -93,6 +94,9 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
                 int i = k % 256 + pack * 4;
                 if (Kind == 12) {
                     wraw[j][0] = *(const unsigned int *)(p + 16 + (i / 64) * 32 + i % 32);
+                } else if (Kind == 13) {
+                    wraw[j][0] = *(const unsigned int *)(p + 48 + (i / 64) * 32 + i % 32);
+                    wraw[j][W_WORDS - 1] = *(const unsigned int *)(p + 16 + i % 32);
                 } else {
                     int h = i / 128, col = i % 32, quarter = (i % 128) / 32;
                     const unsigned short *lo = (const unsigned short *)(p + h * 64 + col + (quarter % 2) * 32);
@@ -108,7 +112,7 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
             praw[j][0] = praw[j][1] = praw[j][2] = praw[j][3] = 0u;
             if (index < MMQ_ROWS * GROUPS && first_row + row < rows) {
                 const u8 *p = block_of(row, k);
-                if (Kind == 12) {
+                if (HAS_MIN) {
                     const unsigned int *words = (const unsigned int *)p;
                     praw[j][0] = words[0];
                     praw[j][1] = words[1];
@@ -152,6 +156,11 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
             unsigned int packed;
             if (Kind == 12) {
                 packed = (wraw[j][0] >> (4 * ((i / 32) % 2))) & 0x0f0f0f0fu;
+            } else if (Kind == 13) {
+                int g = i / 32;
+                unsigned int lo = (wraw[j][0] >> (4 * (g % 2))) & 0x0f0f0f0fu;
+                unsigned int hi = ((wraw[j][W_WORDS - 1] >> g) & 0x01010101u) << 4;
+                packed = lo | hi;
             } else {
                 int quarter = (i % 128) / 32;
                 unsigned int bits = ((wraw[j][0] >> (4 * (quarter / 2))) & 0x0f0f0f0fu)
@@ -166,7 +175,7 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
             int index = tid + j * THREADS, row = index / GROUPS, g = index % GROUPS;
             if (index >= MMQ_ROWS * GROUPS) continue;
             float a0, a1 = 0.0f, b = 0.0f;
-            if (Kind == 12) {
+            if (HAS_MIN) {
                 int gi = (k % 256) / 32 + g;
                 #define MMQ_SCALE_BYTE(n) ((int)((praw[j][1 + (n) / 4] >> (8 * ((n) % 4))) & 255))
                 int sc = gi < 4 ? MMQ_SCALE_BYTE(gi) & 63
@@ -182,7 +191,7 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
                 a1 = d * (float)(signed char)(praw[j][1] >> 8);
             }
             sh.coefficient[row][2 * g] = a0;
-            sh.coefficient[row][2 * g + 1] = Kind == 12 ? a0 : a1;
+            sh.coefficient[row][2 * g + 1] = HAS_MIN ? a0 : a1;
             sh.minimum[row][g] = b;
         }
         #pragma unroll
@@ -205,10 +214,10 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
                 #pragma unroll
                 for (int c = 0; c < SC; c++) {
                     sh.xs[t][g][c] = sraw[j][c];
-                    if (Kind == 12) m += (float)mraw[j][c] * sraw[j][c];
+                    if (HAS_MIN) m += (float)mraw[j][c] * sraw[j][c];
                 }
             }
-            sh.msum[t][g] = Kind == 12 ? m : 0.0f;
+            sh.msum[t][g] = HAS_MIN ? m : 0.0f;
         }
     };
     int k_begin = SplitK ? blockIdx.z * (width / gridDim.z) : 0;
@@ -228,7 +237,7 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
         #pragma unroll
         for (int g = 0; g < GROUPS; g++) {
             #pragma unroll
-            for (int half = 0; half < (Kind == 12 ? 1 : 2); half++) {
+            for (int half = 0; half < (HAS_MIN ? 1 : 2); half++) {
                 int pack = g * 8 + half * 4 + thread;
                 unsigned int a[2][4];
                 float coef[2][2], mins[2][2];
@@ -237,12 +246,12 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
                     int r = warp_row + m * 16 + group;
                     a[m][0] = sh.wq[r][pack];
                     a[m][1] = sh.wq[r + 8][pack];
-                    a[m][2] = Kind == 12 ? sh.wq[r][pack + 4] : 0u;
-                    a[m][3] = Kind == 12 ? sh.wq[r + 8][pack + 4] : 0u;
+                    a[m][2] = HAS_MIN ? sh.wq[r][pack + 4] : 0u;
+                    a[m][3] = HAS_MIN ? sh.wq[r + 8][pack + 4] : 0u;
                     #pragma unroll
                     for (int h = 0; h < 2; h++) {
                         coef[m][h] = sh.coefficient[r + 8 * h][2 * g + half];
-                        mins[m][h] = Kind == 12 ? sh.minimum[r + 8 * h][g] : 0.0f;
+                        mins[m][h] = HAS_MIN ? sh.minimum[r + 8 * h][g] : 0.0f;
                     }
                 }
                 #pragma unroll
@@ -255,9 +264,9 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
                         for (int i = 0; i < 4; i++) combined[m][i] = 0.0f;
                     if (S16) {
                         unsigned int h0 = sh.xq[0][tb + group][pack];
-                        unsigned int h1 = Kind == 12 ? sh.xq[0][tb + group][pack + 4] : 0u;
+                        unsigned int h1 = HAS_MIN ? sh.xq[0][tb + group][pack + 4] : 0u;
                         unsigned int l0 = sh.xq[1][tb + group][pack];
-                        unsigned int l1 = Kind == 12 ? sh.xq[1][tb + group][pack + 4] : 0u;
+                        unsigned int l1 = HAS_MIN ? sh.xq[1][tb + group][pack + 4] : 0u;
                         float s0 = sh.xs[t0][g][0], s1 = sh.xs[t0 + 1][g][0];
                         int e0 = sh.factor[t0][g], e1 = sh.factor[t0 + 1][g];
                         #pragma unroll
@@ -278,7 +287,7 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
                     #pragma unroll
                     for (int c = 0; c < (S16 ? 0 : C); c++) {
                         unsigned int b0 = sh.xq[c][tb + group][pack];
-                        unsigned int b1 = Kind == 12 ? sh.xq[c][tb + group][pack + 4] : 0u;
+                        unsigned int b1 = HAS_MIN ? sh.xq[c][tb + group][pack + 4] : 0u;
                         float s0 = sh.xs[t0][g][S16 ? 0 : c], s1 = sh.xs[t0 + 1][g][S16 ? 0 : c];
                         #pragma unroll
                         for (int m = 0; m < 2; m++) {
@@ -290,14 +299,14 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
                             combined[m][3] += (float)dot[3] * s1;
                         }
                     }
-                    float m0 = Kind == 12 && half == 0 ? sh.msum[t0][g] : 0.0f;
-                    float m1 = Kind == 12 && half == 0 ? sh.msum[t0 + 1][g] : 0.0f;
+                    float m0 = HAS_MIN && half == 0 ? sh.msum[t0][g] : 0.0f;
+                    float m1 = HAS_MIN && half == 0 ? sh.msum[t0 + 1][g] : 0.0f;
                     #pragma unroll
                     for (int m = 0; m < 2; m++) {
                         #pragma unroll
                         for (int i = 0; i < 4; i++) {
                             float value = coef[m][i / 2] * combined[m][i];
-                            if (Kind == 12) value -= mins[m][i / 2] * (i % 2 ? m1 : m0);
+                            if (HAS_MIN) value -= mins[m][i / 2] * (i % 2 ? m1 : m0);
                             acc[m][n][i] += value;
                         }
                     }
@@ -515,23 +524,40 @@ __device__ void mmq_pipe_q4(const u8 *weights, const signed char *values, const 
 // int8-fast pipelined tiles: Q4_K through mmq_pipe_q4, Q6_K through mmq_tile
 // without prefetch (210-byte blocks are not 16-byte aligned for cp.async).
 #if __CUDA_ARCH__ >= 800
-#define MMQ_PIPE_SIZE(BN, KS) (sizeof(MmqPipeShared<BN, KS>) > sizeof(MmqShared<1, BN, KS, 1>) \
-    ? sizeof(MmqPipeShared<BN, KS>) : sizeof(MmqShared<1, BN, KS, 1>))
-#define MMQ_PIPE_BODY(BN, KS, SK, PF) \
-    __shared__ __align__(16) unsigned char raw[MMQ_PIPE_SIZE(BN, KS)]; \
-    if (kind == 12) mmq_pipe_q4<BN, KS, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, *reinterpret_cast<MmqPipeShared<BN, KS> *>(raw)); \
+// KQ: Q4_K K step (mmq_pipe_q4); KS: Q6_K K step (mmq_tile).
+#define MMQ_PIPE_SIZE(BN, KQ, KS) (sizeof(MmqPipeShared<BN, KQ>) > sizeof(MmqShared<1, BN, KS, 1>) \
+    ? sizeof(MmqPipeShared<BN, KQ>) : sizeof(MmqShared<1, BN, KS, 1>))
+#define MMQ_PIPE_BODY(BN, KQ, KS, SK, PF) \
+    __shared__ __align__(16) unsigned char raw[MMQ_PIPE_SIZE(BN, KQ, KS)]; \
+    MMQ_PIPE_DISPATCH(BN, KQ, KS, SK, PF)
+// Dynamic shared memory (> 48 KB): the host sizes it from mmq_dynamic_shared.
+#define MMQ_PIPE_BODY_DYNAMIC(BN, KQ, KS, SK, PF) \
+    extern __shared__ __align__(16) unsigned char raw[]; \
+    MMQ_PIPE_DISPATCH(BN, KQ, KS, SK, PF)
+#define MMQ_PIPE_DISPATCH(BN, KQ, KS, SK, PF) \
+    if (kind == 12) mmq_pipe_q4<BN, KQ, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, *reinterpret_cast<MmqPipeShared<BN, KQ> *>(raw)); \
+    if (kind == 13) mmq_tile<13, 1, BN, KS, false, PF, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, *reinterpret_cast<MmqShared<1, BN, KS, 1> *>(raw)); \
     if (kind == 14) mmq_tile<14, 1, BN, KS, false, PF, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, *reinterpret_cast<MmqShared<1, BN, KS, 1> *>(raw)); \
-    if (kind != 12 && kind != 14 && threadIdx.x == 0) atomicOr(status, 8);
+    if (kind != 12 && kind != 13 && kind != 14 && threadIdx.x == 0) atomicOr(status, 8);
 #else
-#define MMQ_PIPE_BODY(BN, KS, SK, PF) if (threadIdx.x == 0) atomicOr(status, 16);
+#define MMQ_PIPE_BODY(BN, KQ, KS, SK, PF) if (threadIdx.x == 0) atomicOr(status, 16);
+#define MMQ_PIPE_BODY_DYNAMIC(BN, KQ, KS, SK, PF) if (threadIdx.x == 0) atomicOr(status, 16);
+#define MMQ_PIPE_SIZE(BN, KQ, KS) 0
 #endif
-#define MMQ_PIPE_KERNEL(Name, BN, KS, SK) MMQ_PIPE_KERNEL_BLOCKS(Name, BN, KS, SK, 1, false)
-#define MMQ_PIPE_KERNEL_BLOCKS(Name, BN, KS, SK, Blocks, PF) \
+#define MMQ_PIPE_KERNEL(Name, BN, KS, SK) MMQ_PIPE_KERNEL_BLOCKS(Name, BN, KS, KS, SK, 1, false)
+#define MMQ_PIPE_KERNEL_DYNAMIC(Name, BN, KQ, KS, SK) \
+extern "C" __global__ void __launch_bounds__(256, 1) \
+Name(const u8 *weights, int kind, const signed char *values, const float *scales, \
+     const int *sums, float *output, int width, int rows, int tokens, const int *groups, \
+     int used, int grouped, int assignment_major, int *status) { \
+    MMQ_PIPE_BODY_DYNAMIC(BN, KQ, KS, SK, true) \
+}
+#define MMQ_PIPE_KERNEL_BLOCKS(Name, BN, KQ, KS, SK, Blocks, PF) \
 extern "C" __global__ void __launch_bounds__(256, Blocks) \
 Name(const u8 *weights, int kind, const signed char *values, const float *scales, \
      const int *sums, float *output, int width, int rows, int tokens, const int *groups, \
      int used, int grouped, int assignment_major, int *status) { \
-    MMQ_PIPE_BODY(BN, KS, SK, PF) \
+    MMQ_PIPE_BODY(BN, KQ, KS, SK, PF) \
 }
 
 // 256 threads; grid = (ceil(rows / 128), grouped ? slots : ceil(tokens / BN)).
@@ -541,8 +567,9 @@ Name(const u8 *weights, int kind, const signed char *values, const float *scales
 #define MMQ_BODY(C, BN, KS, S16, PF, SK) \
     __shared__ MmqShared<C, BN, KS, S16 ? 2 : C> sh; \
     if (kind == 12) mmq_tile<12, C, BN, KS, S16, PF, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, sh); \
+    if (kind == 13) mmq_tile<13, C, BN, KS, S16, PF, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, sh); \
     if (kind == 14) mmq_tile<14, C, BN, KS, S16, PF, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, sh); \
-    if (kind != 12 && kind != 14 && threadIdx.x == 0) atomicOr(status, 8);
+    if (kind != 12 && kind != 13 && kind != 14 && threadIdx.x == 0) atomicOr(status, 8);
 #else
 #define MMQ_BODY(C, BN, KS, S16, PF, SK) if (threadIdx.x == 0) atomicOr(status, 16);
 #endif
@@ -573,11 +600,21 @@ MMQ_KERNEL_BLOCKS(mmq_c3_grouped, 3, 32, 128, false, MMQ_C3_GROUPED_BLOCKS)
 // at one block per SM for 64/128-token tiles (register prefetch spills with one
 // plane), two for 32-token tiles. Split-K variants: few blocks (short prompts),
 // gridDim.z K splits, then mmq_splitk_reduce.
-MMQ_PIPE_KERNEL(mmq_c1_pipe128, 128, 64, false)
-MMQ_PIPE_KERNEL(mmq_c1_pipe128_splitk, 128, 64, true)
-MMQ_PIPE_KERNEL(mmq_c1_pipe64, 64, 64, false)
-MMQ_PIPE_KERNEL_BLOCKS(mmq_c1_pipe32, 32, 64, false, 2, true)
-MMQ_PIPE_KERNEL_BLOCKS(mmq_c1_pipe32_splitk, 32, 64, true, 2, true)
+// Q4_K takes 128-wide K steps (half the barriers of 64; Qwen3-30B 0.5k TTFT
+// 48 -> 44 ms for the 32-token tiles), Q6_K (mmq_tile) 64. The 64/128-token tiles
+// exceed 48 KB of shared memory: dynamic, sized by mmq_dynamic_shared.
+MMQ_PIPE_KERNEL_DYNAMIC(mmq_c1_pipe128, 128, 128, 64, false)
+MMQ_PIPE_KERNEL_DYNAMIC(mmq_c1_pipe128_splitk, 128, 128, 64, true)
+MMQ_PIPE_KERNEL_DYNAMIC(mmq_c1_pipe64, 64, 128, 64, false)
+MMQ_PIPE_KERNEL_BLOCKS(mmq_c1_pipe32, 32, 128, 64, false, 2, true)
+MMQ_PIPE_KERNEL_BLOCKS(mmq_c1_pipe32_splitk, 32, 128, 64, true, 2, true)
+
+// Dynamic shared bytes of mmq_c1_pipe128, mmq_c1_pipe128_splitk, mmq_c1_pipe64.
+extern "C" __global__ void mmq_dynamic_shared(int *bytes) {
+    bytes[0] = (int)MMQ_PIPE_SIZE(128, 128, 64);
+    bytes[1] = (int)MMQ_PIPE_SIZE(128, 128, 64);
+    bytes[2] = (int)MMQ_PIPE_SIZE(64, 128, 64);
+}
 
 // Sums gridDim-z partials of a split-K MMQ in a fixed order (deterministic).
 extern "C" __global__ void mmq_splitk_reduce(const float *partials, float *output, int count,

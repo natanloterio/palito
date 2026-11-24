@@ -1,5 +1,5 @@
-//! Slow independent packed CPU oracle for the CUDA transformer's model layout.
-use super::{State, greedy};
+//! Slow independent packed CPU backend covering every dense, hybrid, and Mamba layout.
+//! It serves architectures the fast CPU path lacks and is the oracle for CUDA.
 use crate::{
     Config, Error, Result,
     backend::{Backend, ModelInfo},
@@ -8,9 +8,11 @@ use crate::{
     transformer::{BLOOM_ALIBI_MAX, Weights, route, route_softmax},
 };
 mod mamba;
-pub(super) mod qwen35;
+pub(crate) mod qwen35;
+pub(crate) mod state;
 use mamba::Mamba;
 use qwen35::Qwen35;
+use state::{State, greedy};
 
 enum Model {
     Dense(Weights<Tensor>),

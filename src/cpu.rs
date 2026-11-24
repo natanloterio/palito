@@ -1,9 +1,11 @@
-//! Independent dense llama execution with packed weights and causal batched prefill.
+//! Independent dense transformer execution on CPU with packed weights and causal batched prefill.
+//! Consumes the shared `transformer::Weights` normalized representation used by CUDA, Metal, and Vulkan.
 use crate::{
     Config, Error, GenerationMode, Result,
-    backend::{Backend, Capabilities, MemoryUsage, ModelInfo, SpeculationStats},
+    backend::{Backend, MemoryUsage, ModelInfo, SpeculationStats},
     gguf::{Gguf, Tensor},
     tokenizer::Tokenizer,
+    transformer::{Gemma, Weights},
 };
 use rayon::prelude::*;
 use serde::Serialize;
@@ -92,15 +94,19 @@ impl Workspace {
 }
 
 struct Layer {
-    attention_norm: Tensor,
+    attention_norm: Option<Tensor>,
     query: Tensor,
     key: Tensor,
     value: Tensor,
+    qkv_bias: Option<[Tensor; 3]>,
+    q_norm: Option<Tensor>,
+    k_norm: Option<Tensor>,
     attention_output: Tensor,
-    ffn_norm: Tensor,
+    ffn_norm: Option<Tensor>,
     gate: Tensor,
     up: Tensor,
     down: Tensor,
+    post_norms: Option<[Tensor; 2]>,
     keys: Vec<f32>,
     values: Vec<f32>,
 }
@@ -138,14 +144,19 @@ pub struct CpuBackend {
     pool: Arc<rayon::ThreadPool>,
     embedding: Tensor,
     layers: Vec<Layer>,
-    output_norm: Tensor,
+    output_norm: Option<Tensor>,
     output: Option<Tensor>,
+    rope_factors: Option<Tensor>,
+    gemma: Option<Gemma>,
+    width: usize,
     heads: usize,
     kv_heads: usize,
     head_dim: usize,
     epsilon: f32,
     rope_base: f32,
-    eos: i32,
+    rope_attn_factor: f32,
+    neox: bool,
+    eog: Vec<i32>,
     position: usize,
     logits: Vec<f32>,
     logits_valid: bool,
@@ -173,10 +184,6 @@ pub(crate) fn norm(input: &[f32], weights: &Tensor, epsilon: f32, output: &mut [
     for ((value, x), w) in output.iter_mut().zip(input).zip(weights.floats()) {
         *value = x * inverse * w;
     }
-}
-
-fn rope(vector: &mut [f32], head_dim: usize, position: usize, base: f32) {
-    rotary(vector, head_dim, position, base, false);
 }
 
 pub(crate) fn rotary(vector: &mut [f32], head_dim: usize, position: usize, base: f32, neox: bool) {
@@ -210,6 +217,7 @@ pub(crate) fn rotary_with_factors(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attend(
     query: &[f32],
@@ -306,6 +314,22 @@ pub(crate) fn attend_with_divisor(
     }
 }
 
+/// Whether the fast packed CPU path can run this model. Other layouts (MoE,
+/// affine FFN, recurrent/hybrid) use the reference backend.
+pub fn has_fast_path(path: &Path) -> Result<bool> {
+    let (metadata, _tensors) = Gguf::read_layout(path)?;
+    let arch = match metadata.get("general.architecture") {
+        Some(crate::gguf::Value::Text(arch)) => arch.as_str(),
+        _ => return Ok(false),
+    };
+    let dense_gated = matches!(
+        arch,
+        "llama" | "qwen2" | "qwen3" | "phi3" | "olmo2" | "gemma2" | "gemma3"
+    );
+    let has_experts = metadata.contains_key(&format!("{arch}.expert_count"));
+    Ok(dense_gated && !has_experts)
+}
+
 impl CpuBackend {
     pub fn open(path: &Path, config: &Config) -> Result<Self> {
         Self::open_with_options(path, config, CpuOptions::default())
@@ -322,67 +346,34 @@ impl CpuBackend {
                 tensor.accelerated = false;
             }
         }
-        if model.text("general.architecture")? != "llama" {
-            return Err(invalid("only dense llama architecture is implemented"));
-        }
-        for key in [
-            "llama.rope.scaling.type",
-            "llama.attention.sliding_window",
-            "llama.expert_count",
-            "llama.attention.logit_softcap",
-        ] {
-            if model.metadata.contains_key(key) {
-                return Err(invalid(format!("unsupported model feature {key}")));
-            }
-        }
-        let width = model.integer("llama.embedding_length")?;
-        let heads = model.integer("llama.attention.head_count")?;
-        let kv_heads = model.integer("llama.attention.head_count_kv")?;
-        let layer_count = model.integer("llama.block_count")?;
-        let hidden = model.integer("llama.feed_forward_length")?;
-        let trained_context = model.integer("llama.context_length")?;
-        if width == 0
-            || heads == 0
-            || kv_heads == 0
-            || layer_count == 0
-            || hidden == 0
-            || width % heads != 0
-            || heads % kv_heads != 0
-            || (width / heads) % 2 != 0
-            || config.context_tokens as usize > trained_context
-        {
-            return Err(invalid(
-                "invalid dimensions or context exceeds training capacity",
-            ));
-        }
-        let head_dim = width / heads;
-        if model.integer("llama.rope.dimension_count")? != head_dim {
-            return Err(invalid("partial rotary embeddings are not supported"));
-        }
-        let kv_width = kv_heads * head_dim;
-        let epsilon = model.float("llama.attention.layer_norm_rms_epsilon")?;
-        let rope_base = model.float("llama.rope.freq_base")?;
-        let vocab = model
-            .tensors
-            .get("token_embd.weight")
-            .filter(|tensor| tensor.dims.len() == 2)
-            .map(|tensor| tensor.dims[1])
-            .ok_or_else(|| invalid("missing embedding matrix"))?;
-        let eos = i32::try_from(model.integer("tokenizer.ggml.eos_token_id")?)
-            .map_err(|_| invalid("EOG token exceeds i32"))?;
-        if vocab == 0 || vocab > i32::MAX as usize || eos < 0 || eos as usize >= vocab {
-            return Err(invalid("invalid vocabulary or EOG token"));
-        }
-        let tokenizer = Tokenizer::from_metadata(&model.metadata).and_then(|tokenizer| {
-            if tokenizer.vocab_tokens() != vocab {
-                return Err(invalid(
-                    "tokenizer vocabulary does not match embedding rows",
-                ));
-            }
-            Ok(tokenizer)
-        });
         let weights_allocated_bytes: u64 =
             model.tensors.values().map(Tensor::allocated_bytes).sum();
+        let weights = Weights::from_gguf(model, config)?;
+        if weights.spec.experts > 0
+            || weights.position_embedding.is_some()
+            || weights.embedding_norm.is_some()
+            || weights.output_norm_bias.is_some()
+            || weights.spec.rotary_dim != weights.spec.dim
+            || weights
+                .layers
+                .iter()
+                .any(|l| l.affine.is_some() || l.gate.is_none())
+        {
+            return Err(invalid(format!(
+                "fast CPU path does not support {} layout; use ReferenceBackend",
+                weights.spec.info.architecture
+            )));
+        }
+        let s = &weights.spec;
+        let width = s.width;
+        let heads = s.heads;
+        let kv_heads = s.kv_heads;
+        let head_dim = s.dim;
+        let q_width = heads * head_dim;
+        let kv_width = kv_heads * head_dim;
+        let layer_count = weights.layers.len();
+        let hidden = s.hidden;
+        let vocab = s.info.vocab_tokens as usize;
         let product = |a: usize, b: usize| {
             a.checked_mul(b)
                 .ok_or_else(|| invalid("allocation size overflow"))
@@ -390,19 +381,20 @@ impl CpuBackend {
         let batch = config.batch_tokens as usize;
         let context = config.context_tokens as usize;
         let bw = product(batch, width)?;
+        let bq = product(batch, q_width)?;
         let bk = product(batch, kv_width)?;
         let bh = product(batch, hidden)?;
         let sizes = [
             bw,
             bw,
-            bw,
+            bq,
             bk,
             bk,
-            bw,
+            bq,
             bw,
             bh,
             bh,
-            product(batch, width.max(hidden).max(kv_width))?,
+            product(batch, width.max(q_width).max(hidden).max(kv_width))?,
             context,
             vocab,
             product(options.speculative_window as usize, vocab)?,
@@ -448,39 +440,46 @@ impl CpuBackend {
                 "numerical reservation {numerical_reservation_bytes} bytes exceeds memory limit"
             )));
         }
-        let embedding = model.tensor("token_embd.weight", &[width, vocab])?;
-        let output_norm = model.tensor("output_norm.weight", &[width])?;
-        let output = if model.tensors.contains_key("output.weight") {
-            Some(model.tensor("output.weight", &[width, vocab])?)
-        } else {
-            None
-        };
         let cache_elements = (config.context_tokens as usize)
             .checked_mul(kv_width)
             .ok_or_else(|| invalid("KV cache size overflow"))?;
-        let mut layers = Vec::new();
-        for index in 0..layer_count {
-            let prefix = format!("blk.{index}");
-            layers.push(Layer {
-                attention_norm: model.tensor(&format!("{prefix}.attn_norm.weight"), &[width])?,
-                query: model.tensor(&format!("{prefix}.attn_q.weight"), &[width, width])?,
-                key: model.tensor(&format!("{prefix}.attn_k.weight"), &[width, kv_width])?,
-                value: model.tensor(&format!("{prefix}.attn_v.weight"), &[width, kv_width])?,
-                attention_output: model
-                    .tensor(&format!("{prefix}.attn_output.weight"), &[width, width])?,
-                ffn_norm: model.tensor(&format!("{prefix}.ffn_norm.weight"), &[width])?,
-                gate: model.tensor(&format!("{prefix}.ffn_gate.weight"), &[width, hidden])?,
-                up: model.tensor(&format!("{prefix}.ffn_up.weight"), &[width, hidden])?,
-                down: model.tensor(&format!("{prefix}.ffn_down.weight"), &[hidden, width])?,
+        let mut info = weights.spec.info;
+        info.backend = match (
+            options.expand_weights,
+            !options.scalar_kernels && crate::kernels::avx2_available(),
+        ) {
+            (true, _) => "rust-cpu-f32-reference",
+            (false, true) => "rust-cpu-packed-avx2",
+            (false, false) => "rust-cpu-packed-portable",
+        }
+        .into();
+        let epsilon = weights.spec.epsilon;
+        let rope_base = weights.spec.rope_base;
+        let rope_attn_factor = weights.spec.rope_attn_factor;
+        let neox = weights.spec.neox;
+        let eog = weights.spec.eog;
+        let tokenizer = weights.spec.tokenizer;
+        let layers = weights
+            .layers
+            .into_iter()
+            .map(|l| Layer {
+                attention_norm: l.norm,
+                query: l.q,
+                key: l.k,
+                value: l.v,
+                qkv_bias: l.qkv_bias,
+                q_norm: l.q_norm,
+                k_norm: l.k_norm,
+                attention_output: l.output,
+                ffn_norm: l.ffn_norm,
+                gate: l.gate.expect("dense gated layer"),
+                up: l.up,
+                down: l.down,
+                post_norms: l.post_norms,
                 keys: vec![0.0; cache_elements],
                 values: vec![0.0; cache_elements],
-            });
-        }
-        if !model.tensors.is_empty() {
-            let mut names: Vec<_> = model.tensors.keys().cloned().collect();
-            names.sort();
-            return Err(invalid(format!("unsupported tensors: {names:?}")));
-        }
+            })
+            .collect();
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(config.threads as usize)
             .build()
@@ -488,40 +487,23 @@ impl CpuBackend {
         let workspace = Workspace::new(sizes);
         let workspace_allocated_bytes = workspace.allocated_bytes();
         Ok(Self {
-            info: ModelInfo {
-                backend: match (
-                    options.expand_weights,
-                    !options.scalar_kernels && crate::kernels::avx2_available(),
-                ) {
-                    (true, _) => "rust-cpu-f32-reference",
-                    (false, true) => "rust-cpu-packed-avx2",
-                    (false, false) => "rust-cpu-packed-portable",
-                }
-                .into(),
-                revision: env!("CARGO_PKG_VERSION").into(),
-                architecture: "llama".into(),
-                tensor_types: model.tensor_types,
-                weight_bytes: model.file_bytes,
-                parameters: model.parameters,
-                context_tokens: config.context_tokens,
-                batch_tokens: config.batch_tokens,
-                vocab_tokens: vocab as u32,
-                capabilities: Capabilities {
-                    token_step: true,
-                    chunked_prefill: true,
-                },
-            },
+            info,
             pool: Arc::new(pool),
-            embedding,
+            embedding: weights.embedding,
             layers,
-            output_norm,
-            output,
+            output_norm: weights.output_norm,
+            output: weights.output,
+            rope_factors: weights.rope_factors,
+            gemma: weights.gemma,
+            width,
             heads,
             kv_heads,
             head_dim,
             epsilon,
             rope_base,
-            eos,
+            rope_attn_factor,
+            neox,
+            eog,
             position: 0,
             logits: vec![0.0; vocab],
             logits_valid: false,
@@ -552,93 +534,224 @@ impl CpuBackend {
     }
 
     fn forward(&mut self, tokens: &[i32], verify: bool) -> Result<()> {
-        let width = self.embedding.dims[0];
+        let width = self.width;
+        let q_width = self.heads * self.head_dim;
         let kv_width = self.kv_heads * self.head_dim;
         let count = tokens.len();
         let hidden = self.layers[0].gate.dims[1];
+        let olmo2 = self.info.architecture == "olmo2";
+        let gemma_arch = self.info.architecture == "gemma3";
+        let factors = self.rope_factors.as_ref().map(Tensor::floats);
         let w = &mut self.workspace;
         for (&token, output) in tokens.iter().zip(w.state.chunks_mut(width)) {
             self.embedding.row(token as usize, output);
+            if self.gemma.is_some() {
+                let scale = (width as f32).sqrt();
+                for v in output {
+                    *v *= scale;
+                }
+            }
         }
-        for layer in &mut self.layers {
-            w.normalized[..count * width]
-                .par_chunks_mut(width)
-                .zip(w.state[..count * width].par_chunks(width))
-                .for_each(|(output, input)| {
-                    norm(input, &layer.attention_norm, self.epsilon, output)
-                });
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let gemma_attn = self.gemma.as_ref().map(|g| {
+                let dim = if gemma_arch && g.local_layers.len() == 62 {
+                    width / self.heads
+                } else {
+                    self.head_dim
+                };
+                let (window, base) = if g.local_layers[layer_idx] {
+                    (g.window, g.local_rope_base)
+                } else {
+                    (0, self.rope_base)
+                };
+                (window, base, (dim as f32).sqrt().recip(), g.attention_softcap)
+            });
+            let rope_base = gemma_attn.map_or(self.rope_base, |(_, base, _, _)| base);
+
+            let attn_input = if olmo2 || layer.attention_norm.is_none() {
+                &w.state[..count * width]
+            } else {
+                let attn_norm = layer.attention_norm.as_ref().unwrap();
+                w.normalized[..count * width]
+                    .par_chunks_mut(width)
+                    .zip(w.state[..count * width].par_chunks(width))
+                    .for_each(|(output, input)| norm(input, attn_norm, self.epsilon, output));
+                &w.normalized[..count * width]
+            };
             layer.query.multiply(
-                &w.normalized[..count * width],
+                attn_input,
                 count,
-                &mut w.query[..count * width],
+                &mut w.query[..count * q_width],
                 &mut w.columns,
             );
             layer.key.multiply(
-                &w.normalized[..count * width],
+                attn_input,
                 count,
                 &mut w.key[..count * kv_width],
                 &mut w.columns,
             );
             layer.value.multiply(
-                &w.normalized[..count * width],
+                attn_input,
                 count,
                 &mut w.value[..count * kv_width],
                 &mut w.columns,
             );
+            if let Some([qb, kb, vb]) = &layer.qkv_bias {
+                for time in 0..count {
+                    for (dst, b) in w.query[time * q_width..(time + 1) * q_width]
+                        .iter_mut()
+                        .zip(qb.floats())
+                    {
+                        *dst += b;
+                    }
+                    for (dst, b) in w.key[time * kv_width..(time + 1) * kv_width]
+                        .iter_mut()
+                        .zip(kb.floats())
+                    {
+                        *dst += b;
+                    }
+                    for (dst, b) in w.value[time * kv_width..(time + 1) * kv_width]
+                        .iter_mut()
+                        .zip(vb.floats())
+                    {
+                        *dst += b;
+                    }
+                }
+            }
             for time in 0..count {
                 let position = self.position + time;
+                let query = &mut w.query[time * q_width..(time + 1) * q_width];
                 let key = &mut w.key[time * kv_width..(time + 1) * kv_width];
-                rope(key, self.head_dim, position, self.rope_base);
-                rope(
-                    &mut w.query[time * width..(time + 1) * width],
+                if let Some(qn) = &layer.q_norm {
+                    let nw = if olmo2 { q_width } else { self.head_dim };
+                    let mut tmp = vec![0.0; nw];
+                    for chunk in query.chunks_exact_mut(nw) {
+                        norm(chunk, qn, self.epsilon, &mut tmp);
+                        chunk.copy_from_slice(&tmp);
+                    }
+                }
+                if let Some(kn) = &layer.k_norm {
+                    let nw = if olmo2 { kv_width } else { self.head_dim };
+                    let mut tmp = vec![0.0; nw];
+                    for chunk in key.chunks_exact_mut(nw) {
+                        norm(chunk, kn, self.epsilon, &mut tmp);
+                        chunk.copy_from_slice(&tmp);
+                    }
+                }
+                rotary_with_factors(
+                    key,
                     self.head_dim,
                     position,
-                    self.rope_base,
+                    rope_base,
+                    self.neox,
+                    factors,
+                    self.rope_attn_factor,
+                );
+                rotary_with_factors(
+                    query,
+                    self.head_dim,
+                    position,
+                    rope_base,
+                    self.neox,
+                    factors,
+                    self.rope_attn_factor,
                 );
                 layer.keys[position * kv_width..(position + 1) * kv_width].copy_from_slice(key);
                 layer.values[position * kv_width..(position + 1) * kv_width]
                     .copy_from_slice(&w.value[time * kv_width..(time + 1) * kv_width]);
             }
             for time in 0..count {
-                attend(
-                    &w.query[time * width..(time + 1) * width],
-                    &layer.keys,
-                    &layer.values,
+                let total = self.position + time + 1;
+                let (start, divisor, softcap) = if let Some((window, _, scale, softcap)) = gemma_attn
+                {
+                    let start = if window > 0 && total > window {
+                        total - window
+                    } else {
+                        0
+                    };
+                    for v in &mut w.query[time * q_width..(time + 1) * q_width] {
+                        *v *= scale;
+                    }
+                    (start, 1.0, softcap)
+                } else {
+                    (0, (self.head_dim as f32).sqrt(), 0.0)
+                };
+                attend_with_divisor(
+                    &w.query[time * q_width..(time + 1) * q_width],
+                    &layer.keys[start * kv_width..],
+                    &layer.values[start * kv_width..],
                     self.heads,
                     self.kv_heads,
                     self.head_dim,
-                    self.position + time + 1,
-                    &mut w.attention[time * width..(time + 1) * width],
+                    total - start,
+                    divisor,
+                    softcap,
+                    0.0,
+                    &mut w.attention[time * q_width..(time + 1) * q_width],
                     &mut w.scores,
                 );
             }
             layer.attention_output.multiply(
-                &w.attention[..count * width],
+                &w.attention[..count * q_width],
                 count,
                 &mut w.projected[..count * width],
                 &mut w.columns,
             );
-            for (x, update) in w.state.iter_mut().zip(&w.projected).take(count * width) {
-                *x += update;
+            if let Some([post_attn, _]) = &layer.post_norms {
+                w.normalized[..count * width]
+                    .par_chunks_mut(width)
+                    .zip(w.projected[..count * width].par_chunks(width))
+                    .for_each(|(output, input)| norm(input, post_attn, self.epsilon, output));
+                for (x, update) in w.state.iter_mut().zip(&w.normalized).take(count * width) {
+                    *x += update;
+                }
+            } else if olmo2 {
+                let post_attn = layer.attention_norm.as_ref().unwrap();
+                w.normalized[..count * width]
+                    .par_chunks_mut(width)
+                    .zip(w.projected[..count * width].par_chunks(width))
+                    .for_each(|(output, input)| norm(input, post_attn, self.epsilon, output));
+                for (x, update) in w.state.iter_mut().zip(&w.normalized).take(count * width) {
+                    *x += update;
+                }
+            } else {
+                for (x, update) in w.state.iter_mut().zip(&w.projected).take(count * width) {
+                    *x += update;
+                }
             }
-            w.normalized[..count * width]
-                .par_chunks_mut(width)
-                .zip(w.state[..count * width].par_chunks(width))
-                .for_each(|(output, input)| norm(input, &layer.ffn_norm, self.epsilon, output));
+
+            let ffn_input = if olmo2 || layer.ffn_norm.is_none() {
+                &w.state[..count * width]
+            } else {
+                let ffn_norm = layer.ffn_norm.as_ref().unwrap();
+                w.normalized[..count * width]
+                    .par_chunks_mut(width)
+                    .zip(w.state[..count * width].par_chunks(width))
+                    .for_each(|(output, input)| norm(input, ffn_norm, self.epsilon, output));
+                &w.normalized[..count * width]
+            };
             layer.gate.multiply(
-                &w.normalized[..count * width],
+                ffn_input,
                 count,
                 &mut w.gate[..count * hidden],
                 &mut w.columns,
             );
             layer.up.multiply(
-                &w.normalized[..count * width],
+                ffn_input,
                 count,
                 &mut w.up[..count * hidden],
                 &mut w.columns,
             );
-            for (g, u) in w.gate.iter_mut().zip(&w.up).take(count * hidden) {
-                *g = *g / (1.0 + (-*g).exp()) * u;
+            if self.gemma.is_some() {
+                for (g, u) in w.gate.iter_mut().zip(&w.up).take(count * hidden) {
+                    let gelu =
+                        0.5 * *g * (1.0 + (0.797_884_6 * *g * (1.0 + 0.044715 * *g * *g)).tanh());
+                    *g = gelu * u;
+                }
+            } else {
+                for (g, u) in w.gate.iter_mut().zip(&w.up).take(count * hidden) {
+                    *g = *g / (1.0 + (-*g).exp()) * u;
+                }
             }
             layer.down.multiply(
                 &w.gate[..count * hidden],
@@ -646,34 +759,63 @@ impl CpuBackend {
                 &mut w.projected[..count * width],
                 &mut w.columns,
             );
-            for (x, update) in w.state.iter_mut().zip(&w.projected).take(count * width) {
-                *x += update;
+            if let Some([_, post_ffn]) = &layer.post_norms {
+                w.normalized[..count * width]
+                    .par_chunks_mut(width)
+                    .zip(w.projected[..count * width].par_chunks(width))
+                    .for_each(|(output, input)| norm(input, post_ffn, self.epsilon, output));
+                for (x, update) in w.state.iter_mut().zip(&w.normalized).take(count * width) {
+                    *x += update;
+                }
+            } else if olmo2 {
+                let post_ffn = layer.ffn_norm.as_ref().unwrap();
+                w.normalized[..count * width]
+                    .par_chunks_mut(width)
+                    .zip(w.projected[..count * width].par_chunks(width))
+                    .for_each(|(output, input)| norm(input, post_ffn, self.epsilon, output));
+                for (x, update) in w.state.iter_mut().zip(&w.normalized).take(count * width) {
+                    *x += update;
+                }
+            } else {
+                for (x, update) in w.state.iter_mut().zip(&w.projected).take(count * width) {
+                    *x += update;
+                }
             }
         }
         let start = if verify { 0 } else { (count - 1) * width };
-        for (input, output) in w.state[start..count * width]
-            .chunks(width)
-            .zip(w.normalized[start..count * width].chunks_mut(width))
-        {
-            norm(input, &self.output_norm, self.epsilon, output);
-        }
+        let final_input = if let Some(output_norm) = &self.output_norm {
+            for (input, output) in w.state[start..count * width]
+                .chunks(width)
+                .zip(w.normalized[start..count * width].chunks_mut(width))
+            {
+                norm(input, output_norm, self.epsilon, output);
+            }
+            &w.normalized[start..count * width]
+        } else {
+            &w.state[start..count * width]
+        };
         let output = self.output.as_ref().unwrap_or(&self.embedding);
         if verify {
             output.multiply_columns(
-                &w.normalized[..count * width],
+                final_input,
                 count,
                 &mut w.verification[..count * self.logits.len()],
             );
+            if let Some(cap) = self.gemma.as_ref().map(|g| g.final_softcap).filter(|&c| c > 0.0) {
+                for v in &mut w.verification[..count * self.logits.len()] {
+                    *v = cap * (*v / cap).tanh();
+                }
+            }
             for (row, value) in self.logits.iter_mut().enumerate() {
                 *value = w.verification[row * count + count - 1];
             }
         } else {
-            output.multiply(
-                &w.normalized[start..count * width],
-                1,
-                &mut self.logits,
-                &mut w.columns,
-            );
+            output.multiply(final_input, 1, &mut self.logits, &mut w.columns);
+            if let Some(cap) = self.gemma.as_ref().map(|g| g.final_softcap).filter(|&c| c > 0.0) {
+                for v in &mut self.logits {
+                    *v = cap * (*v / cap).tanh();
+                }
+            }
         }
         if self.logits.iter().any(|value| !value.is_finite())
             || (verify
@@ -898,7 +1040,7 @@ impl Backend for CpuBackend {
         Ok(best as i32)
     }
     fn is_eog(&self, token: i32) -> bool {
-        token == self.eos
+        self.eog.contains(&token)
     }
     fn memory_usage(&self) -> Option<MemoryUsage> {
         let mut memory = self.memory.clone();
@@ -1008,7 +1150,7 @@ mod tests {
     #[test]
     fn rotary_pairs_preserve_norm_and_use_absolute_positions() {
         let mut x = [1.0, 0.0, 0.0, 1.0];
-        rope(&mut x, 4, 2, 100.0);
+        rotary(&mut x, 4, 2, 100.0, false);
         assert!((x[0] - 2.0f32.cos()).abs() < 1e-6);
         assert!((x[1] - 2.0f32.sin()).abs() < 1e-6);
         assert!((x[2] + 0.2f32.sin()).abs() < 1e-6);

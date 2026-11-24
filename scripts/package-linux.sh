@@ -24,6 +24,9 @@ name="palito-${version}-linux-x86_64"
 nvrtc="${NVRTC_LIB_DIR:-$root/.venv-cuda-bench/lib/python3.11/site-packages/nvidia/cu13/lib}"
 [[ -f "$nvrtc/libnvrtc.so.13" ]] || { echo "libnvrtc.so.13 not found in $nvrtc (set NVRTC_LIB_DIR)" >&2; exit 1; }
 
+# The bindings must carry the same version as the bundle.
+python3 scripts/sync_versions.py --check
+
 cargo build --release --features cuda
 
 dist="$root/target/dist/$name"

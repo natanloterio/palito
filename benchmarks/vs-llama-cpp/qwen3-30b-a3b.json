@@ -1,0 +1,280 @@
+{
+  "metadata": {
+    "date_utc": "2026-11-23T16:33:28Z",
+    "gpu": "NVIDIA GeForce RTX 5090, 615.71.09, 32607 MiB",
+    "palito_version": "palito 0.9.0",
+    "palito_git_sha": "fa7f89f",
+    "llama_cpp_version": "version: 1.0.0-dev (build 12434, commit 6b01a4767)",
+    "model": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "model_bytes": 18556685824,
+    "corpus_rev": "2ded846",
+    "palito_mode": "serve",
+    "context": 40960,
+    "tokens": 256,
+    "runs": 3,
+    "sizes": [
+      500,
+      2900,
+      10000,
+      40000
+    ],
+    "llama_configs": [
+      "fa-on",
+      "fa-on-q8kv"
+    ]
+  },
+  "prompt_tokens": {
+    "500": 507,
+    "2900": 2907,
+    "10000": 10003,
+    "40000": 40001
+  },
+  "results": {
+    "Palito int8-fast": {
+      "500": [
+        {
+          "generated": 256,
+          "ttft_ms": 40.67,
+          "decode_tps": 367.69,
+          "prompt_tokens": 507
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 42.17,
+          "decode_tps": 358.12,
+          "prompt_tokens": 507
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 42.36,
+          "decode_tps": 362.12,
+          "prompt_tokens": 507
+        }
+      ],
+      "2900": [
+        {
+          "generated": 256,
+          "ttft_ms": 164.33,
+          "decode_tps": 335.83,
+          "prompt_tokens": 2907
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 164.8,
+          "decode_tps": 343.03,
+          "prompt_tokens": 2907
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 160.08,
+          "decode_tps": 343.25,
+          "prompt_tokens": 2907
+        }
+      ],
+      "10000": [
+        {
+          "generated": 256,
+          "ttft_ms": 687.23,
+          "decode_tps": 291.81,
+          "prompt_tokens": 10003
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 699.74,
+          "decode_tps": 300.66,
+          "prompt_tokens": 10003
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 707.14,
+          "decode_tps": 293.38,
+          "prompt_tokens": 10003
+        }
+      ],
+      "40000": [
+        {
+          "generated": 256,
+          "ttft_ms": 5200.22,
+          "decode_tps": 191.8,
+          "prompt_tokens": 40001
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 5204.04,
+          "decode_tps": 189.93,
+          "prompt_tokens": 40001
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 5223.5,
+          "decode_tps": 193.78,
+          "prompt_tokens": 40001
+        }
+      ]
+    },
+    "llama.cpp fa-on": {
+      "500": [
+        {
+          "generated": 256,
+          "ttft_ms": 37.2,
+          "decode_tps": 346.74,
+          "prompt_tokens": 507
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 37.02,
+          "decode_tps": 333.9,
+          "prompt_tokens": 507
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 38.25,
+          "decode_tps": 340.44,
+          "prompt_tokens": 507
+        }
+      ],
+      "2900": [
+        {
+          "generated": 256,
+          "ttft_ms": 214.12,
+          "decode_tps": 302.46,
+          "prompt_tokens": 2907
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 213.86,
+          "decode_tps": 311.15,
+          "prompt_tokens": 2907
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 207.01,
+          "decode_tps": 305.2,
+          "prompt_tokens": 2907
+        }
+      ],
+      "10000": [
+        {
+          "generated": 256,
+          "ttft_ms": 843.25,
+          "decode_tps": 278.6,
+          "prompt_tokens": 10003
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 822.1,
+          "decode_tps": 274.99,
+          "prompt_tokens": 10003
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 831.42,
+          "decode_tps": 281.03,
+          "prompt_tokens": 10003
+        }
+      ],
+      "40000": [
+        {
+          "generated": 256,
+          "ttft_ms": 5488.63,
+          "decode_tps": 178.6,
+          "prompt_tokens": 40001
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 5494.89,
+          "decode_tps": 180.39,
+          "prompt_tokens": 40001
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 5520.14,
+          "decode_tps": 182.91,
+          "prompt_tokens": 40001
+        }
+      ]
+    },
+    "llama.cpp fa-on-q8kv": {
+      "500": [
+        {
+          "generated": 256,
+          "ttft_ms": 38.63,
+          "decode_tps": 314.53,
+          "prompt_tokens": 507
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 40.45,
+          "decode_tps": 309.62,
+          "prompt_tokens": 507
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 39.93,
+          "decode_tps": 315.84,
+          "prompt_tokens": 507
+        }
+      ],
+      "2900": [
+        {
+          "generated": 256,
+          "ttft_ms": 224.26,
+          "decode_tps": 275.09,
+          "prompt_tokens": 2907
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 217.51,
+          "decode_tps": 274.71,
+          "prompt_tokens": 2907
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 221.95,
+          "decode_tps": 273.77,
+          "prompt_tokens": 2907
+        }
+      ],
+      "10000": [
+        {
+          "generated": 256,
+          "ttft_ms": 863.1,
+          "decode_tps": 230.38,
+          "prompt_tokens": 10003
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 874.13,
+          "decode_tps": 230.73,
+          "prompt_tokens": 10003
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 881.49,
+          "decode_tps": 229.26,
+          "prompt_tokens": 10003
+        }
+      ],
+      "40000": [
+        {
+          "generated": 256,
+          "ttft_ms": 5707.78,
+          "decode_tps": 125.02,
+          "prompt_tokens": 40001
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 5721.35,
+          "decode_tps": 124.59,
+          "prompt_tokens": 40001
+        },
+        {
+          "generated": 256,
+          "ttft_ms": 5736.17,
+          "decode_tps": 124.95,
+          "prompt_tokens": 40001
+        }
+      ]
+    }
+  }
+}

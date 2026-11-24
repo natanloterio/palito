@@ -25,7 +25,9 @@ fn packed_gemm_shape(matmul: CudaMatmul, tensor: &DeviceTensor, tokens: i32) -> 
 fn residual_projection(matmul: CudaMatmul, tensor: &DeviceTensor, tokens: i32) -> bool {
     matmul.residual_components() > 0
         && tokens >= matmul.residual_min_tokens() as i32
-        && matches!(tensor.kind, 12 | 14)
+        && (matches!(tensor.kind, 12 | 14)
+            || (matches!(matmul, CudaMatmul::Int8Prefill | CudaMatmul::Int8Fast)
+                && tensor.kind == 13))
         && tensor.width % 256 == 0
 }
 
@@ -138,7 +140,7 @@ macro_rules! project_residual {
                     continue;
                 }
                 let region = groups.slice(offset..);
-                launch!($backend,kernel,(row_tiles, slots, 1);256,
+                launch_shared!($backend,kernel,(row_tiles, slots, 1);256,
                     &tensor.bytes,&tensor.kind,&work.values,&work.scales,&work.sums,
                     $output,&tensor.width,&tensor.rows,&tokens,&region,&used,&grouped,&major,
                     &mut $backend.work.status);
@@ -233,14 +235,14 @@ macro_rules! project_residual {
                     let splits_i32 = splits as i32;
                     let count = (tokens as usize) * (tensor.rows as usize);
                     let count_i32 = count as i32;
-                    launch!($backend,split_kernel,(grid.0, grid.1, splits);threads,
+                    launch_shared!($backend,split_kernel,(grid.0, grid.1, splits);threads,
                         &tensor.bytes,&tensor.kind,&work.values,&work.scales,&work.sums,
                         &mut *partials,&tensor.width,&tensor.rows,&tokens,groups,&used,&grouped,
                         &major,&mut $backend.work.status);
                     launch!($backend,"mmq_splitk_reduce",((count as u32).div_ceil(256), 1, 1);256,
                         &*partials,$output,&count_i32,&splits_i32,&mut $backend.work.status);
                 } else {
-                    launch!($backend,kernel,grid;threads,
+                    launch_shared!($backend,kernel,grid;threads,
                         &tensor.bytes,&tensor.kind,&work.values,&work.scales,&work.sums,
                         $output,&tensor.width,&tensor.rows,&tokens,groups,&used,&grouped,&major,
                         &mut $backend.work.status);
@@ -655,7 +657,7 @@ impl CudaBackend {
                 );
             } else if let (Some(halves), true) = (
                 self.work.attention_half.as_mut(),
-                self.matmul.tensor_prefill() && dim == 128 && heads == 8 * kv_heads,
+                self.matmul == CudaMatmul::Int8Prefill && dim == 128 && heads == 8 * kv_heads,
             ) {
                 // int8-prefill: split K/V into FP16 hi/lo planes once per layer, then
                 // FP16 tensor-core attention, 16 tokens x 8 heads per block.
@@ -675,11 +677,7 @@ impl CudaBackend {
                 // 8 warps (16 tokens) per block: 4 warps measured equal, 2 slower.
                 launch!(
                     self,
-                    if self.matmul == CudaMatmul::Int8Fast {
-                        "attention_prefill_mma_half_fast"
-                    } else {
-                        "attention_prefill_mma_half"
-                    },
+                    "attention_prefill_mma_half",
                     (kv_heads as u32, (n as u32).div_ceil(16), 1); 256,
                     &self.work.q,
                     &*halves,
@@ -691,41 +689,73 @@ impl CudaBackend {
                     &stride
                 );
             } else if self.matmul.f32_tiled()
-                && dim == 128
+                && dim <= 128
+                && dim % 4 == 0
                 && kv_heads > 0
                 && heads % kv_heads == 0
                 && heads / kv_heads <= 8
             {
-                // Tiled profile: flash-style prefill attention, K/V tiles shared by
-                // 4 tokens x the GQA group (PREFILL_TOKENS in attention.cu).
-                // 4 warps per token (2 query rows each) measured fastest: 369 -> 260 ms
-                // of attention at 2.9k tokens with 512-token chunks.
-                // FP16 hi/lo tensor-core attention (int8-prefill) needs GQA group 8.
-                let (name, grid_y, threads) = if self.matmul.tensor_prefill()
-                    && heads == 8 * kv_heads
-                {
-                    let name = if self.matmul == CudaMatmul::Int8Fast {
-                        "attention_prefill_mma_fast"
+                if dim == 128 {
+                    let (name, grid_y, threads) = if self.matmul.kv_f16() && heads == 8 * kv_heads {
+                        // int8-fast: single FP16 attention straight from the FP16 K/V
+                        // cache, 16 tokens x 8 heads per block; 8 tokens while that leaves
+                        // fewer than ATTENTION_FAST_BLOCKS blocks.
+                        if kv_heads as u32 * (n as u32).div_ceil(16) >= ATTENTION_FAST_BLOCKS {
+                            ("attention_prefill_mma_fast_f16", (n as u32).div_ceil(16), 256)
+                        } else {
+                            ("attention_prefill_mma_fast4_f16", (n as u32).div_ceil(8), 128)
+                        }
+                    } else if self.matmul.kv_f16() && heads == kv_heads {
+                        // MHA (heads == kv_heads): 64 tokens per block on FP16 tensor cores.
+                        ("attention_prefill_mma_fast_mha_f16", (n as u32).div_ceil(64), 128)
+                    } else if self.matmul.tensor_prefill() && heads == 8 * kv_heads {
+                        ("attention_prefill_mma", (n as u32).div_ceil(8), 128)
                     } else {
-                        "attention_prefill_mma"
+                        ("attention_prefill_flash4", (n as u32).div_ceil(4), 512)
                     };
-                    (name, (n as u32).div_ceil(8), 128)
+                    launch!(
+                        self,
+                        name,
+                        (kv_heads as u32, grid_y, 1); threads,
+                        &self.work.q,
+                        &self.keys[index],
+                        &self.values[index],
+                        &mut self.work.attended,
+                        &heads,
+                        &kv_heads,
+                        &n,
+                        &count
+                    );
+                } else if self.matmul.kv_f16() && dim == 96 && heads == kv_heads {
+                    launch!(
+                        self,
+                        "attention_prefill_mma_fast_mha96_f16",
+                        (kv_heads as u32, (n as u32).div_ceil(64), 1); 128,
+                        &self.work.q,
+                        &self.keys[index],
+                        &self.values[index],
+                        &mut self.work.attended,
+                        &heads,
+                        &kv_heads,
+                        &n,
+                        &count
+                    );
                 } else {
-                    ("attention_prefill_flash4", (n as u32).div_ceil(4), 512)
-                };
-                launch!(
-                    self,
-                    name,
-                    (kv_heads as u32, grid_y, 1); threads,
-                    &self.work.q,
-                    &self.keys[index],
-                    &self.values[index],
-                    &mut self.work.attended,
-                    &heads,
-                    &kv_heads,
-                    &n,
-                    &count
-                );
+                    launch!(
+                        self,
+                        "attention_prefill_flash4_dim",
+                        (kv_heads as u32, (n as u32).div_ceil(4), 1); 512,
+                        &self.work.q,
+                        &self.keys[index],
+                        &self.values[index],
+                        &mut self.work.attended,
+                        &dim,
+                        &heads,
+                        &kv_heads,
+                        &n,
+                        &count
+                    );
+                }
             } else if fused_attention_supported(s) {
                 launch!(
                     self,
@@ -898,8 +928,15 @@ impl CudaBackend {
                 // 5.3 -> ~0.5 ms, 0.55k (F32 before) 3.5 -> ~0.3 ms; F32 is faster
                 // below ~64 tokens. Other kinds: one warp (16 rows) per block.
                 let tiled = t.kind == 0 && t.width % 32 == 0;
+                let wide = (t.rows as u32).div_ceil(64) * (n as u32).div_ceil(16);
                 let (name, grid, threads) = if self.matmul == CudaMatmul::Int8Fast && n >= 64 && tiled {
-                    ("router_tf32_tiled", ((t.rows as u32).div_ceil(64), (n as u32).div_ceil(16), 1), 256)
+                    // Few 64x16 tiles leave SMs idle: 32x8 tiles with a deeper pipeline
+                    // (same per-output K order, so identical results; 0.5k 33 -> 21 us).
+                    if wide >= ROUTER_WIDE_BLOCKS {
+                        ("router_tf32_tiled", ((t.rows as u32).div_ceil(64), (n as u32).div_ceil(16), 1), 256)
+                    } else {
+                        ("router_tf32_small", ((t.rows as u32).div_ceil(32), (n as u32).div_ceil(8), 1), 64)
+                    }
                 } else if self.matmul == CudaMatmul::Int8Fast && n >= 1024 {
                     ("prefill_matmul_tf32", ((t.rows as u32).div_ceil(16), (n as u32).div_ceil(8), 1), 32)
                 } else {
@@ -1300,10 +1337,21 @@ mod tests {
 const MIX_SMALL: usize = 32;
 const MIX_LARGE: usize = 96;
 
-/// Mixed expert tiles once experts average 16 assignments; below, 32-tiles.
-/// GROUP_FAST_EXPERTS bounds group_experts_mixed.
+/// int8-fast router: 64x16-tile blocks below which router_tf32_small is used.
+const ROUTER_WIDE_BLOCKS: u32 = 512;
+
+/// int8-fast prefill attention: 16-token blocks below which 8-token blocks are used
+/// (two waves of 170 SMs).
+const ATTENTION_FAST_BLOCKS: u32 = 340;
+
+/// Mixed expert tiles once experts average MIX_MIN_AVERAGE assignments; below,
+/// 32-tiles (128-wide Q4_K K steps). Qwen3-30B TTFT, 32-tiles / mixed: 0.5k 37 / 44,
+/// 1k 63 / 65, 1.5k 87 / 88, 2.9k 169 / 158 ms. GROUP_FAST_EXPERTS bounds
+/// group_experts_mixed.
+const MIX_MIN_AVERAGE: usize = 128;
+
 fn mixed_expert_tiles(s: &Spec, tokens: i32) -> bool {
-    s.experts <= 256 && tokens as usize * s.used / s.experts.max(1) >= 16
+    s.experts <= 256 && tokens as usize * s.used / s.experts.max(1) >= MIX_MIN_AVERAGE
 }
 
 /// K splits for int8-fast few-block dense MMQ (short prompts): double while the grid

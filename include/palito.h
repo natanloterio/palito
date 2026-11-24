@@ -31,9 +31,11 @@ extern "C" {
 typedef struct palito_engine palito_engine;
 
 enum {
-    PALITO_DEVICE_DEFAULT = 0, /* CUDA when built with it, else CPU */
+    PALITO_DEVICE_DEFAULT = 0, /* CUDA/Metal when built with it, else CPU */
     PALITO_DEVICE_CPU = 1,
-    PALITO_DEVICE_CUDA = 2
+    PALITO_DEVICE_CUDA = 2,
+    PALITO_DEVICE_VULKAN = 3,
+    PALITO_DEVICE_METAL = 4
 };
 
 enum {
@@ -111,7 +113,7 @@ void palito_close(palito_engine *engine);
 
 /* Context tokens actually opened (may be below the requested context). */
 uint32_t palito_context_tokens(const palito_engine *engine);
-/* "cpu", "int8-fast", "f32-tiled" or "f32"; static string. */
+/* "cpu", "metal", "vulkan", "int8-fast", "int8-prefill", "f32-tiled" or "f32"; static string. */
 const char *palito_profile(const palito_engine *engine);
 
 /*

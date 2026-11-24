@@ -755,6 +755,8 @@ fn json_schema_replies_validate_and_the_c_api_takes_a_schema() {
 #[test]
 #[ignore = "requires CUDA 13 and models/benchmark-qwen3/gguf/Qwen3-30B-A3B-Q4_K_M.gguf"]
 fn qwen3_30b_json_schema_replies_validate() {
+    // Two 30B models do not fit in 32 GB: serialize with the other GPU tests.
+    let _gpu = gpu_lock();
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("models/benchmark-qwen3/gguf/Qwen3-30B-A3B-Q4_K_M.gguf");
     let mut engine = Engine::open(

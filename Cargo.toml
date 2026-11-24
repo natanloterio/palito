@@ -1,16 +1,25 @@
 [package]
 name = "palito"
-version = "0.5.0"
+version = "0.11.3"
 edition = "2024"
 rust-version = "1.87"
-description = "Independent Rust GGUF inference engine with external-reference benchmarks"
+description = "Run GGUF LLMs locally in Rust with custom CUDA kernels, streaming chat, tool calling, structured JSON output, and an OpenAI-compatible server."
 default-run = "palito"
 license = "MIT"
+repository = "https://github.com/natanloterio/palito"
+homepage = "https://github.com/natanloterio/palito"
+readme = "README.md"
+keywords = ["llm", "gguf", "inference", "cuda", "qwen"]
+categories = ["science", "command-line-utilities"]
+# crates.io package: the library, the CLI, the C header and kernels only.
+include = ["/src/**", "/include/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
 
 [features]
 default = []
 ktransformers = ["dep:reqwest"]
 cuda = ["dep:cudarc", "dep:libloading", "dep:sha2"]
+vulkan = ["dep:ash", "dep:naga"]
+metal = ["dep:metal"]
 cuda-parallel-grouping-research = ["cuda"]
 cuda-packed-reduction-research = ["cuda"]
 cuda-packed-down-research = ["cuda-packed-reduction-research"]
@@ -48,6 +57,11 @@ path = "examples/cuda_precision.rs"
 required-features = ["cuda"]
 
 [[example]]
+name = "kv-precision"
+path = "examples/kv_precision.rs"
+required-features = ["cuda"]
+
+[[example]]
 name = "cuda-capture"
 path = "examples/cuda_capture.rs"
 required-features = ["cuda"]
@@ -62,10 +76,12 @@ half = "2"
 rayon = "1"
 fancy-regex = "0.16"
 cudarc = { version = "0.18", default-features = false, features = ["driver", "nvrtc", "dynamic-loading", "cuda-13000", "std"], optional = true }
+ash = { version = "0.38", default-features = false, features = ["loaded"], optional = true }
+naga = { version = "25", default-features = false, features = ["wgsl-in", "spv-out"], optional = true }
 libloading = { version = "0.8", optional = true }
 unicode-normalization = "0.1"
 sha2 = { version = "0.10", optional = true }
-minijinja = { version = "3.1.0", default-features = false, features = ["builtins", "json", "loop_controls", "serde", "macros", "std_collections", "adjacent_loop_items"] }
+minijinja = { version = "3.1.0", default-features = false, features = ["builtins", "json", "loop_controls", "serde", "macros", "std_collections", "adjacent_loop_items", "preserve_order"] }
 minijinja-contrib = { version = "3.1.0", default-features = false, features = ["pycompat"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
@@ -74,3 +90,6 @@ llguidance = "1.9.1"
 
 [dev-dependencies]
 jsonschema = { version = "0.29", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.32", optional = true }

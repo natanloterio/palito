@@ -26,6 +26,7 @@ The library is found via $PALITO_LIBRARY, then the installed `palito` command
 import ctypes
 import json
 import os
+import platform
 import queue
 import shutil
 import sys
@@ -35,9 +36,9 @@ from ctypes import (CFUNCTYPE, POINTER, Structure, c_char_p, c_double, c_float, 
 from dataclasses import dataclass
 
 __all__ = ["Palito", "PalitoError", "Completion", "DEVICE_DEFAULT", "DEVICE_CPU",
-           "DEVICE_CUDA", "version", "library_path"]
+           "DEVICE_CUDA", "DEVICE_VULKAN", "DEVICE_METAL", "version", "library_path"]
 
-DEVICE_DEFAULT, DEVICE_CPU, DEVICE_CUDA = 0, 1, 2
+DEVICE_DEFAULT, DEVICE_CPU, DEVICE_CUDA, DEVICE_VULKAN, DEVICE_METAL = 0, 1, 2, 3, 4
 _FINISH_REASONS = {0: "stop", 1: "length", 2: "context_full", 3: "cancelled"}
 
 
@@ -90,11 +91,24 @@ _LIBRARY_NAME = {"darwin": "libpalito.dylib", "win32": "palito.dll"}.get(sys.pla
                                                                          "libpalito.so")
 
 
+def _platform_tag():
+    arch = platform.machine().lower()
+    if arch in ("x86_64", "amd64"):
+        arch = "x64"
+    elif arch in ("aarch64", "arm64"):
+        arch = "arm64"
+    return f"{sys.platform}-{arch}"
+
+
 def library_path():
     """Where libpalito is loaded from (see the module docstring)."""
     explicit = os.environ.get("PALITO_LIBRARY")
     if explicit:
         return explicit
+    packaged = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_lib",
+                            _platform_tag(), _LIBRARY_NAME)
+    if os.path.isfile(packaged):
+        return packaged
     command = shutil.which("palito")
     if command:
         bundled = os.path.join(os.path.dirname(os.path.realpath(command)), "lib", _LIBRARY_NAME)

@@ -6,7 +6,7 @@ use palito::{
     tokenizer::Tokenizer,
 };
 use serde_json::json;
-use std::{fs, io::Write, path::PathBuf, time::Instant};
+use std::{ffi::OsString, fs, io::Write, path::PathBuf, time::Instant};
 
 mod chat_repl;
 mod server;
@@ -83,6 +83,10 @@ enum LocalBackend {
     Cpu,
     #[cfg(feature = "cuda")]
     Cuda,
+    #[cfg(feature = "vulkan")]
+    Vulkan,
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    Metal,
     /// Slow independent packed CPU oracle for the CUDA model layouts.
     #[cfg(feature = "cuda")]
     Reference,
@@ -331,19 +335,58 @@ impl RuntimeArgs {
                 }
                 LocalBackend::Reference => {
                     return Ok(Box::new(
-                        palito::cuda::reference::ReferenceBackend::open(
+                        palito::reference::ReferenceBackend::open(
                             &self.model,
                             &self.config(),
                         )?,
                     ));
                 }
+                #[cfg(feature = "vulkan")]
+                LocalBackend::Vulkan => {}
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                LocalBackend::Metal => {}
                 LocalBackend::Cpu => {}
             }
+        }
+        #[cfg(feature = "vulkan")]
+        if self.backend == LocalBackend::Vulkan {
+            self.check_cpu_policy()?;
+            let options = palito::vulkan::VulkanOptions::default();
+            return palito::vulkan::open_backend(&self.model, &self.config(), options);
+        }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if self.backend == LocalBackend::Metal {
+            self.check_cpu_policy()?;
+            let options = palito::metal::MetalOptions::default();
+            return palito::metal::open_backend(&self.model, &self.config(), options);
+        }
+        if !palito::cpu::has_fast_path(&self.model)? {
+            return self.open_cpu_reference();
         }
         Ok(Box::new(CpuBackend::open_with_options(
             &self.model,
             &self.config(),
             self.options(),
+        )?))
+    }
+
+    /// Layouts without the fast path run on the reference backend, which has
+    /// none of the fast path's policy options.
+    fn open_cpu_reference(&self) -> Result<Box<dyn Backend>> {
+        if self.f32_weights
+            || self.sequential_prefill
+            || self.memory_limit_bytes.is_some()
+            || self.prefix_cache_bytes != 0
+            || self.speculative_window != 0
+            || self.scalar_kernels
+        {
+            return Err(palito::Error::Invalid(
+                "CPU policy options are not supported for this model architecture".into(),
+            ));
+        }
+        Ok(Box::new(palito::reference::ReferenceBackend::open(
+            &self.model,
+            &self.config(),
         )?))
     }
 
@@ -372,7 +415,7 @@ impl RuntimeArgs {
         self.cuda_matmul.unwrap_or_default()
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "vulkan", all(feature = "metal", target_os = "macos")))]
     fn check_cpu_policy(&self) -> Result<()> {
         if self.backend != LocalBackend::Cpu
             && (self.f32_weights
@@ -476,7 +519,10 @@ impl RuntimeArgs {
         self.prefill_chunk.unwrap_or(DEFAULT_PREFILL_CHUNK)
     }
 
-    fn execution(&self, _info: &palito::backend::ModelInfo) -> serde_json::Value {
+    fn execution(&self, info: &palito::backend::ModelInfo) -> serde_json::Value {
+        if info.backend == "rust-cpu-transformer-reference" {
+            return json!({"backend": "cpu-reference", "prefill": "sequential token steps"});
+        }
         #[cfg(feature = "cuda")]
         match self.backend {
             LocalBackend::Cuda => {
@@ -489,10 +535,32 @@ impl RuntimeArgs {
                     "kv_precision": "f32",
                 });
             }
-            LocalBackend::Reference => {
-                return json!({"backend": "cpu-reference", "prefill": "sequential token steps"});
-            }
+            LocalBackend::Reference => {}
+            #[cfg(feature = "vulkan")]
+            LocalBackend::Vulkan => {}
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            LocalBackend::Metal => {}
             LocalBackend::Cpu => {}
+        }
+        #[cfg(feature = "vulkan")]
+        if self.backend == LocalBackend::Vulkan {
+            return json!({
+                "backend": "vulkan",
+                "options": palito::vulkan::VulkanOptions::default(),
+                "expert_residency": "all weights GPU-resident",
+                "prefill": "layer-wise batched (internal capacity <=64)",
+                "kv_precision": "f32",
+            });
+        }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if self.backend == LocalBackend::Metal {
+            return json!({
+                "backend": "metal",
+                "options": palito::metal::MetalOptions::default(),
+                "expert_residency": "Apple Silicon unified memory (StorageModeShared)",
+                "prefill": "layer-wise batched (internal capacity <=64)",
+                "kv_precision": "f32",
+            });
         }
         json!(self.options())
     }
@@ -516,8 +584,26 @@ impl ModelArgs {
     }
 }
 
+/// Rewrites llama-server's `-np` for `serve`: clap has no two-letter short flags.
+fn normalize_args(args: impl Iterator<Item = OsString>) -> Vec<OsString> {
+    let args: Vec<OsString> = args.collect();
+    if args.get(1).is_none_or(|command| command != "serve") {
+        return args;
+    }
+    args.into_iter()
+        .map(|arg| match arg.to_str() {
+            Some("-np") => "--parallel".into(),
+            Some(text) => match text.strip_prefix("-np=") {
+                Some(value) => format!("--parallel={value}").into(),
+                None => arg,
+            },
+            None => arg,
+        })
+        .collect()
+}
+
 fn execute() -> Result<()> {
-    match Cli::parse().command {
+    match Cli::parse_from(normalize_args(std::env::args_os())).command {
         #[cfg(feature = "ktransformers")]
         Command::Remote { args } => remote(args)?,
         Command::Chat { args } => chat_repl::run(args)?,
@@ -660,6 +746,31 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn np_is_an_alias_of_parallel() {
+        let parsed = |a: &[&str]| normalize_args(a.iter().map(OsString::from));
+        assert_eq!(
+            parsed(&["palito", "serve", "-np", "4"]),
+            ["palito", "serve", "--parallel", "4"]
+        );
+        assert_eq!(
+            parsed(&["palito", "serve", "-np=4"]),
+            ["palito", "serve", "--parallel=4"]
+        );
+        assert_eq!(
+            parsed(&["palito", "chat", "-np", "4"]),
+            ["palito", "chat", "-np", "4"]
+        );
+    }
+
+    #[test]
+    fn parallel_is_limited_to_64() {
+        let base = ["palito", "serve", "--model", "m.gguf", "--parallel"];
+        assert!(Cli::try_parse_from([&base[..], &["64"]].concat()).is_ok());
+        assert!(Cli::try_parse_from([&base[..], &["0"]].concat()).is_err());
+        assert!(Cli::try_parse_from([&base[..], &["65"]].concat()).is_err());
+    }
 
     #[test]
     fn model_commands_require_exactly_one_input_source() {

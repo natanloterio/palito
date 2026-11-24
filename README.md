@@ -4,7 +4,7 @@
 
 Fast local LLM inference for GGUF models, written in Rust, with its own CUDA kernels.
 
-- **Fast:** on an RTX 5090 with Qwen3-30B-A3B (Q4_K_M), the first token of a 2.9k-token prompt arrives in ~0.16 s (llama.cpp: 0.18 s), and decoding runs at ~300–350 tok/s.
+- **Fast:** on an RTX 5090 with Qwen3-30B-A3B (Q4_K_M), `palito serve` delivers the first token of a 2.9k-token prompt in 164 ms (`llama-server -fa on`: 214 ms) and decodes at 343–362 tok/s (`llama-server`: 305–340 tok/s; see [reproducible benchmarks & raw samples](benchmarks/vs-llama-cpp/README.md)).
 - **Uses the model's full context:** `chat` opens with the model's trained context (Qwen3-30B-A3B: 40,960 tokens) and replies run until the model finishes.
 - **One binary:** chat in the terminal, an OpenAI-compatible server (`palito serve`), or a C library for your own program. No Python and no llama.cpp; the Linux bundle ships the CUDA compiler it needs.
 
@@ -12,7 +12,7 @@ Fast local LLM inference for GGUF models, written in Rust, with its own CUDA ker
 
 - Linux x86_64.
 - For the GPU: an NVIDIA GPU with a driver that supports CUDA 13. Ampere (RTX 30xx, A100) or newer gets the fast path; older GPUs work, but more slowly.
-- Enough GPU memory for the model: Qwen3-30B-A3B Q4_K_M needs ~18 GB for the weights, plus ~0.2 MB per context token.
+- Enough GPU memory for the model: Qwen3-30B-A3B Q4_K_M needs ~18 GB for the weights, plus ~0.1 MB per context token (the default GPU profile keeps its K/V cache in FP16; the strict `f32` profiles use ~0.2 MB).
 
 You can also run without a GPU on the CPU backend (small models only, see below).
 
@@ -152,8 +152,15 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 - **Sampling:** `temperature`, `top_p`, `seed`, `presence_penalty`, `frequency_penalty` and `logit_bias` work as in OpenAI's API, plus llama.cpp's `top_k`, `min_p`, `repeat_penalty` and `repeat_last_n`. `logit_bias` takes OpenAI's `{"token id": bias}` or llama.cpp's `[[id, bias]]`, and a bias of `false` bans the token; unknown token ids are rejected. When a request leaves a field out, the server uses its own default, set with the same flags as `palito chat` (e.g. `--temperature 0.6 --top-p 0.95 --top-k 20 --min-p 0.05 --repeat-penalty 1.1`); without flags it is plain greedy. Plain greedy is the fastest (~370 tok/s on Qwen3-30B): any sampling, penalty or bias copies the logits to the CPU for every token (~335 tok/s for greedy with a repeat penalty, ~300 tok/s sampling).
 - **Stop sequences:** `stop` (a string or up to 16 strings) ends the reply; the stop text is not returned. It applies to everything the model writes, reasoning included, so with reasoning on avoid stops like `"\n"`.
 - **JSON output:** `"response_format": {"type": "json_object"}` or `{"type": "json_schema", "json_schema": {"name": "...", "schema": {...}}}` makes the reply JSON that always parses and matches the schema (constrained decoding, also with greedy). Reasoning is turned off for these requests. A schema keyword Palito cannot enforce (e.g. `uniqueItems`, `not`, `if`) returns 400 instead of being ignored. Qwen3-30B decodes at ~327 tok/s greedy (~300 sampled) with a schema.
+- **Tool calling:** `tools`, `tool_choice` (`auto`, `required`, `none` or a named function), `parallel_tool_calls`, and `role: "tool"` history work with and without streaming. It works on models whose chat template uses Qwen's `<tool_call>` JSON format, such as Qwen2.5 and Qwen3. Other templates get a 400 when tools are active.
+  - Call names and arguments are constrained to your schemas once a call starts, and the model can still reason in `<think>` first. `required` and a named function force a call. If `max_tokens` runs out first, the reply ends with `finish_reason: "length"` and any partial call is returned as is.
+  - Tool schemas are tolerant, as in llama.cpp: a keyword Palito cannot enforce is logged and ignored. `response_format` stays strict and cannot be combined with active tools.
+  - **Security:** like llama.cpp, Palito tokenizes tool content with control tokens enabled, so text such as `<|im_end|>` in a tool result becomes a real control token. If your agent passes third-party content (web pages, files, emails) to the model, remove these tokens first.
 - **Not supported:** `n` > 1 is rejected.
-- **One request at a time:** the model runs one request at a time, and others wait in a queue (`--queue`, default 16; beyond that the server returns 503). If a client disconnects, its generation stops.
+- **Concurrent requests:** `--parallel N` (or `-np N`, GPU only, default 1) serves up to N requests at once, taking turns on the GPU, so a short request is not stuck behind a long one. Others wait in a queue (`--queue`, default 16; beyond that the server returns 503). If a client disconnects, its generation stops and its slot is freed.
+  - As in llama.cpp, `--context` is the total and is split between slots: `--context 16384 --parallel 4` gives each request 4096 tokens. Each slot's share is rounded up to a multiple of 256.
+  - Turns share the GPU, they do not add speed. On Qwen3-30B (RTX 5090), 4 simultaneous requests totaled 355 tok/s against 354 tok/s for one alone, so each runs at about a quarter of that. A 16-token request sent during a long one got its first token in 32 ms. `--parallel 1` stayed within 0.5% of the previous release. Raw results are in `benchmarks/concurrency/`.
+  - A reply does not depend on what other slots are doing. Prompts over 512 tokens can differ between `--parallel 1` and higher values, because they are evaluated in different block sizes.
 - **Local by default:** the server only accepts connections from this machine. To serve your network, use `--host 0.0.0.0 --api-key YOUR_KEY` (or set `PALITO_API_KEY`). Clients then send `Authorization: Bearer YOUR_KEY`.
 - **Conversations are cheap to continue:** on the GPU, a request that starts with the previous request's prompt (a chat resent with one more turn) skips most of the shared part. Replies are the same as without it. `--no-prefix-cache` turns it off.
 - **Other options:** `--port`, `--context`, `--backend cpu`, `--gpu-memory-limit-bytes`, `--model-name`.
@@ -218,10 +225,12 @@ Qwen3-30B-A3B Q4_K_M on an RTX 5090:
 
 | Prompt length | Time to first token | Decode speed |
 |---|---|---|
-| 0.5k tokens | 0.04 s | ~340 tok/s |
-| 2.9k tokens | 0.16 s | ~300 tok/s |
-| 10k tokens | 0.75 s | 211 tok/s |
-| 40k tokens | 6.4 s | 103 tok/s |
+| 0.5k tokens | 0.035 s | ~360 tok/s |
+| 2.9k tokens | 0.15 s | ~340 tok/s |
+| 10k tokens | 0.68 s | ~300 tok/s |
+| 40k tokens | 5.1 s | ~190 tok/s |
+
+llama.cpp (`-fa on`, same GPU and model) measured 0.035 / 0.21 / 0.82 / 5.5 s and 345 / 310 / 281 / 184 tok/s. See the [long-context comparison](docs/technical-reference.md#long-context-comparison-with-llamacpp).
 
 Continuing a conversation is faster: with ~9.7k tokens of history, the next turn's first token comes after 0.18 s instead of 0.77 s, because the history is not read again.
 
@@ -237,6 +246,7 @@ Continuing a conversation is faster: with ~9.7k tokens of history, the next turn
 
 - [Technical reference](docs/technical-reference.md): precision profiles (`--cuda-matmul`), validation, benchmarks against llama.cpp, tests.
 - [Architecture](docs/architecture.md)
+- [Releasing](docs/releasing.md): version alignment and publishing to crates.io, PyPI, npm, NuGet, Maven Central and Go
 - [Performance report, in Portuguese](docs/relatorio-desempenho-decode-cuda.md)
 
-License: MIT.
+License: MIT (see [LICENSE](LICENSE)).

@@ -12,7 +12,8 @@ The [standalone master Mermaid chart](architecture.mmd) is editable.
 
 ## Default CPU execution scope
 
-- One dense, decoder-only `llama` architecture model, one sequence, CPU execution.
+- One dense, decoder-only `llama` architecture model, one sequence, CPU execution
+  (several sequences exist only in the CUDA server; see "Concurrent slots").
 - GGUF v3 with an explicit tensor allowlist: F32, F16, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K.
 - Own GGUF reader, tensor dequantization, RMSNorm, adjacent-pair RoPE, causal
   grouped-query attention, SwiGLU, residuals, and tied/separate output weights.
@@ -1487,9 +1488,23 @@ baseline; it does not establish a speedup or generalize to larger models.
 
 ## HTTP server
 
-`palito serve` (`src/server/`) is an OpenAI-compatible server on axum/tokio. The `Engine` is opened on a dedicated worker thread and serves one request at a time. HTTP handlers queue jobs into a bounded channel (`--queue`; full → 503 with `Retry-After`) and receive text over an unbounded channel. When the client disconnects, that channel closes and the engine cancels generation at the next token. Streaming follows the OpenAI chunk format (role chunk, content deltas, a finish chunk, an optional `stream_options.include_usage` chunk, `[DONE]`). Responses add a `timings` object (`ttft_ms`, `tokens_per_second`). `/v1` routes require `Authorization: Bearer` when `--api-key`/`PALITO_API_KEY` is set (constant-time comparison). Bodies are limited to 16 MiB. Tests: `cargo test --release --test serve -- --include-ignored` (SmolLM2 fixture, CPU). Checked with the official OpenAI Python SDK (models, chat, streaming, completions) against Qwen3-30B-A3B: about 360 tok/s per request, same as the CLI.
+`palito serve` (`src/server/`) is an OpenAI-compatible server on axum/tokio. The `Engine` is opened on a dedicated worker thread and serves one request at a time, or `--parallel` requests in turns (see "Concurrent slots"). HTTP handlers queue jobs into a bounded channel (`--queue`; full → 503 with `Retry-After`) and receive text over an unbounded channel. When the client disconnects, that channel closes and the engine cancels generation at the next token. Streaming follows the OpenAI chunk format (role chunk, content deltas, a finish chunk, an optional `stream_options.include_usage` chunk, `[DONE]`). Responses add a `timings` object (`ttft_ms`, `tokens_per_second`). `/v1` routes require `Authorization: Bearer` when `--api-key`/`PALITO_API_KEY` is set (constant-time comparison). Bodies are limited to 16 MiB. Tests: `cargo test --release --test serve -- --include-ignored` (SmolLM2 fixture, CPU). Checked with the official OpenAI Python SDK (models, chat, streaming, completions) against Qwen3-30B-A3B: about 360 tok/s per request, same as the CLI.
 
 Chat replies are split into `reasoning_content` and `content` (`src/server/reasoning.rs`) unless the request sends `"reasoning_format": "none"`. The split works on streamed pieces: a tag cut across pieces is held until complete, so streamed and non-streamed replies match. When the rendered prompt already ends with `<think>`, generation starts inside the reasoning. Omitted sampling fields take the server's sampling-flag defaults (greedy). Request sampling fields are parsed in `src/server/sampling.rs`: `logit_bias` accepts OpenAI's object or llama.cpp's array of pairs (`false` bans), and token ids outside the vocabulary are a 400 before any streaming starts.
+
+### Concurrent slots
+
+`palito serve --parallel N` (1 to 64, CUDA only; `src/slots.rs`, `src/slots/`, `src/cuda/slots.rs`, `src/server/slot_worker.rs`) time-slices N sequences on one engine thread. `--parallel 1` keeps the single-request path unchanged.
+
+- **Shared and per-slot state.** Weights, kernels and the workspace are shared. Each slot owns its K/V, logits, decode state and graph, and prefix cache. The active slot's state lives in the backend fields and is swapped with `mem::swap`.
+- **Context.** `slot_context = ceil_256(C / N)`. Without `--context`, C is the trained context, and the per-slot value is capped at 65535 and fitted to GPU memory. `/health` reports `slots`, and `context_tokens` is per slot.
+- **Turns.** Each active slot gets one turn per round, in slot order. A turn is one prompt block of at most 512 tokens, aligned from position 0, or one generated token. A slot running alone may generate bursts of up to 8 tokens.
+- **Slot choice.** A new request takes the free slot that restores the longest prefix of its prompt. Ties go to the least recently used slot, then the lowest index.
+- **Queue.** `--queue` counts only requests waiting for a slot, and a full queue returns 503 with `Retry-After`. A queued request whose client left is dropped without touching the GPU.
+- **Failures.** A request error ends only that request and resets its slot. After a device or numerical error the worker synchronizes the CUDA stream: if that works, the other slots continue; if not, all active and queued requests get an error.
+- **Determinism.** On a server with a given `N > 1`, a request produces the same tokens with or without other active slots, greedy or with a fixed `seed`. Equality between `--parallel 1` and `N > 1` is not promised above 512 prompt tokens, because the kernels are not invariant to batch size. On Qwen3-30B, a 1486-token prompt matched under greedy and diverged under `seed`; the three shorter prompts matched in both.
+- **Measured** (Qwen3-30B-A3B Q4_K_M, RTX 5090, `benchmarks/concurrency/`): 354 tok/s for one request and 355 tok/s total for four (ratio 1.004); 32 ms to first token for a short request during a long one; `--parallel 1` median 0.45% below master over 3 runs.
+- **Not supported:** a unified K/V cache shared between slots, true batched decoding across slots, the `/slots` endpoint, `id_slot`, the CPU backend, and `qwen35` models.
 
 ## Sampling and stop sequences
 
@@ -1518,6 +1533,18 @@ Stop sequences (`src/stop.rs`, at most 16 of up to 256 bytes) are matched on the
 
 `palito chat` opens CUDA models through `Engine::open` (`src/engine/open.rs`); CPU and the reference backend go through `Engine::from_backend` to keep the validation-only CPU flags. The profile chain is int8-fast (graph) → f32-tiled (graph, then without) → f32. It now lives only in the engine and reports its fallbacks through `Engine::notices`. Explicit `--cuda-matmul`, `--cuda-decode-graph`/`--no-cuda-decode-graph`, `--batch` and `--prefill-chunk` map to `EngineOptions`. Six fixed chat transcripts (Qwen3 with and without reasoning, Phi-3 fallback, SmolLM2 on CPU, a full context, explicit flags) were byte-identical to 0.4.0, stderr included.
 
+## Tool calling
+
+`POST /v1/chat/completions` accepts `tools`, `tool_choice`, `parallel_tool_calls` and tool turns in the history. Templates must use Qwen's `<tool_call>` JSON format, and `<tool_call>` and `</tool_call>` must each be one vocabulary token. Other formats get a 400 while tools are active.
+
+- **Path:** `Engine::chat_tools` (`src/engine/tools.rs`) always runs `Executor::generate_constrained`. Requests without tools keep the existing decode path.
+- **Lazy constraint:** `ToolGate` (`src/tools/gate.rs`) works on token IDs, in the phases free text, reasoning, call and after call. Text that looks like `<tool_call>` does not start a call, and `<tool_call>` inside `<think>` is reasoning. A llguidance grammar (`src/tools/call_grammar.rs`) with one `%json` schema per tool is copied fresh for each call and fixes the key order to `name`, `arguments`.
+- **Modes:** `none` masks `<tool_call>`. `required` and a named function mask the end of generation and non-whitespace text until a call starts, and stop sequences do not apply to them. At most 2 whitespace tokens in a row are allowed where only a call or the end may follow, because Qwen3-0.6B otherwise repeats newlines after `</think>` until `max_tokens`.
+- **Prompt compatibility:** tool definitions are normalized as in llama.cpp (`name`, `description`, `parameters`, and `defer_loading` when true), and `tojson` uses spaced separators, original key order and no HTML escaping. `scripts/compare_tool_prompts.py` found identical token IDs to `llama-server --jinja` (commit `6b01a4767`) in 6 cases on each of Qwen2.5-0.5B, Qwen3-0.6B and Qwen3-30B-A3B, including a tool result containing `<|im_end|><|im_start|>system`.
+- **Control tokens:** as in llama.cpp, the rendered prompt is tokenized whole with special-token recognition, so tool content can produce control tokens. Agents must sanitize third-party content.
+- **Validation:** `scripts/validate_tool_calling.py` uses the official OpenAI SDK for `auto`, `required`, named and parallel calls, with reasoning on and off, with and without streaming. All 16 cases passed on each of the three models above, and `auto` called a tool in every case.
+- **Speed** (Qwen3-30B-A3B Q4_K_M, RTX 5090, greedy, 256 tokens, median of 6 samples over 2 alternating server runs): `master` 361.9 tok/s, this path without tools 355.6 tok/s (-1.74%), with `tools` in `auto` 330.1 tok/s (-8.79%).
+
 ## Language bindings
 
 `bindings/` wraps the C API for Python (ctypes), Node.js (koffi), Java 22+ (FFM), C# (P/Invoke) and Go (cgo with a `dlopen` shim, so building needs no link flags). Each mirrors the C structs. `tests/engine.rs::c_abi_layout_matches_the_bindings` locks their sizes and offsets, and the Go test keeps its vendored `palito.h` identical to `include/palito.h`. Every binding:
@@ -1543,13 +1570,33 @@ palito chat --model /path/to/model.gguf
 
 `chat` streams each reply to stdout token by token (`--no-stream` prints it when complete; the text is identical either way). With the decode graph the tokens are read back while the next steps already run on the GPU, so streaming does not slow decoding (Qwen3-30B-A3B, 1,014-token reply: 338-341 tok/s streamed, 337-338 tok/s without). `generate --stream` prints plain text as it is generated instead of the final JSON object. Text is emitted once it is stable: a token that ends inside a UTF-8 character is held until the character completes (`palito::stream::TextStream`, used with `Executor::generate_streaming`).
 
-`chat` uses the model's trained context by default (GGUF `context_length`; Qwen3-30B-A3B: 40,960 tokens). On CUDA it is capped at 65,535 and shrunk, in 256-token steps, to the largest context whose buffers fit in free device memory minus 2 GiB, with a notice. Replies run until end of turn or until the context is full, which is reported (`--tokens N` caps a reply; small models stuck in a greedy loop otherwise run to the full context). Older turns are dropped while a message plus a 2048-token reply reserve exceeds the context; a single message that fits alone keeps the remaining context for its reply. Measured on Qwen3-30B-A3B Q4_K_M (RTX 5090, `int8-fast`): a 40.7k-token prompt reaches the first token in 6.4 s and decodes at 103 tok/s (211 tok/s at 9.9k, ~335 tok/s near empty); a 39.7k-token needle-in-a-haystack prompt recalls the needle at 5%, 50% and 95% depth with `int8-fast` and `int8-prefill`; generating the full 40,960-token context runs at 152 tok/s on average. Other commands keep `--context 512` unless given. Without `--gpu-memory-limit-bytes` the CUDA budget is free device memory minus 2 GiB (previously a fixed 24 GiB).
+`chat` uses the model's trained context by default (GGUF `context_length`; Qwen3-30B-A3B: 40,960 tokens). On CUDA it is capped at 65,535 and shrunk, in 256-token steps, to the largest context whose buffers fit in free device memory minus 2 GiB, with a notice. Replies run until end of turn or until the context is full, which is reported (`--tokens N` caps a reply; small models stuck in a greedy loop otherwise run to the full context). Older turns are dropped while a message plus a 2048-token reply reserve exceeds the context; a single message that fits alone keeps the remaining context for its reply. Measured on Qwen3-30B-A3B Q4_K_M (RTX 5090, `int8-fast`, FP16 KV): a 40k-token prompt reaches the first token in 6.0 s and decodes at 172 tok/s (264 tok/s at 10k, ~343 tok/s near empty; see "Long-context comparison with llama.cpp"). With the earlier F32 KV cache, a 39.7k-token needle-in-a-haystack prompt recalled the needle at 5%, 50% and 95% depth with `int8-fast` and `int8-prefill`, and generating the full 40,960-token context ran at 152 tok/s on average (not re-measured). Other commands keep `--context 512` unless given. Without `--gpu-memory-limit-bytes` the CUDA budget is free device memory minus 2 GiB (previously a fixed 24 GiB).
 
 `PALITO_BACKEND`, `PALITO_MODEL` and `PALITO_CUDA_KERNEL_CACHE` set the defaults, and flags take precedence.
 
 `chat` on CUDA defaults to `--cuda-matmul int8-fast` (below) with the decode graph and prefill chunks of up to 4096 tokens; GPUs below sm_80 fall back to `f32-tiled`, and models whose weights only the reference path supports (Q5_K, e.g. Phi-3-mini-128k Q4_K_M) to `f32` without the decode graph, each with a notice. `--cuda-matmul int8-prefill` keeps the more precise tensor-core prefill: INT8 MMA projections, FP16 hi/lo attention over K/V converted once per layer; attention projections use a two-plane residual pair with an integer factor, FFN/expert projections three residual components; decode is the `f32-tiled` path. Its logits pass a relaxed gate against the F32 oracle (same argmax, cos >= 0.99999, max_abs <= 0.15; 0.09 on a 256-token real-text prompt); Qwen3-30B-A3B 2.9k prompt on an RTX 5090: 0.35 s to the first token. Pass `--cuda-matmul f32-tiled` for F32 prefill.
 
-`--cuda-matmul int8-fast` (chat default) runs prefill at llama.cpp's precision: one 8-bit plane per 32 activations (as `q8_1`), single FP16 attention and a TF32 MoE router. Q4_K projections run in cp.async double-buffered INT8 MMA tiles, and each expert's assignments fill whole 128-token tiles plus a 64- and/or 32-token remainder tile. On Qwen3-30B-A3B Q4_K_M (RTX 5090) it reaches the first token of a 2.9k prompt in ~0.16 s (llama.cpp 0.183 s; `int8-prefill` 0.35 s), 1.4k in ~0.086 s (llama.cpp 0.090 s), 0.55k in ~0.043 s (llama.cpp 0.045 s). Its logits are about 1 off F32 (max_abs 0.86-0.97, cos ~0.99966 on a 256-token real-text prompt), so generated text can differ from the F32 profiles.
+`--cuda-matmul int8-fast` (chat default) runs prefill at llama.cpp's precision: one 8-bit plane per 32 activations (as `q8_1`), single FP16 attention and a TF32 MoE router. Q4_K projections run in cp.async double-buffered INT8 MMA tiles, and each expert's assignments fill whole 128-token tiles plus a 64- and/or 32-token remainder tile. On Qwen3-30B-A3B Q4_K_M (RTX 5090) it reaches the first token of a 2.9k prompt in ~0.16 s (llama.cpp 0.183 s; `int8-prefill` 0.35 s), 1.4k in ~0.086 s (llama.cpp 0.090 s), 0.55k in ~0.043 s (llama.cpp 0.045 s). Its logits are about 1 off F32 (max_abs 0.86-0.97, cos ~0.99966 on a 256-token real-text prompt), so generated text can differ from the F32 profiles. It keeps the K/V cache in FP16 (below).
+
+### FP16 KV cache (`int8-fast`)
+
+`int8-fast` stores K and V in FP16 on the device (`src/cuda/kv.rs`); every other profile keeps F32. Values are rounded to nearest when written (`cache_kv`, `qkv_head_norm_rope_cache`), and every kernel that reads them accumulates in F32:
+- **Decode:** `attention_decode_mma` (`attention_mma.cu`). One warp per contiguous key range serves all query heads of a GQA group on tensor cores: the group's heads are rows 0..7 of the m16n8k16 A operand, keys its columns, so S = QKᵀ and O += PV are 2 × 32 MMAs per 32-key stage. Each K/V row is read once per step, streamed through shared memory with cp.async (double buffered). Q and P are rounded to FP16; scores, softmax and accumulation stay F32. It writes split-K partials over at most 64 chunks (`ATTENTION_ROW_CHUNKS`), reduced by the 1024-thread `attention_combine_rows`. Other shapes use `_f16` variants of the existing kernels (same arguments, registered under the base names).
+- **Prefill:** `attention_prefill_mma_fast_f16` stages K and V tiles straight from the cache with coalesced 16-byte copies. V stays row-major and feeds the P·V MMA through `ldmatrix.trans`. The per-layer F32 → FP16 conversion (`attention_half_kv`) and its 4-plane buffer are gone on this profile. The tiles hold the bits that conversion produced, so prefill logits are bit-identical to the F32-KV `int8-fast`.
+- **Memory:** 96 KiB per token on Qwen3-30B-A3B (48 layers × 4 KV heads × 128 × K and V × 2 bytes), 3.75 GiB at 40,960 tokens instead of 7.5 GiB. Under `--gpu-memory-limit-bytes 21474836480` (20 GiB), `chat` fits 20,992 context tokens instead of 10,240.
+
+Precision, from `cargo run --release --features cuda --example kv-precision`. It dumps full-vocabulary logits at the prompt boundary and after 15 decode steps, teacher-forced on the F32 oracle's greedy tokens. Prompts: the first 256 tokens of `README.md` and the first 2,900 of this file. Qwen3-30B-A3B Q4_K_M, decode graph on, 512-token chunks, 16 steps:
+
+| Prompt | Comparison | max_abs (all steps) | min cosine | same argmax | prompt boundary |
+|---|---|---|---|---|---|
+| 256 | F16 KV vs F32-KV `int8-fast` | 0.215 | 0.999963 | 16/16 | bit-identical |
+| 256 | F16 KV vs F32 oracle | 0.902 | 0.997921 | 16/16 | 0.226 |
+| 256 | F32-KV `int8-fast` vs F32 oracle | 0.900 | 0.997924 | 16/16 | 0.226 |
+| 2,900 | F16 KV vs F32-KV `int8-fast` | 0.0084 | 0.99999986 | 16/16 | bit-identical |
+| 2,900 | F16 KV vs F32 oracle | 0.786 | 0.997847 | 16/16 | 0.786 |
+| 2,900 | F32-KV `int8-fast` vs F32 oracle | 0.786 | 0.997847 | 16/16 | 0.786 |
+
+The FP16 cache adds much less error than the profile already has against F32. Greedy replies to the README examples (photosynthesis with `--no-thinking`, "Hello!" with reasoning, and a ~15k-token document question) are byte-identical to the F32-KV build. So are the prefix-cache chat replies in `tests/engine.rs`. `f32` (with and without the decode graph) and `f32-tiled` produce bit-identical logits to before on both prompts.
 
 ## Long-context comparison with llama.cpp
 
@@ -1561,35 +1608,44 @@ python3 -m unittest discover -s scripts -p 'test_bench_long_context.py'
 ```
 
 Conditions (2026-11-22): RTX 5090 (driver 615.71.09), i9-14900K, Qwen3-30B-A3B Q4_K_M.
-- **Palito:** 0.5.0 (`~/.local/bin/palito`), `chat --backend cuda --tokens 256 --stats --no-stream`, defaults (`int8-fast`, decode graph, context 40,960, F32 KV), one `/reset` between requests and no prefix cache. TTFT and tok/s come from `--stats`.
+- **Palito:** a release build of `perf/beat-llama-cpp` (on 0.6.0), `chat --backend cuda --tokens 256 --stats --no-stream --no-prefix-cache`, defaults (`int8-fast`, decode graph, context 40,960, FP16 KV), one `/reset` between requests. TTFT and tok/s come from `--stats`. The "0.6.0" columns are the previous release, measured the same way.
 - **llama.cpp:** commit `6b01a4767` (build 12434, `target/benchmark-llama-cuda13`), `llama-server -c 40960 -ngl 99 -np 1 --jinja --reasoning-format none` plus the flags in the column header, requested through `/v1/chat/completions` with `temperature 0`, `top_k 1` and `cache_prompt false`. TTFT is `timings.prompt_ms` and decode is `timings.predicted_per_second`.
 - Prompt tokens are the templated counts that llama.cpp reports. Palito receives the same message text, whose untemplated size `palito tokenize` cut to the target.
 
-| Prompt tokens | Palito TTFT | Palito decode | llama.cpp `-fa off` TTFT | `-fa off` decode | `-fa on` TTFT | `-fa on` decode | `-fa on -ctk q8_0 -ctv q8_0` TTFT | q8_0 KV decode |
-|---|---|---|---|---|---|---|---|---|
-| 507 | 49 ms | 339 tok/s | 39 ms | 305 tok/s | 36 ms | 336 tok/s | 36 ms | 311 tok/s |
-| 2,907 | 169 ms | 291 tok/s | 325 ms | 258 tok/s | 206 ms | 304 tok/s | 218 ms | 272 tok/s |
-| 10,003 | 777 ms | 221 tok/s | 1,772 ms | 186 tok/s | 850 ms | 272 tok/s | 870 ms | 232 tok/s |
-| 40,001 | 6,421 ms | 107 tok/s | 22,268 ms | 76 tok/s | 5,595 ms | 179 tok/s | 5,715 ms | 125 tok/s |
+| Prompt tokens | Palito TTFT | Palito decode | 0.6.0 TTFT | 0.6.0 decode | llama.cpp `-fa off` TTFT | `-fa off` decode | `-fa on` TTFT | `-fa on` decode | `-fa on -ctk q8_0 -ctv q8_0` TTFT | q8_0 KV decode |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 507 | 35 ms | 364 tok/s | 48 ms | 343 tok/s | 39 ms | 311 tok/s | 35 ms | 345 tok/s | 36 ms | 319 tok/s |
+| 2,907 | 153 ms | 343 tok/s | 166 ms | 305 tok/s | 305 ms | 264 tok/s | 205 ms | 310 tok/s | 212 ms | 279 tok/s |
+| 10,003 | 679 ms | 298 tok/s | 750 ms | 264 tok/s | 1,751 ms | 187 tok/s | 824 ms | 281 tok/s | 851 ms | 233 tok/s |
+| 40,001 | 5,120 ms | 192 tok/s | 5,960 ms | 172 tok/s | 21,933 ms | 77 tok/s | 5,485 ms | 184 tok/s | 5,663 ms | 126 tok/s |
 
-Run-to-run spread was at most 5% for decode (llama.cpp q8_0 KV at 0.5k) and 8% for TTFT (llama.cpp `-fa off` at 2.9k). llama.cpp's default `-fa auto` enables flash attention on this GPU, so the `-fa on` columns show what it does out of the box.
+At 0.5k the TTFT samples were 34/35/35 ms for Palito (`--stats` rounds to whole ms) and 34.5/34.6/34.8 ms for llama.cpp `-fa on`: a tie. Every other cell is ahead of every llama.cpp configuration. The script passes `--no-prefix-cache`: since the prefix cache (d61ddf8), `chat` would otherwise reuse the repeated prompt.
 
-**Reading:**
-- **Prefill:** Palito's TTFT is close to llama.cpp with flash attention: ahead up to 10k, 15% behind at 40k.
-- **Decode against plain llama.cpp:** Palito is ahead of llama.cpp without flash attention at every length (107 against 76 tok/s at 40k).
-- **Decode against llama.cpp's default:** with flash attention, llama.cpp loses much less speed as the context grows: 179 against 107 tok/s at 40k (1.68x) and 272 against 221 at 10k (1.23x).
+**What changed after 0.6.0:**
+- **Decode attention on tensor cores** (`attention_decode_mma`): the GQA group's heads are MMA rows, keys stream through shared memory in 32-key cp.async stages, and 64 key chunks are merged by a 1024-thread `attention_combine_rows`.
+- **Prefill attention** (`attention_prefill_mma_fast_f16`): 32-key double-buffered cp.async tiles, blocks with the longest causal span first, and P·V accumulated per tile in FP16 (twice the FP32-accumulate tensor rate on GeForce) and then added into F32. Below 340 blocks of 16 tokens, `attention_prefill_mma_fast4_f16` uses 8-token blocks (0.5k: 29 → 22 µs per layer).
+- **Q4_K MMQ in 128-wide K steps** (half the barriers). The 64- and 128-token tiles exceed 48 KB and get dynamic shared memory, sized on the device by `mmq_dynamic_shared` (`cuda/shared.rs`).
+- **Expert tiles:** 32-token tiles below 128 assignments per expert (`MIX_MIN_AVERAGE`), mixed 128/64/32 above (0.5k 44 → 37 ms).
+- **Router:** below 512 64×16 tiles, 32×8 TF32 tiles with a 6-stage pipeline (`router_tf32_small`). The per-output K order is unchanged, so the expert choices are identical (0.5k: 33 → 21 µs per layer).
 
-The context-dependent part of a decode step is the step time minus the near-empty step time:
+**Precision:** `f32` and `f32-tiled` are bit-identical to 0.6.0 (`kv-precision` against fresh 0.6.0 dumps: max_abs 0.0). `int8-fast` against the F32 oracle: prompt-boundary max_abs 0.25 at 256 tokens and 0.77 at 2.9k (0.6.0: 0.24 and 0.80), cosine ≥ 0.9976 and the same argmax at all 16 steps. Greedy replies can differ from 0.6.0 after a few dozen tokens: the FP16 P·V tiles change near-tie tokens (3 of 5 test prompts). Neither version is closer to `f32-tiled`: the replies match it for the same number of words on two prompts (20, 64) and 65 against 55 on the third.
 
-| | step at 40k | near-empty step | context-dependent part |
+**Tried and dropped:**
+- A split-K router was 0.35 ms faster at 0.5k, but its different summation order changed expert choices near ties.
+- 64-token tiles for small dense grids were slower.
+- Two cp.async-pipelined Q6_K tiles were slower than `mmq_tile`.
+
+Q6_K expert down projections remain the largest gap at 0.5k (~265 against llama.cpp's ~162 µs per layer). In a test kernel, removing their epilogue saved 8% and removing their unpacking 13%, so most of the cost is in loading the 210-byte, 2-byte-aligned blocks.
+
+The context-dependent part of a decode step is the step time at 40k minus the step time at 0.5k:
+
+| | step at 40k | step at 0.5k | context-dependent part |
 |---|---|---|---|
-| Palito | 9.38 ms | 2.95 ms | 6.4 ms |
-| llama.cpp `-fa on` | 5.58 ms | 2.98 ms | 2.6 ms |
+| Palito | 5.21 ms | 2.75 ms | 2.5 ms |
+| Palito 0.6.0 | 5.81 ms | 2.92 ms | 2.9 ms |
+| llama.cpp `-fa on` | 5.44 ms | 2.90 ms | 2.5 ms |
 
-Assuming Qwen3-30B-A3B's attention geometry of 48 layers × 4 KV heads × 128 dimensions for both K and V (an estimate; not re-read from the GGUF for this run), each step reads 7.9 GB of F32 KV at 40k in Palito and 3.9 GB of F16 KV in llama.cpp. That works out to about 1.2 and 1.5 TB/s. So most of the gap is the bytes Palito reads, and a smaller part is the kernel.
-
-**Conclusion:** long-context decode is worth optimizing, and the bytes per KV element are the lever.
-- **F16 KV with a flash-decoding (split-K) attention kernel:** this is the change worth making, and it would only apply to `int8-fast`, whose prefill already uses FP16 attention. It halves the KV traffic, which should bring 40k decode from 107 toward the 150–180 tok/s range (an estimate, not measured).
-- **Not worth it for speed:** q8_0 KV. On this GPU it is slower than F16 KV in llama.cpp (125 against 179 tok/s at 40k), because dequantizing costs more than the saved bandwidth. It is only worth it to fit longer contexts in memory.
-- **`f32` and `f32-tiled`:** F16 KV would change their output, so these profiles must keep F32 KV.
-- **Prefill:** prefill attention needs no change for these lengths.
+**Remaining:**
+- **q8_0 KV is not worth it for speed:** on this GPU it is slower than FP16 KV in llama.cpp (126 against 184 tok/s at 40k), because dequantizing costs more than the saved bandwidth. It is only worth it to fit longer contexts in memory.
+- **`f32` and `f32-tiled`** keep F32 KV, since FP16 would change their output.
+- **Short prompts:** a faster Q6_K expert tile is the next lever for 0.5k TTFT.

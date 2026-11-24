@@ -380,6 +380,50 @@ pub fn quantize_gguf_qtip3(
     Ok(reports)
 }
 
+/// Writes `output`: `base` with each tensor in `names` replaced by the
+/// tensor of the same name and shape from `donor` (any type `gguf` reads,
+/// such as a llama.cpp Q6_K output head). Metadata comes from `base`.
+pub fn splice_gguf(base: &Path, donor: &Path, names: &[String], output: &Path) -> Result<()> {
+    if output.exists() {
+        return Err(Error::Invalid(format!(
+            "{} already exists",
+            output.display()
+        )));
+    }
+    let (base_bytes, donor_bytes) = (fs::read(base)?, fs::read(donor)?);
+    let (base_dir, donor_dir) = (
+        Directory::read(&base_bytes)?,
+        Directory::read(&donor_bytes)?,
+    );
+    let mut tensors: Vec<(String, Vec<usize>, u32, &[u8])> = Vec::new();
+    let mut replaced = 0;
+    for entry in &base_dir.tensors {
+        let source = if names.contains(&entry.name) {
+            let found = donor_dir
+                .tensors
+                .iter()
+                .find(|d| d.name == entry.name && d.dims == entry.dims)
+                .ok_or_else(|| {
+                    Error::Invalid(format!("{}: missing or reshaped in donor", entry.name))
+                })?;
+            replaced += 1;
+            (found.kind, &donor_bytes[found.data.clone()])
+        } else {
+            (entry.kind, &base_bytes[entry.data.clone()])
+        };
+        tensors.push((entry.name.clone(), entry.dims.clone(), source.0, source.1));
+    }
+    if replaced != names.len() {
+        return Err(Error::Invalid(
+            "a spliced tensor is not in the base model".into(),
+        ));
+    }
+    let partial = output.with_extension("partial");
+    write_gguf(&partial, &base_bytes, &base_dir, &tensors)?;
+    fs::rename(&partial, output)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,6 +503,50 @@ mod tests {
         assert!((distortion(&q, &written).relative - reports[0].relative_error).abs() < 1e-3);
 
         assert!(quantize_gguf(&input, &output, method, 1, None, None, |_, _, _| {}).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn splices_only_the_named_tensors() {
+        let dir = std::env::temp_dir().join(format!("palito-splice-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (base, donor, output) = (dir.join("a.gguf"), dir.join("b.gguf"), dir.join("c.gguf"));
+        let (q, e) = (values(32 * 64), values(16 * 64));
+        let other: Vec<f32> = e.iter().map(|v| v * 0.5).collect();
+        write_gguf(
+            &base,
+            &[
+                ("blk.0.attn_q.weight", 32, 64, q.clone()),
+                ("token_embd.weight", 16, 64, e),
+            ],
+        );
+        write_gguf(
+            &donor,
+            &[
+                (
+                    "blk.0.attn_q.weight",
+                    32,
+                    64,
+                    values(32 * 64).iter().map(|v| -v).collect(),
+                ),
+                ("token_embd.weight", 16, 64, other),
+            ],
+        );
+        let names = ["token_embd.weight".to_string()];
+        splice_gguf(&base, &donor, &names, &output).unwrap();
+        let (a, b, c) = (
+            Gguf::open(&base, false).unwrap(),
+            Gguf::open(&donor, false).unwrap(),
+            Gguf::open(&output, false).unwrap(),
+        );
+        let same = |x: &Gguf, name: &str| matrix(&x.tensors[name]).0 == matrix(&c.tensors[name]).0;
+        assert!(same(&b, "token_embd.weight") && !same(&a, "token_embd.weight"));
+        assert!(same(&a, "blk.0.attn_q.weight"));
+        // Existing output, and a name the base lacks, are refused.
+        assert!(splice_gguf(&base, &donor, &names, &output).is_err());
+        let missing = ["blk.9.attn_q.weight".to_string()];
+        assert!(splice_gguf(&base, &donor, &missing, &dir.join("d.gguf")).is_err());
+        assert!(!dir.join("d.gguf").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -10,7 +10,7 @@
 use clap::{Parser, ValueEnum};
 use palito::qtip::{
     hessian::Hessians,
-    model::{Method, quantize_gguf, quantize_gguf_qtip3},
+    model::{Method, quantize_gguf, quantize_gguf_qtip3, splice_gguf},
 };
 use std::{path::PathBuf, time::Instant};
 
@@ -53,10 +53,21 @@ struct Args {
     /// Hadamards) instead of an F16 probe; only Palito CUDA reads it.
     #[arg(long)]
     packed: bool,
+    /// Instead of quantizing, copy --input with these tensors taken from
+    /// --splice-from (same name and shape), e.g. a llama.cpp Q6_K head.
+    #[arg(long, requires = "splice_from")]
+    splice: Vec<String>,
+    #[arg(long)]
+    splice_from: Option<PathBuf>,
 }
 
 fn main() -> palito::Result<()> {
     let args = Args::parse();
+    if let Some(donor) = &args.splice_from {
+        splice_gguf(&args.input, donor, &args.splice, &args.output)?;
+        println!("spliced {} tensors", args.splice.len());
+        return Ok(());
+    }
     let method = match args.method {
         MethodArg::Trellis => Method::Trellis {
             state_bits: args.state_bits,

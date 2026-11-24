@@ -5,7 +5,7 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>io.github.natanloterio</groupId>
   <artifactId>palito</artifactId>
-  <version>0.11.3</version>
+  <version>0.12.0</version>
   <name>Palito</name>
   <description>Run GGUF LLMs locally from Java (22+ FFM) with custom CUDA kernels, token streaming, and structured JSON output — no llama.cpp required.</description>
   <url>https://github.com/natanloterio/palito</url>

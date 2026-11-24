@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -48,6 +49,20 @@ class PalitoTest {
         assertEquals(llm.chat(HELLO, sampled).text(), llm.chat(HELLO, sampled).text());
         Completion cancelled = llm.complete("Once upon a time", new Generation().onText(t -> false));
         assertEquals(Completion.FinishReason.CANCELLED, cancelled.finishReason());
+    }
+
+    @Test
+    void penaltiesMinPAndLogitBias() {
+        String ones = "1, 1, 1, 1, 1, 1,";
+        assertTrue(llm.complete(ones, new Generation().maxTokens(4)).text().startsWith(" 1"));
+        Completion penalized = llm.complete(ones, new Generation().maxTokens(4)
+                .frequencyPenalty(2f).presencePenalty(0.5f).repeatPenalty(1.1f));
+        assertFalse(penalized.text().startsWith(" 1"), penalized.text());
+        Generation seeded = new Generation().maxTokens(8).temperature(1f).minP(0.05f).seed(3);
+        assertEquals(llm.complete(ones, seeded).text(), llm.complete(ones, seeded).text());
+        assertThrows(PalitoException.class, () -> llm.complete(ones,
+                new Generation().maxTokens(2).logitBias(Map.of(1 << 30, 1f))));
+        assertThrows(PalitoException.class, () -> llm.complete(ones, new Generation().minP(2f)));
     }
 
     @Test

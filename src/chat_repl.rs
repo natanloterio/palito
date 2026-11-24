@@ -10,7 +10,7 @@ use palito::{
     Result,
     chat::{Message, fit_history},
     engine::{Completion, Engine, FinishReason, GenerationOptions},
-    sampling::Sampling,
+    sampling::{DEFAULT_REPEAT_LAST_N, Sampling},
 };
 use std::{
     fs,
@@ -61,6 +61,21 @@ pub(crate) struct SamplingArgs {
     /// Sample among the k most likely tokens; 0 disables it.
     #[arg(long, default_value_t = 0)]
     pub(crate) top_k: u32,
+    /// Drop tokens less likely than this fraction of the most likely one; 0 disables it.
+    #[arg(long, default_value_t = 0.0)]
+    pub(crate) min_p: f32,
+    /// Penalize repeating any of the last --repeat-last-n tokens (prompt included); 1 disables it.
+    #[arg(long, default_value_t = 1.0)]
+    pub(crate) repeat_penalty: f32,
+    /// Tokens the penalties look back at; 0 disables the penalties.
+    #[arg(long, default_value_t = DEFAULT_REPEAT_LAST_N)]
+    pub(crate) repeat_last_n: u32,
+    /// Subtracted from the logit of every token in the window; 0 disables it.
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    pub(crate) presence_penalty: f32,
+    /// Subtracted from a token's logit per occurrence in the window; 0 disables it.
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    pub(crate) frequency_penalty: f32,
     /// Seed for reproducible sampling [default: a new one each reply].
     #[arg(long)]
     pub(crate) seed: Option<u64>,
@@ -72,6 +87,12 @@ impl SamplingArgs {
             temperature: self.temperature,
             top_p: self.top_p,
             top_k: self.top_k,
+            min_p: self.min_p,
+            repeat_penalty: self.repeat_penalty,
+            repeat_last_n: self.repeat_last_n,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+            logit_bias: Vec::new(),
             seed: self.seed,
         }
     }

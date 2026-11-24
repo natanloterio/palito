@@ -56,6 +56,25 @@ public class PalitoTests(EngineFixture fixture) : IClassFixture<EngineFixture>
     }
 
     [Fact]
+    public void PenaltiesMinPAndLogitBias()
+    {
+        const string ones = "1, 1, 1, 1, 1, 1,";
+        Assert.StartsWith(" 1", Llm.Complete(ones, new GenerationOptions { MaxTokens = 4 }).Text);
+        var penalized = Llm.Complete(ones, new GenerationOptions
+        {
+            MaxTokens = 4, FrequencyPenalty = 2f, PresencePenalty = 0.5f, RepeatPenalty = 1.1f,
+        });
+        Assert.False(penalized.Text.StartsWith(" 1"), penalized.Text);
+        var seeded = new GenerationOptions { MaxTokens = 8, Temperature = 1f, MinP = 0.05f, Seed = 3 };
+        Assert.Equal(Llm.Complete(ones, seeded).Text, Llm.Complete(ones, seeded).Text);
+        Assert.Throws<PalitoException>(() => Llm.Complete(ones, new GenerationOptions
+        {
+            MaxTokens = 2, LogitBias = new Dictionary<int, float> { [1 << 30] = 1f },
+        }));
+        Assert.Throws<PalitoException>(() => Llm.Complete(ones, new GenerationOptions { MinP = 2f }));
+    }
+
+    [Fact]
     public void Errors()
     {
         Assert.Throws<PalitoException>(() => PalitoEngine.Open("/nonexistent.gguf"));

@@ -113,6 +113,12 @@ public sealed unsafe class PalitoEngine : IDisposable
             Temperature = options.Temperature,
             TopP = options.TopP,
             TopK = options.TopK,
+            MinP = options.MinP,
+            RepeatPenalty = options.RepeatPenalty,
+            RepeatLastN = options.RepeatLastN,
+            PresencePenalty = options.PresencePenalty,
+            FrequencyPenalty = options.FrequencyPenalty,
+            LogitBias = options.LogitBias,
             Seed = options.Seed,
             Stop = options.Stop,
             OnText = onText,
@@ -133,6 +139,15 @@ public sealed unsafe class PalitoEngine : IDisposable
         gen.Temperature = options.Temperature;
         gen.TopP = options.TopP;
         gen.TopK = options.TopK;
+        gen.MinP = options.MinP;
+        gen.RepeatPenalty = options.RepeatPenalty;
+        gen.RepeatLastN = options.RepeatLastN;
+        gen.PresencePenalty = options.PresencePenalty;
+        gen.FrequencyPenalty = options.FrequencyPenalty;
+        var biases = options.LogitBias
+            .Select(entry => new NativeLogitBias { Token = entry.Key, Bias = entry.Value })
+            .DefaultIfEmpty()
+            .ToArray();
         gen.Seed = options.Seed is ulong seed ? (long)(seed & long.MaxValue) : -1;
         var stops = new IntPtr[Math.Max(options.Stop.Count, 1)];
         for (int i = 0; i < options.Stop.Count; i++) stops[i] = strings.Add(options.Stop[i]);
@@ -141,9 +156,12 @@ public sealed unsafe class PalitoEngine : IDisposable
         try
         {
             fixed (IntPtr* stopPointer = stops)
+            fixed (NativeLogitBias* biasPointer = biases)
             {
                 gen.Stop = options.Stop.Count > 0 ? (IntPtr)stopPointer : IntPtr.Zero;
                 gen.StopCount = (nuint)options.Stop.Count;
+                gen.LogitBias = options.LogitBias.Count > 0 ? (IntPtr)biasPointer : IntPtr.Zero;
+                gen.LogitBiasCount = (nuint)options.LogitBias.Count;
                 NativeResult result;
                 IntPtr error = IntPtr.Zero;
                 int status;

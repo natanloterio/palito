@@ -240,6 +240,11 @@ impl<B: Backend + ?Sized> Engine<B> {
         self.executor.info().context_tokens
     }
 
+    /// Vocabulary size (token ids are below it).
+    pub fn vocab_tokens(&self) -> u32 {
+        self.executor.info().vocab_tokens
+    }
+
     /// Numerical profile in use: "cpu", or the CUDA matmul profile.
     pub fn profile(&self) -> &'static str {
         self.profile
@@ -312,7 +317,7 @@ impl<B: Backend + ?Sized> Engine<B> {
     /// Validates a text request and works out its tokens and budget.
     fn text_request(&mut self, prompt: &str, options: &GenerationOptions) -> Result<TextRequest> {
         stop::validate(&options.stop)?;
-        let sampler = Sampler::new(options.sampling)?;
+        let sampler = Sampler::new(options.sampling.clone())?;
         let constraint = match &options.json_schema {
             Some(schema) => Some(self.json_decoder()?.constraint(schema)?),
             None => None,
@@ -344,7 +349,7 @@ impl<B: Backend + ?Sized> Engine<B> {
         let plan = self.reply_plan(tokens.len(), budget, room);
         let mut output = TextOutput::new(plan, &options.stop, sink);
         let mode = GenerationMode::UntilEog;
-        let result = if sampler.is_greedy() && constraint.is_none() {
+        let result = if !sampler.needs_host_logits() && constraint.is_none() {
             self.executor
                 .generate_streaming(&tokens, budget, mode, |token| output.token(token))
         } else {

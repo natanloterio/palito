@@ -21,7 +21,9 @@ __device__ __forceinline__ qtip_f16 qtip_to_f16(float v) {
 }
 
 #define QTIP_MMA_TOKENS 128
+#ifndef QTIP_MMA_WARPS
 #define QTIP_MMA_WARPS 4
+#endif
 // Padding (in halves) keeps the fragment loads free of bank conflicts.
 #define QTIP_MMA_PAD 8
 
@@ -103,16 +105,22 @@ __device__ __forceinline__ void qtip_ldmatrix4(unsigned (&r)[4], const void* row
 #endif
 }
 
-// grid (rows / 64, ceil(tokens / 128), splits), block 128. Warp w owns row
-// group blockIdx.x * 4 + w (16 rotated rows) and the block's 128 tokens over
-// column tiles [z * split_tiles, (z + 1) * split_tiles): each tile is decoded
-// once and feeds 16 mma.m16n8k16. Plane z of yr gets that part of the
-// rotated, unscaled product Ŵ X' (F32). Inputs and decoded tiles are double
-// buffered, so one barrier per column tile suffices.
+#ifndef QTIP_MMA_STEP_TILES
+#define QTIP_MMA_STEP_TILES 2
+#endif
+
+// grid (rows / 64, ceil(tokens / 128), splits), block 128, split_tiles a
+// multiple of QTIP_MMA_STEP_TILES. Warp w owns row group blockIdx.x * 4 + w
+// (16 rotated rows) and the block's 128 tokens over column tiles
+// [z * split_tiles, (z + 1) * split_tiles), QTIP_MMA_STEP_TILES per step:
+// each tile is decoded once and feeds 16 mma.m16n8k16. Plane z of yr gets
+// that part of the rotated, unscaled product Ŵ X' (F32). Inputs and decoded
+// tiles are double buffered, so one barrier per step suffices.
 extern "C" __global__ void __launch_bounds__(QTIP_MMA_WARPS * 32)
 qtip_matmul_mma(const unsigned* __restrict__ tiles, const qtip_f16* __restrict__ xr,
                 float* __restrict__ yr, int cols, int rows, int tokens, int split_tiles) {
-    constexpr int stride = QTIP_TILE + QTIP_MMA_PAD;
+    constexpr int S = QTIP_MMA_STEP_TILES;
+    constexpr int stride = S * QTIP_TILE + QTIP_MMA_PAD;
     __shared__ __align__(16) qtip_f16 xs[2][QTIP_MMA_TOKENS][stride];
     __shared__ __align__(16) qtip_f16 ws[2][QTIP_MMA_WARPS][QTIP_TILE][stride];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -120,7 +128,7 @@ qtip_matmul_mma(const unsigned* __restrict__ tiles, const qtip_f16* __restrict__
     const int group = blockIdx.x * QTIP_MMA_WARPS + warp;
     const int token0 = blockIdx.y * QTIP_MMA_TOKENS;
     const int k0 = blockIdx.z * split_tiles;
-    const int steps = min(k0 + split_tiles, col_tiles) - k0;
+    const int steps = (min(k0 + split_tiles, col_tiles) - k0) / S;
     const unsigned* base = tiles + ((size_t)group * col_tiles + k0) * QTIP_WORDS;
     yr += (size_t)blockIdx.z * tokens * rows;
     // Decode layout: lane holds tile elements lane * 8 .. + 8 (row lane / 2).
@@ -129,11 +137,22 @@ qtip_matmul_mma(const unsigned* __restrict__ tiles, const qtip_f16* __restrict__
     const int hi_word = bit / 32, shift = bit % 32;
     const int lo_word = min(hi_word + 1, 31);
     const int w_row = first / QTIP_TILE, w_col = first % QTIP_TILE;
-    // Input staging: thread i loads the 16 columns (32 bytes) of token i.
-    const int x_token = threadIdx.x;
-    const bool x_valid = token0 + x_token < tokens;
-    const uint4* x_src =
-        reinterpret_cast<const uint4*>(xr + (size_t)(token0 + x_token) * cols + k0 * QTIP_TILE);
+    // Input staging: each step moves 128 tokens x 2S uint4; thread i takes
+    // uint4 j = i + T v (v < V) of token j / (2S), part j % (2S).
+    constexpr int T = QTIP_MMA_WARPS * 32;
+    constexpr int V = (QTIP_MMA_TOKENS * 2 * S + T - 1) / T;
+    int x_token[V], x_part[V];
+    bool x_valid[V];
+    const uint4* x_src[V];
+#pragma unroll
+    for (int v = 0; v < V; ++v) {
+        const int j = threadIdx.x + T * v;
+        x_token[v] = j / (2 * S);
+        x_part[v] = j % (2 * S);
+        x_valid[v] = j < QTIP_MMA_TOKENS * 2 * S && token0 + x_token[v] < tokens;
+        x_src[v] = reinterpret_cast<const uint4*>(xr + (size_t)(token0 + x_token[v]) * cols +
+                                                  k0 * QTIP_TILE) + x_part[v];
+    }
     // ldmatrix row addresses: matrix m = lane / 8, row lane % 8.
     const int m = lane / 8, r = lane % 8;
     const int a_row = r + (m % 2) * 8, a_col = (m / 2) * 8;
@@ -141,41 +160,71 @@ qtip_matmul_mma(const unsigned* __restrict__ tiles, const qtip_f16* __restrict__
 
     float c[QTIP_MMA_TOKENS / 8][4] = {};
     const uint4 zero = make_uint4(0, 0, 0, 0);
-    unsigned word = lane < QTIP_WORDS ? __ldg(base + lane) : 0u;
-    uint4 x_lo = x_valid ? x_src[0] : zero, x_hi = x_valid ? x_src[1] : zero;
+    const bool loads = lane < QTIP_WORDS;
+    unsigned words[S];
+    uint4 xv[V];
+#pragma unroll
+    for (int u = 0; u < S; ++u) {
+        words[u] = loads ? __ldg(base + (size_t)u * QTIP_WORDS + lane) : 0u;
+    }
+#pragma unroll
+    for (int v = 0; v < V; ++v) {
+        xv[v] = x_valid[v] ? x_src[v][0] : zero;
+    }
     for (int k = 0; k < steps; ++k) {
         const int b = k & 1;
-        *reinterpret_cast<uint4*>(&xs[b][x_token][0]) = x_lo;
-        *reinterpret_cast<uint4*>(&xs[b][x_token][8]) = x_hi;
-        const unsigned hi = __shfl_sync(0xffffffffu, word, hi_word);
-        const unsigned lo = __shfl_sync(0xffffffffu, word, lo_word);
-        // Prefetch the next tile and input columns while this one computes.
+        unsigned current[S];
+#pragma unroll
+        for (int v = 0; v < V; ++v) {
+            if (threadIdx.x + T * v < QTIP_MMA_TOKENS * 2 * S) {
+                *reinterpret_cast<uint4*>(&xs[b][x_token[v]][8 * x_part[v]]) = xv[v];
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < S; ++u) {
+            current[u] = words[u];
+        }
+        // Prefetch the next step's tiles and inputs while this one computes.
         if (k + 1 < steps) {
-            word = lane < QTIP_WORDS ? __ldg(base + (size_t)(k + 1) * QTIP_WORDS + lane) : 0u;
-            x_lo = x_valid ? x_src[2 * (k + 1)] : zero;
-            x_hi = x_valid ? x_src[2 * (k + 1) + 1] : zero;
-        }
-        const unsigned top = __funnelshift_l(lo, hi, shift);
-        const unsigned low = lo << shift;
-        qtip_f16 decoded[QTIP_PER_LANE];
 #pragma unroll
-        for (int j = 0; j < QTIP_PER_LANE; ++j) {
-            const int end = QTIP_K * j + QTIP_L;
-            const unsigned field =
-                end <= 32 ? (top >> (32 - end)) : __funnelshift_l(low, top, end - 32);
-            decoded[j] = qtip_to_f16(qtip_code(field & ((1u << QTIP_L) - 1u)));
+            for (int u = 0; u < S; ++u) {
+                const int tile = (k + 1) * S + u;
+                words[u] = loads ? __ldg(base + (size_t)tile * QTIP_WORDS + lane) : 0u;
+            }
+#pragma unroll
+            for (int v = 0; v < V; ++v) {
+                xv[v] = x_valid[v] ? x_src[v][2 * S * (k + 1)] : zero;
+            }
         }
-        *reinterpret_cast<uint4*>(&ws[b][warp][w_row][w_col]) =
-            *reinterpret_cast<const uint4*>(decoded);
+#pragma unroll
+        for (int u = 0; u < S; ++u) {
+            const unsigned hi = __shfl_sync(0xffffffffu, current[u], hi_word);
+            const unsigned lo = __shfl_sync(0xffffffffu, current[u], lo_word);
+            const unsigned top = __funnelshift_l(lo, hi, shift);
+            const unsigned low = lo << shift;
+            qtip_f16 decoded[QTIP_PER_LANE];
+#pragma unroll
+            for (int j = 0; j < QTIP_PER_LANE; ++j) {
+                const int end = QTIP_K * j + QTIP_L;
+                const unsigned field =
+                    end <= 32 ? (top >> (32 - end)) : __funnelshift_l(low, top, end - 32);
+                decoded[j] = qtip_to_f16(qtip_code(field & ((1u << QTIP_L) - 1u)));
+            }
+            *reinterpret_cast<uint4*>(&ws[b][warp][w_row][16 * u + w_col]) =
+                *reinterpret_cast<const uint4*>(decoded);
+        }
         __syncthreads();
-        unsigned a[4];
-        qtip_ldmatrix4(a, &ws[b][warp][a_row][a_col]);
 #pragma unroll
-        for (int n = 0; n < QTIP_MMA_TOKENS / 8; n += 2) {
-            unsigned bf[4];
-            qtip_ldmatrix4(bf, &xs[b][n * 8 + b_token][b_col]);
-            qtip_mma(c[n], a, bf[0], bf[1]);
-            qtip_mma(c[n + 1], a, bf[2], bf[3]);
+        for (int u = 0; u < S; ++u) {
+            unsigned a[4];
+            qtip_ldmatrix4(a, &ws[b][warp][a_row][16 * u + a_col]);
+#pragma unroll
+            for (int n = 0; n < QTIP_MMA_TOKENS / 8; n += 2) {
+                unsigned bf[4];
+                qtip_ldmatrix4(bf, &xs[b][n * 8 + b_token][16 * u + b_col]);
+                qtip_mma(c[n], a, bf[0], bf[1]);
+                qtip_mma(c[n + 1], a, bf[2], bf[3]);
+            }
         }
     }
     const int g = lane / 4, t = lane % 4;

@@ -95,6 +95,10 @@ struct Matrix {
 
 /// Tokens per `qtip_matmul_mma` block (QTIP_MMA_TOKENS).
 const MATMUL_TOKENS: usize = 128;
+/// Column tiles per `qtip_matmul_mma` step (QTIP_MMA_STEP_TILES).
+const MATMUL_STEP_TILES: usize = 2;
+/// Warps (16 rows each) per `qtip_matmul_mma` block (QTIP_MMA_WARPS).
+const MATMUL_WARPS: usize = 4;
 /// Prefill matmul blocks the K split aims for, and the scratch it may use.
 const MATMUL_TARGET_BLOCKS: usize = 1024;
 const MATMUL_SCRATCH_FLOATS: usize = 16 << 20;
@@ -110,7 +114,10 @@ fn matmul_split_tiles(col_tiles: usize, blocks: usize, plane: usize) -> usize {
         .min(affordable)
         .min(col_tiles / MATMUL_MIN_SPLIT_TILES)
         .max(1);
-    col_tiles.div_ceil(splits)
+    // A multiple of the kernel's tiles per step (QTIP_MMA_STEP_TILES).
+    col_tiles
+        .div_ceil(splits)
+        .next_multiple_of(MATMUL_STEP_TILES)
 }
 
 fn pointer<T>(slice: &CudaSlice<T>, stream: &CudaStream) -> u64 {
@@ -140,7 +147,9 @@ impl QtipKernel {
         tensors: impl Iterator<Item = &'a DeviceTensor>,
     ) -> Result<Self> {
         let source = format!(
-            "#define QTIP_L 12\n#define QTIP_K 3\n#define QTIP_UNROLL 4\n{}\n{}",
+            "#define QTIP_L 12\n#define QTIP_K 3\n#define QTIP_UNROLL 4\n\
+             #define QTIP_MMA_WARPS {MATMUL_WARPS}\n#define QTIP_MMA_STEP_TILES {MATMUL_STEP_TILES}\n\
+             {}\n{}",
             include_str!("../qtip/matvec.cu"),
             include_str!("../qtip/matmul.cu")
         );
@@ -339,7 +348,13 @@ impl QtipKernel {
             return Err(invalid("QTIP3 matmul buffers are too small"));
         }
         let col_tiles = cols / TILE;
-        let blocks = (rows / 64) * tokens.div_ceil(MATMUL_TOKENS);
+        let row_block = 16 * MATMUL_WARPS;
+        if rows % row_block != 0 {
+            return Err(invalid(
+                "QTIP3 matmul rows must be a multiple of the row block",
+            ));
+        }
+        let blocks = (rows / row_block) * tokens.div_ceil(MATMUL_TOKENS);
         let split_tiles = matmul_split_tiles(col_tiles, blocks, tokens * rows);
         let splits = col_tiles.div_ceil(split_tiles);
         let grow = |len: usize, need: usize| len < need;
@@ -383,11 +398,11 @@ impl QtipKernel {
             .arg(&split_tiles_i);
         let config = LaunchConfig {
             grid_dim: (
-                (rows / 64) as u32,
+                (rows / row_block) as u32,
                 tokens.div_ceil(MATMUL_TOKENS) as u32,
                 splits as u32,
             ),
-            block_dim: (128, 1, 1),
+            block_dim: (32 * MATMUL_WARPS as u32, 1, 1),
             shared_mem_bytes: 0,
         };
         // tensor.bytes holds rows / 16 row groups of cols / 16 tiles; yr

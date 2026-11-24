@@ -93,6 +93,26 @@ struct Matrix {
     scale: f32,
 }
 
+/// Tokens per `qtip_matmul_mma` block (QTIP_MMA_TOKENS).
+const MATMUL_TOKENS: usize = 128;
+/// Prefill matmul blocks the K split aims for, and the scratch it may use.
+const MATMUL_TARGET_BLOCKS: usize = 1024;
+const MATMUL_SCRATCH_FLOATS: usize = 16 << 20;
+/// Fewest column tiles per split (shorter splits only add partial planes).
+const MATMUL_MIN_SPLIT_TILES: usize = 8;
+
+/// Column tiles per K split of `qtip_matmul_mma`: enough splits to reach
+/// about MATMUL_TARGET_BLOCKS blocks, within the scratch budget.
+fn matmul_split_tiles(col_tiles: usize, blocks: usize, plane: usize) -> usize {
+    let wanted = MATMUL_TARGET_BLOCKS.div_ceil(blocks.max(1));
+    let affordable = (MATMUL_SCRATCH_FLOATS / plane.max(1)).max(1);
+    let splits = wanted
+        .min(affordable)
+        .min(col_tiles / MATMUL_MIN_SPLIT_TILES)
+        .max(1);
+    col_tiles.div_ceil(splits)
+}
+
 fn pointer<T>(slice: &CudaSlice<T>, stream: &CudaStream) -> u64 {
     slice.device_ptr(stream).0
 }
@@ -101,6 +121,13 @@ pub(super) struct QtipKernel {
     function: CudaFunction,
     multi: CudaFunction,
     multi_swiglu: CudaFunction,
+    rotate_input: CudaFunction,
+    rotate_output: CudaFunction,
+    mma: CudaFunction,
+    /// Prefill scratch, grown on demand: rotated FP16 inputs and the rotated
+    /// F32 product.
+    rotated_input: Option<CudaSlice<u16>>,
+    rotated_output: Option<CudaSlice<f32>>,
 }
 
 impl QtipKernel {
@@ -113,8 +140,9 @@ impl QtipKernel {
         tensors: impl Iterator<Item = &'a DeviceTensor>,
     ) -> Result<Self> {
         let source = format!(
-            "#define QTIP_L 12\n#define QTIP_K 3\n#define QTIP_UNROLL 4\n{}",
-            include_str!("../qtip/matvec.cu")
+            "#define QTIP_L 12\n#define QTIP_K 3\n#define QTIP_UNROLL 4\n{}\n{}",
+            include_str!("../qtip/matvec.cu"),
+            include_str!("../qtip/matmul.cu")
         );
         let ptx = cache::compile(
             cache_dir,
@@ -133,6 +161,11 @@ impl QtipKernel {
         let multi_swiglu = module
             .load_function("qtip_matvec_multi_swiglu")
             .map_err(failure)?;
+        let rotate_input = module.load_function("qtip_rotate_input").map_err(failure)?;
+        let rotate_output = module
+            .load_function("qtip_rotate_output")
+            .map_err(failure)?;
+        let mma = module.load_function("qtip_matmul_mma").map_err(failure)?;
         let tensors: Vec<&DeviceTensor> = tensors.filter(|t| t.qtip.is_some()).collect();
         let shared = tensors
             .iter()
@@ -163,6 +196,11 @@ impl QtipKernel {
             function,
             multi,
             multi_swiglu,
+            rotate_input,
+            rotate_output,
+            mma,
+            rotated_input: None,
+            rotated_output: None,
         })
     }
 
@@ -278,6 +316,96 @@ impl QtipKernel {
         Ok(())
     }
 
+    /// `y[t * rows + r] = (W x_t)[r]` for `tokens` token-major inputs (prefill),
+    /// on FP16 tensor cores: the inputs are rounded to FP16 after rotation,
+    /// the weights are exact, sums are F32. Needs sm_80+ and rows % 64 == 0.
+    pub(super) fn matmul(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        tensor: &DeviceTensor,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        tokens: usize,
+    ) -> Result<()> {
+        let q = tensor
+            .qtip
+            .as_ref()
+            .ok_or_else(|| invalid("QTIP3 matmul needs a QTIP3 tensor"))?;
+        let (rows, cols) = (tensor.rows as usize, tensor.width as usize);
+        if rows % 64 != 0 || cols % CHUNK != 0 {
+            return Err(invalid("QTIP3 matmul needs rows % 64 and cols % 256 == 0"));
+        }
+        if x.len() < tokens * cols || y.len() < tokens * rows {
+            return Err(invalid("QTIP3 matmul buffers are too small"));
+        }
+        let col_tiles = cols / TILE;
+        let blocks = (rows / 64) * tokens.div_ceil(MATMUL_TOKENS);
+        let split_tiles = matmul_split_tiles(col_tiles, blocks, tokens * rows);
+        let splits = col_tiles.div_ceil(split_tiles);
+        let grow = |len: usize, need: usize| len < need;
+        if self
+            .rotated_input
+            .as_ref()
+            .is_none_or(|b| grow(b.len(), tokens * cols))
+        {
+            self.rotated_input = Some(stream.alloc_zeros(tokens * cols).map_err(failure)?);
+        }
+        let planes = splits * tokens * rows;
+        if self
+            .rotated_output
+            .as_ref()
+            .is_none_or(|b| grow(b.len(), planes))
+        {
+            self.rotated_output = Some(stream.alloc_zeros(planes).map_err(failure)?);
+        }
+        let (xr, yr) = (
+            self.rotated_input.as_mut().unwrap(),
+            self.rotated_output.as_mut().unwrap(),
+        );
+        let col_signs = q.signs.slice(rows..);
+        let (cols_i, rows_i, tokens_i) = (cols as i32, rows as i32, tokens as i32);
+        let chunks = |n: usize| (n / CHUNK).div_ceil(8) as u32;
+        let rotate = |n: usize| LaunchConfig {
+            grid_dim: (chunks(n), tokens as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = stream.launch_builder(&self.rotate_input);
+        args.arg(x).arg(&col_signs).arg(&mut *xr).arg(&cols_i);
+        // Bounds checked above; x and xr hold tokens * cols values.
+        unsafe { args.launch(rotate(cols)) }.map_err(failure)?;
+        let mut args = stream.launch_builder(&self.mma);
+        args.arg(&tensor.bytes).arg(&*xr).arg(&mut *yr);
+        let (split_tiles_i, splits_i) = (split_tiles as i32, splits as i32);
+        args.arg(&cols_i)
+            .arg(&rows_i)
+            .arg(&tokens_i)
+            .arg(&split_tiles_i);
+        let config = LaunchConfig {
+            grid_dim: (
+                (rows / 64) as u32,
+                tokens.div_ceil(MATMUL_TOKENS) as u32,
+                splits as u32,
+            ),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // tensor.bytes holds rows / 16 row groups of cols / 16 tiles; yr
+        // holds `splits` planes of tokens * rows values.
+        unsafe { args.launch(config) }.map_err(failure)?;
+        let scale16 = q.scale * 16.0;
+        let mut args = stream.launch_builder(&self.rotate_output);
+        args.arg(&*yr)
+            .arg(&q.signs)
+            .arg(y)
+            .arg(&rows_i)
+            .arg(&scale16);
+        args.arg(&splits_i).arg(&tokens_i);
+        // Bounds checked above; row signs are the first rows values.
+        unsafe { args.launch(rotate(rows)) }.map_err(failure)?;
+        Ok(())
+    }
+
     /// `y[..rows] = W x[..cols]` for a QTIP3 tensor.
     pub(super) fn matvec(
         &self,
@@ -324,6 +452,91 @@ impl QtipKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A QTIP3 tensor of random trellis words (every bitstream decodes) and
+    /// signs, with its companion, as `gguf` folds it.
+    fn random_tensor(
+        cols: usize,
+        rows: usize,
+        seed: u64,
+        stream: &Arc<CudaStream>,
+    ) -> DeviceTensor {
+        let mut state = seed;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let tiles = rows * cols / (TILE * TILE) * QTIP3_TILE_BYTES;
+        let mut bytes: Vec<u8> = (0..tiles).map(|_| next() as u8).collect();
+        let sign = |v: u64| if v & 1 == 0 { 1.0f32 } else { -1.0 };
+        let companion = std::iter::once(0.02f32).chain((0..rows + cols).map(|_| sign(next())));
+        bytes.extend(companion.flat_map(f32::to_le_bytes));
+        let tensor = crate::gguf::Tensor {
+            dims: vec![cols, rows],
+            storage: crate::gguf::Storage::Packed {
+                kind: QTIP3_KIND,
+                bytes,
+            },
+            accelerated: true,
+            block_elements: 256,
+        };
+        DeviceTensor::upload(tensor, stream).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires CUDA (sm_80+); run serially in release mode"]
+    fn batched_matmul_matches_the_decode_matvec() -> Result<()> {
+        let context = CudaContext::new(0).map_err(failure)?;
+        let stream = context.default_stream();
+        let major = context
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .map_err(failure)?;
+        let minor = context
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+            .map_err(failure)?;
+        // q/k/v, gate and down shapes; 130 tokens cross a 128-token block.
+        let shapes = [(2048, 512), (2048, 8192), (8192, 2048)];
+        let tensors: Vec<DeviceTensor> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, &(c, r))| random_tensor(c, r, i as u64 + 1, &stream))
+            .collect();
+        let mut kernel = QtipKernel::load(&context, (major, minor), None, tensors.iter())?;
+        for (tensor, &(cols, rows)) in tensors.iter().zip(&shapes) {
+            for tokens in [3, 130] {
+                let host: Vec<f32> = (0..tokens * cols)
+                    .map(|i| ((i * 7919 % 2003) as f32 - 1001.0) / 500.0)
+                    .collect();
+                let x = stream.clone_htod(&host).map_err(failure)?;
+                let mut y = stream.alloc_zeros::<f32>(tokens * rows).map_err(failure)?;
+                kernel.matmul(&stream, tensor, &x, &mut y, tokens)?;
+                let batched = stream.clone_dtoh(&y).map_err(failure)?;
+                let (mut error, mut norm) = (0.0f64, 0.0f64);
+                for t in 0..tokens {
+                    let xt = stream
+                        .clone_htod(&host[t * cols..(t + 1) * cols])
+                        .map_err(failure)?;
+                    let mut yt = stream.alloc_zeros::<f32>(rows).map_err(failure)?;
+                    kernel.matvec(&stream, tensor, &xt, &mut yt)?;
+                    let reference = stream.clone_dtoh(&yt).map_err(failure)?;
+                    for (a, b) in batched[t * rows..(t + 1) * rows].iter().zip(&reference) {
+                        error += f64::from(a - b).powi(2);
+                        norm += f64::from(*b).powi(2);
+                    }
+                }
+                // FP16 inputs after rotation, exact weights: about 2e-4.
+                let relative = (error / norm).sqrt();
+                assert!(
+                    relative < 1e-3,
+                    "{cols}x{rows}, {tokens} tokens: {relative}"
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn splits_cover_whole_chunks() {

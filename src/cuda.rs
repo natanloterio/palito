@@ -2778,13 +2778,6 @@ impl Backend for CudaBackend {
 }
 
 impl CudaBackend {
-    fn has_qtip(&self) -> bool {
-        #[cfg(feature = "qtip-research")]
-        return self.qtip.is_some();
-        #[cfg(not(feature = "qtip-research"))]
-        false
-    }
-
     fn evaluate_inner(&mut self, tokens: &[i32], position: u32, host_logits: bool) -> Result<()> {
         self.state
             .begin(tokens, position, &self.weights.spec.info)?;
@@ -2801,13 +2794,7 @@ impl CudaBackend {
         for (index, chunk) in tokens.chunks(capacity).enumerate() {
             let offset = index * capacity;
             let output_logits = offset + chunk.len() == tokens.len();
-            if chunk.len() > 1 && self.has_qtip() {
-                // No batched QTIP3 projection: prefill one token at a time.
-                for (i, &token) in chunk.iter().enumerate() {
-                    let last = output_logits && i + 1 == chunk.len();
-                    self.step(token, position as usize + offset + i, last, false)?;
-                }
-            } else if chunk.len() > 1 {
+            if chunk.len() > 1 {
                 self.batched_prefill(chunk, position as usize + offset, output_logits)?;
             } else if self.decode.is_some() && output_logits {
                 self.replay_decode(chunk[0], position as usize + offset)?;

@@ -263,3 +263,132 @@ qtip_fwht_fast(const float* __restrict__ in, float* __restrict__ out, const floa
         default: break;
     }
 }
+
+// Fused product with block-diagonal Hadamards of 256 (Incoherence::with_block):
+//   y = scale * S_r (I (x) H_256) W' (I (x) H_256) S_c x
+// with W' the decoded tiles. A block owns 256 rows (16 row groups, one warp
+// each, so blockDim = 512) and the column tiles [k0, k1) of its split. It
+// rotates the 256-column chunks its range touches in shared memory, and
+// rotates its 256 partial sums before adding them to y (zeroed): the output
+// Hadamard is linear, so rotating each split's partial sum is exact.
+// tiles_per_split * 16 must divide 256 or be a multiple of 256 so a split
+// touches whole chunks only once. Dynamic shared = chunks * 256 floats with
+// chunks = ceil over the split. scale folds sigma / 147.80054 and both 1/16 norms.
+#define QTIP_CHUNK 256
+#define QTIP_FUSED_WARPS 16
+
+// Unnormalized H_256 of v[lane + 32 e], e < 8, held by one warp: index bits
+// 5..7 are the register, bits 0..4 the lane.
+__device__ __forceinline__ void qtip_fwht256_warp(float (&v)[8]) {
+    const int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int span = 1; span < 8; span <<= 1) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            if ((e & span) == 0) {
+                const float a = v[e], b = v[e + span];
+                v[e] = a + b;
+                v[e + span] = a - b;
+            }
+        }
+    }
+#pragma unroll
+    for (int span = 1; span < 32; span <<= 1) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const float other = __shfl_xor_sync(0xffffffffu, v[e], span);
+            v[e] = (lane & span) ? other - v[e] : v[e] + other;
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(512)
+qtip_matvec_fused(const unsigned* __restrict__ tiles, const float* __restrict__ x,
+                  const float* __restrict__ col_signs, const float* __restrict__ row_signs,
+                  float* __restrict__ y, int cols, int tiles_per_split, float scale) {
+    extern __shared__ float4 shared_x4[];
+    float* xs = reinterpret_cast<float*>(shared_x4);
+    __shared__ float partial[QTIP_CHUNK];
+    const int col_tiles = cols / QTIP_TILE;
+    const int k0 = blockIdx.y * tiles_per_split;
+    const int k1 = min(k0 + tiles_per_split, col_tiles);
+    // Whole 256-column chunks covering [k0 * 16, k1 * 16).
+    const int c_first = (k0 * QTIP_TILE) / QTIP_CHUNK * QTIP_CHUNK;
+    const int chunks = (k1 * QTIP_TILE - c_first + QTIP_CHUNK - 1) / QTIP_CHUNK;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    // One warp per 256-column chunk: load, sign, rotate in registers, store.
+    for (int chunk = warp; chunk < chunks; chunk += QTIP_FUSED_WARPS) {
+        const int c = c_first + chunk * QTIP_CHUNK;
+        float v[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int i = c + lane + 32 * e;
+            v[e] = x[i] * col_signs[i];
+        }
+        qtip_fwht256_warp(v);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            xs[chunk * QTIP_CHUNK + lane + 32 * e] = v[e];
+        }
+    }
+    __syncthreads();
+
+    const int group = blockIdx.x * QTIP_FUSED_WARPS + warp;
+    const int first = lane * QTIP_PER_LANE;
+    const int row_in_tile = first / QTIP_TILE;
+    const int col_in_tile = first % QTIP_TILE;
+    const int bit = first * QTIP_K;
+    const int hi_word = bit / 32, shift = bit % 32;
+    const int lo_word = min(hi_word + 1, 31);
+    const unsigned* base = tiles + (size_t)group * col_tiles * QTIP_WORDS;
+    const float* xbase = xs + (k0 * QTIP_TILE - c_first);
+    float acc = 0.0f;
+    for (int k = k0; k < k1; k += QTIP_UNROLL) {
+        unsigned words[QTIP_UNROLL];
+#pragma unroll
+        for (int u = 0; u < QTIP_UNROLL; ++u) {
+            const int kk = k + u;
+            words[u] = (lane < QTIP_WORDS && kk < k1) ? __ldg(base + (size_t)kk * QTIP_WORDS + lane) : 0u;
+        }
+#pragma unroll
+        for (int u = 0; u < QTIP_UNROLL; ++u) {
+            const int kk = k + u;
+            const unsigned hi = __shfl_sync(0xffffffffu, words[u], hi_word);
+            const unsigned lo = __shfl_sync(0xffffffffu, words[u], lo_word);
+            if (kk >= k1) {
+                break;
+            }
+            const unsigned top = __funnelshift_l(lo, hi, shift);
+            const unsigned low = lo << shift;
+            const float* xv = xbase + (kk - k0) * QTIP_TILE + col_in_tile;
+            const float4 xa = *reinterpret_cast<const float4*>(xv);
+            const float4 xb = *reinterpret_cast<const float4*>(xv + 4);
+            const float xx[QTIP_PER_LANE] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+#pragma unroll
+            for (int j = 0; j < QTIP_PER_LANE; ++j) {
+                const int end = QTIP_K * j + QTIP_L;
+                const unsigned field = end <= 32 ? (top >> (32 - end))
+                                                 : __funnelshift_l(low, top, end - 32);
+                acc = fmaf(qtip_code(field & ((1u << QTIP_L) - 1u)), xx[j], acc);
+            }
+        }
+    }
+    acc += __shfl_xor_sync(0xffffffffu, acc, 1);
+    if ((lane & 1) == 0) {
+        partial[warp * QTIP_TILE + row_in_tile] = acc;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float v[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            v[e] = partial[lane + 32 * e];
+        }
+        qtip_fwht256_warp(v);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int row = blockIdx.x * QTIP_CHUNK + lane + 32 * e;
+            atomicAdd(&y[row], v[e] * row_signs[row] * scale);
+        }
+    }
+}

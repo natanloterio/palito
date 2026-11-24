@@ -56,6 +56,9 @@ mod bench {
         /// Aim for about this many matvec blocks (split-K over column tiles).
         #[arg(long, default_value_t = 680)]
         target_blocks: usize,
+        /// Aim for about this many fused blocks (16 warps each).
+        #[arg(long, default_value_t = 340)]
+        fused_blocks: usize,
         #[arg(long, default_value_t = 100)]
         launches: usize,
         /// Reuse one weight copy (warm L2), as llama.cpp's test-backend-ops perf does.
@@ -71,6 +74,7 @@ mod bench {
         matvec: CudaFunction,
         fwht: CudaFunction,
         fwht_fast: CudaFunction,
+        fused: CudaFunction,
         f16: CudaFunction,
     }
 
@@ -130,6 +134,7 @@ mod bench {
             matvec: module.load_function("qtip_matvec")?,
             fwht: module.load_function("qtip_fwht")?,
             fwht_fast: module.load_function("qtip_fwht_fast")?,
+            fused: module.load_function("qtip_matvec_fused")?,
             f16: module.load_function("f16_matvec")?,
         })
     }
@@ -199,6 +204,8 @@ mod bench {
         fwht_in_us: f64,
         fwht_out_us: f64,
         pipeline_us: f64,
+        fused_us: f64,
+        fused_error: f64,
         qtip_error: f64,
         fwht_error: f64,
     }
@@ -387,7 +394,61 @@ mod bench {
             matvec(stream, &rotated, &mut y)?;
             launch_fwht(gpu, &y, &mut out, &signs_out, rows, false, 1.0)
         })?;
+        // Fused: block-diagonal Hadamard of 256 on both sides, inside the kernel.
+        let host_signs_in: Vec<f32> = uniform(cols, 3).iter().map(|v| v.signum()).collect();
+        let host_signs_out: Vec<f32> = uniform(rows, 5).iter().map(|v| v.signum()).collect();
+        let mut x_rot: Vec<f32> = x.iter().zip(&host_signs_in).map(|(a, s)| a * s).collect();
+        x_rot.chunks_exact_mut(256).for_each(fwht_cpu);
+        let mut y_rot: Vec<f32> = dense
+            .chunks_exact(cols)
+            .map(|row| {
+                row.iter()
+                    .zip(&x_rot)
+                    .map(|(&w, &v)| f64::from(w) * f64::from(v))
+                    .sum::<f64>() as f32
+            })
+            .collect();
+        y_rot.chunks_exact_mut(256).for_each(fwht_cpu);
+        let fused_expected: Vec<f64> = y_rot
+            .iter()
+            .zip(&host_signs_out)
+            .map(|(v, s)| f64::from(v * s))
+            .collect();
+        let fused_tiles = fused_split(col_tiles, (rows / 256).max(1), args.fused_blocks);
+        let fused_splits = col_tiles.div_ceil(fused_tiles);
+        let chunks = (fused_tiles * 16).div_ceil(256);
+        let fused_shared = (chunks * 256 * 4) as u32;
+        opt_in(&gpu.fused, fused_shared)?;
+        let fused_config = LaunchConfig {
+            grid_dim: ((rows / 256) as u32, fused_splits as u32, 1),
+            block_dim: (512, 1, 1),
+            shared_mem_bytes: fused_shared,
+        };
+        let (fused_tiles_i, fused_scale) = (fused_tiles as i32, sigma / BYTE_SUM_STD / 256.0);
+        let fused = |y: &mut CudaSlice<f32>| -> Result<(), Error> {
+            let tiles = &tile_copies[next.get() % tile_copies.len()];
+            next.set(next.get() + 1);
+            stream.memset_zeros(y)?;
+            let mut builder = stream.launch_builder(&gpu.fused);
+            builder
+                .arg(tiles)
+                .arg(&x_device)
+                .arg(&signs_in)
+                .arg(&signs_out)
+                .arg(&mut *y)
+                .arg(&cols_i)
+                .arg(&fused_tiles_i)
+                .arg(&fused_scale);
+            // 256 rows per 512-thread block; the split covers whole 256-chunks.
+            unsafe { builder.launch(fused_config) }?;
+            Ok(())
+        };
+        fused(&mut y)?;
+        let fused_error = max_relative(&stream.clone_dtoh(&y)?, &fused_expected);
+        let fused_us = time(stream, args.launches, || fused(&mut y))?;
         Ok(Timings {
+            fused_us,
+            fused_error,
             f16_us,
             qtip_us,
             fwht_in_us,
@@ -396,6 +457,17 @@ mod bench {
             qtip_error,
             fwht_error,
         })
+    }
+
+    /// Column tiles per fused split: about `target` blocks in all, and the
+    /// split's columns divide 256 or are a multiple of it.
+    fn fused_split(col_tiles: usize, row_blocks: usize, target: usize) -> usize {
+        let wanted = col_tiles.div_ceil(target.div_ceil(row_blocks).clamp(1, col_tiles));
+        if wanted >= 16 {
+            wanted.div_ceil(16) * 16
+        } else {
+            wanted.next_power_of_two()
+        }
     }
 
     pub fn run() -> Result<(), Error> {
@@ -423,14 +495,14 @@ mod bench {
             }
         );
         println!(
-            "shape | f16 us (GB/s) | qtip us (GB/s) | speedup vs f16 | fwht in / out us | in+matvec+out us | max rel err qtip / fwht"
+            "shape | f16 us (GB/s) | qtip us (GB/s) | speedup vs f16 | fwht in / out us | in+matvec+out us | fused us (vs f16) | max rel err qtip / fwht / fused"
         );
         for (rows, cols) in shapes {
             let t = measure(&gpu, &args, rows, cols)?;
             let weights = (rows * cols) as f64;
             let gbs = |bytes: f64, us: f64| bytes / us / 1e3;
             println!(
-                "{rows}x{cols} | {:.2} ({:.0}) | {:.2} ({:.0}) | {:.2}x | {:.2} / {:.2} | {:.2} | {:.1e} / {:.1e}",
+                "{rows}x{cols} | {:.2} ({:.0}) | {:.2} ({:.0}) | {:.2}x | {:.2} / {:.2} | {:.2} | {:.2} ({:.2}x) | {:.1e} / {:.1e} / {:.1e}",
                 t.f16_us,
                 gbs(weights * 2.0, t.f16_us),
                 t.qtip_us,
@@ -439,10 +511,13 @@ mod bench {
                 t.fwht_in_us,
                 t.fwht_out_us,
                 t.pipeline_us,
+                t.fused_us,
+                t.f16_us / t.fused_us,
                 t.qtip_error,
-                t.fwht_error
+                t.fwht_error,
+                t.fused_error
             );
-            if t.qtip_error > 1e-4 || t.fwht_error > 1e-5 {
+            if t.qtip_error > 1e-4 || t.fwht_error > 1e-5 || t.fused_error > 1e-4 {
                 return Err(
                     format!("{rows}x{cols}: GPU result differs from the CPU reference").into(),
                 );

@@ -13,6 +13,7 @@ pub mod incoherence;
 pub mod ldlq;
 pub mod matrix;
 pub mod model;
+pub mod packed;
 pub mod scalar;
 pub mod trellis;
 

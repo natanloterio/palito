@@ -53,6 +53,11 @@ path = "examples/qtip_quantize.rs"
 required-features = ["qtip-research"]
 
 [[example]]
+name = "qtip-matvec-bench"
+path = "examples/qtip_matvec_bench.rs"
+required-features = ["cuda", "qtip-research"]
+
+[[example]]
 name = "perplexity"
 path = "examples/perplexity.rs"
 

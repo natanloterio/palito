@@ -302,15 +302,16 @@ __device__ __forceinline__ void qtip_fwht256_warp(float (&v)[8]) {
     }
 }
 
-extern "C" __global__ void __launch_bounds__(512)
-qtip_matvec_fused(const unsigned* __restrict__ tiles, const float* __restrict__ x,
-                  const float* __restrict__ col_signs, const float* __restrict__ row_signs,
-                  float* __restrict__ y, int cols, int tiles_per_split, float scale) {
-    extern __shared__ float4 shared_x4[];
-    float* xs = reinterpret_cast<float*>(shared_x4);
-    __shared__ float partial[QTIP_CHUNK];
+// One block of the fused product: row block `row_block` (256 rows) and
+// column split `split`. With x_up, the input is SwiGLU(x, x_up) =
+// x / (1 + exp(-x)) * x_up, computed while loading (Palito's swiglu kernel).
+__device__ __forceinline__ void qtip_fused_block(
+    const unsigned* __restrict__ tiles, const float* __restrict__ x,
+    const float* __restrict__ x_up, const float* __restrict__ col_signs,
+    const float* __restrict__ row_signs, float* __restrict__ y, int cols,
+    int tiles_per_split, float scale, int row_block, int split, float* xs, float* partial) {
     const int col_tiles = cols / QTIP_TILE;
-    const int k0 = blockIdx.y * tiles_per_split;
+    const int k0 = split * tiles_per_split;
     const int k1 = min(k0 + tiles_per_split, col_tiles);
     // Whole 256-column chunks covering [k0 * 16, k1 * 16).
     const int c_first = (k0 * QTIP_TILE) / QTIP_CHUNK * QTIP_CHUNK;
@@ -319,11 +320,30 @@ qtip_matvec_fused(const unsigned* __restrict__ tiles, const float* __restrict__ 
     // One warp per 256-column chunk: load, sign, rotate in registers, store.
     for (int chunk = warp; chunk < chunks; chunk += QTIP_FUSED_WARPS) {
         const int c = c_first + chunk * QTIP_CHUNK;
-        float v[8];
+        // Issue every load of the chunk before using any: a branch between
+        // them would serialize eight memory latencies.
+        float v[8], sign[8];
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
             const int i = c + lane + 32 * e;
-            v[e] = x[i] * col_signs[i];
+            // __ldg: pointers from the launch struct lose __restrict__.
+            v[e] = __ldg(x + i);
+            sign[e] = __ldg(col_signs + i);
+        }
+        if (x_up != nullptr) {
+            float up[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                up[e] = __ldg(x_up + c + lane + 32 * e);
+            }
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                v[e] = v[e] / (1.0f + expf(-v[e])) * up[e];
+            }
+        }
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            v[e] *= sign[e];
         }
         qtip_fwht256_warp(v);
 #pragma unroll
@@ -333,7 +353,7 @@ qtip_matvec_fused(const unsigned* __restrict__ tiles, const float* __restrict__ 
     }
     __syncthreads();
 
-    const int group = blockIdx.x * QTIP_FUSED_WARPS + warp;
+    const int group = row_block * QTIP_FUSED_WARPS + warp;
     const int first = lane * QTIP_PER_LANE;
     const int row_in_tile = first / QTIP_TILE;
     const int col_in_tile = first % QTIP_TILE;
@@ -387,8 +407,74 @@ qtip_matvec_fused(const unsigned* __restrict__ tiles, const float* __restrict__ 
         qtip_fwht256_warp(v);
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
-            const int row = blockIdx.x * QTIP_CHUNK + lane + 32 * e;
+            const int row = row_block * QTIP_CHUNK + lane + 32 * e;
             atomicAdd(&y[row], v[e] * row_signs[row] * scale);
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(512)
+qtip_matvec_fused(const unsigned* __restrict__ tiles, const float* __restrict__ x,
+                  const float* __restrict__ col_signs, const float* __restrict__ row_signs,
+                  float* __restrict__ y, int cols, int tiles_per_split, float scale) {
+    extern __shared__ float4 shared_x4[];
+    __shared__ float partial[QTIP_CHUNK];
+    qtip_fused_block(tiles, x, nullptr, col_signs, row_signs, y, cols, tiles_per_split, scale,
+                     blockIdx.x, blockIdx.y, reinterpret_cast<float*>(shared_x4), partial);
+}
+
+// Up to three matrices (count) with the same input in one launch (q/k/v,
+// gate/up): row blocks [0, rb0) are matrix 0, the next rb1 matrix 1, the rest
+// matrix 2; all share cols and tiles_per_split. z0..z2 (n0..n2 floats) are
+// buffers of a later projection, zeroed on the way. Scalar __restrict__
+// parameters: pointers read from a struct lose them, which cost ~1 us here.
+#define QTIP_MULTI_PARAMS                                                                  \
+    const unsigned* __restrict__ t0, const unsigned* __restrict__ t1,                       \
+        const unsigned* __restrict__ t2, const float* __restrict__ c0,                      \
+        const float* __restrict__ c1, const float* __restrict__ c2,                         \
+        const float* __restrict__ r0, const float* __restrict__ r1,                         \
+        const float* __restrict__ r2, float* __restrict__ y0, float* __restrict__ y1,       \
+        float* __restrict__ y2, float s0, float s1, float s2, int rb0, int rb1,             \
+        const float* __restrict__ x, const float* __restrict__ x_up, float* __restrict__ z0, \
+        float* __restrict__ z1, float* __restrict__ z2, int n0, int n1, int n2, int cols,   \
+        int tiles_per_split
+
+template <bool SwiGLU>
+__device__ __forceinline__ void qtip_multi_body(QTIP_MULTI_PARAMS) {
+    extern __shared__ float4 shared_x4[];
+    __shared__ float partial[QTIP_CHUNK];
+    const int threads = gridDim.x * gridDim.y * blockDim.x;
+    const int id = (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
+    for (int i = id; i < n0; i += threads) z0[i] = 0.0f;
+    for (int i = id; i < n1; i += threads) z1[i] = 0.0f;
+    for (int i = id; i < n2; i += threads) z2[i] = 0.0f;
+    int row_block = blockIdx.x;
+    const unsigned* tiles = t0;
+    const float *col_signs = c0, *row_signs = r0;
+    float* y = y0;
+    float scale = s0;
+    if (row_block >= rb0) {
+        row_block -= rb0;
+        tiles = t1, col_signs = c1, row_signs = r1, y = y1, scale = s1;
+        if (row_block >= rb1) {
+            row_block -= rb1;
+            tiles = t2, col_signs = c2, row_signs = r2, y = y2, scale = s2;
+        }
+    }
+    qtip_fused_block(tiles, x, SwiGLU ? x_up : nullptr, col_signs, row_signs, y, cols,
+                     tiles_per_split, scale, row_block, blockIdx.y,
+                     reinterpret_cast<float*>(shared_x4), partial);
+}
+
+#define QTIP_MULTI_ARGS                                                                    \
+    t0, t1, t2, c0, c1, c2, r0, r1, r2, y0, y1, y2, s0, s1, s2, rb0, rb1, x, x_up, z0, z1, \
+        z2, n0, n1, n2, cols, tiles_per_split
+
+extern "C" __global__ void __launch_bounds__(512) qtip_matvec_multi(QTIP_MULTI_PARAMS) {
+    qtip_multi_body<false>(QTIP_MULTI_ARGS);
+}
+
+// qtip_matvec_multi on SwiGLU(x, x_up).
+extern "C" __global__ void __launch_bounds__(512) qtip_matvec_multi_swiglu(QTIP_MULTI_PARAMS) {
+    qtip_multi_body<true>(QTIP_MULTI_ARGS);
 }

@@ -67,6 +67,9 @@ mod bench {
         /// Tiles each warp loads before decoding (QTIP_UNROLL).
         #[arg(long, default_value_t = 4)]
         unroll: u32,
+        /// Time qtip_matvec_multi (one matrix, launch struct) in the fused column.
+        #[arg(long)]
+        multi: bool,
     }
 
     struct Gpu {
@@ -75,6 +78,7 @@ mod bench {
         fwht: CudaFunction,
         fwht_fast: CudaFunction,
         fused: CudaFunction,
+        multi: CudaFunction,
         f16: CudaFunction,
     }
 
@@ -135,6 +139,7 @@ mod bench {
             fwht: module.load_function("qtip_fwht")?,
             fwht_fast: module.load_function("qtip_fwht_fast")?,
             fused: module.load_function("qtip_matvec_fused")?,
+            multi: module.load_function("qtip_matvec_multi")?,
             f16: module.load_function("f16_matvec")?,
         })
     }
@@ -429,6 +434,41 @@ mod bench {
             let tiles = &tile_copies[next.get() % tile_copies.len()];
             next.set(next.get() + 1);
             stream.memset_zeros(y)?;
+            if args.multi {
+                use cudarc::driver::DevicePtr;
+                let p = |s: &CudaSlice<f32>| s.device_ptr(stream).0;
+                let t = tiles.device_ptr(stream).0;
+                let (c, r, yp, xp) = (p(&signs_in), p(&signs_out), p(y), p(&x_device));
+                let (rb, zero, none) = ((rows / 256) as i32, 0i32, 0u64);
+                let mut builder = stream.launch_builder(&gpu.multi);
+                // qtip_matvec_multi with one matrix: rb0 covers the grid.
+                builder
+                    .arg(&t)
+                    .arg(&t)
+                    .arg(&t)
+                    .arg(&c)
+                    .arg(&c)
+                    .arg(&c)
+                    .arg(&r)
+                    .arg(&r)
+                    .arg(&r);
+                builder.arg(&yp).arg(&yp).arg(&yp);
+                builder
+                    .arg(&fused_scale)
+                    .arg(&fused_scale)
+                    .arg(&fused_scale)
+                    .arg(&rb)
+                    .arg(&rb);
+                builder.arg(&xp).arg(&none).arg(&none).arg(&none).arg(&none);
+                builder
+                    .arg(&zero)
+                    .arg(&zero)
+                    .arg(&zero)
+                    .arg(&cols_i)
+                    .arg(&fused_tiles_i);
+                unsafe { builder.launch(fused_config) }?;
+                return Ok(());
+            }
             let mut builder = stream.launch_builder(&gpu.fused);
             builder
                 .arg(tiles)

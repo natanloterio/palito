@@ -608,6 +608,26 @@ macro_rules! qtip_matvec {
     }};
 }
 
+/// Up to three QTIP3 projections of one input in a single launch (see
+/// `qtip::QtipKernel::multi`); only reached when `qtip_chain` is set.
+macro_rules! qtip_multi {
+    ($backend:ident, [$($t:expr),+], [$($y:expr),+], $x:expr, $up:expr, [$($z:expr),*],
+     $memset:expr) => {{
+        #[cfg(feature = "qtip-research")]
+        $backend
+            .qtip
+            .as_ref()
+            .ok_or_else(|| invalid("QTIP3 kernel not loaded"))?
+            .multi(&$backend.stream, &[$($t),+], &mut [$($y),+], $x, $up, &mut [$($z),*], $memset)?;
+        #[cfg(not(feature = "qtip-research"))]
+        {
+            let _ = ($($t,)+ $($y,)+ $x, $($z,)* $memset);
+            let _: Option<&CudaSlice<f32>> = $up;
+            unreachable!("QTIP3 chain needs the qtip-research feature");
+        }
+    }};
+}
+
 /// launch! with the kernel's dynamic shared memory (shared::configure), if any.
 macro_rules! launch_shared {
     ($backend:ident, $name:expr, $grid:expr; $threads:expr, $($arg:expr),+ $(,)?) => {{
@@ -893,6 +913,10 @@ pub struct CudaBackend {
     /// Fused trellis matvec, when the model has QTIP3 projections.
     #[cfg(feature = "qtip-research")]
     qtip: Option<qtip::QtipKernel>,
+    /// Every layer's seven projections are QTIP3 (Llama): decode then batches
+    /// q/k/v and gate/up, fuses SwiGLU into down, and each launch zeroes the
+    /// next projection's output instead of a memset.
+    qtip_chain: bool,
 }
 
 /// Warps sharing one output row in `matvec_packed_rows` (mirrors the device
@@ -1507,6 +1531,7 @@ impl CudaBackend {
             prefix: options.prefix_cache.then(prefix::PrefixCache::default),
             #[cfg(feature = "qtip-research")]
             qtip: None,
+            qtip_chain: false,
         };
         #[cfg(feature = "qtip-research")]
         if has_qtip {
@@ -1522,6 +1547,18 @@ impl CudaBackend {
                 options.kernel_cache_dir.as_deref(),
                 tensors,
             )?);
+            backend.qtip_chain = backend.weights.gemma.is_none()
+                && backend.weights.layers.iter().all(|l| {
+                    let gate = l.gate.as_ref();
+                    l.router.is_none()
+                        && l.affine.is_none()
+                        && gate.is_some_and(|g| g.is_qtip() && g.width == l.up.width)
+                        && [&l.q, &l.k, &l.v, &l.output, &l.up, &l.down]
+                            .iter()
+                            .all(|t| t.is_qtip())
+                        && l.q.width == l.k.width
+                        && l.k.width == l.v.width
+                });
         }
         if options.decode_graph {
             backend.capture_decode_graph()?;
@@ -1627,7 +1664,18 @@ impl CudaBackend {
                     s.epsilon
                 );
             }
-            if cfg!(feature = "cuda-decode-fusion-research")
+            if self.qtip_chain {
+                // The previous layer's down launch zeroed q, k and v.
+                qtip_multi!(
+                    self,
+                    [&l.q, &l.k, &l.v],
+                    [&mut self.work.q, &mut self.work.k, &mut self.work.v],
+                    &self.work.normalized,
+                    None,
+                    [(&mut self.work.projected, l.output.rows as usize)],
+                    index == 0
+                );
+            } else if cfg!(feature = "cuda-decode-fusion-research")
                 && self.matmul == CudaMatmul::ResidualMma3Research
                 && l.q.width == l.k.width
                 && l.k.width == l.v.width
@@ -2094,7 +2142,21 @@ impl CudaBackend {
                 );
             }
             let t = &l.output;
-            if t.is_qtip() {
+            if self.qtip_chain {
+                let gate = l.gate.as_ref().expect("QTIP3 chain layers are gated");
+                qtip_multi!(
+                    self,
+                    [t],
+                    [&mut self.work.projected],
+                    &self.work.attended,
+                    None,
+                    [
+                        (&mut self.work.gate, gate.rows as usize),
+                        (&mut self.work.up, l.up.rows as usize)
+                    ],
+                    false
+                );
+            } else if t.is_qtip() {
                 qtip_matvec!(self, t, &self.work.attended, &mut self.work.projected);
             } else {
                 launch!(
@@ -2242,7 +2304,18 @@ impl CudaBackend {
             }
             let moe = i32::from(l.router.is_some());
             let gate = l.gate.as_ref().expect("gated CUDA layer");
-            if cfg!(feature = "cuda-packed-gate-up-research")
+            if self.qtip_chain {
+                // SwiGLU happens inside the down launch below.
+                qtip_multi!(
+                    self,
+                    [gate, &l.up],
+                    [&mut self.work.gate, &mut self.work.up],
+                    &self.work.normalized,
+                    None,
+                    [(&mut self.work.down, l.down.rows as usize)],
+                    false
+                );
+            } else if cfg!(feature = "cuda-packed-gate-up-research")
                 && self.matmul == CudaMatmul::ResidualMma3Research
                 && moe != 0
                 && gate.width == 2048
@@ -2340,6 +2413,25 @@ impl CudaBackend {
                     &t.rows,
                     &self.work.ids
                 );
+            } else if self.qtip_chain {
+                let up = &self.work.up;
+                if let Some(next) = self.weights.layers.get(index + 1) {
+                    qtip_multi!(
+                        self,
+                        [t],
+                        [&mut self.work.down],
+                        &self.work.gate,
+                        Some(up),
+                        [
+                            (&mut self.work.q, next.q.rows as usize),
+                            (&mut self.work.k, next.k.rows as usize),
+                            (&mut self.work.v, next.v.rows as usize)
+                        ],
+                        false
+                    );
+                } else {
+                    qtip_multi!(self, [t], [&mut self.work.down], &self.work.gate, Some(up), [], false);
+                }
             } else if t.is_qtip() && moe == 0 {
                 qtip_matvec!(self, t, &self.work.gate, &mut self.work.down);
             } else {

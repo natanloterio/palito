@@ -1,6 +1,8 @@
 //! QTIP3 projections (feature `qtip-research`): the fused trellis matvec of
-//! `src/qtip/matvec.cu`, which applies both 256-block Hadamards itself, so a
-//! QTIP3 projection is one memset and one launch.
+//! `src/qtip/matvec.cu`, which applies both 256-block Hadamards itself. A
+//! single projection is one memset and one launch (`matvec`); a Llama layer
+//! made only of QTIP3 projections runs in four launches without memsets
+//! (`multi`: q/k/v, output, gate/up, and down with SwiGLU fused in).
 
 use super::{DeviceTensor, cache, failure};
 use crate::{
@@ -9,7 +11,10 @@ use crate::{
     transformer::invalid,
 };
 use cudarc::{
-    driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg, sys},
+    driver::{
+        CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
+        sys,
+    },
     nvrtc::CompileOptions,
 };
 use std::{path::Path, sync::Arc};
@@ -77,8 +82,25 @@ impl QtipTensor {
     }
 }
 
+/// One matrix of a `qtip_matvec_multi` launch (device pointers).
+#[derive(Clone, Copy, Default)]
+struct Matrix {
+    tiles: u64,
+    col_signs: u64,
+    row_signs: u64,
+    y: u64,
+    row_blocks: i32,
+    scale: f32,
+}
+
+fn pointer<T>(slice: &CudaSlice<T>, stream: &CudaStream) -> u64 {
+    slice.device_ptr(stream).0
+}
+
 pub(super) struct QtipKernel {
     function: CudaFunction,
+    multi: CudaFunction,
+    multi_swiglu: CudaFunction,
 }
 
 impl QtipKernel {
@@ -107,20 +129,153 @@ impl QtipKernel {
         )?;
         let module = context.load_module(ptx).map_err(failure)?;
         let function = module.load_function("qtip_matvec_fused").map_err(failure)?;
+        let multi = module.load_function("qtip_matvec_multi").map_err(failure)?;
+        let multi_swiglu = module
+            .load_function("qtip_matvec_multi_swiglu")
+            .map_err(failure)?;
+        let tensors: Vec<&DeviceTensor> = tensors.filter(|t| t.qtip.is_some()).collect();
         let shared = tensors
+            .iter()
             .filter_map(|t| t.qtip.as_ref())
             .map(|q| q.shared_bytes)
             .max()
             .unwrap_or(0);
-        if shared > STATIC_SHARED_LIMIT {
-            function
-                .set_attribute(
+        // A multi launch splits by its combined row blocks; a whole row bounds it.
+        let multi_shared = tensors
+            .iter()
+            .map(|t| (t.width as usize).div_ceil(CHUNK) * CHUNK * 4)
+            .max()
+            .unwrap_or(0) as u32;
+        for (f, bytes) in [
+            (&function, shared),
+            (&multi, multi_shared),
+            (&multi_swiglu, multi_shared),
+        ] {
+            if bytes > STATIC_SHARED_LIMIT {
+                f.set_attribute(
                     sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    shared as i32,
+                    bytes as i32,
                 )
                 .map_err(failure)?;
+            }
         }
-        Ok(Self { function })
+        Ok(Self {
+            function,
+            multi,
+            multi_swiglu,
+        })
+    }
+
+    /// `outputs[i][..rows_i] = W_i x` for up to three QTIP3 tensors of the same
+    /// width in one launch. With `x_up`, the input is SwiGLU(x, x_up). Each
+    /// `zero` buffer (a later projection's output, untouched here) is zeroed
+    /// on the way. Outputs must already be zero unless `memset_outputs`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn multi(
+        &self,
+        stream: &Arc<CudaStream>,
+        tensors: &[&DeviceTensor],
+        outputs: &mut [&mut CudaSlice<f32>],
+        x: &CudaSlice<f32>,
+        x_up: Option<&CudaSlice<f32>>,
+        zero: &mut [(&mut CudaSlice<f32>, usize)],
+        memset_outputs: bool,
+    ) -> Result<()> {
+        let count = tensors.len();
+        let cols = tensors.first().map_or(0, |t| t.width as usize);
+        if !(1..=3).contains(&count) || outputs.len() != count || zero.len() > 3 {
+            return Err(invalid(
+                "QTIP3 multi launch takes 1-3 tensors and 0-3 zero buffers",
+            ));
+        }
+        if x.len() < cols || x_up.is_some_and(|u| u.len() < cols) {
+            return Err(invalid("QTIP3 multi input is too small"));
+        }
+        let mut m = [Matrix::default(); 3];
+        let mut row_blocks = 0;
+        for (i, (t, y)) in tensors.iter().zip(outputs.iter_mut()).enumerate() {
+            let q = t
+                .qtip
+                .as_ref()
+                .filter(|_| t.kind == QTIP3_KIND as i32 && t.width as usize == cols)
+                .ok_or_else(|| invalid("multi launch needs QTIP3 tensors of one width"))?;
+            let rows = t.rows as usize;
+            if y.len() < rows {
+                return Err(invalid("QTIP3 multi output is too small"));
+            }
+            if memset_outputs {
+                stream
+                    .memset_zeros(&mut y.slice_mut(..rows))
+                    .map_err(failure)?;
+            }
+            m[i] = Matrix {
+                tiles: pointer(&t.bytes, stream),
+                row_signs: pointer(&q.signs, stream),
+                col_signs: pointer(&q.signs, stream) + 4 * rows as u64,
+                y: pointer(&**y, stream),
+                row_blocks: (rows / CHUNK) as i32,
+                scale: q.scale,
+            };
+            row_blocks += rows / CHUNK;
+        }
+        // Unused slots repeat matrix 0; rb0 and rb1 keep the kernel off them.
+        let first = m[0];
+        m.iter_mut().skip(count).for_each(|slot| *slot = first);
+        let (rb0, rb1) = match count {
+            1 => (row_blocks as i32, 0),
+            2 => (m[0].row_blocks, row_blocks as i32),
+            _ => (m[0].row_blocks, m[1].row_blocks),
+        };
+        let mut zeros = [(0u64, 0i32); 3];
+        for (slot, (buffer, n)) in zeros.iter_mut().zip(zero.iter()) {
+            if buffer.len() < *n {
+                return Err(invalid("QTIP3 zero buffer is too small"));
+            }
+            *slot = (pointer(&**buffer, stream), *n as i32);
+        }
+        let col_tiles = cols / TILE;
+        let per_split = tiles_per_split(col_tiles, row_blocks) as i32;
+        let config = LaunchConfig {
+            grid_dim: (
+                row_blocks as u32,
+                col_tiles.div_ceil(per_split as usize) as u32,
+                1,
+            ),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: ((per_split as usize * TILE).div_ceil(CHUNK) * CHUNK * 4) as u32,
+        };
+        let (x, x_up) = (pointer(x, stream), x_up.map_or(0, |u| pointer(u, stream)));
+        let cols = cols as i32;
+        let function = if x_up != 0 {
+            &self.multi_swiglu
+        } else {
+            &self.multi
+        };
+        let tiles = m.map(|m| m.tiles);
+        let col_signs = m.map(|m| m.col_signs);
+        let row_signs = m.map(|m| m.row_signs);
+        let ys = m.map(|m| m.y);
+        let scales = m.map(|m| m.scale);
+        let zero_ptrs = zeros.map(|z| z.0);
+        let zero_counts = zeros.map(|z| z.1);
+        let mut args = stream.launch_builder(function);
+        for group in [&tiles, &col_signs, &row_signs, &ys] {
+            args.arg(&group[0]).arg(&group[1]).arg(&group[2]);
+        }
+        args.arg(&scales[0]).arg(&scales[1]).arg(&scales[2]);
+        args.arg(&rb0).arg(&rb1).arg(&x).arg(&x_up);
+        args.arg(&zero_ptrs[0])
+            .arg(&zero_ptrs[1])
+            .arg(&zero_ptrs[2]);
+        args.arg(&zero_counts[0])
+            .arg(&zero_counts[1])
+            .arg(&zero_counts[2]);
+        args.arg(&cols).arg(&per_split);
+        // QTIP_MULTI_PARAMS order. Pointers come from live slices checked
+        // above; the zero buffers are disjoint from this launch's inputs and
+        // outputs, and rb0/rb1 keep the grid on the `count` real matrices.
+        unsafe { args.launch(config) }.map_err(failure)?;
+        Ok(())
     }
 
     /// `y[..rows] = W x[..cols]` for a QTIP3 tensor.

@@ -112,7 +112,12 @@ def main():
     args = ap.parse_args()
 
     cfg = json.loads(args.config.read_text())
-    sd = torch.load(args.input, map_location="cpu", weights_only=False)
+    if args.input.suffix == ".safetensors":
+        from safetensors.torch import load_file
+
+        sd = load_file(str(args.input))
+    else:
+        sd = torch.load(args.input, map_location="cpu", weights_only=False)
     tap_layers = [int(x) for x in args.tap_layers.split(",")]
     assert len(tap_layers) == 3
 

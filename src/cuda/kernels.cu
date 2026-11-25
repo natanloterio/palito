@@ -430,13 +430,17 @@ __device__ __forceinline__ float q4k_wide_row_part(const u8 *w, const float *x, 
 }
 
 // Vectorized Q4_K multi-vector product (1 <= tokens <= 8):
-// 1 warp per output row (8 rows/block), reads each 144-byte Q4_K superblock ONCE
-// and multiplies by all `tokens <= 8` input vectors in registers.
+// 4 warps per output row (2 rows/block, grid = ceil(rows / 2)), reads each 144-byte
+// Q4_K superblock ONCE across all `tokens <= 8` input vectors with 4x K-parallelism
+// and zero atomics/memsets.
 extern "C" __global__ void matvec_q4k_multi8(const u8 *w, const float *x, float *y,
                                              int width, int rows, int tokens) {
+    __shared__ float smem[2][4][8];
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
-    int row = blockIdx.x * 8 + warp;
+    int local_row = warp >> 2;
+    int part = warp & 3;
+    int row = blockIdx.x * 2 + local_row;
     if (row >= rows) return;
 
     u64 offset = (u64)row * width;
@@ -447,7 +451,7 @@ extern "C" __global__ void matvec_q4k_multi8(const u8 *w, const float *x, float 
     #pragma unroll
     for (int t = 0; t < 8; t++) acc[t] = 0.0f;
 
-    for (int first = (lane >> 3) * 256; first < width; first += 1024) {
+    for (int first = (part * 4 + (lane >> 3)) * 256; first < width; first += 4096) {
         const u8 *p = w + ((offset + first) / 256) * 144;
         uint4 qv = *(const uint4 *)(p + 16 + sub * 16);
         unsigned int dd = *(const unsigned int *)p;
@@ -492,8 +496,14 @@ extern "C" __global__ void matvec_q4k_multi8(const u8 *w, const float *x, float 
     for (int t = 0; t < 8; t++) {
         if (t < tokens) {
             float sum = warp_sum(acc[t]);
-            if (lane == 0) y[(u64)t * rows + row] = sum;
+            if (lane == 0) smem[local_row][part][t] = sum;
         }
+    }
+    __syncthreads();
+    if (part == 0 && lane < tokens) {
+        float total = smem[local_row][0][lane] + smem[local_row][1][lane]
+                    + smem[local_row][2][lane] + smem[local_row][3][lane];
+        y[(u64)lane * rows + row] = total;
     }
 }
 
@@ -583,7 +593,7 @@ __device__ __forceinline__ float q6k_wide_row_part(const u8 *w, const float *x, 
 
 // Vectorized Q6_K multi-vector product for speculative LM head (1 <= tokens <= 8):
 // 1 warp per output row (8 rows/block), reads each 210-byte Q6_K superblock ONCE
-// and multiplies by all `tokens` input vectors in registers.
+// and multiplies by all `tokens` input vectors in registers via L1-cached __ldg.
 extern "C" __global__ void matvec_q6k_multi8(const u8 *w, const float *x, float *y,
                                              int width, int rows, int tokens) {
     int lane = threadIdx.x & 31;
@@ -860,6 +870,70 @@ extern "C" __global__ void normalize_warp(const float *x, const u8 *w, float *y,
     for (int i = 0; i < (int)blockDim.x / 32; i++) total += partial[i];
     float inverse = 1.0f / sqrtf(total / (float)n + epsilon);
     for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = x[i] * inverse * ((const float *)w)[i];
+}
+
+// Packs 3 tapped hidden states [t0, t1, t2] of shape [n, width] into [n, 3 * width] in 1 launch.
+// Grid: (ceil(width / 256), n, 1), Block: 256 threads.
+extern "C" __global__ void eagle3_concat3(const float *t0, const float *t1, const float *t2,
+                                          float *out, int width) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width) return;
+    int tok = blockIdx.y;
+    u64 src = (u64)tok * width + i;
+    u64 dst = (u64)tok * (3 * width) + i;
+    out[dst] = t0[src];
+    out[dst + width] = t1[src];
+    out[dst + 2 * width] = t2[src];
+}
+
+// Fuses input_layernorm(emb[tok]) and hidden_norm(g[tok]) directly into
+// inp_cat[tok * 2 * width .. (tok + 1) * 2 * width] in 1 launch (grid = (n, 2, 1)).
+extern "C" __global__ void eagle3_norm_cat(const float *emb, const float *g,
+                                           const u8 *w_emb, const u8 *w_g,
+                                           float *inp_cat, int width, float epsilon) {
+    __shared__ float partial[32];
+    int tok = blockIdx.x;
+    int which = blockIdx.y;
+    const float *x = (which == 0 ? emb : g) + (u64)tok * width;
+    const float *w = (const float *)(which == 0 ? w_emb : w_g);
+    float *y = inp_cat + (u64)tok * (2 * width) + (u64)which * width;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) sum += x[i] * x[i];
+    sum = warp_sum(sum);
+    if ((threadIdx.x & 31) == 0) partial[threadIdx.x / 32] = sum;
+    __syncthreads();
+    float total = 0.0f;
+    for (int i = 0; i < (int)blockDim.x / 32; i++) total += partial[i];
+    float inverse = rsqrtf(total / (float)width + epsilon);
+    for (int i = threadIdx.x; i < width; i += blockDim.x) y[i] = x[i] * inverse * w[i];
+}
+
+// Fused residual add + unit-variance RMSNorm for PLT1 folded-RMSNorm layers:
+//   x[tok, i] += delta[tok, i]
+//   norm_out[tok, i] = x[tok, i] * rsqrt(mean(x[tok]^2) + eps)
+// Grid: (n, 1, 1), Block: 256 threads. Eliminates 63 launches + 63 global reads/step.
+extern "C" __global__ void residual_unit_norm(float *x, const float *delta, float *norm_out,
+                                              int width, float epsilon) {
+    __shared__ float partial[32];
+    int tok = blockIdx.x;
+    float *xt = x + (u64)tok * width;
+    const float *dt = delta + (u64)tok * width;
+    float *yt = norm_out + (u64)tok * width;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+        float v = xt[i] + dt[i];
+        xt[i] = v;
+        sum += v * v;
+    }
+    sum = warp_sum(sum);
+    if ((threadIdx.x & 31) == 0) partial[threadIdx.x / 32] = sum;
+    __syncthreads();
+    float total = 0.0f;
+    for (int i = 0; i < (int)blockDim.x / 32; i++) total += partial[i];
+    float inverse = rsqrtf(total / (float)width + epsilon);
+    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+        yt[i] = xt[i] * inverse;
+    }
 }
 
 template<int Kind>
@@ -1268,7 +1342,8 @@ __device__ __forceinline__ void rotary_factored_cache_kv_impl(
         int pair = tid % (dim / 2), head = tid / (dim / 2);
         int a = head * dim + (neox ? pair : 2 * pair);
         int b = neox ? a + dim / 2 : a + 1;
-        float angle = (float)position * powf(base, -(float)(2 * pair) / (float)dim) / factors[pair];
+        float angle = (float)position * powf(base, -(float)(2 * pair) / (float)dim);
+        if (factors) angle /= factors[pair];
         float sine = sinf(angle) * magnitude, cosine = cosf(angle) * magnitude;
         float u = q[a], w = q[b];
         q[a] = u * cosine - w * sine;
@@ -1278,7 +1353,8 @@ __device__ __forceinline__ void rotary_factored_cache_kv_impl(
         int pair = p % (dim / 2), head = p / (dim / 2);
         int a = head * dim + (neox ? pair : 2 * pair);
         int b = neox ? a + dim / 2 : a + 1;
-        float angle = (float)position * powf(base, -(float)(2 * pair) / (float)dim) / factors[pair];
+        float angle = (float)position * powf(base, -(float)(2 * pair) / (float)dim);
+        if (factors) angle /= factors[pair];
         float sine = sinf(angle) * magnitude, cosine = cosf(angle) * magnitude;
         float u = k[a], w = k[b];
         float ra = u * cosine - w * sine;
@@ -1300,12 +1376,30 @@ extern "C" __global__ void rotary_factored_cache_kv_decode(
                                   neox, factors, magnitude);
 }
 
+extern "C" __global__ void rotary_factored_cache_kv_batch(
+    float *q, int q_size, float *k, const float *v, float *keys, float *values, int k_size,
+    int dim, int position, float base, int neox, const float *factors, float magnitude) {
+    int tok = blockIdx.y;
+    rotary_factored_cache_kv_impl(q + (u64)tok * q_size, q_size, k + (u64)tok * k_size,
+                                  v + (u64)tok * k_size, keys, values, k_size, dim,
+                                  position + tok, base, neox, factors, magnitude);
+}
+
 #ifdef CUDA_KV_F16
 extern "C" __global__ void rotary_factored_cache_kv_decode_f16(
     float *q, int q_size, float *k, const float *v, kv_f16 *keys, kv_f16 *values, int k_size,
     int dim, const int *control, float base, int neox, const float *factors, float magnitude) {
     rotary_factored_cache_kv_impl(q, q_size, k, v, keys, values, k_size, dim, control[1], base,
                                   neox, factors, magnitude);
+}
+
+extern "C" __global__ void rotary_factored_cache_kv_batch_f16(
+    float *q, int q_size, float *k, const float *v, kv_f16 *keys, kv_f16 *values, int k_size,
+    int dim, int position, float base, int neox, const float *factors, float magnitude) {
+    int tok = blockIdx.y;
+    rotary_factored_cache_kv_impl(q + (u64)tok * q_size, q_size, k + (u64)tok * k_size,
+                                  v + (u64)tok * k_size, keys, values, k_size, dim,
+                                  position + tok, base, neox, factors, magnitude);
 }
 #endif
 

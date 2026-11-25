@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokens: usize,
         #[arg(long, default_value_t = 1024)]
         context: u32,
-        /// Draft chain length per cycle (1..=7; total verified = 1 root + draft_len <= 8).
+        /// Draft chain length per cycle (1..=15; total verified = 1 root + draft_len <= 16).
         #[arg(long, default_value_t = 5)]
         draft_len: usize,
         /// Use 16-node branching draft tree (depth 6, top-3/top-2) with bitmask tree attention.
@@ -48,10 +48,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         /// Optional PLT1 (.palito) HYB Q=5 projection overlay.
         #[arg(long)]
         plt1: Option<PathBuf>,
+        /// CUDA matmul profile: f32-tiled or int8-fast (FP16 KV + Tensor-Core attention).
+        #[arg(long, default_value = "f32-tiled")]
+        matmul: String,
     }
 
     let args = Args::parse();
-    let draft_len = args.draft_len.clamp(1, 7);
+    let draft_len = args.draft_len.clamp(1, 15);
+    let matmul = match args.matmul.as_str() {
+        "f32-tiled" => CudaMatmul::F32Tiled,
+        "int8-fast" => CudaMatmul::Int8Fast,
+        other => return Err(format!("unsupported matmul {other}").into()),
+    };
 
     let config = Config {
         context_tokens: args.context,
@@ -63,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &args.model,
         &config,
         CudaOptions {
-            matmul: CudaMatmul::F32Tiled,
+            matmul,
             decode_graph: true,
             ..Default::default()
         },
@@ -82,6 +90,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (
             "coding",
             "<|start_header_id|>user<|end_header_id|>\n\nWrite a complete, idiomatic Rust implementation of an LRU cache with O(1) get and put operations, including unit tests.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+        ),
+        (
+            "refactor",
+            "<|start_header_id|>user<|end_header_id|>\n\nRewrite this Rust struct and impl block to add a `scale: f32` field to `TensorHeader`, keeping all existing fields and methods intact and returning the full updated code:\n```rust\npub struct TensorHeader {\n    pub name: String,\n    pub rows: u32,\n    pub cols: u32,\n    pub offset: u64,\n    pub size: u64,\n}\nimpl TensorHeader {\n    pub fn byte_end(&self) -> u64 {\n        self.offset + self.size\n    }\n    pub fn num_elements(&self) -> u64 {\n        u64::from(self.rows) * u64::from(self.cols)\n    }\n}\n```<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
         ),
     ];
 
@@ -133,45 +145,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut init_tokens = Vec::with_capacity(prompt_len);
             init_tokens.extend_from_slice(&prompt[1..]);
             init_tokens.push(first);
-            let mut next_draft = b.eagle3_ingest_tapped(&init_tokens, 0)?;
+            b.eagle3_ingest_tapped_to_dev(&init_tokens, 0)?;
             let mut eagle_pos = prompt_len;
             let mut steps = 0usize;
+            let mut t_draft = 0.0f64;
+            let mut t_verify = 0.0f64;
+            let mut t_ingest = 0.0f64;
             let t0 = Instant::now();
 
             while out.len() < args.tokens && !b.is_eog(root) {
                 let remaining = args.tokens - out.len();
                 steps += 1;
 
+                let td0 = Instant::now();
                 let suffix_draft = if args.hybrid {
-                    suffix.draft(7.min(remaining))
+                    suffix.draft(draft_len.min(remaining))
                 } else {
                     Vec::new()
                 };
                 let use_tree = (args.tree || args.tree8) && suffix_draft.len() < 3;
-                let (tree, target_i32) = if suffix_draft.len() >= 3 {
-                    let t = SpecTree::from_chain(root as u32, &suffix_draft);
-                    let chain_i32: Vec<i32> = t.tokens.iter().map(|&tok| tok as i32).collect();
-                    let tgt = b.verify_chain_greedy(&chain_i32, pos)?;
-                    (t, tgt)
+                let (tree, used_suffix) = if suffix_draft.len() >= 3 {
+                    (SpecTree::from_chain(root as u32, &suffix_draft), true)
                 } else if args.tree8 {
-                    let t = b.eagle3_draft_tree_8(root, eagle_pos)?;
-                    let tgt = b.verify_tree_greedy(&t, pos)?;
-                    (t, tgt)
+                    (b.eagle3_draft_tree_8(root, eagle_pos)?, false)
                 } else if args.tree {
-                    let t = b.eagle3_draft_tree(root, eagle_pos)?;
-                    let tgt = b.verify_tree_greedy(&t, pos)?;
-                    (t, tgt)
+                    (b.eagle3_draft_tree(root, eagle_pos)?, false)
                 } else {
                     let k = draft_len.min(remaining);
-                    let draft = b.eagle3_draft_chain(next_draft, eagle_pos, k)?;
-                    let t = SpecTree::from_chain(
-                        root as u32,
-                        &draft.iter().map(|&tok| tok as u32).collect::<Vec<_>>(),
-                    );
-                    let chain_i32: Vec<i32> = t.tokens.iter().map(|&tok| tok as i32).collect();
-                    let tgt = b.verify_chain_greedy(&chain_i32, pos)?;
-                    (t, tgt)
+                    let draft = b.eagle3_draft_chain_from_slot0(eagle_pos, k)?;
+                    (
+                        SpecTree::from_chain(
+                            root as u32,
+                            &draft.iter().map(|&tok| tok as u32).collect::<Vec<_>>(),
+                        ),
+                        false,
+                    )
                 };
+                t_draft += td0.elapsed().as_secs_f64();
+
+                let tv0 = Instant::now();
+                let target_i32 = if !used_suffix && use_tree {
+                    b.verify_tree_greedy(&tree, pos)?
+                } else {
+                    let chain_i32: Vec<i32> = tree.tokens.iter().map(|&tok| tok as i32).collect();
+                    b.verify_chain_greedy(&chain_i32, pos)?
+                };
+                t_verify += tv0.elapsed().as_secs_f64();
                 let target_u32: Vec<u32> = target_i32.iter().map(|&t| t as u32).collect();
                 let (accepted_u32, path_nodes) = tree.verify_greedy(&target_u32);
 
@@ -202,10 +221,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
                 // Feed the accepted tokens paired with target's freshly tapped features.
-                next_draft = b.eagle3_ingest_tapped(&accepted_i32, eagle_pos)?;
+                // Zero-sync: writes first draft token directly to GPU slot 0, so the
+                // next step's draft chain runs back-to-back with ZERO sync between ingest & draft!
+                let ti0 = Instant::now();
+                let need_eagle_next = !args.hybrid
+                    || suffix.draft(draft_len.min(args.tokens - out.len())).len() < 3;
+                if need_eagle_next && !args.tree && !args.tree8 {
+                    b.eagle3_ingest_tapped_to_dev(&accepted_i32, eagle_pos)?;
+                } else {
+                    b.eagle3_ingest_tapped_opt(&accepted_i32, eagle_pos, false)?;
+                }
+                t_ingest += ti0.elapsed().as_secs_f64();
                 eagle_pos += pushed;
             }
-            Ok((out, t0.elapsed().as_secs_f64(), steps))
+            let total = t0.elapsed().as_secs_f64();
+            eprintln!(
+                "  [{label:7} breakdown] draft={:.1} ms ({:.2}/step) | verify={:.1} ms ({:.2}/step) | ingest={:.1} ms ({:.2}/step)",
+                t_draft * 1e3,
+                t_draft * 1e3 / steps.max(1) as f64,
+                t_verify * 1e3,
+                t_verify * 1e3 / steps.max(1) as f64,
+                t_ingest * 1e3,
+                t_ingest * 1e3 / steps.max(1) as f64,
+            );
+            Ok((out, total, steps))
         };
 
         let _ = run_eagle(&mut backend)?; // warmup

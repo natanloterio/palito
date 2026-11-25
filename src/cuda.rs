@@ -206,6 +206,7 @@ struct Workspace {
     status: CudaSlice<i32>,
     logits: CudaSlice<f32>,
     batch_logits: Option<CudaSlice<f32>>,
+    batch_tokens: Option<CudaSlice<i32>>,
     tree_pos: Option<CudaSlice<i32>>,
     tree_mask: Option<CudaSlice<u64>>,
     tokens: Option<CudaSlice<i32>>,
@@ -522,6 +523,7 @@ impl Workspace {
             status: stream.alloc_zeros(1).map_err(failure)?,
             logits: alloc(spec.info.vocab_tokens as usize)?,
             batch_logits: None,
+            batch_tokens: None,
             tree_pos: None,
             tree_mask: None,
             tokens: if prefill_capacity(spec) > 1 {
@@ -1215,6 +1217,12 @@ impl CudaBackend {
             "matvec_q6k_multi8",
             "matvec_q6k_multi16",
             "matvec_q4k_multi8",
+            "greedy_batch_argmax",
+            "eagle3_argmax_d2t",
+            "eagle3_concat3",
+            "eagle3_norm_cat",
+            "residual_unit_norm",
+            "rotary_factored_cache_kv_batch",
             "rotary_tree",
             "rotary_factored_tree",
             "attention_tree",
@@ -1223,6 +1231,7 @@ impl CudaBackend {
             "grouped_matmul",
             "combine_batch",
             "attention_fused",
+            "attention_warp128",
             "prefill_matmul_tiled",
             "group_experts_tiled",
             "grouped_matmul_tiled",
@@ -1736,6 +1745,8 @@ impl CudaBackend {
                     &self.work.normalized,
                     None,
                     1,
+                    &[(&mut self.work.projected, pl.o.desc.rows as usize)],
+                    index == 0,
                 )?;
                 true
             } else {
@@ -2230,6 +2241,11 @@ impl CudaBackend {
                     &self.work.attended,
                     None,
                     1,
+                    &[
+                        (&mut self.work.gate, pl.gate.desc.rows as usize),
+                        (&mut self.work.up, pl.up.desc.rows as usize),
+                    ],
+                    false,
                 )?;
                 true
             } else {
@@ -2411,6 +2427,8 @@ impl CudaBackend {
                     &self.work.normalized,
                     None,
                     1,
+                    &[(&mut self.work.down, pl.down.desc.rows as usize)],
+                    false,
                 )?;
                 true
             } else {
@@ -2514,12 +2532,29 @@ impl CudaBackend {
             #[cfg(feature = "qtip-research")]
             let ran_plt1_down = if let Some(plt1) = &self.plt1_hyb {
                 let pl = &plt1.layers[index];
-                plt1.run_multi(
-                    &[(&pl.down, &mut self.work.down)],
-                    &self.work.gate,
-                    Some(&self.work.up),
-                    1,
-                )?;
+                if let Some(next_pl) = plt1.layers.get(index + 1) {
+                    plt1.run_multi(
+                        &[(&pl.down, &mut self.work.down)],
+                        &self.work.gate,
+                        Some(&self.work.up),
+                        1,
+                        &[
+                            (&mut self.work.q, next_pl.q.desc.rows as usize),
+                            (&mut self.work.k, next_pl.k.desc.rows as usize),
+                            (&mut self.work.v, next_pl.v.desc.rows as usize),
+                        ],
+                        false,
+                    )?;
+                } else {
+                    plt1.run_multi(
+                        &[(&pl.down, &mut self.work.down)],
+                        &self.work.gate,
+                        Some(&self.work.up),
+                        1,
+                        &[],
+                        false,
+                    )?;
+                }
                 true
             } else {
                 false
@@ -2913,7 +2948,7 @@ impl Backend for CudaBackend {
 }
 
 impl CudaBackend {
-    /// Evaluates a speculative chain `[root, draft_0, ..., draft_{k-1}]` (`1 <= k <= 8`)
+    /// Evaluates a speculative chain `[root, draft_0, ..., draft_{k-1}]` (`1 <= k <= 16`)
     /// at `position` in a single batched forward pass and returns the greedy argmax
     /// next-token prediction for every position `0..k`.
     ///
@@ -2921,9 +2956,9 @@ impl CudaBackend {
     /// `rewind_to(position + accepted)` so the next step starts cleanly right
     /// after the accepted prefix.
     pub fn verify_chain_greedy(&mut self, tokens: &[i32], position: u32) -> Result<Vec<i32>> {
-        if tokens.is_empty() || tokens.len() > 8 {
+        if tokens.is_empty() || tokens.len() > 16 {
             return Err(invalid(
-                "verify_chain_greedy requires between 1 and 8 tokens",
+                "verify_chain_greedy requires between 1 and 16 tokens",
             ));
         }
         if tokens.len() == 1 {
@@ -2943,6 +2978,7 @@ impl CudaBackend {
         let n_i32 = n as i32;
         let width_i32 = self.weights.spec.width as i32;
         let vocab = self.weights.spec.info.vocab_tokens as usize;
+        let vocab_i32 = vocab as i32;
 
         // Normalize all `n` token hidden states in one launch.
         transformer_norm!(
@@ -2955,13 +2991,21 @@ impl CudaBackend {
             self.weights.spec.epsilon
         );
 
-        // Single-read batched LM head for all `n <= 8` tokens.
-        if self.work.batch_logits.is_none() {
+        // Single-read batched LM head for all `n <= 16` tokens.
+        if self
+            .work
+            .batch_logits
+            .as_ref()
+            .is_none_or(|b| b.len() < 16 * vocab)
+        {
             self.work.batch_logits = Some(
                 self.stream
-                    .alloc_zeros(8 * vocab)
+                    .alloc_zeros(16 * vocab)
                     .map_err(failure)?,
             );
+        }
+        if self.work.batch_tokens.is_none() {
+            self.work.batch_tokens = Some(self.stream.alloc_zeros(16).map_err(failure)?);
         }
         let t = self
             .weights
@@ -2970,9 +3014,14 @@ impl CudaBackend {
             .unwrap_or(&self.weights.embedding);
         let batch_logits = self.work.batch_logits.as_mut().unwrap();
         if t.kind == 14 && t.width % 256 == 0 {
+            let kernel = if n <= 8 {
+                "matvec_q6k_multi8"
+            } else {
+                "matvec_q6k_multi16"
+            };
             launch!(
                 self,
-                "matvec_q6k_multi8",
+                kernel,
                 ((t.rows as u32).div_ceil(8), 1, 1),
                 &t.bytes,
                 &self.work.normalized,
@@ -2981,11 +3030,11 @@ impl CudaBackend {
                 &t.rows,
                 &n_i32
             );
-        } else if t.kind == 12 && t.width % 256 == 0 {
+        } else if t.kind == 12 && t.width % 256 == 0 && n <= 8 {
             launch!(
                 self,
                 "matvec_q4k_multi8",
-                ((t.rows as u32).div_ceil(8), 1, 1),
+                ((t.rows as u32).div_ceil(2), 1, 1),
                 &t.bytes,
                 &self.work.normalized,
                 batch_logits,
@@ -2997,7 +3046,7 @@ impl CudaBackend {
             launch!(
                 self,
                 "prefill_matmul_8",
-                (t.rows as u32, 1, 1),
+                (t.rows as u32, (n as u32).div_ceil(8), 1),
                 &t.bytes,
                 &t.kind,
                 &self.work.normalized,
@@ -3008,29 +3057,26 @@ impl CudaBackend {
             );
         }
 
-        let out = if self.decode.is_some() {
-            for tok_idx in 0..n {
-                self.prepare_decode(0, position as usize + tok_idx, tok_idx as i32)?;
-                self.device_sample_batch_slot(tok_idx * vocab)?;
-            }
-            self.read_decode_tokens(n)?
-        } else {
-            let mut argmax = Vec::with_capacity(n);
-            for tok_idx in 0..n {
-                let logits_slice = self
-                    .work
-                    .batch_logits
-                    .as_ref()
-                    .unwrap()
-                    .slice(tok_idx * vocab..(tok_idx + 1) * vocab);
-                self.stream
-                    .memcpy_dtoh(&logits_slice, &mut self.logits)
-                    .map_err(failure)?;
-                self.stream.synchronize().map_err(failure)?;
-                argmax.push(greedy(&self.logits)?);
-            }
-            argmax
-        };
+        // Single-launch batched greedy argmax across all `n` rows (0 H2D copies, 1 D2H read).
+        let batch_logits_ref = self.work.batch_logits.as_ref().unwrap();
+        let batch_tokens = self.work.batch_tokens.as_mut().unwrap();
+        launch!(
+            self,
+            "greedy_batch_argmax",
+            (n as u32, 1, 1),
+            batch_logits_ref,
+            &vocab_i32,
+            batch_tokens,
+            &mut self.work.status
+        );
+        let mut out = vec![0i32; n];
+        self.stream
+            .memcpy_dtoh(
+                &self.work.batch_tokens.as_ref().unwrap().slice(0..n),
+                &mut out,
+            )
+            .map_err(failure)?;
+        self.stream.synchronize().map_err(failure)?;
         self.state.finish(tokens.len());
         Ok(out)
     }

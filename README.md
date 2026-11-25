@@ -2,11 +2,26 @@
   <img src="docs/palito_logo.png" alt="Palito: fast local LLM inference" width="640">
 </p>
 
-Fast local LLM inference for GGUF models, written in Rust, with its own CUDA kernels.
+Ultra-fast local LLM inference in Rust with custom CUDA (Blackwell SM_120 / Ampere+), Vulkan, and Metal kernels — **up to 1,002+ tok/s on Llama 3.1 8B (2.94× faster than llama.cpp)** with zero llama.cpp or Python dependencies.
 
-- **Fast:** on an RTX 5090 with Qwen3-30B-A3B (Q4_K_M), `palito serve` delivers the first token of a 2.9k-token prompt in 164 ms (`llama-server -fa on`: 214 ms) and decodes at 343–362 tok/s (`llama-server`: 305–340 tok/s; see [reproducible benchmarks & raw samples](benchmarks/vs-llama-cpp/README.md)).
+- **Blazing fast on NVIDIA GPUs (RTX 5090):**
+  - **Llama 3.1 8B (`PLT1 HYB Q=5` 2.0 bpw + `EAGLE-3 Q4_K` / `SuffixDecoding`):** up to **1,002.6 tok/s** on coding (**2.94× faster** than `llama.cpp IQ3_XXS` at 341 tok/s, **1.75 GB** projections, 100% lossless exact parity) and **571–757 tok/s** on general text (**1.68×–2.22×**).
+  - **Llama 3.2 1B (`QTIP3` + Q6_K head):** **1,361 tok/s** (`0.735 ms/tok`) vs `llama.cpp IQ3_XXS` **1,053 tok/s** (**1.29× faster**, with much lower perplexity: `16.94` vs `19.96`).
+  - **Qwen3-30B-A3B (Q4_K_M MoE):** `palito serve` delivers the first token of a 2.9k-token prompt in **164 ms** (`llama-server -fa on`: 214 ms) and decodes at **343–362 tok/s** (`llama-server`: 305–340 tok/s; see [reproducible benchmarks & raw samples](benchmarks/vs-llama-cpp/README.md)).
+  - **Tensor-Core Prefill (`Q8_0` / `F16` / `QTIP`):** 501-token prefill in **12.1 ms** (1B Q8_0) and **15.6 ms** (1B F16) — **14×–16×** faster than scalar prefill.
 - **Uses the model's full context:** `chat` opens with the model's trained context (Qwen3-30B-A3B: 40,960 tokens) and replies run until the model finishes.
-- **One binary:** chat in the terminal, an OpenAI-compatible server (`palito serve`), or a C library for your own program. No Python and no llama.cpp; the Linux bundle ships the CUDA compiler it needs.
+- **One binary, native bindings everywhere:** terminal chat, OpenAI-compatible server (`palito serve`), C library (`libpalito.so`), and official bindings for **Python, Node.js, Java, C#, and Go**. No Python and no llama.cpp; the Linux bundle ships the CUDA compiler it needs.
+
+## Performance vs `llama.cpp` (RTX 5090, CUDA 13)
+
+| Model & Format | Workload | Palito | `llama.cpp` | Speedup | Notes |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| **Llama 3.1 8B** (`PLT1 HYB Q=5` 2.0 bpw + `EAGLE-3` Hybrid) | Coding (128 tok, lossless) | **1,002.6 tok/s** | 341.0 tok/s (`IQ3_XXS`) | **2.94×** | `1.75 GB` projections, `exact_parity=true` |
+| **Llama 3.1 8B** (`PLT1 HYB Q=5` 2.0 bpw + `EAGLE-3` Hybrid) | Refactoring (128 tok, lossless) | **896.6 tok/s** | 341.0 tok/s (`IQ3_XXS`) | **2.63×** | `tau = 5.12`, `exact_parity=true` |
+| **Llama 3.1 8B** (`PLT1 HYB Q=5` 2.0 bpw + `EAGLE-3` Hybrid) | General text (128–256 tok) | **571–757 tok/s** | 341.0 tok/s (`IQ3_XXS`) | **1.68×–2.22×** | `exact_parity=true` |
+| **Llama 3.1 8B** (`HYB Q=5 MMA` 2.0 bpw kernel, `n=8`) | `4096×16384` verify kernel | **65.1 TFLOPS** (`16.5 µs`) | 29.7 TFLOPS (`31.6 µs`) | **2.19×–2.40×** | vs `IQ3_XXS` / `IQ2_S` (`test-backend-ops`) |
+| **Llama 3.2 1B** (`QTIP3` + Q6_K head) | Decode (`B=1`, 128 tok) | **1,361 tok/s** | 1,053 tok/s (`IQ3_XXS`) | **1.29×** | Lower PPL (`16.94` vs `19.96`) |
+| **Qwen3-30B-A3B** (`Q4_K_M` MoE) | 2.9k-tok TTFT / Decode | **164 ms / 362 tok/s** | 214 ms / 340 tok/s | **1.30× TTFT** | Full 40k context |
 
 ## Requirements
 

@@ -54,8 +54,8 @@ pub struct Plt1HybRuntime {
     stream: Arc<CudaStream>,
     r1_enter_fn: CudaFunction,
     r1_exit_fn: CudaFunction,
-    /// `(pair_bits, skip_in, skip_out)` -> `(small_k_multi, small_k_multi_swiglu)`.
-    kernels: HashMap<(u8, bool, bool), (CudaFunction, CudaFunction)>,
+    /// `(pair_bits, skip_in, skip_out)` -> `(k8_plain, k8_swiglu, k16_plain, k16_swiglu)`.
+    kernels: HashMap<(u8, bool, bool), (CudaFunction, CudaFunction, CudaFunction, CudaFunction)>,
 }
 
 impl Plt1HybRuntime {
@@ -146,38 +146,46 @@ impl Plt1HybRuntime {
         let mut kernels = HashMap::new();
         let mut r1_fns = None;
         for (pair_bits, skip_in, skip_out) in kernel_keys {
-            let src = format!(
-                "#define HYB_L 12\n#define HYB_B {pair_bits}\n#define HYB_Q 5\n#define HYB_UNROLL 4\n\
-                 #define HYB_SKIP_IN_RHT {}\n#define HYB_SKIP_OUT_RHT {}\n\
-                 #define HYB_VEC_K 8\n{}",
-                usize::from(skip_in),
-                usize::from(skip_out),
-                include_str!("../qtip/hyb_matvec.cu")
-            );
-            let ptx = compile_ptx_with_opts(
-                src,
-                CompileOptions {
-                    arch: Some("compute_120"),
-                    ..Default::default()
-                },
-            )
-            .map_err(cuda_err)?;
-            let module = ctx.load_module(ptx).map_err(cuda_err)?;
-            if r1_fns.is_none() {
-                r1_fns = Some((
-                    module.load_function("hyb_r1_enter").map_err(cuda_err)?,
-                    module.load_function("hyb_r1_exit").map_err(cuda_err)?,
-                ));
-            }
-            kernels.insert(
-                (pair_bits, skip_in, skip_out),
-                (
+            let compile_max_k = |max_k: u32, want_r1: bool| -> Result<(CudaFunction, CudaFunction, Option<(CudaFunction, CudaFunction)>)> {
+                let src = format!(
+                    "#define HYB_L 12\n#define HYB_B {pair_bits}\n#define HYB_Q 5\n#define HYB_UNROLL 4\n\
+                     #define HYB_SKIP_IN_RHT {}\n#define HYB_SKIP_OUT_RHT {}\n\
+                     #define HYB_MAX_K {max_k}\n#define HYB_VEC_K 8\n{}",
+                    usize::from(skip_in),
+                    usize::from(skip_out),
+                    include_str!("../qtip/hyb_matvec.cu")
+                );
+                let ptx = compile_ptx_with_opts(
+                    src,
+                    CompileOptions {
+                        arch: Some("compute_120"),
+                        ..Default::default()
+                    },
+                )
+                .map_err(cuda_err)?;
+                let module = ctx.load_module(ptx).map_err(cuda_err)?;
+                let r1 = if want_r1 {
+                    Some((
+                        module.load_function("hyb_r1_enter").map_err(cuda_err)?,
+                        module.load_function("hyb_r1_exit").map_err(cuda_err)?,
+                    ))
+                } else {
+                    None
+                };
+                Ok((
                     module.load_function("hyb_small_k_multi").map_err(cuda_err)?,
                     module
                         .load_function("hyb_small_k_multi_swiglu")
                         .map_err(cuda_err)?,
-                ),
-            );
+                    r1,
+                ))
+            };
+            let (k8_p, k8_s, r1) = compile_max_k(8, r1_fns.is_none())?;
+            if r1_fns.is_none() {
+                r1_fns = r1;
+            }
+            let (k16_p, k16_s, _) = compile_max_k(16, false)?;
+            kernels.insert((pair_bits, skip_in, skip_out), (k8_p, k8_s, k16_p, k16_s));
         }
         let (r1_enter_fn, r1_exit_fn) =
             r1_fns.ok_or_else(|| Error::Invalid("PLT1 file contained no HYB layers".into()))?;
@@ -232,18 +240,28 @@ impl Plt1HybRuntime {
 
     /// Runs 1..=3 HYB Q=5 projections sharing input `x` (and optional `x_up` for SwiGLU)
     /// for `1 <= tokens <= 16`.
+    /// When `zero_self` is false, caller guarantees outputs were already zeroed by the
+    /// previous projection's `zero_next` pointers (eliminating 224 memset_d8_async calls/step).
+    #[allow(clippy::too_many_arguments)]
     pub fn run_multi(
         &self,
         matrices: &[(&Plt1GpuTensor, &mut CudaSlice<f32>)],
         x: &CudaSlice<f32>,
         x_up: Option<&CudaSlice<f32>>,
         tokens: usize,
+        zero_next: &[(&mut CudaSlice<f32>, usize)],
+        zero_self: bool,
     ) -> Result<()> {
         let first = matrices[0].0;
         let skip_in = (first.desc.flags & tensor_flags::SKIP_IN_RHT) != 0;
         let skip_out = (first.desc.flags & tensor_flags::SKIP_OUT_RHT) != 0;
-        let (fn_plain, fn_swiglu) = &self.kernels[&(first.desc.pair_bits, skip_in, skip_out)];
-        let func = if x_up.is_some() { fn_swiglu } else { fn_plain };
+        let (k8_p, k8_s, k16_p, k16_s) = &self.kernels[&(first.desc.pair_bits, skip_in, skip_out)];
+        let func = match (tokens <= 8, x_up.is_some()) {
+            (true, false) => k8_p,
+            (true, true) => k8_s,
+            (false, false) => k16_p,
+            (false, true) => k16_s,
+        };
 
         let cols = first.desc.cols as usize;
         let mut tiles = [0u64; 3];
@@ -259,14 +277,16 @@ impl Plt1HybRuntime {
         for (i, (t, y)) in matrices.iter().enumerate() {
             let r = t.desc.rows as usize;
             let y_ptr = y.device_ptr(&self.stream).0;
-            unsafe {
-                cudarc::driver::result::memset_d8_async(
-                    y_ptr,
-                    0,
-                    tokens * r * std::mem::size_of::<f32>(),
-                    self.stream.cu_stream(),
-                )
-                .map_err(cuda_err)?;
+            if zero_self {
+                unsafe {
+                    cudarc::driver::result::memset_d8_async(
+                        y_ptr,
+                        0,
+                        tokens * r * std::mem::size_of::<f32>(),
+                        self.stream.cu_stream(),
+                    )
+                    .map_err(cuda_err)?;
+                }
             }
             tiles[i] = t.tiles.device_ptr(&self.stream).0;
             luts[i] = t.lut.device_ptr(&self.stream).0;
@@ -279,6 +299,13 @@ impl Plt1HybRuntime {
             rbs[i] = r / 256;
             total_rb += rbs[i];
         }
+        let mut zs = [0u64; 3];
+        let mut ns = [0i32; 3];
+        for (i, (buf, count)) in zero_next.iter().take(3).enumerate() {
+            zs[i] = buf.device_ptr(&self.stream).0;
+            ns[i] = *count as i32;
+        }
+
         let rb0 = rbs[0] as i32;
         let rb1 = if matrices.len() >= 2 {
             rbs[1] as i32
@@ -286,7 +313,8 @@ impl Plt1HybRuntime {
             total_rb as i32
         };
         let total_chunks = cols / 256;
-        let splits = 340usize.div_ceil(total_rb).clamp(1, total_chunks);
+        // Fit exact 2-wave multiples on RTX 5090's 170 SMs (avoid 3rd tail wave on Gate+Up!).
+        let splits = (340usize / total_rb).clamp(1, total_chunks);
         let cps = total_chunks.div_ceil(splits);
         let splits = total_chunks.div_ceil(cps);
 
@@ -301,6 +329,8 @@ impl Plt1HybRuntime {
         b.arg(&scales[0]).arg(&scales[1]).arg(&scales[2]);
         b.arg(&rows_arr[0]).arg(&rows_arr[1]).arg(&rows_arr[2]);
         b.arg(&rb0).arg(&rb1).arg(&x_ptr).arg(&x_up_ptr);
+        b.arg(&zs[0]).arg(&zs[1]).arg(&zs[2]);
+        b.arg(&ns[0]).arg(&ns[1]).arg(&ns[2]);
         b.arg(&cols_i).arg(&tokens_i).arg(&cps_i);
         unsafe {
             b.launch(LaunchConfig {

@@ -136,7 +136,7 @@ Updated Rust code:\n```rust\n";
     );
 
     // 2. SuffixDecoding speculative decode (warmup + measured).
-    let max_draft = args.max_draft.min(7);
+    let max_draft = args.max_draft.min(15);
     let run_spec = |backend: &mut CudaBackend| -> Result<(Vec<i32>, f64, usize, usize, usize), palito::Error> {
         backend.reset()?;
         let mut drafter = SuffixDrafter::new(8);

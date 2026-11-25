@@ -142,6 +142,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     b.arg(&scale).arg(&scale).arg(&scale);
                     b.arg(&r0).arg(&r1).arg(&r2);
                     b.arg(&rb0).arg(&rb1).arg(&x_ptr).arg(&zero_u64);
+                    let zero_i = 0i32;
+                    b.arg(&zero_u64).arg(&zero_u64).arg(&zero_u64);
+                    b.arg(&zero_i).arg(&zero_i).arg(&zero_i);
                     b.arg(&cols_i).arg(&tokens_i).arg(&cps_i);
                     unsafe {
                         b.launch(LaunchConfig {
@@ -173,6 +176,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     b.arg(&scale).arg(&scale).arg(&scale);
                     b.arg(&r0).arg(&r0).arg(&r0);
                     b.arg(&rb0).arg(&rb0).arg(&q_ptr).arg(&zero_u64);
+                    let zero_i = 0i32;
+                    b.arg(&zero_u64).arg(&zero_u64).arg(&zero_u64);
+                    b.arg(&zero_i).arg(&zero_i).arg(&zero_i);
                     b.arg(&cols_i).arg(&tokens_i).arg(&cps_i);
                     unsafe {
                         b.launch(LaunchConfig {
@@ -204,6 +210,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     b.arg(&scale).arg(&scale).arg(&scale);
                     b.arg(&r0).arg(&r0).arg(&r0);
                     b.arg(&rb0).arg(&rb0).arg(&x_ptr).arg(&zero_u64);
+                    let zero_i = 0i32;
+                    b.arg(&zero_u64).arg(&zero_u64).arg(&zero_u64);
+                    b.arg(&zero_i).arg(&zero_i).arg(&zero_i);
                     b.arg(&cols_i).arg(&tokens_i).arg(&cps_i);
                     unsafe {
                         b.launch(LaunchConfig {
@@ -234,6 +243,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     b.arg(&scale).arg(&scale).arg(&scale);
                     b.arg(&r0).arg(&r0).arg(&r0);
                     b.arg(&rb0).arg(&rb0).arg(&gate_ptr).arg(&up_ptr);
+                    let zero_u64 = 0u64;
+                    let zero_i = 0i32;
+                    b.arg(&zero_u64).arg(&zero_u64).arg(&zero_u64);
+                    b.arg(&zero_i).arg(&zero_i).arg(&zero_i);
                     b.arg(&cols_i).arg(&tokens_i).arg(&cps_i);
                     unsafe {
                         b.launch(LaunchConfig {

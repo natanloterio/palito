@@ -15,6 +15,9 @@
 #ifndef HYB_Q
 #define HYB_Q 5
 #endif
+#ifndef HYB_MAX_K
+#define HYB_MAX_K 16
+#endif
 #define HYB_STATE_MASK ((1u << HYB_L) - 1u)
 #ifndef HYB_UNROLL
 #define HYB_UNROLL 4
@@ -494,8 +497,8 @@ __device__ __forceinline__ void hyb_small_k_block(
     const float* __restrict__ col_signs, const float* __restrict__ row_signs,
     float* __restrict__ y, int rows, int cols, int tokens, int chunks_per_split,
     float scale, int row_block, int split) {
-    __shared__ unsigned xs_h2[16][HYB_CHUNK / 2]; // 8 KB
-    __shared__ float partial[16][HYB_CHUNK];      // 16 KB
+    __shared__ unsigned xs_h2[HYB_MAX_K][HYB_CHUNK / 2]; // 4 KB (K=8) or 8 KB (K=16)
+    __shared__ float partial[HYB_MAX_K][HYB_CHUNK];      // 8 KB (K=8) or 16 KB (K=16)
 
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x & 31;
@@ -519,8 +522,10 @@ __device__ __forceinline__ void hyb_small_k_block(
 
     const unsigned* base = tiles + (size_t)group * col_tiles * HYB_WORDS;
     float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+#if HYB_MAX_K > 8
     float e0 = 0.0f, e1 = 0.0f, e2 = 0.0f, e3 = 0.0f;
     const bool has_hi = tokens > 8;
+#endif
 
     for (int ch = ch0; ch < ch1; ++ch) {
         const int c = ch * HYB_CHUNK;
@@ -613,6 +618,7 @@ __device__ __forceinline__ void hyb_small_k_block(
                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
                     : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#if HYB_MAX_K > 8
                 if (has_hi) {
                     const int g_hi = 8 + group_id;
                     const unsigned b2 = (g_hi < tokens) ? xs_h2[g_hi][xoff] : 0u;
@@ -623,6 +629,7 @@ __device__ __forceinline__ void hyb_small_k_block(
                         : "+f"(e0), "+f"(e1), "+f"(e2), "+f"(e3)
                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b2), "r"(b3));
                 }
+#endif
             }
         }
         __syncthreads();
@@ -638,6 +645,7 @@ __device__ __forceinline__ void hyb_small_k_block(
         partial[tok1][warp * HYB_TILE + group_id] = d1;
         partial[tok1][warp * HYB_TILE + group_id + 8] = d3;
     }
+#if HYB_MAX_K > 8
     if (has_hi) {
         if (8 + tok0 < tokens) {
             partial[8 + tok0][warp * HYB_TILE + group_id] = e0;
@@ -648,6 +656,7 @@ __device__ __forceinline__ void hyb_small_k_block(
             partial[8 + tok1][warp * HYB_TILE + group_id + 8] = e3;
         }
     }
+#endif
     __syncthreads();
 
     if (warp < tokens) {
@@ -681,10 +690,25 @@ __device__ __forceinline__ void hyb_small_k_block(
         const float* __restrict__ r1, const float* __restrict__ r2, float* __restrict__ y0, \
         float* __restrict__ y1, float* __restrict__ y2, float s0, float s1, float s2,       \
         int rows0, int rows1, int rows2, int rb0, int rb1, const float* __restrict__ x,     \
-        const float* __restrict__ x_up, int cols, int tokens, int chunks_per_split
+        const float* __restrict__ x_up, float* __restrict__ z0, float* __restrict__ z1,     \
+        float* __restrict__ z2, int n0, int n1, int n2, int cols, int tokens,               \
+        int chunks_per_split
 
 template <bool SwiGLU>
 __device__ __forceinline__ void hyb_small_k_multi_body(HYB_SMALL_K_MULTI_PARAMS) {
+    // Zero the next projection's output buffers in-kernel (eliminating 224 memset_d8_async calls).
+    const int tid_global = (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
+    const int stride_global = gridDim.x * gridDim.y * blockDim.x;
+    if (n0 > 0) {
+        for (int i = tid_global; i < n0; i += stride_global) z0[i] = 0.0f;
+    }
+    if (n1 > 0) {
+        for (int i = tid_global; i < n1; i += stride_global) z1[i] = 0.0f;
+    }
+    if (n2 > 0) {
+        for (int i = tid_global; i < n2; i += stride_global) z2[i] = 0.0f;
+    }
+
     int row_block = blockIdx.x;
     const unsigned *tiles = t0, *lut = l0;
     const float *col_signs = c0, *row_signs = r0;
@@ -705,7 +729,7 @@ __device__ __forceinline__ void hyb_small_k_multi_body(HYB_SMALL_K_MULTI_PARAMS)
 
 #define HYB_SMALL_K_MULTI_ARGS                                                              \
     t0, t1, t2, l0, l1, l2, c0, c1, c2, r0, r1, r2, y0, y1, y2, s0, s1, s2, rows0, rows1,   \
-        rows2, rb0, rb1, x, x_up, cols, tokens, chunks_per_split
+        rows2, rb0, rb1, x, x_up, z0, z1, z2, n0, n1, n2, cols, tokens, chunks_per_split
 
 extern "C" __global__ void __launch_bounds__(512)
 hyb_small_k_multi(HYB_SMALL_K_MULTI_PARAMS) {

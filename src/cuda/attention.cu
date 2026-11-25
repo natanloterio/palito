@@ -99,6 +99,66 @@ extern "C" __global__ void attention_fused(const float *q, const float *keys,
     attention_fused_impl(q, keys, values, output, dim, heads, kv_heads, count);
 }
 
+// Fast 1-warp-per-(head, token) causal FlashAttention for small-batch verification
+// and EAGLE-3 drafting (dim == 128, 1 <= n <= 16, zero __syncthreads(), float4 loads).
+// Grid: (heads, n, 1), Block: 32 threads.
+template<typename KV>
+__device__ __forceinline__ void attention_warp128_impl(
+    const float *q, const KV *keys, const KV *values, float *output,
+    int heads, int kv_heads, int count) {
+    int head = blockIdx.x, token = blockIdx.y, lane = threadIdx.x;
+    int kv_head = head / (heads / kv_heads);
+    int limit = count + token;
+    const float4 qv = __ldg((const float4 *)(q + ((u64)token * heads + head) * 128) + lane);
+    const float scale = 0.0883883476f; // 1 / sqrt(128)
+
+    float m = -1.0e30f;
+    float l = 0.0f;
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+
+    for (int t = 0; t < limit; ++t) {
+        u64 kv_off = ((u64)t * kv_heads + kv_head) * 128 + lane * 4;
+        float k0 = kv_load(keys, kv_off);
+        float k1 = kv_load(keys, kv_off + 1);
+        float k2 = kv_load(keys, kv_off + 2);
+        float k3 = kv_load(keys, kv_off + 3);
+        float dot = qv.x * k0 + qv.y * k1 + qv.z * k2 + qv.w * k3;
+        #pragma unroll
+        for (int s = 16; s > 0; s >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, s);
+        float score = dot * scale;
+        float m_new = fmaxf(m, score);
+        float alpha = expf(m - m_new);
+        float p = expf(score - m_new);
+        float v0 = kv_load(values, kv_off);
+        float v1 = kv_load(values, kv_off + 1);
+        float v2 = kv_load(values, kv_off + 2);
+        float v3 = kv_load(values, kv_off + 3);
+        o0 = fmaf(o0, alpha, p * v0);
+        o1 = fmaf(o1, alpha, p * v1);
+        o2 = fmaf(o2, alpha, p * v2);
+        o3 = fmaf(o3, alpha, p * v3);
+        l = fmaf(l, alpha, p);
+        m = m_new;
+    }
+    float inv_l = 1.0f / l;
+    float4 *out4 = (float4 *)(output + ((u64)token * heads + head) * 128);
+    out4[lane] = make_float4(o0 * inv_l, o1 * inv_l, o2 * inv_l, o3 * inv_l);
+}
+
+extern "C" __global__ void attention_warp128(const float *q, const float *keys,
+                                             const float *values, float *output,
+                                             int heads, int kv_heads, int count) {
+    attention_warp128_impl(q, keys, values, output, heads, kv_heads, count);
+}
+
+#ifdef CUDA_KV_F16
+extern "C" __global__ void attention_warp128_f16(const float *q, const kv_f16 *keys,
+                                                 const kv_f16 *values, float *output,
+                                                 int heads, int kv_heads, int count) {
+    attention_warp128_impl(q, keys, values, output, heads, kv_heads, count);
+}
+#endif
+
 // Vectorized tree-masked causal attention for speculative tree verification (tree_len <= 64).
 // Uses warp-parallel 8-way dot products matching attention_fused_impl (4x-6x faster than scalar).
 // Grid: (heads, tree_len, 1), Block: 256 threads (8 warps).

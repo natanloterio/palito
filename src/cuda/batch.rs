@@ -311,6 +311,26 @@ impl CudaBackend {
         position: usize,
         output_logits: bool,
     ) -> Result<()> {
+        self.batched_prefill_inner(tokens, position, output_logits, None)
+    }
+
+    pub(super) fn batched_prefill_tree(
+        &mut self,
+        tokens: &[i32],
+        position: usize,
+        tree_pos: &CudaSlice<i32>,
+        tree_mask: &CudaSlice<u64>,
+    ) -> Result<()> {
+        self.batched_prefill_inner(tokens, position, false, Some((tree_pos, tree_mask)))
+    }
+
+    fn batched_prefill_inner(
+        &mut self,
+        tokens: &[i32],
+        position: usize,
+        output_logits: bool,
+        tree: Option<(&CudaSlice<i32>, &CudaSlice<u64>)>,
+    ) -> Result<()> {
         let s = &self.weights.spec;
         let n = tokens.len() as i32;
         let (projection, grouped_projection, row_tile, token_tile, group_row_tile) = match self
@@ -418,6 +438,14 @@ impl CudaBackend {
             );
         }
         for (index, l) in self.weights.layers.iter().enumerate() {
+            if let Some(eagle) = &mut self.eagle3
+                && let Some(slot) = eagle.tap_layers.iter().position(|&tl| tl == index)
+            {
+                let count = tokens.len() * s.width;
+                let src = self.work.x.slice(0..count);
+                let mut dst = eagle.tap_hidden[slot].slice_mut(0..count);
+                self.stream.memcpy_dtod(&src, &mut dst).map_err(failure)?;
+            }
             let gate = l.gate.as_ref();
             let affine = l.affine.as_ref();
             let gemma_attention = gemma.map(|g| g.attention(s, index));
@@ -485,6 +513,29 @@ impl CudaBackend {
             {
                 prepare_residual!(self, &self.work.normalized, n * w, true);
             }
+            #[cfg(feature = "qtip-research")]
+            let fused_small_qkv = self.qtip_chain
+                && (2..=16).contains(&tokens.len())
+                && l.qkv_bias.is_none()
+                && self.qtip.is_some()
+                && l.q.kind == l.k.kind
+                && l.k.kind == l.v.kind;
+            #[cfg(not(feature = "qtip-research"))]
+            let fused_small_qkv = false;
+            if fused_small_qkv {
+                #[cfg(feature = "qtip-research")]
+                self.qtip.as_ref().unwrap().matmul_small_k_multi(
+                    &self.stream,
+                    &[
+                        (&l.q, &mut self.work.q),
+                        (&l.k, &mut self.work.k),
+                        (&l.v, &mut self.work.v),
+                    ],
+                    &self.work.normalized,
+                    None,
+                    tokens.len(),
+                )?;
+            } else {
             for (component, (tensor, output, stage)) in [
                 (&l.q, &mut self.work.q, "Qproj"),
                 (&l.k, &mut self.work.k, "Kproj"),
@@ -548,6 +599,7 @@ impl CudaBackend {
                     )?;
                 }
             }
+            }
             for (norm, values, size) in [
                 (&l.q_norm, &mut self.work.q, qw),
                 (&l.k_norm, &mut self.work.k, kw),
@@ -594,7 +646,16 @@ impl CudaBackend {
                     continue;
                 }
                 let grid = (((size / 2) as u32).div_ceil(256), n as u32, 1);
-                if s.rotary_dim != s.dim {
+                if let Some((tree_pos, _)) = tree {
+                    if let Some(factors) = &self.weights.rope_factors {
+                        launch!(self, "rotary_factored_tree", grid;
+                            256, values, &size, &dim, tree_pos, &rope_base, &neox, &factors.bytes, &s.rope_attn_factor);
+                    } else {
+                        launch!(
+                            self, "rotary_tree", grid, values, &size, &dim, tree_pos, &rope_base, &neox
+                        );
+                    }
+                } else if s.rotary_dim != s.dim {
                     let rotary_dim = s.rotary_dim as i32;
                     launch!(self, "rotary_partial_neox", grid;
                         256, values, &size, &dim, &pos, &rope_base, &rotary_dim);
@@ -653,7 +714,29 @@ impl CudaBackend {
                 return Err(invalid("prefill score workspace too small for this chunk"));
             }
             // Future KV rows are already written; each query can only see its prefix.
-            if embedding_norm.is_some() {
+            if let Some((_, tree_mask)) = tree {
+                let smem = ((position + tokens.len()) * std::mem::size_of::<f32>()) as u32;
+                let func = self.functions["attention_tree"].clone();
+                let mut b = self.stream.launch_builder(&func);
+                b.arg(&self.work.q)
+                    .arg(&self.keys[index])
+                    .arg(&self.values[index])
+                    .arg(&mut self.work.attended)
+                    .arg(&dim)
+                    .arg(&heads)
+                    .arg(&kv_heads)
+                    .arg(&pos)
+                    .arg(&n)
+                    .arg(tree_mask);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (heads as u32, n as u32, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: smem,
+                    })
+                }
+                .map_err(failure)?;
+            } else if embedding_norm.is_some() {
                 alibi_attention!(self, index, heads, kv_heads, dim, context, count, n);
             } else if let Some((window, _, scale)) = gemma_attention {
                 gemma_attention!(
@@ -1122,6 +1205,35 @@ impl CudaBackend {
             {
                 prepare_residual!(self, &self.work.normalized, n * w);
             }
+            #[cfg(feature = "qtip-research")]
+            let fused_small_ffn = self.qtip_chain
+                && (2..=16).contains(&tokens.len())
+                && gemma.is_none()
+                && self.work.groups.is_none()
+                && self.qtip.is_some()
+                && gate.kind == l.up.kind;
+            #[cfg(not(feature = "qtip-research"))]
+            let fused_small_ffn = false;
+            if fused_small_ffn {
+                #[cfg(feature = "qtip-research")]
+                {
+                    let qtip = self.qtip.as_ref().unwrap();
+                    qtip.matmul_small_k_multi(
+                        &self.stream,
+                        &[(gate, &mut self.work.gate), (&l.up, &mut self.work.up)],
+                        &self.work.normalized,
+                        None,
+                        tokens.len(),
+                    )?;
+                    qtip.matmul_small_k_multi(
+                        &self.stream,
+                        &[(&l.down, &mut self.work.down)],
+                        &self.work.gate,
+                        Some(&self.work.up),
+                        tokens.len(),
+                    )?;
+                }
+            } else {
             for (t, out) in [(gate, &mut self.work.gate), (&l.up, &mut self.work.up)] {
                 if integer_groups || (s.experts == 0 && residual_projection(matmul, t, n)) {
                     project_residual!(
@@ -1304,6 +1416,7 @@ impl CudaBackend {
                         &n
                     );
                 });
+            }
             }
 
             capture_projection!(

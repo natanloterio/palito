@@ -20,8 +20,10 @@ mod kernels;
 #[cfg(feature = "ktransformers")]
 pub mod ktransformers;
 pub mod tokenizer;
+pub mod plt1;
 #[cfg(feature = "qtip-research")]
 pub mod qtip;
+pub mod speculative;
 pub mod tools;
 mod transformer;
 

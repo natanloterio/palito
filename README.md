@@ -88,21 +88,17 @@ print(reply.choices[0].message.content)
 
 ## How to Run Models at 1,000+ tok/s (`.palito` Format)
 
-To hit **1,000+ tok/s** on Llama 3.1 8B, you run a `.palito` (`PLT1`) model together with its compact `EAGLE-3` predictor:
-
-1. **Convert your model once** into a 1.75 GB `.palito` file (`gguf-to-plt1`).
-2. **Pack the `EAGLE-3` predictor** (`239 MB`) into `.palito` format (`pack_eagle3_plt1.py`).
-3. **Run in hybrid mode** (`EAGLE-3` + `SuffixDecoding`) for up to **1,002+ tok/s**:
+A single `.palito` file bundles everything — tokenizer, GPU-native model weights, and the built-in `EAGLE-3` predictor — so you just pass it directly to `palito chat` or `palito serve` with **zero extra flags** (CUDA and speculative decoding turn on automatically):
 
 ```sh
-./target/release/examples/eagle3-spec-bench \
-  --model models/Llama-3.1-8B-Instruct-Q6_K.gguf \
-  --plt1 models/plt1-hyb-q5-2bpw.palito \
-  --eagle3 models/eagle3/eagle3-q4_k.palito \
-  --tokens 128 --draft-len 7 --hybrid
+# Chat directly with a single .palito file
+palito chat --model models/llama-3.1-8b.palito --stats
+
+# Or serve it over an OpenAI-compatible API
+palito serve --model models/llama-3.1-8b.palito
 ```
 
-👉 **Want the exact build & conversion commands?** See the **[`.palito` (`PLT1`) Format & 1,000+ tok/s Guide](docs/plt1-format.md)**.
+To build your own `.palito` file from an F16 GGUF model, see the **[`.palito` (`PLT1`) Format & 1,000+ tok/s Guide](docs/plt1-format.md)** (`gguf-to-plt1` → `pack-palito`).
 
 ---
 

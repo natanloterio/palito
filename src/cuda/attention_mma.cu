@@ -398,7 +398,9 @@ __device__ __forceinline__ void attention_prefill_fast_impl(
 #if __CUDA_ARCH__ >= 800
     constexpr int THREADS = 32 * WARPS, K = FA_FAST_KEYS;
     constexpr int K_STRIDE = DIM + 8;
-    constexpr int TOKENS_PER_WARP = GROUP == 1 ? 16 : 2;
+    // MMA row r (0..15) -> token r / GROUP of the warp, head r % GROUP.
+    static_assert(GROUP == 1 || GROUP == 2 || GROUP == 4 || GROUP == 8, "GROUP must divide 8");
+    constexpr int TOKENS_PER_WARP = 16 / GROUP;
     constexpr int BLOCK_TOKENS = TOKENS_PER_WARP * WARPS;
     constexpr int PIECES = K * DIM / 8 / THREADS;
     static_assert(PIECES * THREADS == K * DIM / 8, "THREADS must divide the tile");
@@ -407,8 +409,8 @@ __device__ __forceinline__ void attention_prefill_fast_impl(
     int kv_head = blockIdx.x, tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
     int group = lane / 4, thread = lane % 4;
     int first = (gridDim.y - 1 - blockIdx.y) * BLOCK_TOKENS;
-    int token0 = GROUP == 1 ? first + 16 * warp + group : first + 2 * warp;
-    int token1 = GROUP == 1 ? token0 + 8 : token0 + 1;
+    int token0 = first + TOKENS_PER_WARP * warp + group / GROUP;
+    int token1 = token0 + 8 / GROUP;
     // Rows of tokens past the chunk compute on one valid key and are not stored.
     int limit0 = token0 < tokens ? count + token0 : 1;
     int limit1 = token1 < tokens ? count + token1 : 1;
@@ -440,7 +442,7 @@ __device__ __forceinline__ void attention_prefill_fast_impl(
     // Scores are kept in log2 units: Q is pre-scaled by log2(e) / sqrt(dim).
     const float qscale = 1.4426950408889634f * rsqrtf((float)DIM);
     unsigned int qf[DIM / 16][4];
-    int head = GROUP == 1 ? kv_head : kv_head * GROUP + group;
+    int head = kv_head * GROUP + group % GROUP;
     {
         const float *q0 = q + ((u64)min(token0, tokens - 1) * heads + head) * DIM;
         const float *q1 = q + ((u64)min(token1, tokens - 1) * heads + head) * DIM;
@@ -588,6 +590,13 @@ extern "C" __global__ void __launch_bounds__(128)
 attention_prefill_mma_fast_mha_f16(const float *q, const kv_f16 *keys, const kv_f16 *values,
                                    float *output, int heads, int kv_heads, int tokens, int count) {
     attention_prefill_fast_impl<4, 1, 128>(q, keys, values, output, heads, kv_heads, tokens, count);
+}
+
+// GQA group 4 with head_dim == 64 (e.g. Llama 3.2 1B): 4 warps x 4 tokens.
+extern "C" __global__ void __launch_bounds__(128)
+attention_prefill_mma_fast_g4d64_f16(const float *q, const kv_f16 *keys, const kv_f16 *values,
+                                     float *output, int heads, int kv_heads, int tokens, int count) {
+    attention_prefill_fast_impl<4, 4, 64>(q, keys, values, output, heads, kv_heads, tokens, count);
 }
 
 // MHA with head_dim == 96 (e.g. Phi-3-mini): 64 tokens per block on FP16 tensor cores.

@@ -1,5 +1,30 @@
 use super::*;
 
+/// Runs `$fallback` unless `$t` is QTIP3, which takes the batched tensor-core
+/// path (`qtip::QtipKernel::matmul`) instead: int8 under int8-fast, exact
+/// weights with FP16 inputs otherwise.
+macro_rules! qtip_or {
+    ($self:ident, $t:expr, $x:expr, $y:expr, $n:expr, $fallback:block) => {{
+        #[cfg(feature = "qtip-research")]
+        if $t.is_qtip() {
+            $self
+                .qtip
+                .as_mut()
+                .ok_or_else(|| failure("QTIP3 kernels are not loaded"))?
+                .matmul(
+                    &$self.stream,
+                    $t,
+                    $x,
+                    $y,
+                    $n as usize,
+                    $self.matmul == CudaMatmul::Int8Fast,
+                )?;
+        } else $fallback
+        #[cfg(not(feature = "qtip-research"))]
+        $fallback
+    }};
+}
+
 fn reference_dense_shape(
     matmul: CudaMatmul,
     kind: i32,
@@ -483,22 +508,24 @@ impl CudaBackend {
                         Some(&mut self.work.down)
                     );
                 } else {
-                    launch!(
-                        self,
-                        projection,
-                        (
-                            (tensor.rows as u32).div_ceil(row_tile),
-                            (n as u32).div_ceil(token_tile),
-                            1
-                        ),
-                        &tensor.bytes,
-                        &tensor.kind,
-                        &self.work.normalized,
-                        &mut *output,
-                        &tensor.width,
-                        &tensor.rows,
-                        &n
-                    );
+                    qtip_or!(self, tensor, &self.work.normalized, &mut *output, n, {
+                        launch!(
+                            self,
+                            projection,
+                            (
+                                (tensor.rows as u32).div_ceil(row_tile),
+                                (n as u32).div_ceil(token_tile),
+                                1
+                            ),
+                            &tensor.bytes,
+                            &tensor.kind,
+                            &self.work.normalized,
+                            &mut *output,
+                            &tensor.width,
+                            &tensor.rows,
+                            &n
+                        );
+                    });
                 }
                 if let Some(biases) = &l.qkv_bias {
                     let bias = &biases[component];
@@ -734,6 +761,21 @@ impl CudaBackend {
                         &n,
                         &count
                     );
+                } else if self.matmul.kv_f16() && dim == 64 && heads == 4 * kv_heads {
+                    // int8-fast GQA group 4, head_dim 64: 16 tokens x 4 heads per block.
+                    launch!(
+                        self,
+                        "attention_prefill_mma_fast_g4d64_f16",
+                        (kv_heads as u32, (n as u32).div_ceil(16), 1); 128,
+                        &self.work.q,
+                        &self.keys[index],
+                        &self.values[index],
+                        &mut self.work.attended,
+                        &heads,
+                        &kv_heads,
+                        &n,
+                        &count
+                    );
                 } else if self.matmul.kv_f16() && dim == 96 && heads == kv_heads {
                     launch!(
                         self,
@@ -832,22 +874,24 @@ impl CudaBackend {
                     Some(&mut self.work.down)
                 );
             } else {
-                launch!(
-                    self,
-                    output_projection,
-                    (
-                        (t.rows as u32).div_ceil(output_rows),
-                        (n as u32).div_ceil(output_tokens),
-                        1
-                    ),
-                    &t.bytes,
-                    &t.kind,
-                    &self.work.attended,
-                    &mut self.work.projected,
-                    &t.width,
-                    &t.rows,
-                    &n
-                );
+                qtip_or!(self, t, &self.work.attended, &mut self.work.projected, n, {
+                    launch!(
+                        self,
+                        output_projection,
+                        (
+                            (t.rows as u32).div_ceil(output_rows),
+                            (n as u32).div_ceil(output_tokens),
+                            1
+                        ),
+                        &t.bytes,
+                        &t.kind,
+                        &self.work.attended,
+                        &mut self.work.projected,
+                        &t.width,
+                        &t.rows,
+                        &n
+                    );
+                });
             }
             capture_projection!(
                 self,
@@ -1113,22 +1157,24 @@ impl CudaBackend {
                     );
                 } else {
                     let (projection, row_tile, token_tile) = dense_projection(t);
-                    launch!(
-                        self,
-                        projection,
-                        (
-                            (t.rows as u32).div_ceil(row_tile),
-                            (n as u32).div_ceil(token_tile),
-                            1
-                        ),
-                        &t.bytes,
-                        &t.kind,
-                        &self.work.normalized,
-                        out,
-                        &t.width,
-                        &t.rows,
-                        &n
-                    );
+                    qtip_or!(self, t, &self.work.normalized, &mut *out, n, {
+                        launch!(
+                            self,
+                            projection,
+                            (
+                                (t.rows as u32).div_ceil(row_tile),
+                                (n as u32).div_ceil(token_tile),
+                                1
+                            ),
+                            &t.bytes,
+                            &t.kind,
+                            &self.work.normalized,
+                            out,
+                            &t.width,
+                            &t.rows,
+                            &n
+                        );
+                    });
                 }
             }
             capture_projection!(
@@ -1240,22 +1286,24 @@ impl CudaBackend {
                 );
             } else {
                 let (projection, row_tile, token_tile) = dense_projection(t);
-                launch!(
-                    self,
-                    projection,
-                    (
-                        (t.rows as u32).div_ceil(row_tile),
-                        (n as u32).div_ceil(token_tile),
-                        1
-                    ),
-                    &t.bytes,
-                    &t.kind,
-                    &self.work.gate,
-                    &mut self.work.down,
-                    &t.width,
-                    &t.rows,
-                    &n
-                );
+                qtip_or!(self, t, &self.work.gate, &mut self.work.down, n, {
+                    launch!(
+                        self,
+                        projection,
+                        (
+                            (t.rows as u32).div_ceil(row_tile),
+                            (n as u32).div_ceil(token_tile),
+                            1
+                        ),
+                        &t.bytes,
+                        &t.kind,
+                        &self.work.gate,
+                        &mut self.work.down,
+                        &t.width,
+                        &t.rows,
+                        &n
+                    );
+                });
             }
 
             capture_projection!(

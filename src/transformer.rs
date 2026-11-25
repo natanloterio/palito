@@ -153,13 +153,42 @@ impl<T> Weights<T> {
 }
 
 impl Weights<Tensor> {
-    #[cfg_attr(not(any(feature = "cuda", feature = "vulkan", all(feature = "metal", target_os = "macos"))), allow(dead_code))]
+    #[cfg_attr(
+        any(
+            feature = "qtip-research",
+            not(any(feature = "cuda", feature = "vulkan", all(feature = "metal", target_os = "macos")))
+        ),
+        allow(dead_code)
+    )]
     pub fn open(path: &Path, config: &Config) -> Result<Self> {
         config.validate()?;
         Self::from_gguf(Gguf::open(path, false)?, config)
     }
 
-    pub(crate) fn from_gguf(mut model: Gguf, config: &Config) -> Result<Self> {
+    /// Rejects QTIP3 tensors: only the CUDA backend executes them (open_qtip3).
+    pub(crate) fn from_gguf(model: Gguf, config: &Config) -> Result<Self> {
+        if model.has_qtip3() {
+            return Err(invalid(
+                "QTIP3 tensors need the CUDA backend built with the qtip-research feature",
+            ));
+        }
+        Self::from_gguf_any(model, config)
+    }
+
+    /// Like `open`, but accepts QTIP3 projections (research, Llama only).
+    #[cfg(feature = "qtip-research")]
+    pub(crate) fn open_qtip3(path: &Path, config: &Config) -> Result<Self> {
+        config.validate()?;
+        let model = Gguf::open(path, false)?;
+        if model.has_qtip3() && model.text("general.architecture")? != "llama" {
+            return Err(invalid(
+                "QTIP3 tensors are supported for the llama architecture only",
+            ));
+        }
+        Self::from_gguf_any(model, config)
+    }
+
+    fn from_gguf_any(mut model: Gguf, config: &Config) -> Result<Self> {
         let arch = model.text("general.architecture")?.to_owned();
         let (qwen, moe) = match arch.as_str() {
             "llama" => (false, false),

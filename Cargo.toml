@@ -32,6 +32,7 @@ cuda-block-reduction-research = ["cuda"]
 cuda-attention-reuse-research = ["cuda"]
 cuda-attention-query-pair-research = ["cuda-attention-reuse-research"]
 cuda-attention-query-pair-even-research = ["cuda-attention-query-pair-research"]
+qtip-research = []
 
 [lib]
 # rlib for Rust users, cdylib for the C API (libpalito.so, include/palito.h).
@@ -45,6 +46,20 @@ path = "src/main.rs"
 name = "ktransformers"
 path = "src/bin/ktransformers.rs"
 required-features = ["ktransformers"]
+
+[[example]]
+name = "qtip-quantize"
+path = "examples/qtip_quantize.rs"
+required-features = ["qtip-research"]
+
+[[example]]
+name = "qtip-matvec-bench"
+path = "examples/qtip_matvec_bench.rs"
+required-features = ["cuda", "qtip-research"]
+
+[[example]]
+name = "perplexity"
+path = "examples/perplexity.rs"
 
 [[example]]
 name = "trace-reference"

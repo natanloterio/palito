@@ -534,6 +534,7 @@ impl CudaBackend {
             {
                 let pl = &plt1.layers[index];
                 let nt = tokens.len();
+                let zero_self = index == 0 || plt1.layers[index - 1].moe_ffn;
                 plt1.run_multi(
                     &[
                         (&pl.q, &mut self.work.q),
@@ -544,7 +545,7 @@ impl CudaBackend {
                     None,
                     nt,
                     &[(&mut self.work.projected, nt * pl.o.desc.rows as usize)],
-                    index == 0,
+                    zero_self,
                 )?;
                 true
             } else {
@@ -1020,17 +1021,28 @@ impl CudaBackend {
             {
                 let pl = &plt1.layers[index];
                 let nt = tokens.len();
-                plt1.run_multi(
-                    &[(&pl.o, &mut self.work.projected)],
-                    &self.work.attended,
-                    None,
-                    nt,
-                    &[
-                        (&mut self.work.gate, nt * pl.gate.desc.rows as usize),
-                        (&mut self.work.up, nt * pl.up.desc.rows as usize),
-                    ],
-                    false,
-                )?;
+                if pl.moe_ffn {
+                    plt1.run_multi(
+                        &[(&pl.o, &mut self.work.projected)],
+                        &self.work.attended,
+                        None,
+                        nt,
+                        &[],
+                        false,
+                    )?;
+                } else {
+                    plt1.run_multi(
+                        &[(&pl.o, &mut self.work.projected)],
+                        &self.work.attended,
+                        None,
+                        nt,
+                        &[
+                            (&mut self.work.gate, nt * pl.gate.desc.rows as usize),
+                            (&mut self.work.up, nt * pl.up.desc.rows as usize),
+                        ],
+                        false,
+                    )?;
+                }
                 true
             } else {
                 false
@@ -1334,39 +1346,61 @@ impl CudaBackend {
             {
                 let pl = &plt1.layers[index];
                 let nt = tokens.len();
-                plt1.run_multi(
-                    &[
-                        (&pl.gate, &mut self.work.gate),
-                        (&pl.up, &mut self.work.up),
-                    ],
-                    &self.work.normalized,
-                    None,
-                    nt,
-                    &[(&mut self.work.down, nt * pl.down.desc.rows as usize)],
-                    false,
-                )?;
-                if let Some(next_pl) = plt1.layers.get(index + 1) {
-                    plt1.run_multi(
-                        &[(&pl.down, &mut self.work.down)],
-                        &self.work.gate,
-                        Some(&self.work.up),
+                if pl.moe_ffn {
+                    plt1.run_moe_gate_up(
+                        &pl.gate,
+                        &pl.up,
+                        &self.work.normalized,
+                        &self.work.ids,
+                        &mut self.work.gate,
+                        &mut self.work.up,
                         nt,
-                        &[
-                            (&mut self.work.q, nt * next_pl.q.desc.rows as usize),
-                            (&mut self.work.k, nt * next_pl.k.desc.rows as usize),
-                            (&mut self.work.v, nt * next_pl.v.desc.rows as usize),
-                        ],
-                        false,
+                        s.used,
+                    )?;
+                    plt1.run_moe_down(
+                        &pl.down,
+                        &self.work.gate,
+                        &self.work.up,
+                        &self.work.ids,
+                        &mut self.work.down,
+                        nt,
+                        s.used,
                     )?;
                 } else {
                     plt1.run_multi(
-                        &[(&pl.down, &mut self.work.down)],
-                        &self.work.gate,
-                        Some(&self.work.up),
+                        &[
+                            (&pl.gate, &mut self.work.gate),
+                            (&pl.up, &mut self.work.up),
+                        ],
+                        &self.work.normalized,
+                        None,
                         nt,
-                        &[],
+                        &[(&mut self.work.down, nt * pl.down.desc.rows as usize)],
                         false,
                     )?;
+                    if let Some(next_pl) = plt1.layers.get(index + 1) {
+                        plt1.run_multi(
+                            &[(&pl.down, &mut self.work.down)],
+                            &self.work.gate,
+                            Some(&self.work.up),
+                            nt,
+                            &[
+                                (&mut self.work.q, nt * next_pl.q.desc.rows as usize),
+                                (&mut self.work.k, nt * next_pl.k.desc.rows as usize),
+                                (&mut self.work.v, nt * next_pl.v.desc.rows as usize),
+                            ],
+                            false,
+                        )?;
+                    } else {
+                        plt1.run_multi(
+                            &[(&pl.down, &mut self.work.down)],
+                            &self.work.gate,
+                            Some(&self.work.up),
+                            nt,
+                            &[],
+                            false,
+                        )?;
+                    }
                 }
                 true
             } else {

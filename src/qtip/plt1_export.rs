@@ -60,10 +60,14 @@ fn is_residual_input_proj(name: &str) -> bool {
         || name.ends_with("attn_v.weight")
         || name.ends_with("ffn_gate.weight")
         || name.ends_with("ffn_up.weight")
+        || name.ends_with("ffn_gate_exps.weight")
+        || name.ends_with("ffn_up_exps.weight")
 }
 
 fn is_residual_output_proj(name: &str) -> bool {
-    name.ends_with("attn_output.weight") || name.ends_with("ffn_down.weight")
+    name.ends_with("attn_output.weight")
+        || name.ends_with("ffn_down.weight")
+        || name.ends_with("ffn_down_exps.weight")
 }
 
 fn is_quantized_proj(name: &str) -> bool {
@@ -77,7 +81,11 @@ fn rmsnorm_name_for(proj: &str) -> Option<String> {
         || proj.ends_with("attn_v.weight")
     {
         Some(format!("blk.{idx}.attn_norm.weight"))
-    } else if proj.ends_with("ffn_gate.weight") || proj.ends_with("ffn_up.weight") {
+    } else if proj.ends_with("ffn_gate.weight")
+        || proj.ends_with("ffn_up.weight")
+        || proj.ends_with("ffn_gate_exps.weight")
+        || proj.ends_with("ffn_up_exps.weight")
+    {
         Some(format!("blk.{idx}.ffn_norm.weight"))
     } else {
         None
@@ -122,6 +130,7 @@ pub fn export_gguf_to_plt1(
     let d_ff = model
         .tensors
         .get("blk.0.ffn_gate.weight")
+        .or_else(|| model.tensors.get("blk.0.ffn_gate_exps.weight"))
         .map_or(0, |t| t.dims[1] as u32);
     let vocab_size = model
         .tensors
@@ -202,6 +211,185 @@ pub fn export_gguf_to_plt1(
     let mut reports = Vec::with_capacity(names.len());
     for (idx, name) in names.iter().enumerate() {
         let tensor = &model.tensors[name];
+        if tensor.dims.len() == 3 {
+            // 3D MoE expert tensor: GGUF dims = [cols, rows, n_experts].
+            let cols = tensor.dims[0];
+            let rows = tensor.dims[1];
+            let n_experts = tensor.dims[2];
+            if rows % RHT_BLOCK != 0 || cols % RHT_BLOCK != 0 {
+                return Err(Error::Invalid(format!(
+                    "{name}: PLT1 HYB requires {RHT_BLOCK}-aligned shapes, got {n_experts}x{rows}x{cols}"
+                )));
+            }
+            let gamma = if opts.fold_residual_rht
+                && let Some(norm_name) = rmsnorm_name_for(name)
+                && let Some(norm_tensor) = model.tensors.get(&norm_name)
+            {
+                let mut g = vec![0.0f32; cols];
+                norm_tensor.row(0, &mut g);
+                Some(g)
+            } else {
+                None
+            };
+            let tensor_seed = opts.seed ^ (idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let base_rht = Incoherence::with_block(rows, cols, tensor_seed, Some(RHT_BLOCK))?;
+            let rht = if opts.fold_residual_rht && is_residual_input_proj(name) {
+                Incoherence::with_signs(
+                    rows,
+                    cols,
+                    base_rht.row_signs().to_vec(),
+                    r1_signs.clone(),
+                    Some(RHT_BLOCK),
+                )?
+            } else if opts.fold_residual_rht && is_residual_output_proj(name) {
+                Incoherence::with_signs(
+                    rows,
+                    cols,
+                    r1_signs.clone(),
+                    base_rht.col_signs().to_vec(),
+                    Some(RHT_BLOCK),
+                )?
+            } else {
+                base_rht
+            };
+            // Identity Hessian fallback for MoE experts (optional shared Hessian if present).
+            let mut h_mat = vec![0.0f64; cols * cols];
+            for i in 0..cols {
+                h_mat[i * cols + i] = 1.0 + f64::from(opts.damping);
+            }
+            let u = block_feedback(&cholesky_upper(&rht.transform_hessian(&h_mat), cols)?, cols)?;
+
+            let mut all_tile_bytes = Vec::new();
+            let mut expert_scales = Vec::with_capacity(n_experts);
+            let mut sum_rel = 0.0f64;
+            let mut row_buf = vec![0.0f32; cols];
+            for e in 0..n_experts {
+                let mut w_e = vec![0.0f32; rows * cols];
+                for r in 0..rows {
+                    tensor.row(e * rows + r, &mut row_buf);
+                    if let Some(g) = &gamma {
+                        for (dst, (&v, &gv)) in
+                            w_e[r * cols..(r + 1) * cols].iter_mut().zip(row_buf.iter().zip(g))
+                        {
+                            *dst = v * gv;
+                        }
+                    } else {
+                        w_e[r * cols..(r + 1) * cols].copy_from_slice(&row_buf);
+                    }
+                }
+                let rotated = rht.forward(&w_e);
+                let sigma = rms(&rotated).max(1e-8);
+                let (quantized, tiles) = ldlq_with(&rotated, rows, cols, &u, |tile| {
+                    let swizzled = swizzle_tile_to_mma(tile);
+                    let norm: Vec<f32> = swizzled.iter().map(|&v| v / sigma).collect();
+                    let words = quantizer.quantize_normalized(&norm);
+                    let decoded = match &words {
+                        Ok(w) => decode_hyb_tile_mma_l(
+                            w,
+                            opts.state_bits,
+                            opts.pair_bits,
+                            &codebook,
+                            sigma,
+                        )
+                        .to_vec(),
+                        Err(_) => vec![0.0; tile.len()],
+                    };
+                    (decoded, words)
+                })?;
+                let reconstructed = rht.inverse(&quantized);
+                sum_rel += distortion(&w_e, &reconstructed).relative;
+                for w in tiles.into_iter().collect::<Result<Vec<_>>>()?.concat() {
+                    all_tile_bytes.extend_from_slice(&w.to_le_bytes());
+                }
+                expert_scales.push(if opts.fold_residual_rht {
+                    sigma / 16.0
+                } else {
+                    sigma / 256.0
+                });
+            }
+            let report = TensorReport {
+                name: name.clone(),
+                relative_error: sum_rel / n_experts as f64,
+                proxy_error: None,
+            };
+            progress(&report, idx + 1, names.len());
+            reports.push(report);
+
+            let mut tflags = tensor_flags::MMA_SWIZZLED;
+            if opts.fold_residual_rht {
+                if is_residual_input_proj(name) {
+                    tflags |= tensor_flags::SKIP_IN_RHT;
+                }
+                if is_residual_output_proj(name) {
+                    tflags |= tensor_flags::SKIP_OUT_RHT;
+                }
+            }
+            writer.add_tensor(
+                TensorDesc {
+                    name: name.clone(),
+                    rows: rows as u32,
+                    cols: cols as u32,
+                    codec,
+                    flags: tflags,
+                    pair_bits: opts.pair_bits as u8,
+                    lut_bits: opts.lut_bits as u8,
+                    scale: 1.0,
+                    teal_thresholds: [0.0; 4],
+                    data_offset: 0,
+                    data_size: 0,
+                    lut_offset: 0,
+                },
+                all_tile_bytes,
+                Some(codebook.lut_f16x2.clone()),
+            );
+            let scales_bytes: Vec<u8> = expert_scales
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            writer.add_tensor(
+                TensorDesc {
+                    name: format!("{name}.scales"),
+                    rows: 1,
+                    cols: n_experts as u32,
+                    codec: Codec::F16,
+                    flags: 0,
+                    pair_bits: 0,
+                    lut_bits: 0,
+                    scale: 1.0,
+                    teal_thresholds: [0.0; 4],
+                    data_offset: 0,
+                    data_size: 0,
+                    lut_offset: 0,
+                },
+                scales_bytes,
+                None,
+            );
+            let signs_bytes: Vec<u8> = rht
+                .row_signs()
+                .iter()
+                .chain(rht.col_signs().iter())
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            writer.add_tensor(
+                TensorDesc {
+                    name: format!("{name}.signs"),
+                    rows: 1,
+                    cols: (rows + cols) as u32,
+                    codec: Codec::F16,
+                    flags: 0,
+                    pair_bits: 0,
+                    lut_bits: 0,
+                    scale: 1.0,
+                    teal_thresholds: [0.0; 4],
+                    data_offset: 0,
+                    data_size: 0,
+                    lut_offset: 0,
+                },
+                signs_bytes,
+                None,
+            );
+            continue;
+        }
         let (mut weights, rows, cols) = matrix(tensor);
         if rows % RHT_BLOCK != 0 || cols % RHT_BLOCK != 0 {
             return Err(Error::Invalid(format!(

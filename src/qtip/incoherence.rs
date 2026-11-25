@@ -71,13 +71,9 @@ impl Incoherence {
     }
 
     /// `block`: Hadamard block size (a power of two of at least 2), capped at
-    /// each dimension; `None` transforms whole rows and columns.
+    /// each dimension; `None` transforms whole rows and columns. Each
+    /// dimension must be a power of two or a multiple of the block.
     pub fn with_block(rows: usize, cols: usize, seed: u64, block: Option<usize>) -> Result<Self> {
-        if !rows.is_power_of_two() || !cols.is_power_of_two() {
-            return Err(Error::Invalid(format!(
-                "Hadamard incoherence needs power-of-two dimensions, got {rows} x {cols}"
-            )));
-        }
         if let Some(b) = block
             && (b < 2 || !b.is_power_of_two())
         {
@@ -86,11 +82,19 @@ impl Incoherence {
             )));
         }
         let block = block.unwrap_or(usize::MAX);
+        let (row_block, col_block) = (block.min(rows), block.min(cols));
+        let tiles = |dim: usize, b: usize| b.is_power_of_two() && dim.is_multiple_of(b);
+        if !tiles(rows, row_block) || !tiles(cols, col_block) {
+            return Err(Error::Invalid(format!(
+                "Hadamard incoherence needs power-of-two dimensions or multiples of \
+                 the block, got {rows} x {cols}"
+            )));
+        }
         Ok(Self {
             rows,
             cols,
-            row_block: block.min(rows),
-            col_block: block.min(cols),
+            row_block,
+            col_block,
             row_signs: signs(rows, seed),
             col_signs: signs(cols, seed ^ 0xA5A5_A5A5_A5A5_A5A5),
         })
@@ -302,5 +306,25 @@ mod tests {
     fn rejects_non_power_of_two_shapes() {
         assert!(Incoherence::new(12, 16, 1).is_err());
         assert!(Incoherence::new(16, 24, 1).is_err());
+        // Blocks must tile each dimension exactly.
+        assert!(Incoherence::with_block(16, 24, 1, Some(16)).is_err());
+        assert!(Incoherence::with_block(12, 16, 1, Some(8)).is_err());
+    }
+
+    #[test]
+    fn blocks_allow_dimensions_that_are_multiples_of_the_block() {
+        // Like ffn_down of Llama 3.1 8B: 14336 = 56 x 256 columns.
+        let (rows, cols) = (16, 24);
+        let rht = Incoherence::with_block(rows, cols, 5, Some(8)).unwrap();
+        let w = matrix(rows, cols);
+        let rotated = rht.forward(&w);
+        assert!((norm(&rotated) - norm(&w)).abs() < 1e-3 * norm(&w));
+        let back = rht.inverse(&rotated);
+        let err: f64 = w
+            .iter()
+            .zip(&back)
+            .map(|(a, b)| f64::from(a - b).powi(2))
+            .sum();
+        assert!(err < 1e-8 * norm(&w), "round trip error {err}");
     }
 }

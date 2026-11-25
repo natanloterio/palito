@@ -15,6 +15,10 @@ Output directory:
 Before collecting, `--eval-chunks` chunks of `--eval-text` are scored (second
 half of each chunk) as a check that the torch model matches the GGUF.
 
+Large models: `--dtype bfloat16` halves the GPU weights, and
+`--layers-per-pass N` keeps the f64 accumulators of only N layers on the GPU
+at a time (one forward pass over the calibration text per N layers).
+
     python3 scripts/qtip/collect_hessians.py \
         --model models/compat-llama32/Llama-3.2-1B-Instruct-f16.gguf \
         --text models/wikitext-2-raw/wiki.train.raw \
@@ -57,14 +61,16 @@ def parse_args():
     parser.add_argument("--chunks", type=int, default=256)
     parser.add_argument("--eval-text", type=Path)
     parser.add_argument("--eval-chunks", type=int, default=8)
+    parser.add_argument("--dtype", choices=["float32", "bfloat16", "float16"], default="float32")
+    parser.add_argument("--layers-per-pass", type=int, help="default: every layer in one pass")
     return parser.parse_args()
 
 
-def load(path: Path):
+def load(path: Path, dtype: torch.dtype):
     if not path.is_file():
         sys.exit(f"model not found: {path}")
     reader = gguf.GGUFReader(path)
-    kwargs = {"gguf_file": path.name, "dtype": torch.float32}
+    kwargs = {"gguf_file": path.name, "dtype": dtype}
     tokenizer = AutoTokenizer.from_pretrained(path.parent, gguf_file=path.name)
     fix_pre_tokenizer(tokenizer, reader)
     model = AutoModelForCausalLM.from_pretrained(path.parent, **kwargs).cuda().eval()
@@ -127,10 +133,11 @@ def perplexity(model, windows) -> float:
 
 
 @torch.no_grad()
-def collect(model, windows):
+def collect(model, windows, layers: range):
     torch.backends.cuda.matmul.allow_tf32 = False
     sums, handles = {}, []
-    for index, layer in enumerate(model.model.layers):
+    for index in layers:
+        layer = model.model.layers[index]
         for group, (path, _) in GROUPS.items():
             module = layer.get_submodule(path)
             key = f"blk.{index}.{group}"
@@ -146,16 +153,16 @@ def collect(model, windows):
         for done, window in enumerate(windows, 1):
             model(window[None].cuda())
             if done % 32 == 0 or done == len(windows):
-                print(f"[{done}/{len(windows)}] {time.time() - started:.0f}s", flush=True)
+                print(f"layers {layers.start}-{layers.stop - 1} [{done}/{len(windows)}] "
+                      f"{time.time() - started:.0f}s", flush=True)
     finally:
         for handle in handles:
             handle.remove()
     return sums
 
 
-def save(sums, tokens: int, layers: int, output: Path):
-    output.mkdir(parents=True)
-    tensors = {}
+def save(sums, tokens: int, output: Path, tensors: dict):
+    """Writes each Hessian and records its GGUF tensors in `tensors`."""
     for key, total in sums.items():
         mean = (total / tokens).float()
         if not torch.isfinite(mean).all():
@@ -165,22 +172,31 @@ def save(sums, tokens: int, layers: int, output: Path):
         layer, group = key.split(".")[1], key.split(".", 2)[2]
         for name in GROUPS[group][1]:
             tensors[f"blk.{layer}.{name}.weight"] = {"file": file, "dim": mean.shape[0]}
-    manifest = {"tokens": tokens, "layers": layers, "tensors": tensors}
-    (output / "manifest.json").write_text(json.dumps(manifest, indent=1, sort_keys=True))
 
 
 def main():
     args = parse_args()
     if args.output.exists():
         sys.exit(f"{args.output} already exists")
-    tokenizer, model = load(args.model)
+    if args.layers_per_pass is not None and args.layers_per_pass < 1:
+        sys.exit("--layers-per-pass must be at least 1")
+    tokenizer, model = load(args.model, getattr(torch, args.dtype))
     if args.eval_text:
         windows = chunks(tokenizer, args.eval_text, args.context, args.eval_chunks)
         print(f"check: perplexity {perplexity(model, windows):.4f} over {len(windows)} chunks", flush=True)
     windows = chunks(tokenizer, args.text, args.context, args.chunks)
-    sums = collect(model, windows)
-    save(sums, windows.numel(), len(model.model.layers), args.output)
-    print(f"wrote {len(sums)} Hessians from {windows.numel()} tokens to {args.output}")
+    layers = len(model.model.layers)
+    step = args.layers_per_pass or layers
+    args.output.mkdir(parents=True)
+    tensors = {}
+    for first in range(0, layers, step):
+        sums = collect(model, windows, range(first, min(first + step, layers)))
+        save(sums, windows.numel(), args.output, tensors)
+        del sums
+        torch.cuda.empty_cache()
+    manifest = {"tokens": windows.numel(), "layers": layers, "tensors": tensors}
+    (args.output / "manifest.json").write_text(json.dumps(manifest, indent=1, sort_keys=True))
+    print(f"wrote {len(tensors)} tensor entries from {windows.numel()} tokens to {args.output}")
 
 
 if __name__ == "__main__":

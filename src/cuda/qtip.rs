@@ -104,7 +104,7 @@ const MATMUL_WARPS: usize = 4;
 /// registers (QTIP_I8_MAX_CHUNKS 256-chunks).
 const MATMUL_I8_TOKENS: usize = 128;
 const MATMUL_I8_WARPS: usize = 4;
-const MATMUL_I8_MAX_CHUNKS: usize = 32;
+const MATMUL_I8_MAX_CHUNKS: usize = 64;
 /// Prefill matmul blocks the K split aims for, and the scratch it may use.
 const MATMUL_TARGET_BLOCKS: usize = 1024;
 const MATMUL_SCRATCH_FLOATS: usize = 16 << 20;
@@ -395,7 +395,7 @@ impl QtipKernel {
             return Err(invalid("QTIP3 matmul needs rows % 64 and cols % 256 == 0"));
         }
         if fast && cols / CHUNK > MATMUL_I8_MAX_CHUNKS {
-            return Err(invalid("QTIP3 int8 matmul supports up to 8192 columns"));
+            return Err(invalid("QTIP3 int8 matmul supports up to 16384 columns"));
         }
         if x.len() < tokens * cols || y.len() < tokens * rows {
             return Err(invalid("QTIP3 matmul buffers are too small"));
@@ -556,8 +556,9 @@ mod tests {
         let minor = context
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
             .map_err(failure)?;
-        // q/k/v, gate and down shapes; 130 tokens cross a 128-token block.
-        let shapes = [(2048, 512), (2048, 8192), (8192, 2048)];
+        // q/k/v, gate and down shapes, then Llama 3.1 8B ffn_down (56 chunks,
+        // not a power of two); 130 tokens cross a 128-token block.
+        let shapes = [(2048, 512), (2048, 8192), (8192, 2048), (14336, 4096)];
         let tensors: Vec<DeviceTensor> = shapes
             .iter()
             .enumerate()
@@ -611,6 +612,8 @@ mod tests {
             (2048, 8192),
             (8192, 2048),
             (16384, 4096),
+            (14336, 4096),
+            (4096, 14336),
         ] {
             let col_tiles = cols / TILE;
             let per = tiles_per_split(col_tiles, rows / CHUNK);

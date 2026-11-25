@@ -252,7 +252,7 @@ qtip_matmul_mma(const unsigned* __restrict__ tiles, const qtip_f16* __restrict__
 // FP16 kernel's time. Same three steps, with qtip_rotate_output taking
 // scale (not 16 scale): X' is not divided by 16 here.
 
-#define QTIP_I8_MAX_CHUNKS 32
+#define QTIP_I8_MAX_CHUNKS 64
 #define QTIP_I8_TOKENS 128
 #define QTIP_I8_WARPS 4
 

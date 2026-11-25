@@ -805,3 +805,53 @@ fn gpu_fit_context_shrinks_to_the_largest_admitted_step() {
         CudaBackend::open(&fixture.0, &config, CudaOptions { fit_context: false, ..options }).is_err()
     );
 }
+
+/// Prompt-sized prefill through the relaxed tensor-core profiles against the strict
+/// f32-tiled profile on real models whose projections are not K-quants (Q8_0 and
+/// F16 take dedicated tensor-core paths there). Relaxed gate of the CUDA policy:
+/// same argmax, cosine >= 0.99999 and max_abs <= 0.15 for int8-prefill; int8-fast
+/// (llama.cpp precision) only needs the same argmax and cosine >= 0.9999.
+/// PALITO_PREFILL_MODELS: colon-separated GGUF paths.
+#[test]
+#[ignore = "requires CUDA 13, PALITO_PREFILL_MODELS and an idle GPU; run serially in release mode"]
+fn relaxed_prefill_profiles_match_f32_tiled_on_dense_projection_types() {
+    let models = std::env::var("PALITO_PREFILL_MODELS").expect("PALITO_PREFILL_MODELS");
+    let config = Config {
+        context_tokens: 512,
+        batch_tokens: 512,
+        prefill_chunk: 512,
+        threads: 2,
+    };
+    // Deterministic ids spread over a Llama 3 vocabulary, 300 tokens in one chunk.
+    let tokens: Vec<i32> = (0..300).map(|i| ((i * 7919 + 13) % 30000 + 100) as i32).collect();
+    let logits = |path: &str, matmul: CudaMatmul| {
+        let options = CudaOptions { matmul, ..CudaOptions::default() };
+        let mut gpu = CudaBackend::open(path.as_ref(), &config, options).unwrap();
+        gpu.evaluate(&tokens, 0).unwrap();
+        gpu.logits().unwrap().to_vec()
+    };
+    let argmax = |v: &[f32]| {
+        v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0
+    };
+    for path in models.split(':').filter(|p| !p.is_empty()) {
+        let expected = logits(path, CudaMatmul::F32Tiled);
+        for (matmul, min_cosine, max_abs_bound) in [
+            (CudaMatmul::Int8Prefill, 0.99999, 0.15f32),
+            (CudaMatmul::Int8Fast, 0.9999, f32::INFINITY),
+        ] {
+            let actual = logits(path, matmul);
+            let (mut dot, mut aa, mut bb, mut max_abs) = (0.0f64, 0.0f64, 0.0f64, 0.0f32);
+            for (&a, &b) in actual.iter().zip(&expected) {
+                dot += f64::from(a) * f64::from(b);
+                aa += f64::from(a) * f64::from(a);
+                bb += f64::from(b) * f64::from(b);
+                max_abs = max_abs.max((a - b).abs());
+            }
+            let cosine = dot / (aa.sqrt() * bb.sqrt());
+            println!("{path} {matmul:?}: cosine {cosine:.7} max_abs {max_abs:.4}");
+            assert_eq!(argmax(&actual), argmax(&expected), "{path} {matmul:?} argmax");
+            assert!(cosine >= min_cosine, "{path} {matmul:?} cosine {cosine}");
+            assert!(max_abs <= max_abs_bound, "{path} {matmul:?} max_abs {max_abs}");
+        }
+    }
+}

@@ -1,4 +1,4 @@
-// Integer tensor-core prefill projection for packed Q4_K / Q6_K weights and INT8
+// Integer tensor-core prefill projection for packed Q4_K / Q5_K / Q6_K / Q8_0 weights and INT8
 // activation planes: same ABI as residual_matmul_mma3. Activations are either C
 // residual components (residual_quantize32_precise<C>, one scale/sum per component)
 // or, with S16, two residual planes whose scales differ by an integer factor
@@ -74,14 +74,18 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
     constexpr int P_ITEMS = (MMQ_ROWS * GROUPS + THREADS - 1) / THREADS;
     constexpr int X_ITEMS = (C * BN * PACKS + THREADS - 1) / THREADS;
     constexpr int S_ITEMS = (BN * GROUPS + THREADS - 1) / THREADS;
-    constexpr int W_WORDS = Kind == 12 ? 1 : 2;
+    constexpr int W_WORDS = Kind == 12 || Kind == 8 ? 1 : 2;
     constexpr bool HAS_MIN = Kind == 12 || Kind == 13;
+    // One k32 MMA and one scale per 32 values (Q6_K: two k16 MMAs, two scales).
+    constexpr bool K32 = HAS_MIN || Kind == 8;
+    // Q8_0: 34-byte blocks of 32 values, {f16 d, 32 x s8}; w = d * q.
+    constexpr int BLOCK = Kind == 8 ? 32 : 256;
     unsigned int wraw[W_ITEMS][W_WORDS], praw[P_ITEMS][4], xraw[X_ITEMS];
     float sraw[S_ITEMS][SC];
     int mraw[S_ITEMS][SC];
     auto block_of = [&](int row, int k) {
-        return weights + (((u64)expert * rows + first_row + row) * width + k) / 256
-            * (Kind == 12 ? 144 : Kind == 13 ? 176 : 210);
+        return weights + (((u64)expert * rows + first_row + row) * width + k) / BLOCK
+            * (Kind == 12 ? 144 : Kind == 13 ? 176 : Kind == 8 ? 34 : 210);
     };
     auto fetch = [&](int k) {
         #pragma unroll
@@ -90,9 +94,13 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
             wraw[j][0] = 0u;
             if (W_WORDS > 1) wraw[j][W_WORDS - 1] = 0u;
             if (index < MMQ_ROWS * PACKS && first_row + row < rows) {
-                const u8 *p = block_of(row, k);
+                const u8 *p = block_of(row, Kind == 8 ? k + pack * 4 : k);
                 int i = k % 256 + pack * 4;
-                if (Kind == 12) {
+                if (Kind == 8) {
+                    // Values start 2 bytes into the block: only 2-byte aligned.
+                    const unsigned short *q = (const unsigned short *)(p + 2 + (k + pack * 4) % 32);
+                    wraw[j][0] = (unsigned int)q[0] | ((unsigned int)q[1] << 16);
+                } else if (Kind == 12) {
                     wraw[j][0] = *(const unsigned int *)(p + 16 + (i / 64) * 32 + i % 32);
                 } else if (Kind == 13) {
                     wraw[j][0] = *(const unsigned int *)(p + 48 + (i / 64) * 32 + i % 32);
@@ -111,8 +119,10 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
             int index = tid + j * THREADS, row = index / GROUPS, g = index % GROUPS;
             praw[j][0] = praw[j][1] = praw[j][2] = praw[j][3] = 0u;
             if (index < MMQ_ROWS * GROUPS && first_row + row < rows) {
-                const u8 *p = block_of(row, k);
-                if (HAS_MIN) {
+                const u8 *p = block_of(row, Kind == 8 ? k + g * 32 : k);
+                if (Kind == 8) {
+                    praw[j][0] = *(const unsigned short *)p;
+                } else if (HAS_MIN) {
                     const unsigned int *words = (const unsigned int *)p;
                     praw[j][0] = words[0];
                     praw[j][1] = words[1];
@@ -154,7 +164,9 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
             if (index >= MMQ_ROWS * PACKS) continue;
             int i = k % 256 + pack * 4;
             unsigned int packed;
-            if (Kind == 12) {
+            if (Kind == 8) {
+                packed = wraw[j][0];
+            } else if (Kind == 12) {
                 packed = (wraw[j][0] >> (4 * ((i / 32) % 2))) & 0x0f0f0f0fu;
             } else if (Kind == 13) {
                 int g = i / 32;
@@ -175,7 +187,9 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
             int index = tid + j * THREADS, row = index / GROUPS, g = index % GROUPS;
             if (index >= MMQ_ROWS * GROUPS) continue;
             float a0, a1 = 0.0f, b = 0.0f;
-            if (HAS_MIN) {
+            if (Kind == 8) {
+                a0 = a1 = half_value_bits(praw[j][0]);
+            } else if (HAS_MIN) {
                 int gi = (k % 256) / 32 + g;
                 #define MMQ_SCALE_BYTE(n) ((int)((praw[j][1 + (n) / 4] >> (8 * ((n) % 4))) & 255))
                 int sc = gi < 4 ? MMQ_SCALE_BYTE(gi) & 63
@@ -237,7 +251,7 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
         #pragma unroll
         for (int g = 0; g < GROUPS; g++) {
             #pragma unroll
-            for (int half = 0; half < (HAS_MIN ? 1 : 2); half++) {
+            for (int half = 0; half < (K32 ? 1 : 2); half++) {
                 int pack = g * 8 + half * 4 + thread;
                 unsigned int a[2][4];
                 float coef[2][2], mins[2][2];
@@ -246,8 +260,8 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
                     int r = warp_row + m * 16 + group;
                     a[m][0] = sh.wq[r][pack];
                     a[m][1] = sh.wq[r + 8][pack];
-                    a[m][2] = HAS_MIN ? sh.wq[r][pack + 4] : 0u;
-                    a[m][3] = HAS_MIN ? sh.wq[r + 8][pack + 4] : 0u;
+                    a[m][2] = K32 ? sh.wq[r][pack + 4] : 0u;
+                    a[m][3] = K32 ? sh.wq[r + 8][pack + 4] : 0u;
                     #pragma unroll
                     for (int h = 0; h < 2; h++) {
                         coef[m][h] = sh.coefficient[r + 8 * h][2 * g + half];
@@ -264,9 +278,9 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
                         for (int i = 0; i < 4; i++) combined[m][i] = 0.0f;
                     if (S16) {
                         unsigned int h0 = sh.xq[0][tb + group][pack];
-                        unsigned int h1 = HAS_MIN ? sh.xq[0][tb + group][pack + 4] : 0u;
+                        unsigned int h1 = K32 ? sh.xq[0][tb + group][pack + 4] : 0u;
                         unsigned int l0 = sh.xq[1][tb + group][pack];
-                        unsigned int l1 = HAS_MIN ? sh.xq[1][tb + group][pack + 4] : 0u;
+                        unsigned int l1 = K32 ? sh.xq[1][tb + group][pack + 4] : 0u;
                         float s0 = sh.xs[t0][g][0], s1 = sh.xs[t0 + 1][g][0];
                         int e0 = sh.factor[t0][g], e1 = sh.factor[t0 + 1][g];
                         #pragma unroll
@@ -287,7 +301,7 @@ __device__ void mmq_tile(const u8 *weights, const signed char *values, const flo
                     #pragma unroll
                     for (int c = 0; c < (S16 ? 0 : C); c++) {
                         unsigned int b0 = sh.xq[c][tb + group][pack];
-                        unsigned int b1 = HAS_MIN ? sh.xq[c][tb + group][pack + 4] : 0u;
+                        unsigned int b1 = K32 ? sh.xq[c][tb + group][pack + 4] : 0u;
                         float s0 = sh.xs[t0][g][S16 ? 0 : c], s1 = sh.xs[t0 + 1][g][S16 ? 0 : c];
                         #pragma unroll
                         for (int m = 0; m < 2; m++) {
@@ -538,7 +552,8 @@ __device__ void mmq_pipe_q4(const u8 *weights, const signed char *values, const 
     if (kind == 12) mmq_pipe_q4<BN, KQ, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, *reinterpret_cast<MmqPipeShared<BN, KQ> *>(raw)); \
     if (kind == 13) mmq_tile<13, 1, BN, KS, false, PF, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, *reinterpret_cast<MmqShared<1, BN, KS, 1> *>(raw)); \
     if (kind == 14) mmq_tile<14, 1, BN, KS, false, PF, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, *reinterpret_cast<MmqShared<1, BN, KS, 1> *>(raw)); \
-    if (kind != 12 && kind != 13 && kind != 14 && threadIdx.x == 0) atomicOr(status, 8);
+    if (kind == 8) mmq_tile<8, 1, BN, KS, false, PF, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, *reinterpret_cast<MmqShared<1, BN, KS, 1> *>(raw)); \
+    if (kind != 12 && kind != 13 && kind != 14 && kind != 8 && threadIdx.x == 0) atomicOr(status, 8);
 #else
 #define MMQ_PIPE_BODY(BN, KQ, KS, SK, PF) if (threadIdx.x == 0) atomicOr(status, 16);
 #define MMQ_PIPE_BODY_DYNAMIC(BN, KQ, KS, SK, PF) if (threadIdx.x == 0) atomicOr(status, 16);
@@ -569,7 +584,8 @@ Name(const u8 *weights, int kind, const signed char *values, const float *scales
     if (kind == 12) mmq_tile<12, C, BN, KS, S16, PF, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, sh); \
     if (kind == 13) mmq_tile<13, C, BN, KS, S16, PF, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, sh); \
     if (kind == 14) mmq_tile<14, C, BN, KS, S16, PF, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, sh); \
-    if (kind != 12 && kind != 13 && kind != 14 && threadIdx.x == 0) atomicOr(status, 8);
+    if (kind == 8) mmq_tile<8, C, BN, KS, S16, PF, SK>(weights, values, scales, sums, output, width, rows, tokens, groups, used, grouped, assignment_major, status, sh); \
+    if (kind != 12 && kind != 13 && kind != 14 && kind != 8 && threadIdx.x == 0) atomicOr(status, 8);
 #else
 #define MMQ_BODY(C, BN, KS, S16, PF, SK) if (threadIdx.x == 0) atomicOr(status, 16);
 #endif

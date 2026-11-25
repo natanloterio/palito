@@ -27,7 +27,7 @@ fn residual_projection(matmul: CudaMatmul, tensor: &DeviceTensor, tokens: i32) -
         && tokens >= matmul.residual_min_tokens() as i32
         && (matches!(tensor.kind, 12 | 14)
             || (matches!(matmul, CudaMatmul::Int8Prefill | CudaMatmul::Int8Fast)
-                && tensor.kind == 13))
+                && matches!(tensor.kind, 8 | 13)))
         && tensor.width % 256 == 0
 }
 

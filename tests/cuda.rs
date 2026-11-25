@@ -823,7 +823,7 @@ fn relaxed_prefill_profiles_match_f32_tiled_on_dense_projection_types() {
         threads: 2,
     };
     // Deterministic ids spread over a Llama 3 vocabulary, 300 tokens in one chunk.
-    let tokens: Vec<i32> = (0..300).map(|i| ((i * 7919 + 13) % 30000 + 100) as i32).collect();
+    let tokens: Vec<i32> = (0..300).map(|i| (i * 7919 + 13) % 30000 + 100).collect();
     let logits = |path: &str, matmul: CudaMatmul| {
         let options = CudaOptions { matmul, ..CudaOptions::default() };
         let mut gpu = CudaBackend::open(path.as_ref(), &config, options).unwrap();

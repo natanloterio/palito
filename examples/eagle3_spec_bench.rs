@@ -142,10 +142,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut root = first;
 
             // Prompt-phase EAGLE-3 KV cache initialization (part of prefill, before decode timer).
-            let mut init_tokens = Vec::with_capacity(prompt_len);
-            init_tokens.extend_from_slice(&prompt[1..]);
+            // Non-final prefill chunks (e.g. PLT1 16-token chunks) were already ingested inside
+            // `evaluate`; ingest only the trailing `pending_start..prompt_len` slice here.
+            let pending_start = b.eagle3_pending_start();
+            let pending_len = prompt_len.saturating_sub(pending_start);
+            let mut init_tokens = Vec::with_capacity(pending_len);
+            if pending_len > 1 {
+                init_tokens.extend_from_slice(&prompt[pending_start + 1..]);
+            }
             init_tokens.push(first);
-            b.eagle3_ingest_tapped_to_dev(&init_tokens, 0)?;
+            b.eagle3_ingest_tapped_to_dev(&init_tokens, pending_start)?;
             let mut eagle_pos = prompt_len;
             let mut steps = 0usize;
             let mut t_draft = 0.0f64;

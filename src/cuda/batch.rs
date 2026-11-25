@@ -453,12 +453,6 @@ impl CudaBackend {
                 let src = self.work.x.slice(0..count);
                 let mut dst = eagle.tap_hidden[slot].slice_mut(0..count);
                 self.stream.memcpy_dtod(&src, &mut dst).map_err(failure)?;
-                #[cfg(feature = "qtip-research")]
-                if let Some(plt1) = &self.plt1_hyb
-                    && tokens.len() <= 16
-                {
-                    plt1.r1_exit(&mut eagle.tap_hidden[slot], s.width, tokens.len())?;
-                }
             }
             let gate = l.gate.as_ref();
             let affine = l.affine.as_ref();

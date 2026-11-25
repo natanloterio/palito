@@ -1728,10 +1728,6 @@ impl CudaBackend {
                 let src = self.work.x.slice(0..s.width);
                 let mut dst = eagle.tap_hidden[slot].slice_mut(0..s.width);
                 self.stream.memcpy_dtod(&src, &mut dst).map_err(failure)?;
-                #[cfg(feature = "qtip-research")]
-                if let Some(plt1) = &self.plt1_hyb {
-                    plt1.r1_exit(&mut eagle.tap_hidden[slot], s.width, 1)?;
-                }
             }
             let gemma_attention = gemma.map(|g| g.attention(s, index));
             let rope_base = gemma_attention.map_or(s.rope_base, |(_, base, _)| base);

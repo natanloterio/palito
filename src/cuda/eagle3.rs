@@ -1285,6 +1285,10 @@ impl CudaBackend {
     /// Same as `eagle3_ingest_tapped`, but skips `lm_head` + GPU sync when
     /// `sample_next == false` (used by hybrid mode when SuffixDecoding handles
     /// the next step).
+    pub fn eagle3_pending_start(&self) -> usize {
+        self.eagle3_pending_start
+    }
+
     pub fn eagle3_ingest_tapped_opt(
         &mut self,
         tokens: &[i32],

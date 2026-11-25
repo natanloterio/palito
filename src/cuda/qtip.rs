@@ -137,6 +137,7 @@ struct Variant {
     function: CudaFunction,
     multi: CudaFunction,
     multi_swiglu: CudaFunction,
+    small_k: CudaFunction,
     rotate_input: CudaFunction,
     rotate_output: CudaFunction,
     product: CudaFunction,
@@ -210,6 +211,7 @@ impl Variant {
             function: load("qtip_matvec_fused")?,
             multi: load("qtip_matvec_multi")?,
             multi_swiglu: load("qtip_matvec_multi_swiglu")?,
+            small_k: load("qtip_matvec_small_k")?,
             rotate_input: load("qtip_rotate_input")?,
             rotate_output: load("qtip_rotate_output")?,
             product: load("qtip_matmul_mma")?,
@@ -437,6 +439,45 @@ impl QtipKernel {
         }
         if x.len() < tokens * cols || y.len() < tokens * rows {
             return Err(invalid("QTIP3 matmul buffers are too small"));
+        }
+        // Small-batch (k <= 8, e.g. speculative verification): use the 1-launch
+        // fused multi-vector kernel instead of the 3-launch 128-token MMA path.
+        if (2..=8).contains(&tokens) && rows.is_multiple_of(CHUNK) {
+            let mut y_slice = y.slice_mut(0..tokens * rows);
+            stream.memset_zeros(&mut y_slice).map_err(failure)?;
+            let row_blocks = rows / CHUNK;
+            let total_chunks = cols / CHUNK;
+            let splits = 340usize
+                .div_ceil(row_blocks)
+                .clamp(1, total_chunks);
+            let chunks_per_split = total_chunks.div_ceil(splits);
+            let splits = total_chunks.div_ceil(chunks_per_split);
+            let col_signs = q.signs.slice(rows..);
+            let row_signs = q.signs.slice(..rows);
+            let (rows_i, cols_i, tokens_i, cps_i) = (
+                rows as i32,
+                cols as i32,
+                tokens as i32,
+                chunks_per_split as i32,
+            );
+            let config = LaunchConfig {
+                grid_dim: (row_blocks as u32, splits as u32, 1),
+                block_dim: (512, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut args = stream.launch_builder(&variant.small_k);
+            args.arg(&tensor.bytes)
+                .arg(x)
+                .arg(&col_signs)
+                .arg(&row_signs)
+                .arg(&mut y_slice)
+                .arg(&rows_i)
+                .arg(&cols_i)
+                .arg(&tokens_i)
+                .arg(&cps_i)
+                .arg(&q.scale);
+            unsafe { args.launch(config) }.map_err(failure)?;
+            return Ok(());
         }
         let col_tiles = cols / TILE;
         let blocks = (rows / row_block) * tokens.div_ceil(block_tokens);

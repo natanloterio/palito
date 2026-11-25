@@ -205,6 +205,7 @@ struct Workspace {
     probabilities: CudaSlice<f32>,
     status: CudaSlice<i32>,
     logits: CudaSlice<f32>,
+    batch_logits: Option<CudaSlice<f32>>,
     tokens: Option<CudaSlice<i32>>,
     groups: Option<CudaSlice<i32>>,
     /// int8-fast mixed expert tiles: (slots, element offset) of the 128-, 64- and
@@ -518,6 +519,7 @@ impl Workspace {
                 .map_err(failure)?,
             status: stream.alloc_zeros(1).map_err(failure)?,
             logits: alloc(spec.info.vocab_tokens as usize)?,
+            batch_logits: None,
             tokens: if prefill_capacity(spec) > 1 {
                 Some(
                     stream
@@ -1193,6 +1195,7 @@ impl CudaBackend {
             "residual",
             "combine",
             "prefill_matmul",
+            "prefill_matmul_8",
             "prefill_embedding",
             "group_experts",
             "grouped_matmul",
@@ -2825,19 +2828,68 @@ impl CudaBackend {
             decode.sampled = None;
         }
         self.batched_prefill(tokens, position as usize, false)?;
-        let width = self.weights.spec.width;
+        let n = tokens.len();
+        let n_i32 = n as i32;
+        let width_i32 = self.weights.spec.width as i32;
+        let vocab = self.weights.spec.info.vocab_tokens as usize;
+
+        // Normalize all `n` token hidden states in one launch.
+        transformer_norm!(
+            self,
+            &self.work.x,
+            self.weights.output_norm.as_ref(),
+            self.weights.output_norm_bias.as_ref(),
+            n_i32,
+            width_i32,
+            self.weights.spec.epsilon
+        );
+
+        // Single-read batched LM head for all `n <= 8` tokens.
+        if self.work.batch_logits.is_none() {
+            self.work.batch_logits = Some(
+                self.stream
+                    .alloc_zeros(8 * vocab)
+                    .map_err(failure)?,
+            );
+        }
+        let t = self
+            .weights
+            .output
+            .as_ref()
+            .unwrap_or(&self.weights.embedding);
+        let batch_logits = self.work.batch_logits.as_mut().unwrap();
+        launch!(
+            self,
+            "prefill_matmul_8",
+            (t.rows as u32, 1, 1),
+            &t.bytes,
+            &t.kind,
+            &self.work.normalized,
+            batch_logits,
+            &t.width,
+            &t.rows,
+            &n_i32
+        );
+
         let out = if self.decode.is_some() {
-            for t in 0..tokens.len() {
-                self.project_logits(t * width)?;
-                self.prepare_decode(0, position as usize + t, t as i32)?;
-                self.device_sample()?;
+            for tok_idx in 0..n {
+                self.prepare_decode(0, position as usize + tok_idx, tok_idx as i32)?;
+                self.device_sample_batch_slot(tok_idx * vocab)?;
             }
-            self.read_decode_tokens(tokens.len())?
+            self.read_decode_tokens(n)?
         } else {
-            let mut argmax = Vec::with_capacity(tokens.len());
-            for t in 0..tokens.len() {
-                self.project_logits(t * width)?;
-                self.finish_evaluation()?;
+            let mut argmax = Vec::with_capacity(n);
+            for tok_idx in 0..n {
+                let logits_slice = self
+                    .work
+                    .batch_logits
+                    .as_ref()
+                    .unwrap()
+                    .slice(tok_idx * vocab..(tok_idx + 1) * vocab);
+                self.stream
+                    .memcpy_dtoh(&logits_slice, &mut self.logits)
+                    .map_err(failure)?;
+                self.stream.synchronize().map_err(failure)?;
                 argmax.push(greedy(&self.logits)?);
             }
             argmax

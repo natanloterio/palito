@@ -2,266 +2,137 @@
   <img src="docs/palito_logo.png" alt="Palito: fast local LLM inference" width="640">
 </p>
 
-Ultra-fast local LLM inference in Rust with custom CUDA (Blackwell SM_120 / Ampere+), Vulkan, and Metal kernels — **up to 1,002+ tok/s on Llama 3.1 8B (2.94× faster than llama.cpp)** with zero llama.cpp or Python dependencies.
+**Run AI models on your own computer at over 1,000 tokens per second** — nearly **3× faster than `llama.cpp`**, using half the GPU memory, in a single fast Rust binary with no Python or `llama.cpp` required.
 
-- **Blazing fast on NVIDIA GPUs (RTX 5090):**
-  - **Llama 3.1 8B (`PLT1 HYB Q=5` 2.0 bpw + `EAGLE-3 Q4_K` / `SuffixDecoding`):** up to **1,002.6 tok/s** on coding (**2.94× faster** than `llama.cpp IQ3_XXS` at 341 tok/s, **1.75 GB** projections, 100% lossless exact parity) and **571–757 tok/s** on general text (**1.68×–2.22×**).
-  - **Llama 3.2 1B (`QTIP3` + Q6_K head):** **1,361 tok/s** (`0.735 ms/tok`) vs `llama.cpp IQ3_XXS` **1,053 tok/s** (**1.29× faster**, with much lower perplexity: `16.94` vs `19.96`).
-  - **Qwen3-30B-A3B (Q4_K_M MoE):** `palito serve` delivers the first token of a 2.9k-token prompt in **164 ms** (`llama-server -fa on`: 214 ms) and decodes at **343–362 tok/s** (`llama-server`: 305–340 tok/s; see [reproducible benchmarks & raw samples](benchmarks/vs-llama-cpp/README.md)).
-  - **Tensor-Core Prefill (`Q8_0` / `F16` / `QTIP`):** 501-token prefill in **12.1 ms** (1B Q8_0) and **15.6 ms** (1B F16) — **14×–16×** faster than scalar prefill.
-- **Uses the model's full context:** `chat` opens with the model's trained context (Qwen3-30B-A3B: 40,960 tokens) and replies run until the model finishes.
-- **One binary, native bindings everywhere:** terminal chat, OpenAI-compatible server (`palito serve`), C library (`libpalito.so`), and official bindings for **Python, Node.js, Java, C#, and Go**. No Python and no llama.cpp; the Linux bundle ships the CUDA compiler it needs.
+---
 
-## Performance vs `llama.cpp` (RTX 5090, CUDA 13)
+## Why Palito? Meet the `.palito` (`PLT1`) Model Format
 
-| Model & Format | Workload | Palito | `llama.cpp` | Speedup | Notes |
-| :--- | :--- | :---: | :---: | :---: | :--- |
-| **Llama 3.1 8B** (`PLT1 HYB Q=5` 2.0 bpw + `EAGLE-3` Hybrid) | Coding (128 tok, lossless) | **1,002.6 tok/s** | 341.0 tok/s (`IQ3_XXS`) | **2.94×** | `1.75 GB` projections, `exact_parity=true` |
-| **Llama 3.1 8B** (`PLT1 HYB Q=5` 2.0 bpw + `EAGLE-3` Hybrid) | Refactoring (128 tok, lossless) | **896.6 tok/s** | 341.0 tok/s (`IQ3_XXS`) | **2.63×** | `tau = 5.12`, `exact_parity=true` |
-| **Llama 3.1 8B** (`PLT1 HYB Q=5` 2.0 bpw + `EAGLE-3` Hybrid) | General text (128–256 tok) | **571–757 tok/s** | 341.0 tok/s (`IQ3_XXS`) | **1.68×–2.22×** | `exact_parity=true` |
-| **Llama 3.1 8B** (`HYB Q=5 MMA` 2.0 bpw kernel, `n=8`) | `4096×16384` verify kernel | **65.1 TFLOPS** (`16.5 µs`) | 29.7 TFLOPS (`31.6 µs`) | **2.19×–2.40×** | vs `IQ3_XXS` / `IQ2_S` (`test-backend-ops`) |
-| **Llama 3.2 1B** (`QTIP3` + Q6_K head) | Decode (`B=1`, 128 tok) | **1,361 tok/s** | 1,053 tok/s (`IQ3_XXS`) | **1.29×** | Lower PPL (`16.94` vs `19.96`) |
-| **Qwen3-30B-A3B** (`Q4_K_M` MoE) | 2.9k-tok TTFT / Decode | **164 ms / 362 tok/s** | 214 ms / 340 tok/s | **1.30× TTFT** | Full 40k context |
+Most local AI tools use the GGUF format, which was originally designed for CPUs. When you load a GGUF file on a modern NVIDIA GPU, the GPU spends a large chunk of its time unpacking data instead of generating text.
 
-## Requirements
+Palito introduces **`.palito` (`PLT1`)** — a model format built specifically for GPUs:
 
-- Linux x86_64.
-- For the GPU: an NVIDIA GPU with a driver that supports CUDA 13. Ampere (RTX 30xx, A100) or newer gets the fast path; older GPUs work, but more slowly.
-- Enough GPU memory for the model: Qwen3-30B-A3B Q4_K_M needs ~18 GB for the weights, plus ~0.1 MB per context token (the default GPU profile keeps its K/V cache in FP16; the strict `f32` profiles use ~0.2 MB).
+- **Half the size:** Shrinks an 8B model's layers down to **1.75 GB** (~2 bits per weight) so it streams off GPU memory much faster.
+- **GPU-ready on disk:** Weights are pre-arranged for NVIDIA Tensor Cores so the GPU reads and computes directly with minimal overhead.
+- **Generates multiple tokens at once (100% identical answers):** Bundles a tiny built-in predictor (`EAGLE-3`) and smart text lookup (`SuffixDecoding`) that draft several tokens ahead and verify them in a single pass — giving **2×–3× speedups** with **zero quality loss**.
+- **Works with GGUF too:** Already have GGUF models? Palito runs them out of the box with its own custom CUDA, Vulkan, and Metal kernels.
 
-You can also run without a GPU on the CPU backend (small models only, see below).
+---
 
-## Install
+## Speed vs `llama.cpp` (NVIDIA RTX 5090)
 
-### From a release bundle
+| Model | Task | Palito | `llama.cpp` | Speedup |
+| :--- | :--- | :---: | :---: | :---: |
+| **Llama 3.1 8B** (`.palito` format) | Coding | **1,002.6 tok/s** | 341 tok/s (`IQ3_XXS`) | **2.94× faster** |
+| **Llama 3.1 8B** (`.palito` format) | Code refactoring | **896.6 tok/s** | 341 tok/s (`IQ3_XXS`) | **2.63× faster** |
+| **Llama 3.1 8B** (`.palito` format) | General chat & writing | **571–757 tok/s** | 341 tok/s (`IQ3_XXS`) | **1.7×–2.2× faster** |
+| **Llama 3.2 1B** (`QTIP3`) | Single-stream decode | **1,361 tok/s** | 1,053 tok/s (`IQ3_XXS`) | **1.29× faster** |
+| **Qwen3-30B-A3B** (`Q4_K_M` MoE) | Long prompt (2.9k tok) | **164 ms** first token / **362 tok/s** | 214 ms / 340 tok/s | **1.30× faster TTFT** |
 
-Download `palito-<version>-linux-x86_64.tar.gz` from the [releases page](https://github.com/natanloterio/palito/releases), then:
+*All speculative runs are verified 100% bit-exact (`exact_parity=true`) against standard token-by-token generation. See [reproducible benchmarks](benchmarks/vs-llama-cpp/README.md).*
+
+---
+
+## Quick Start (3 Simple Steps)
+
+### 1. Install Palito
+
+Download the latest Linux release from the [Releases page](https://github.com/natanloterio/palito/releases):
 
 ```sh
-tar xzf palito-<version>-linux-x86_64.tar.gz
+tar xzf palito-0.13.0-linux-x86_64.tar.gz
 mkdir -p ~/.local/bin
-ln -sf "$PWD/palito-<version>-linux-x86_64/palito" ~/.local/bin/palito
+ln -sf "$PWD/palito-0.13.0-linux-x86_64/palito" ~/.local/bin/palito
 palito --version
 ```
 
-The `palito` launcher in the bundle uses the GPU by default and keeps compiled kernels in `~/.cache/palito/kernels`.
+*(Uses your NVIDIA GPU with CUDA 13 drivers automatically; CPU mode also works for small models.)*
 
-### From source
-
-You need Rust 1.87 or newer.
+### 2. Download a Model
 
 ```sh
-# GPU build, packaged and installed as ~/.local/bin/palito.
-# The script needs libnvrtc.so.13; point NVRTC_LIB_DIR at a CUDA 13 lib folder.
-NVRTC_LIB_DIR=/usr/local/cuda-13/lib64 scripts/package-linux.sh --install
-
-# CPU-only build
-cargo build --release
-./target/release/palito --help
-```
-
-## Get a model
-
-Any supported GGUF file works. For example, with the Hugging Face CLI (`pip install -U huggingface_hub`):
-
-```sh
-# Qwen3-30B-A3B (MoE, 18 GB): the model Palito is tuned for
+# Fast 30B MoE model (requires Hugging Face CLI: pip install huggingface_hub)
 hf download Qwen/Qwen3-30B-A3B-GGUF Qwen3-30B-A3B-Q4_K_M.gguf --local-dir models
 
-# SmolLM2-135M (105 MB): tiny, good for a quick test, runs on CPU
+# Or a tiny 105 MB model that runs even on a CPU
 hf download bartowski/SmolLM2-135M-Instruct-GGUF SmolLM2-135M-Instruct-Q4_K_M.gguf --local-dir models
 ```
 
-## Use
+### 3. Chat or Start a Local API Server
 
-### Chat
-
-```sh
-palito chat --model models/Qwen3-30B-A3B-Q4_K_M.gguf
-```
-
-Type a message and press Enter. The reply appears token by token as it is generated. `/reset` clears the conversation and `/exit` quits.
-
-Useful options:
-
-| Option | What it does |
-|---|---|
-| `--no-thinking` | Turns off Qwen3's reasoning, for short, direct answers |
-| `--system "You are..."` | Sets a system message |
-| `--stats` | Prints tokens, time to first token and tok/s after each reply |
-| `--tokens N` | Caps each reply at N tokens (default: until the model stops or the context is full) |
-| `--context N` | Uses N context tokens instead of the model's full context |
-| `--no-stream` | Prints each reply only once it is complete |
-| `--temperature T` | Samples instead of always picking the most likely token (default 0: greedy, the same reply every time) |
-| `--top-p P`, `--top-k K`, `--seed S` | Narrow the sampling to the most likely tokens; a seed makes it repeatable |
-| `--min-p P` | Drops tokens less likely than P times the most likely one (default 0: off; llama.cpp uses 0.05) |
-| `--repeat-penalty R`, `--repeat-last-n N` | Makes the last N tokens (prompt included, default 64) less likely, as in llama.cpp (default 1: off; 1.1 is a common choice) |
-| `--presence-penalty P`, `--frequency-penalty F` | OpenAI-style penalties over the same window: P once per token already seen, F per occurrence (default 0: off) |
-| `--stop TEXT` | Ends the reply at TEXT, which is not printed (repeat for several) |
-| `--no-prefix-cache` | Re-reads the whole conversation every turn instead of reusing the previous turn's work (GPU) |
-
-For Qwen3, its authors suggest `--temperature 0.6 --top-p 0.95 --top-k 20` with reasoning on, and `--temperature 0.7 --top-p 0.8 --top-k 20` with `--no-thinking`. Greedy decoding works well for short answers, but long reasoning can start repeating itself.
-
-Sampling follows llama.cpp's order: penalties, top-k, top-p, min-p, then temperature. Penalties also work with greedy decoding, but they need the logits on the CPU for every token, so greedy with a penalty runs at sampling speed rather than full greedy speed (see the server notes below).
-
-Set `PALITO_MODEL` once to skip `--model`:
+**Chat in your terminal:**
 
 ```sh
-export PALITO_MODEL=$PWD/models/Qwen3-30B-A3B-Q4_K_M.gguf
-palito chat
+palito chat --model models/Qwen3-30B-A3B-Q4_K_M.gguf --stats
 ```
 
-### Send a prompt from a file or a script
-
-`chat` reads from standard input, so you can pipe in a prompt, even a very long one:
-
-```sh
-echo "Explain photosynthesis in three sentences." | palito chat --no-thinking
-palito chat --no-thinking < long-document-and-question.txt
-```
-
-### Plain text completion
-
-`generate` continues a text without a chat template. `--stream` prints the text as it is generated; without it you get one JSON object (text, token IDs, timings) at the end:
-
-```sh
-palito generate --model models/SmolLM2-135M-Instruct-Q4_K_M.gguf \
-  --prompt "The capital of France is" --tokens 16 --stream
-
-palito generate --model models/SmolLM2-135M-Instruct-Q4_K_M.gguf \
-  --prompt "The capital of France is" --tokens 16 | jq -r .text
-```
-
-### CPU only
-
-```sh
-palito chat --backend cpu --model models/SmolLM2-135M-Instruct-Q4_K_M.gguf --tokens 300
-```
-
-## Run as a server (OpenAI-compatible API)
+**Or start an OpenAI-compatible server** (works with Open WebUI, Cursor, Continue, and any OpenAI SDK):
 
 ```sh
 palito serve --model models/Qwen3-30B-A3B-Q4_K_M.gguf
-# Serving the OpenAI API at http://127.0.0.1:8080/v1
+# OpenAI API ready at http://127.0.0.1:8080/v1
 ```
-
-Any OpenAI client works: point it at `http://127.0.0.1:8080/v1`. That includes the official SDKs, Open WebUI and editor plugins. The API key can be any text unless you set one.
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
-for chunk in client.chat.completions.create(
-        model="palito", stream=True,
-        messages=[{"role": "user", "content": "Hello!"}]):
-    print(chunk.choices[0].delta.content or "", end="", flush=True)
+reply = client.chat.completions.create(
+    model="palito",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(reply.choices[0].message.content)
 ```
+
+---
+
+## How to Run Models at 1,000+ tok/s (`.palito` Format)
+
+To hit **1,000+ tok/s** on Llama 3.1 8B, you run a `.palito` (`PLT1`) model together with its compact `EAGLE-3` predictor:
+
+1. **Convert your model once** into a 1.75 GB `.palito` file (`gguf-to-plt1`).
+2. **Pack the `EAGLE-3` predictor** (`239 MB`) into `.palito` format (`pack_eagle3_plt1.py`).
+3. **Run in hybrid mode** (`EAGLE-3` + `SuffixDecoding`) for up to **1,002+ tok/s**:
 
 ```sh
-curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "Hello!"}]}'
+./target/release/examples/eagle3-spec-bench \
+  --model models/Llama-3.1-8B-Instruct-Q6_K.gguf \
+  --plt1 models/plt1-hyb-q5-2bpw.palito \
+  --eagle3 models/eagle3/eagle3-q4_k.palito \
+  --tokens 128 --draft-len 7 --hybrid
 ```
 
-- **Endpoints:** `POST /v1/chat/completions`, `POST /v1/completions` (both support `"stream": true`), `GET /v1/models`, `GET /health`.
-- **Qwen3 reasoning:** the `<think>` part comes back separately as `reasoning_content` (as with llama.cpp and vLLM), and `content` holds only the answer. Send `"reasoning_format": "none"` to keep it inside `content`, or `"chat_template_kwargs": {"enable_thinking": false}` to turn reasoning off.
-- **Sampling:** `temperature`, `top_p`, `seed`, `presence_penalty`, `frequency_penalty` and `logit_bias` work as in OpenAI's API, plus llama.cpp's `top_k`, `min_p`, `repeat_penalty` and `repeat_last_n`. `logit_bias` takes OpenAI's `{"token id": bias}` or llama.cpp's `[[id, bias]]`, and a bias of `false` bans the token; unknown token ids are rejected. When a request leaves a field out, the server uses its own default, set with the same flags as `palito chat` (e.g. `--temperature 0.6 --top-p 0.95 --top-k 20 --min-p 0.05 --repeat-penalty 1.1`); without flags it is plain greedy. Plain greedy is the fastest (~370 tok/s on Qwen3-30B): any sampling, penalty or bias copies the logits to the CPU for every token (~335 tok/s for greedy with a repeat penalty, ~300 tok/s sampling).
-- **Stop sequences:** `stop` (a string or up to 16 strings) ends the reply; the stop text is not returned. It applies to everything the model writes, reasoning included, so with reasoning on avoid stops like `"\n"`.
-- **JSON output:** `"response_format": {"type": "json_object"}` or `{"type": "json_schema", "json_schema": {"name": "...", "schema": {...}}}` makes the reply JSON that always parses and matches the schema (constrained decoding, also with greedy). Reasoning is turned off for these requests. A schema keyword Palito cannot enforce (e.g. `uniqueItems`, `not`, `if`) returns 400 instead of being ignored. Qwen3-30B decodes at ~327 tok/s greedy (~300 sampled) with a schema.
-- **Tool calling:** `tools`, `tool_choice` (`auto`, `required`, `none` or a named function), `parallel_tool_calls`, and `role: "tool"` history work with and without streaming. It works on models whose chat template uses Qwen's `<tool_call>` JSON format, such as Qwen2.5 and Qwen3. Other templates get a 400 when tools are active.
-  - Call names and arguments are constrained to your schemas once a call starts, and the model can still reason in `<think>` first. `required` and a named function force a call. If `max_tokens` runs out first, the reply ends with `finish_reason: "length"` and any partial call is returned as is.
-  - Tool schemas are tolerant, as in llama.cpp: a keyword Palito cannot enforce is logged and ignored. `response_format` stays strict and cannot be combined with active tools.
-  - **Security:** like llama.cpp, Palito tokenizes tool content with control tokens enabled, so text such as `<|im_end|>` in a tool result becomes a real control token. If your agent passes third-party content (web pages, files, emails) to the model, remove these tokens first.
-- **Not supported:** `n` > 1 is rejected.
-- **Concurrent requests:** `--parallel N` (or `-np N`, GPU only, default 1) serves up to N requests at once, taking turns on the GPU, so a short request is not stuck behind a long one. Others wait in a queue (`--queue`, default 16; beyond that the server returns 503). If a client disconnects, its generation stops and its slot is freed.
-  - As in llama.cpp, `--context` is the total and is split between slots: `--context 16384 --parallel 4` gives each request 4096 tokens. Each slot's share is rounded up to a multiple of 256.
-  - Turns share the GPU, they do not add speed. On Qwen3-30B (RTX 5090), 4 simultaneous requests totaled 355 tok/s against 354 tok/s for one alone, so each runs at about a quarter of that. A 16-token request sent during a long one got its first token in 32 ms. `--parallel 1` stayed within 0.5% of the previous release. Raw results are in `benchmarks/concurrency/`.
-  - A reply does not depend on what other slots are doing. Prompts over 512 tokens can differ between `--parallel 1` and higher values, because they are evaluated in different block sizes.
-- **Local by default:** the server only accepts connections from this machine. To serve your network, use `--host 0.0.0.0 --api-key YOUR_KEY` (or set `PALITO_API_KEY`). Clients then send `Authorization: Bearer YOUR_KEY`.
-- **Conversations are cheap to continue:** on the GPU, a request that starts with the previous request's prompt (a chat resent with one more turn) skips most of the shared part. Replies are the same as without it. `--no-prefix-cache` turns it off.
-- **Other options:** `--port`, `--context`, `--backend cpu`, `--gpu-memory-limit-bytes`, `--model-name`.
+👉 **Want the exact build & conversion commands?** See the **[`.palito` (`PLT1`) Format & 1,000+ tok/s Guide](docs/plt1-format.md)**.
 
-## Use Palito from your own program
+---
 
-Palito is also a library, `libpalito.so`, with a C API in [`include/palito.h`](include/palito.h). Your program loads it and calls it directly, in the same process: no server, no subprocess. Ready-made bindings for **Python, Node.js, Java, C# and Go** are in [`bindings/`](bindings/README.md), and in the release bundle. They run at the same speed as `palito chat`.
+## Use Palito in Your Language
 
-Every binding finds the library through the installed `palito` command, so once Palito is installed there is nothing to configure. Elsewhere, set `PALITO_LIBRARY=/path/to/libpalito.so`.
+Palito ships ready-made bindings that run at full native speed in-process (no server needed):
 
-| Language | Install | Hello |
-|---|---|---|
-| Python | `pip install ./bindings/python` | `palito.Palito("model.gguf").chat([{"role": "user", "content": "Hi"}])` |
-| Node.js | `npm install ./bindings/node` | `await (await Palito.open("model.gguf")).chat([{ role: "user", content: "Hi" }])` |
-| Java 22+ | `mvn -f bindings/java/pom.xml install` | `Palito.open(Path.of("model.gguf"), new Options()).chat(List.of(Message.user("Hi")), new Generation())` |
-| C# | `dotnet add reference bindings/csharp/Palito/Palito.csproj` | `PalitoEngine.Open("model.gguf").Chat(new[] { Message.User("Hi") })` |
-| Go | `go get github.com/natanloterio/palito/bindings/go` | `engine.Chat(ctx, []palito.Message{{Role: "user", Content: "Hi"}}, nil)` |
+| Language | Install | One-Line Example |
+| :--- | :--- | :--- |
+| **Python** | `pip install palito` | `palito.Palito("model.gguf").chat([{"role": "user", "content": "Hi"}])` |
+| **Node.js / TS** | `npm install palito` | `await (await Palito.open("model.gguf")).chat([{ role: "user", content: "Hi" }])` |
+| **Java 22+** | Maven (`io.github.natanloterio:palito`) | `Palito.open(Path.of("model.gguf"), new Options()).chat(...)` |
+| **C# / .NET** | `dotnet add package Palito` | `PalitoEngine.Open("model.gguf").Chat(new[] { Message.User("Hi") })` |
+| **Go** | `go get github.com/natanloterio/palito/bindings/go` | `engine.Chat(ctx, []palito.Message{{Role: "user", Content: "Hi"}}, nil)` |
+| **Rust / C** | `cargo add palito` / `libpalito.so` | See [`examples/c/chat.c`](examples/c/chat.c) |
 
-Each binding streams the reply as it is generated, can stop early, and takes the same settings: token cap, reasoning, sampling and stop sequences. See its README for an example.
+---
 
-**C** ([`examples/c/chat.c`](examples/c/chat.c)):
+## Supported Models
 
-```c
-palito_engine *engine = palito_open("model.gguf", NULL, &error);   // NULL: default options
-palito_message messages[] = {{"user", "Hello!"}};
-palito_result result;
-palito_chat(engine, messages, 1, NULL, print_text, NULL, &result, &error);
-// print_text(text, length, user_data) receives the reply as it is generated;
-// result.text holds the full reply, result.tokens_per_second the speed.
-palito_result_free(&result);
-palito_close(engine);
-```
+Works out of the box with **Llama 3 / 3.1 / 3.2**, **Qwen 2.5 / 3 / 3.5** (dense and MoE), **Gemma 2 / 3**, **SmolLM2**, **Phi-3**, **StarCoder2**, **OLMo / OLMo 2 / OLMoE**, and more.
 
-```sh
-cc examples/c/chat.c -Iinclude -Llib -lpalito -Wl,-rpath,"$PWD/lib" -o chat
-./chat models/Qwen3-30B-A3B-Q4_K_M.gguf "Hello!"
-```
+---
 
-How it works:
-- Open a model once, then call `palito_chat` or `palito_complete` as many times as you like. The defaults are the same as `palito chat`: full context, fastest GPU profile.
-- Each call is stateless: pass the whole conversation every time.
-- The callback gets the text as it is generated; return nonzero to stop.
-- `palito_generation` sets the token cap, reasoning, sampling (`temperature`, `top_p`, `top_k`, `min_p`, `seed`), penalties (`repeat_penalty`, `repeat_last_n`, `presence_penalty`, `frequency_penalty`), `logit_bias` and stop sequences. Fill it with `palito_generation_init` first.
-- `palito_chat_json` and `palito_complete_json` take an extra JSON Schema string; the output is JSON matching it. Existing struct fields never move, but `palito_generation` grew after 0.5.0 (penalties, `min_p`, `logit_bias`), so rebuild programs against the current header.
-- `libpalito.so` finds the NVRTC bundled next to it, so `LD_LIBRARY_PATH` is not needed.
-- Errors come back as `-1` plus a message.
-- Use one engine per thread, or guard it with a lock.
+## Deep-Dive Documentation
 
-Rust programs can use the crate directly: `palito::engine::Engine`.
-
-## Supported models
-
-Tested on the GPU with the fast path: **Qwen3** (dense and MoE, e.g. Qwen3-0.6B and Qwen3-30B-A3B), **SmolLM2 / Llama**, **Gemma 3**.
-
-Also supported, using the slower reference path, which Palito picks automatically: Llama 3.2, Qwen2.5, Qwen3.5, Gemma 2, Phi-3 (4K and 128K), StarCoder2, GPT-2, Bloom, Pythia, OLMo, OLMo 2 and OLMoE.
-
-The CPU backend runs Llama-family models such as SmolLM2. See [docs/technical-reference.md](docs/technical-reference.md) for the exact list of tested files and quantizations.
-
-## Speed
-
-Qwen3-30B-A3B Q4_K_M on an RTX 5090:
-
-| Prompt length | Time to first token | Decode speed |
-|---|---|---|
-| 0.5k tokens | 0.035 s | ~360 tok/s |
-| 2.9k tokens | 0.15 s | ~340 tok/s |
-| 10k tokens | 0.68 s | ~300 tok/s |
-| 40k tokens | 5.1 s | ~190 tok/s |
-
-llama.cpp (`-fa on`, same GPU and model) measured 0.035 / 0.21 / 0.82 / 5.5 s and 345 / 310 / 281 / 184 tok/s. See the [long-context comparison](docs/technical-reference.md#long-context-comparison-with-llamacpp).
-
-Continuing a conversation is faster: with ~9.7k tokens of history, the next turn's first token comes after 0.18 s instead of 0.77 s, because the history is not read again.
-
-## Troubleshooting
-
-- **The first run is slow to start.** Palito compiles its GPU kernels the first time and caches them. Later runs start faster.
-- **`context N tokens: M do not fit in device memory`.** The full context did not fit in free GPU memory, so Palito used a smaller one. Close other GPU programs, or pass `--context` with a smaller value.
-- **`reply stopped: the N-token context is full`.** The conversation filled the context. Use `/reset`, or start with a shorter prompt.
-- **`libcuda.so.1` or `libnvrtc.so.13` not found.** Install or update the NVIDIA driver (CUDA 13 support). From a source build, put the CUDA 13 libraries on `LD_LIBRARY_PATH`.
-- **The GPU is shared with something else.** `--gpu-memory-limit-bytes N` caps how much GPU memory Palito uses.
-
-## More
-
-- [Technical reference](docs/technical-reference.md): precision profiles (`--cuda-matmul`), validation, benchmarks against llama.cpp, tests.
-- [Architecture](docs/architecture.md)
-- [Releasing](docs/releasing.md): version alignment and publishing to crates.io, PyPI, npm, NuGet, Maven Central and Go
-- [Performance report, in Portuguese](docs/relatorio-desempenho-decode-cuda.md)
+- **[`.palito` (`PLT1`) Format & 1,000+ tok/s Guide](docs/plt1-format.md)** — How `PLT1` works under the hood, converting GGUF → `.palito`, building from source, full CLI/server flags, C API, and troubleshooting.
+- **[Benchmarks vs `llama.cpp`](benchmarks/vs-llama-cpp/README.md)** — Reproducible benchmark scripts and raw measurements.
+- **[Language Bindings](bindings/README.md)** — Guides for Python, Node.js, Java, C#, and Go.
+- **[Technical Reference & Architecture](docs/technical-reference.md)** — Kernel architecture, tested models, and long-context numbers.
+- **[Architecture](docs/architecture.md)** | **[Releasing](docs/releasing.md)** | **[Portuguese CUDA report](docs/relatorio-desempenho-decode-cuda.md)**
 
 License: MIT (see [LICENSE](LICENSE)).

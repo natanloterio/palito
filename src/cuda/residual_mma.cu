@@ -11,7 +11,7 @@ using ResidualMmaTile = ResidualMmaTileComponents<3>;
 template<int Kind>
 __device__ __forceinline__ void residual_mma_group(unsigned int a0, unsigned int a1,
     unsigned int a2, unsigned int a3, unsigned int b0, unsigned int b1, int (&d)[4]) {
-    if (Kind == 12 || Kind == 13) {
+    if (Kind == 12 || Kind == 13 || Kind == 8) {
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
             : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])

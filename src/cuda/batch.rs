@@ -22,12 +22,18 @@ fn packed_gemm_shape(matmul: CudaMatmul, tensor: &DeviceTensor, tokens: i32) -> 
         && tensor.width % 256 == 0
 }
 
+/// FP16 tensor-core GEMM (gemm_f16.cu) for F16 weights in the relaxed tensor-core
+/// profiles; below 32 tokens the F32 kernel is as fast (memory bound).
+fn f16_tensor_shape(matmul: CudaMatmul, tensor: &DeviceTensor, tokens: i32) -> bool {
+    matmul.tensor_prefill() && tokens >= 32 && tensor.kind == 1 && tensor.width % 32 == 0
+}
+
 fn residual_projection(matmul: CudaMatmul, tensor: &DeviceTensor, tokens: i32) -> bool {
     matmul.residual_components() > 0
         && tokens >= matmul.residual_min_tokens() as i32
         && (matches!(tensor.kind, 12 | 14)
             || (matches!(matmul, CudaMatmul::Int8Prefill | CudaMatmul::Int8Fast)
-                && tensor.kind == 13))
+                && matches!(tensor.kind, 8 | 13)))
         && tensor.width % 256 == 0
 }
 
@@ -305,7 +311,9 @@ impl CudaBackend {
         };
         let matmul = self.matmul;
         let dense_projection = |t: &DeviceTensor| {
-            if packed_gemm_shape(matmul, t, n) {
+            if f16_tensor_shape(matmul, t, n) {
+                ("gemm_f16", 128, 128)
+            } else if packed_gemm_shape(matmul, t, n) {
                 ("gemm_packed_dense", 64, 64)
             } else if reference_dense_shape(matmul, t.kind, t.width, t.rows, n) {
                 ("prefill_matmul_ref2x16", 2, 16)

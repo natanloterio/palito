@@ -1169,6 +1169,18 @@ impl CudaBackend {
     /// EAGLE-3 KV position `start_pos`, returning the first drafted token.
     pub fn eagle3_ingest_tapped(&mut self, tokens: &[i32], start_pos: usize) -> Result<i32> {
         let width = self.weights.spec.width;
+        // When target runs in the PLT1 R_1-rotated residual basis, unrotate the
+        // 3 tapped hidden states back to the standard basis before EAGLE-3's `fc`.
+        #[cfg(feature = "qtip-research")]
+        if let Some(plt1) = &self.plt1_hyb
+            && plt1.r1_signs.is_some()
+        {
+            let e = self.eagle3.as_mut().unwrap();
+            for slot in 0..3 {
+                plt1.r1_exit(&mut e.tap_hidden[slot], width, tokens.len())?;
+            }
+        }
+
         let is_q4k = self
             .eagle3
             .as_ref()

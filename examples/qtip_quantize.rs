@@ -49,10 +49,15 @@ struct Args {
     hadamard_block: Option<usize>,
     #[arg(long, default_value_t = 0x5EED)]
     seed: u64,
-    /// Write the compressed QTIP3 format (trellis-ldlq, L12 K3, 256-block
-    /// Hadamards) instead of an F16 probe; only Palito CUDA reads it.
+    /// Write the compressed QTIP format (trellis-ldlq, L12, 256-block
+    /// Hadamards; QTIP3 for --symbol-bits 3, QTIP2 for 2) instead of an F16
+    /// probe; only Palito CUDA reads it.
     #[arg(long)]
     packed: bool,
+    /// With --packed --symbol-bits 2: tensor kinds kept at 3 bits, by name
+    /// part (e.g. attn_q, ffn_down), for a mixed 2/3-bit model.
+    #[arg(long, value_delimiter = ',')]
+    packed_k3: Vec<String>,
     /// Instead of quantizing, copy --input with these tensors taken from
     /// --splice-from (same name and shape), e.g. a llama.cpp Q6_K head.
     #[arg(long, requires = "splice_from")]
@@ -101,21 +106,29 @@ fn main() -> palito::Result<()> {
         let hessians = hessians
             .as_ref()
             .filter(|_| matches!(args.method, MethodArg::TrellisLdlq))
-            .filter(|_| (args.state_bits, args.symbol_bits) == (12, 3))
+            .filter(|_| args.state_bits == 12 && matches!(args.symbol_bits, 2 | 3))
             .filter(|_| args.hadamard_block.is_none_or(|b| b == 256))
+            .filter(|_| args.packed_k3.is_empty() || args.symbol_bits == 2)
             .ok_or_else(|| {
                 palito::Error::Invalid(
-                    "--packed needs --method trellis-ldlq --hessians --symbol-bits 3 \
-                     (state bits 12, Hadamard block 256)"
+                    "--packed needs --method trellis-ldlq --hessians --symbol-bits 2 or 3 \
+                     (state bits 12, Hadamard block 256); --packed-k3 needs --symbol-bits 2"
                         .into(),
                 )
             })?;
+        let base = args.symbol_bits;
+        let promoted = |name: &str| {
+            args.packed_k3
+                .iter()
+                .any(|part| name.split('.').any(|p| p == part))
+        };
         quantize_gguf_qtip3(
             &args.input,
             &args.output,
             args.seed,
             hessians,
             args.damping,
+            |name| if promoted(name) { 3 } else { base },
             progress,
         )?
     } else {

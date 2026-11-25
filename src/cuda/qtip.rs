@@ -7,7 +7,7 @@
 use super::{DeviceTensor, cache, failure};
 use crate::{
     Result,
-    gguf::{QTIP3_KIND, QTIP3_TILE_BYTES},
+    gguf::{qtip_symbol_bits, qtip_tile_bytes},
     transformer::invalid,
 };
 use cudarc::{
@@ -56,11 +56,13 @@ impl QtipTensor {
     /// signs; `bytes` keeps only the tiles.
     pub(super) fn upload(
         bytes: &mut Vec<u8>,
+        kind: u32,
         cols: usize,
         rows: usize,
         stream: &Arc<CudaStream>,
     ) -> Result<Self> {
-        let tile_bytes = rows * cols / (TILE * TILE) * QTIP3_TILE_BYTES;
+        let per_tile = qtip_tile_bytes(kind).ok_or_else(|| invalid("not a QTIP tensor type"))?;
+        let tile_bytes = rows * cols / (TILE * TILE) * per_tile;
         if bytes.len() != tile_bytes + 4 * (1 + rows + cols) {
             return Err(invalid("QTIP3 tensor bytes do not match its shape"));
         }
@@ -130,19 +132,25 @@ fn pointer<T>(slice: &CudaSlice<T>, stream: &CudaStream) -> u64 {
     slice.device_ptr(stream).0
 }
 
-pub(super) struct QtipKernel {
+/// The kernels of one trellis width K (QTIP_K), compiled from the same source.
+struct Variant {
     function: CudaFunction,
     multi: CudaFunction,
     multi_swiglu: CudaFunction,
     rotate_input: CudaFunction,
     rotate_output: CudaFunction,
     product: CudaFunction,
+    rotate_input_i8: CudaFunction,
+    product_i8: CudaFunction,
+}
+
+pub(super) struct QtipKernel {
+    /// Indexed by K - 2: QTIP2, then QTIP3; only the widths a model uses.
+    variants: [Option<Variant>; 2],
     /// Prefill scratch, grown on demand: rotated FP16 inputs and the rotated
     /// F32 product.
     rotated_input: Option<CudaSlice<u16>>,
     partial_output: Option<CudaSlice<f32>>,
-    rotate_input_i8: CudaFunction,
-    product_i8: CudaFunction,
     quantized_input: Option<CudaSlice<i8>>,
     input_scales: Option<CudaSlice<f32>>,
 }
@@ -168,17 +176,18 @@ fn rotate_config(width: usize, tokens: usize) -> LaunchConfig {
     }
 }
 
-impl QtipKernel {
-    /// Compiles the fused kernel (L = 12, K = 3) and opts it into the dynamic
-    /// shared memory of the widest split among `tensors`.
-    pub(super) fn load<'a>(
+impl Variant {
+    /// Compiles the kernels for K = `symbol_bits` (L = 12) and opts them into
+    /// the dynamic shared memory of the widest split among `tensors`.
+    fn load(
         context: &Arc<CudaContext>,
         architecture: (i32, i32),
         cache_dir: Option<&Path>,
-        tensors: impl Iterator<Item = &'a DeviceTensor>,
+        symbol_bits: u32,
+        tensors: &[&DeviceTensor],
     ) -> Result<Self> {
         let source = format!(
-            "#define QTIP_L 12\n#define QTIP_K 3\n#define QTIP_UNROLL 4\n\
+            "#define QTIP_L 12\n#define QTIP_K {symbol_bits}\n#define QTIP_UNROLL 4\n\
              #define QTIP_MMA_WARPS {MATMUL_WARPS}\n#define QTIP_MMA_STEP_TILES {MATMUL_STEP_TILES}\n\
              {}\n{}",
             include_str!("../qtip/matvec.cu"),
@@ -196,21 +205,17 @@ impl QtipKernel {
             },
         )?;
         let module = context.load_module(ptx).map_err(failure)?;
-        let function = module.load_function("qtip_matvec_fused").map_err(failure)?;
-        let multi = module.load_function("qtip_matvec_multi").map_err(failure)?;
-        let multi_swiglu = module
-            .load_function("qtip_matvec_multi_swiglu")
-            .map_err(failure)?;
-        let rotate_input = module.load_function("qtip_rotate_input").map_err(failure)?;
-        let rotate_output = module
-            .load_function("qtip_rotate_output")
-            .map_err(failure)?;
-        let product = module.load_function("qtip_matmul_mma").map_err(failure)?;
-        let rotate_input_i8 = module
-            .load_function("qtip_rotate_input_i8")
-            .map_err(failure)?;
-        let product_i8 = module.load_function("qtip_matmul_i8").map_err(failure)?;
-        let tensors: Vec<&DeviceTensor> = tensors.filter(|t| t.qtip.is_some()).collect();
+        let load = |name: &str| module.load_function(name).map_err(failure);
+        let variant = Self {
+            function: load("qtip_matvec_fused")?,
+            multi: load("qtip_matvec_multi")?,
+            multi_swiglu: load("qtip_matvec_multi_swiglu")?,
+            rotate_input: load("qtip_rotate_input")?,
+            rotate_output: load("qtip_rotate_output")?,
+            product: load("qtip_matmul_mma")?,
+            rotate_input_i8: load("qtip_rotate_input_i8")?,
+            product_i8: load("qtip_matmul_i8")?,
+        };
         let shared = tensors
             .iter()
             .filter_map(|t| t.qtip.as_ref())
@@ -224,9 +229,9 @@ impl QtipKernel {
             .max()
             .unwrap_or(0) as u32;
         for (f, bytes) in [
-            (&function, shared),
-            (&multi, multi_shared),
-            (&multi_swiglu, multi_shared),
+            (&variant.function, shared),
+            (&variant.multi, multi_shared),
+            (&variant.multi_swiglu, multi_shared),
         ] {
             if bytes > STATIC_SHARED_LIMIT {
                 f.set_attribute(
@@ -236,20 +241,51 @@ impl QtipKernel {
                 .map_err(failure)?;
             }
         }
+        Ok(variant)
+    }
+}
+
+impl QtipKernel {
+    /// Compiles the fused kernels (L = 12) for each trellis width K that
+    /// `tensors` use (QTIP3: K = 3, QTIP2: K = 2).
+    pub(super) fn load<'a>(
+        context: &Arc<CudaContext>,
+        architecture: (i32, i32),
+        cache_dir: Option<&Path>,
+        tensors: impl Iterator<Item = &'a DeviceTensor>,
+    ) -> Result<Self> {
+        let tensors: Vec<&DeviceTensor> = tensors.filter(|t| t.qtip.is_some()).collect();
+        let mut variants = [None, None];
+        for symbol_bits in [2u32, 3] {
+            let used: Vec<&DeviceTensor> = tensors
+                .iter()
+                .copied()
+                .filter(|t| qtip_symbol_bits(t.kind as u32) == Some(symbol_bits))
+                .collect();
+            if !used.is_empty() {
+                variants[symbol_bits as usize - 2] = Some(Variant::load(
+                    context,
+                    architecture,
+                    cache_dir,
+                    symbol_bits,
+                    &used,
+                )?);
+            }
+        }
         Ok(Self {
-            function,
-            multi,
-            multi_swiglu,
-            rotate_input,
-            rotate_output,
-            product,
+            variants,
             rotated_input: None,
             partial_output: None,
-            rotate_input_i8,
-            product_i8,
             quantized_input: None,
             input_scales: None,
         })
+    }
+
+    /// The kernels for a QTIP tensor type.
+    fn variant(variants: &[Option<Variant>; 2], kind: i32) -> Result<&Variant> {
+        qtip_symbol_bits(kind as u32)
+            .and_then(|k| variants[k as usize - 2].as_ref())
+            .ok_or_else(|| invalid("no QTIP kernels for this tensor type"))
     }
 
     /// `outputs[i][..rows_i] = W_i x` for up to three QTIP3 tensors of the same
@@ -283,8 +319,8 @@ impl QtipKernel {
             let q = t
                 .qtip
                 .as_ref()
-                .filter(|_| t.kind == QTIP3_KIND as i32 && t.width as usize == cols)
-                .ok_or_else(|| invalid("multi launch needs QTIP3 tensors of one width"))?;
+                .filter(|_| t.kind == tensors[0].kind && t.width as usize == cols)
+                .ok_or_else(|| invalid("multi launch needs QTIP tensors of one type and width"))?;
             let rows = t.rows as usize;
             if y.len() < rows {
                 return Err(invalid("QTIP3 multi output is too small"));
@@ -332,10 +368,11 @@ impl QtipKernel {
         };
         let (x, x_up) = (pointer(x, stream), x_up.map_or(0, |u| pointer(u, stream)));
         let cols = cols as i32;
+        let variant = Self::variant(&self.variants, tensors[0].kind)?;
         let function = if x_up != 0 {
-            &self.multi_swiglu
+            &variant.multi_swiglu
         } else {
-            &self.multi
+            &variant.multi
         };
         let tiles = m.map(|m| m.tiles);
         let col_signs = m.map(|m| m.col_signs);
@@ -383,7 +420,8 @@ impl QtipKernel {
         let q = tensor
             .qtip
             .as_ref()
-            .ok_or_else(|| invalid("QTIP3 matmul needs a QTIP3 tensor"))?;
+            .ok_or_else(|| invalid("QTIP matmul needs a QTIP tensor"))?;
+        let variant = Self::variant(&self.variants, tensor.kind)?;
         let (rows, cols) = (tensor.rows as usize, tensor.width as usize);
         let (warps, block_tokens) = if fast {
             (MATMUL_I8_WARPS, MATMUL_I8_TOKENS)
@@ -424,7 +462,7 @@ impl QtipKernel {
         let output_scale = if fast {
             let quantized = grown(&mut self.quantized_input, tokens * cols, stream)?;
             let scales = grown(&mut self.input_scales, tokens, stream)?;
-            let mut args = stream.launch_builder(&self.rotate_input_i8);
+            let mut args = stream.launch_builder(&variant.rotate_input_i8);
             args.arg(x)
                 .arg(&col_signs)
                 .arg(&mut *quantized)
@@ -436,7 +474,7 @@ impl QtipKernel {
                 shared_mem_bytes: 0,
             };
             unsafe { args.launch(config) }.map_err(failure)?;
-            let mut args = stream.launch_builder(&self.product_i8);
+            let mut args = stream.launch_builder(&variant.product_i8);
             args.arg(&tensor.bytes).arg(&*quantized).arg(&*scales);
             args.arg(&mut *partial).arg(&cols_i).arg(&rows_i);
             args.arg(&tokens_i).arg(&split_tiles_i);
@@ -444,10 +482,10 @@ impl QtipKernel {
             q.scale
         } else {
             let rotated = grown(&mut self.rotated_input, tokens * cols, stream)?;
-            let mut args = stream.launch_builder(&self.rotate_input);
+            let mut args = stream.launch_builder(&variant.rotate_input);
             args.arg(x).arg(&col_signs).arg(&mut *rotated).arg(&cols_i);
             unsafe { args.launch(rotate_config(cols, tokens)) }.map_err(failure)?;
-            let mut args = stream.launch_builder(&self.product);
+            let mut args = stream.launch_builder(&variant.product);
             args.arg(&tensor.bytes).arg(&*rotated).arg(&mut *partial);
             args.arg(&cols_i)
                 .arg(&rows_i)
@@ -457,7 +495,7 @@ impl QtipKernel {
             // X' was divided by 16 to stay well inside the FP16 range.
             q.scale * 16.0
         };
-        let mut args = stream.launch_builder(&self.rotate_output);
+        let mut args = stream.launch_builder(&variant.rotate_output);
         args.arg(&*partial).arg(&q.signs).arg(y).arg(&rows_i);
         args.arg(&output_scale).arg(&splits_i).arg(&tokens_i);
         // Row signs are the first `rows` values of q.signs.
@@ -476,8 +514,8 @@ impl QtipKernel {
         let q = t
             .qtip
             .as_ref()
-            .filter(|_| t.kind == QTIP3_KIND as i32)
-            .ok_or_else(|| invalid("not a QTIP3 tensor"))?;
+            .ok_or_else(|| invalid("not a QTIP tensor"))?;
+        let variant = Self::variant(&self.variants, t.kind)?;
         let (rows, cols) = (t.rows as usize, t.width as usize);
         if x.len() < cols || y.len() < rows {
             return Err(invalid("QTIP3 matvec buffers are too small"));
@@ -492,7 +530,7 @@ impl QtipKernel {
             block_dim: (THREADS, 1, 1),
             shared_mem_bytes: q.shared_bytes,
         };
-        let mut args = stream.launch_builder(&self.function);
+        let mut args = stream.launch_builder(&variant.function);
         args.arg(&t.bytes)
             .arg(x)
             .arg(&col_signs)
@@ -512,9 +550,10 @@ impl QtipKernel {
 mod tests {
     use super::*;
 
-    /// A QTIP3 tensor of random trellis words (every bitstream decodes) and
-    /// signs, with its companion, as `gguf` folds it.
+    /// A QTIP tensor of `kind` with random trellis words (every bitstream
+    /// decodes) and signs, with its companion, as `gguf` folds it.
     fn random_tensor(
+        kind: u32,
         cols: usize,
         rows: usize,
         seed: u64,
@@ -528,17 +567,14 @@ mod tests {
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             z ^ (z >> 31)
         };
-        let tiles = rows * cols / (TILE * TILE) * QTIP3_TILE_BYTES;
+        let tiles = rows * cols / (TILE * TILE) * qtip_tile_bytes(kind).expect("a QTIP kind");
         let mut bytes: Vec<u8> = (0..tiles).map(|_| next() as u8).collect();
         let sign = |v: u64| if v & 1 == 0 { 1.0f32 } else { -1.0 };
         let companion = std::iter::once(0.02f32).chain((0..rows + cols).map(|_| sign(next())));
         bytes.extend(companion.flat_map(f32::to_le_bytes));
         let tensor = crate::gguf::Tensor {
             dims: vec![cols, rows],
-            storage: crate::gguf::Storage::Packed {
-                kind: QTIP3_KIND,
-                bytes,
-            },
+            storage: crate::gguf::Storage::Packed { kind, bytes },
             accelerated: true,
             block_elements: 256,
         };
@@ -558,11 +594,17 @@ mod tests {
             .map_err(failure)?;
         // q/k/v, gate and down shapes, then Llama 3.1 8B ffn_down (56 chunks,
         // not a power of two); 130 tokens cross a 128-token block.
+        // Every shape as QTIP3, then as QTIP2 (one kernel variant each).
         let shapes = [(2048, 512), (2048, 8192), (8192, 2048), (14336, 4096)];
+        let kinds = [crate::gguf::QTIP3_KIND, crate::gguf::QTIP2_KIND];
+        let shapes: Vec<(usize, usize)> = kinds.iter().flat_map(|_| shapes).collect();
         let tensors: Vec<DeviceTensor> = shapes
             .iter()
             .enumerate()
-            .map(|(i, &(c, r))| random_tensor(c, r, i as u64 + 1, &stream))
+            .map(|(i, &(c, r))| {
+                let kind = kinds[i / (shapes.len() / kinds.len())];
+                random_tensor(kind, c, r, i as u64 + 1, &stream)
+            })
             .collect();
         let mut kernel = QtipKernel::load(&context, (major, minor), None, tensors.iter())?;
         // Exact path, then int8-fast (looser bound).

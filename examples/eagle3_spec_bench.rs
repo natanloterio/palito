@@ -45,6 +45,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         /// Hybrid SuffixDecoding (fast-path) + EAGLE-3 (fallback) for maximum tok/s.
         #[arg(long)]
         hybrid: bool,
+        /// Optional PLT1 (.palito) HYB Q=5 projection overlay.
+        #[arg(long)]
+        plt1: Option<PathBuf>,
     }
 
     let args = Args::parse();
@@ -65,6 +68,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         },
     )?;
+    #[cfg(feature = "qtip-research")]
+    if let Some(plt1_path) = &args.plt1 {
+        backend.load_plt1_projections(plt1_path)?;
+        println!("Loaded PLT1 HYB Q=5 overlay: {}", plt1_path.display());
+    }
 
     let prompts = [
         (

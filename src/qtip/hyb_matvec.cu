@@ -716,3 +716,45 @@ extern "C" __global__ void __launch_bounds__(512)
 hyb_small_k_multi_swiglu(HYB_SMALL_K_MULTI_PARAMS) {
     hyb_small_k_multi_body<true>(HYB_SMALL_K_MULTI_ARGS);
 }
+
+// Once-per-step residual-stream R_1 rotation enter: x <- (H_256 * S_res / 16) * x.
+// Grid: (cols / 256, tokens, 1), Block: 32 threads (1 warp per 256-chunk).
+extern "C" __global__ void hyb_r1_enter(float* __restrict__ x,
+                                        const float* __restrict__ r1_signs,
+                                        int cols) {
+    const int lane = threadIdx.x & 31;
+    const int c = blockIdx.x * HYB_CHUNK;
+    float* xt = x + (size_t)blockIdx.y * cols + c;
+    float v[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const int idx = lane + 32 * e;
+        v[e] = xt[idx] * __ldg(r1_signs + c + idx);
+    }
+    hyb_fwht256_warp(v);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        xt[lane + 32 * e] = v[e] * (1.0f / 16.0f);
+    }
+}
+
+// Once-per-step residual-stream R_1 rotation exit: x <- S_res * (H_256 / 16) * x.
+// Grid: (cols / 256, tokens, 1), Block: 32 threads (1 warp per 256-chunk).
+extern "C" __global__ void hyb_r1_exit(float* __restrict__ x,
+                                       const float* __restrict__ r1_signs,
+                                       int cols) {
+    const int lane = threadIdx.x & 31;
+    const int c = blockIdx.x * HYB_CHUNK;
+    float* xt = x + (size_t)blockIdx.y * cols + c;
+    float v[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        v[e] = xt[lane + 32 * e];
+    }
+    hyb_fwht256_warp(v);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const int idx = lane + 32 * e;
+        xt[idx] = v[e] * __ldg(r1_signs + c + idx) * (1.0f / 16.0f);
+    }
+}

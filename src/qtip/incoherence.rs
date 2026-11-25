@@ -101,6 +101,25 @@ impl Incoherence {
     }
 
     /// `S_r` as `+-1` values.
+    /// Constructs an `Incoherence` transform with explicit `row_signs` and `col_signs`
+    /// (used by PLT1 offline residual-stream R_1 folding so all residual projections
+    /// share the exact same `S_res` sign diagonal).
+    pub fn with_signs(
+        rows: usize,
+        cols: usize,
+        row_signs: Vec<f32>,
+        col_signs: Vec<f32>,
+        block: Option<usize>,
+    ) -> Result<Self> {
+        let mut base = Self::with_block(rows, cols, 0, block)?;
+        if row_signs.len() != rows || col_signs.len() != cols {
+            return Err(Error::Invalid("incoherence sign vector length mismatch".into()));
+        }
+        base.row_signs = row_signs;
+        base.col_signs = col_signs;
+        Ok(base)
+    }
+
     pub fn row_signs(&self) -> &[f32] {
         &self.row_signs
     }

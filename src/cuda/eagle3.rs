@@ -61,6 +61,7 @@ pub(super) struct Eagle3State {
     gate: CudaSlice<f32>,
     up: CudaSlice<f32>,
     draft_logits: CudaSlice<f32>,
+    batch_toks: CudaSlice<i32>,
 }
 
 fn read_bytes(file: &mut File, offset: u64, size: u64) -> Result<Vec<u8>> {
@@ -200,6 +201,7 @@ impl CudaBackend {
             gate: alloc(8 * inter)?,
             up: alloc(8 * inter)?,
             draft_logits: alloc(draft_vocab)?,
+            batch_toks: self.stream.alloc_zeros::<i32>(8).map_err(failure)?,
         });
         Ok(())
     }
@@ -874,16 +876,18 @@ impl CudaBackend {
         let count_i = (start_pos + 1) as i32;
         let neox = 1i32;
 
-        // 1. Embeddings for all `n` tokens via prefill_embedding.
-        let d_toks = self.stream.clone_htod(tokens).map_err(failure)?;
+        // 1. Embeddings for all `n` tokens via prefill_embedding (reusing pre-allocated batch_toks).
         {
             let e = self.eagle3.as_mut().unwrap();
+            self.stream
+                .memcpy_htod(tokens, &mut e.batch_toks.slice_mut(0..n))
+                .map_err(failure)?;
             let emb_w = &self.weights.embedding;
             let func = self.functions["prefill_embedding"].clone();
             let mut b = self.stream.launch_builder(&func);
             b.arg(&emb_w.bytes)
                 .arg(&emb_w.kind)
-                .arg(&d_toks)
+                .arg(&e.batch_toks)
                 .arg(&mut e.emb)
                 .arg(&width_i);
             unsafe {

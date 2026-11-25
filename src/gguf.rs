@@ -226,13 +226,34 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// QTIP3 research tensor (feature `qtip-research`): 16 x 16 trellis tiles
-/// (L = 12, K = 3, 25 words each, layout in qtip::packed) in row-group order,
+/// QTIP research tensors (feature `qtip-research`): 16 x 16 trellis tiles
+/// (L = 12, K = 3 for QTIP3 with 25 words each, K = 2 for QTIP2 with 17;
+/// layout in qtip::packed) in row-group order,
 /// for a rotated matrix with 256-blocks of Hadamard on both sides. Its bytes
 /// are followed in memory by its companion `<name>.qtip` F32 vector
 /// `[sigma, row signs.., column signs..]`, which `parse` folds into it.
 pub(crate) const QTIP3_KIND: u32 = 200;
 pub(crate) const QTIP3_TILE_BYTES: usize = 100;
+pub(crate) const QTIP2_KIND: u32 = 201;
+pub(crate) const QTIP2_TILE_BYTES: usize = 68;
+
+/// Trellis bits per weight (K) of a QTIP tensor type, or None for others.
+pub(crate) fn qtip_symbol_bits(kind: u32) -> Option<u32> {
+    match kind {
+        QTIP3_KIND => Some(3),
+        QTIP2_KIND => Some(2),
+        _ => None,
+    }
+}
+
+/// Bytes per 16 x 16 tile of a QTIP tensor type.
+pub(crate) fn qtip_tile_bytes(kind: u32) -> Option<usize> {
+    match kind {
+        QTIP3_KIND => Some(QTIP3_TILE_BYTES),
+        QTIP2_KIND => Some(QTIP2_TILE_BYTES),
+        _ => None,
+    }
+}
 /// Suffix of the companion vector of a QTIP3 tensor.
 pub(crate) const QTIP3_COMPANION: &str = ".qtip";
 
@@ -260,6 +281,7 @@ fn qtip3_allowed(name: &str) -> bool {
 pub(crate) fn layout(kind: u32) -> Result<(usize, usize, &'static str)> {
     match kind {
         QTIP3_KIND if cfg!(feature = "qtip-research") => Ok((256, QTIP3_TILE_BYTES, "QTIP3")),
+        QTIP2_KIND if cfg!(feature = "qtip-research") => Ok((256, QTIP2_TILE_BYTES, "QTIP2")),
         0 => Ok((1, 4, "F32")),
         1 => Ok((1, 2, "F16")),
         2 => Ok((32, 18, "Q4_0")),
@@ -284,7 +306,7 @@ pub(crate) fn half(bytes: &[u8], offset: usize) -> f32 {
 }
 
 fn finite_packed(kind: u32, bytes: &[u8]) -> bool {
-    if kind == QTIP3_KIND {
+    if qtip_symbol_bits(kind).is_some() {
         // Trellis bits only; the scale is checked with the companion vector.
         return true;
     }
@@ -445,10 +467,7 @@ fn fold_qtip3_companions(tensors: &mut HashMap<String, Tensor>) -> Result<()> {
         .filter(|(_, t)| {
             matches!(
                 t.storage,
-                Storage::Packed {
-                    kind: QTIP3_KIND,
-                    ..
-                }
+                Storage::Packed { kind, .. } if qtip_symbol_bits(kind).is_some()
             )
         })
         .map(|(name, _)| name.clone())
@@ -612,15 +631,12 @@ pub(crate) fn write_gguf(
 }
 
 impl Gguf {
-    /// Whether any tensor is QTIP3, which only the CUDA backend executes.
+    /// Whether any tensor is QTIP3 or QTIP2, which only the CUDA backend executes.
     pub fn has_qtip3(&self) -> bool {
         self.tensors.values().any(|t| {
             matches!(
                 t.storage,
-                Storage::Packed {
-                    kind: QTIP3_KIND,
-                    ..
-                }
+                Storage::Packed { kind, .. } if qtip_symbol_bits(kind).is_some()
             )
         })
     }
@@ -726,11 +742,11 @@ impl Gguf {
             if dims[0] % block != 0 || offset % alignment != 0 {
                 return Err(invalid("unaligned tensor or quantization block"));
             }
-            if kind == QTIP3_KIND
+            if qtip_symbol_bits(kind).is_some()
                 && (expand || dims.len() != 2 || dims[1] % 256 != 0 || !qtip3_allowed(&name))
             {
                 return Err(invalid(format!(
-                    "{name}: QTIP3 needs a 256-aligned projection matrix and packed weights"
+                    "{name}: QTIP needs a 256-aligned projection matrix and packed weights"
                 )));
             }
             let length = (elements / block)
@@ -894,16 +910,21 @@ mod tests {
 
     #[cfg(feature = "qtip-research")]
     fn qtip3_file(name: &str, companion: &[f32]) -> Result<Gguf> {
+        qtip_file(name, companion, QTIP3_KIND)
+    }
+
+    #[cfg(feature = "qtip-research")]
+    fn qtip_file(name: &str, companion: &[f32], kind: u32) -> Result<Gguf> {
         let empty = Directory {
             metadata_count: 0,
             metadata: 24..24,
             alignment: 32,
             tensors: Vec::new(),
         };
-        let tiles = vec![7u8; 256 * 512 / 256 * QTIP3_TILE_BYTES];
+        let tiles = vec![7u8; 256 * 512 / 256 * qtip_tile_bytes(kind).expect("a QTIP kind")];
         let companion: Vec<u8> = companion.iter().flat_map(|v| v.to_le_bytes()).collect();
         let path = std::env::temp_dir().join(format!(
-            "li-qtip3-{}-{}.gguf",
+            "li-qtip{kind}-{}-{}.gguf",
             std::process::id(),
             name.len() + companion.len()
         ));
@@ -913,7 +934,7 @@ mod tests {
             &[0; 24],
             &empty,
             &[
-                (name.into(), vec![256, 512], QTIP3_KIND, &tiles),
+                (name.into(), vec![256, 512], kind, &tiles),
                 (
                     format!("{name}{QTIP3_COMPANION}"),
                     vec![companion.len() / 4],
@@ -953,6 +974,23 @@ mod tests {
         bad[0] = f32::NAN;
         assert!(qtip3_file("blk.0.attn_q.weight", &bad).is_err());
         assert!(qtip3_file("token_embd.weight", &companion).is_err());
+    }
+
+    #[cfg(feature = "qtip-research")]
+    #[test]
+    fn qtip2_uses_17_word_tiles_and_the_same_companion() {
+        let mut companion = vec![0.5f32];
+        companion.extend((0..512 + 256).map(|i| if i % 3 == 0 { -1.0 } else { 1.0 }));
+        let model = qtip_file("blk.0.ffn_up.weight", &companion, QTIP2_KIND).unwrap();
+        assert!(model.has_qtip3());
+        let Storage::Packed { kind, bytes } = &model.tensors["blk.0.ffn_up.weight"].storage else {
+            panic!("QTIP2 stays packed");
+        };
+        assert_eq!(*kind, QTIP2_KIND);
+        assert_eq!(QTIP2_TILE_BYTES, 4 * crate::qtip::packed::tile_words(12, 2));
+        assert_eq!(QTIP3_TILE_BYTES, 4 * crate::qtip::packed::tile_words(12, 3));
+        assert_eq!(bytes.len(), 512 * QTIP2_TILE_BYTES + 4 * companion.len());
+        assert!(qtip_file("token_embd.weight", &companion, QTIP2_KIND).is_err());
     }
 
     #[test]

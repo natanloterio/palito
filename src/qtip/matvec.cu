@@ -479,10 +479,11 @@ extern "C" __global__ void __launch_bounds__(512) qtip_matvec_multi_swiglu(QTIP_
     qtip_multi_body<true>(QTIP_MULTI_ARGS);
 }
 
-// Fused small-batch (2 <= tokens <= 8) QTIP Tensor-Core verification kernel:
-// 1 single launch per projection (12 KB static SMEM => 100% occupancy on SM_120),
+// Fused small-batch (2 <= tokens <= 16) QTIP Tensor-Core verification kernel:
+// 1 single launch per projection (24 KB static SMEM => 100% occupancy on SM_120),
 // fused input+output 256-block FWHT, and direct register-to-Tensor-Core
-// mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 (1 MMA computes all 8 tokens!).
+// mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 (1 MMA for <=8 tokens,
+// 2 MMAs reusing the exact same decoded weights for 9..=16 tokens!).
 // Grid: (rows / 256, splits), Block: 512 threads (16 warps).
 // `chunks_per_split` is in 256-column chunks (16 tiles per chunk).
 // `y` must be zeroed before launch (atomicAdd across splits).
@@ -497,8 +498,8 @@ qtip_matvec_small_k(const unsigned* __restrict__ tiles,
                     int tokens,
                     int chunks_per_split,
                     float scale) {
-    __shared__ unsigned xs_h2[8][QTIP_CHUNK / 2]; // 4 KB: 128 half2 per token
-    __shared__ float partial[8][QTIP_CHUNK];      // 8 KB: scratch + output partial
+    __shared__ unsigned xs_h2[16][QTIP_CHUNK / 2]; // 8 KB: 128 half2 per token
+    __shared__ float partial[16][QTIP_CHUNK];      // 16 KB: scratch + output partial
 
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x & 31;
@@ -512,7 +513,6 @@ qtip_matvec_small_k(const unsigned* __restrict__ tiles,
     const int group = blockIdx.x * QTIP_FUSED_WARPS + warp;
     const unsigned* base = tiles + (size_t)group * col_tiles * QTIP_WORDS;
 
-    // Precompute the 4 (hi_word, lo_word, shift) tuples for this lane's MMA A-fragment pairs.
     const int t_idx[4] = {
         group_id * QTIP_TILE + 2 * tid,
         (group_id + 8) * QTIP_TILE + 2 * tid,
@@ -529,10 +529,12 @@ qtip_matvec_small_k(const unsigned* __restrict__ tiles,
     }
 
     float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+    float e0 = 0.0f, e1 = 0.0f, e2 = 0.0f, e3 = 0.0f;
+    const bool has_hi = tokens > 8;
 
     for (int ch = ch0; ch < ch1; ++ch) {
         const int c = ch * QTIP_CHUNK;
-        // One warp per token rotates this 256-column chunk in parallel and packs to half2.
+        // One warp per token (all 16 warps in parallel for up to 16 tokens!).
         if (warp < tokens) {
             float v[8], sign[8];
             const float* xt = x + (size_t)warp * cols + c;
@@ -594,6 +596,16 @@ qtip_matvec_small_k(const unsigned* __restrict__ tiles,
                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
                     : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                if (has_hi) {
+                    const int g_hi = 8 + group_id;
+                    const unsigned b2 = (g_hi < tokens) ? xs_h2[g_hi][xoff] : 0u;
+                    const unsigned b3 = (g_hi < tokens) ? xs_h2[g_hi][xoff + 4] : 0u;
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                        : "+f"(e0), "+f"(e1), "+f"(e2), "+f"(e3)
+                        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b2), "r"(b3));
+                }
             }
         }
         __syncthreads();
@@ -609,9 +621,18 @@ qtip_matvec_small_k(const unsigned* __restrict__ tiles,
         partial[tok1][warp * QTIP_TILE + group_id] = d1;
         partial[tok1][warp * QTIP_TILE + group_id + 8] = d3;
     }
+    if (has_hi) {
+        if (8 + tok0 < tokens) {
+            partial[8 + tok0][warp * QTIP_TILE + group_id] = e0;
+            partial[8 + tok0][warp * QTIP_TILE + group_id + 8] = e2;
+        }
+        if (8 + tok1 < tokens) {
+            partial[8 + tok1][warp * QTIP_TILE + group_id] = e1;
+            partial[8 + tok1][warp * QTIP_TILE + group_id + 8] = e3;
+        }
+    }
     __syncthreads();
 
-    // One warp per token rotates the 256-row output chunk in parallel.
     if (warp < tokens) {
         float v[8];
 #pragma unroll

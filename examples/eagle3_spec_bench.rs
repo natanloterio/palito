@@ -36,6 +36,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         /// Draft chain length per cycle (1..=7; total verified = 1 root + draft_len <= 8).
         #[arg(long, default_value_t = 5)]
         draft_len: usize,
+        /// Use 16-node branching draft tree (depth 6, top-3/top-2) with bitmask tree attention.
+        #[arg(long)]
+        tree: bool,
+        /// Use compact 8-node branching draft tree (depth 5, top-2, 5 EAGLE-3 steps).
+        #[arg(long)]
+        tree8: bool,
+        /// Hybrid SuffixDecoding (fast-path) + EAGLE-3 (fallback) for maximum tok/s.
+        #[arg(long)]
+        hybrid: bool,
     }
 
     let args = Args::parse();
@@ -100,12 +109,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let base_tps = base_tokens.len() as f64 / base_secs;
         let run_eagle = |b: &mut CudaBackend| -> Result<(Vec<i32>, f64, usize), palito::Error> {
             b.reset()?;
+            let mut suffix = palito::speculative::SuffixDrafter::new(8);
+            suffix.push_tokens(&prompt.iter().map(|&t| t as u32).collect::<Vec<_>>());
             b.evaluate_for_sampling(&prompt, 0)?;
             let prompt_len = prompt.len();
             let mut pos = prompt_len as u32;
             let mut out = Vec::with_capacity(args.tokens);
+
             let first = b.sample_greedy()?;
             out.push(first);
+            suffix.push_tokens(&[first as u32]);
             let mut root = first;
 
             // Prompt-phase EAGLE-3 KV cache initialization (part of prefill, before decode timer).
@@ -119,18 +132,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             while out.len() < args.tokens && !b.is_eog(root) {
                 let remaining = args.tokens - out.len();
-                let k = draft_len.min(remaining);
                 steps += 1;
 
-                let draft = b.eagle3_draft_chain(next_draft, eagle_pos, k)?;
-                let tree = SpecTree::from_chain(
-                    root as u32,
-                    &draft.iter().map(|&t| t as u32).collect::<Vec<_>>(),
-                );
-                let chain_i32: Vec<i32> = tree.tokens.iter().map(|&t| t as i32).collect();
-                let target_i32 = b.verify_chain_greedy(&chain_i32, pos)?;
+                let suffix_draft = if args.hybrid {
+                    suffix.draft(7.min(remaining))
+                } else {
+                    Vec::new()
+                };
+                let use_tree = (args.tree || args.tree8) && suffix_draft.len() < 3;
+                let (tree, target_i32) = if suffix_draft.len() >= 3 {
+                    let t = SpecTree::from_chain(root as u32, &suffix_draft);
+                    let chain_i32: Vec<i32> = t.tokens.iter().map(|&tok| tok as i32).collect();
+                    let tgt = b.verify_chain_greedy(&chain_i32, pos)?;
+                    (t, tgt)
+                } else if args.tree8 {
+                    let t = b.eagle3_draft_tree_8(root, eagle_pos)?;
+                    let tgt = b.verify_tree_greedy(&t, pos)?;
+                    (t, tgt)
+                } else if args.tree {
+                    let t = b.eagle3_draft_tree(root, eagle_pos)?;
+                    let tgt = b.verify_tree_greedy(&t, pos)?;
+                    (t, tgt)
+                } else {
+                    let k = draft_len.min(remaining);
+                    let draft = b.eagle3_draft_chain(next_draft, eagle_pos, k)?;
+                    let t = SpecTree::from_chain(
+                        root as u32,
+                        &draft.iter().map(|&tok| tok as u32).collect::<Vec<_>>(),
+                    );
+                    let chain_i32: Vec<i32> = t.tokens.iter().map(|&tok| tok as i32).collect();
+                    let tgt = b.verify_chain_greedy(&chain_i32, pos)?;
+                    (t, tgt)
+                };
                 let target_u32: Vec<u32> = target_i32.iter().map(|&t| t as u32).collect();
-                let (accepted_u32, _) = tree.verify_greedy(&target_u32);
+                let (accepted_u32, path_nodes) = tree.verify_greedy(&target_u32);
 
                 let mut accepted_i32 = Vec::with_capacity(accepted_u32.len());
                 let mut hit_eog = false;
@@ -140,6 +175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let tok = tok_u32 as i32;
                     out.push(tok);
+                    suffix.push_tokens(&[tok_u32]);
                     accepted_i32.push(tok);
                     root = tok;
                     if b.is_eog(tok) {
@@ -148,8 +184,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 let pushed = accepted_i32.len();
+                if use_tree {
+                    b.compact_tree_kv(pos, &path_nodes[..pushed])?;
+                } else {
+                    b.rewind_to(pos + pushed as u32)?;
+                }
                 pos += pushed as u32;
-                b.rewind_to(pos)?;
                 if hit_eog || out.len() >= args.tokens {
                     break;
                 }

@@ -440,9 +440,9 @@ impl QtipKernel {
         if x.len() < tokens * cols || y.len() < tokens * rows {
             return Err(invalid("QTIP3 matmul buffers are too small"));
         }
-        // Small-batch (k <= 8, e.g. speculative verification): use the 1-launch
-        // fused multi-vector kernel instead of the 3-launch 128-token MMA path.
-        if (2..=8).contains(&tokens) && rows.is_multiple_of(CHUNK) {
+        // Small-batch (k <= 16, e.g. speculative tree verification): use the 1-launch
+        // fused multi-vector Tensor-Core kernel instead of the 3-launch 128-token MMA path.
+        if (2..=16).contains(&tokens) && rows.is_multiple_of(CHUNK) {
             let mut y_slice = y.slice_mut(0..tokens * rows);
             stream.memset_zeros(&mut y_slice).map_err(failure)?;
             let row_blocks = rows / CHUNK;

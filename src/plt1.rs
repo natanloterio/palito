@@ -73,6 +73,7 @@ pub enum Codec {
     F16 = 0,
     Q8_0 = 1,
     Q6K = 2,
+    Q4K = 3,
     /// QTIP HYB (`L=16, V=2`) with warp-register `Q=5` LUT (0 KB SMEM) & circular tiles.
     QtipHybQ5 = 10,
     /// QTIP HYB (`L=16, V=2`) with bank-replicated SMEM LUT (`Q=6..9`).
@@ -89,6 +90,7 @@ impl Codec {
             0 => Ok(Self::F16),
             1 => Ok(Self::Q8_0),
             2 => Ok(Self::Q6K),
+            3 => Ok(Self::Q4K),
             10 => Ok(Self::QtipHybQ5),
             11 => Ok(Self::QtipHybSmem),
             20 => Ok(Self::NvFp4Blk16),

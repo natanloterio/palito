@@ -48,6 +48,8 @@ pub(super) struct Eagle3State {
     // Scratch buffers
     fc_in: CudaSlice<f32>,
     g: CudaSlice<f32>,
+    g_save0: CudaSlice<f32>,
+    g_save1: CudaSlice<f32>,
     emb: CudaSlice<f32>,
     inp_cat: CudaSlice<f32>,
     q: CudaSlice<f32>,
@@ -98,7 +100,7 @@ impl CudaBackend {
             .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
             .collect();
 
-        let load_q8 = |file: &mut File, name: &str| -> Result<DeviceTensor> {
+        let load_proj = |file: &mut File, name: &str| -> Result<DeviceTensor> {
             let desc = index
                 .tensors
                 .iter()
@@ -106,9 +108,15 @@ impl CudaBackend {
                 .ok_or_else(|| invalid(format!("missing EAGLE-3 tensor {name}")))?;
             let raw = read_bytes(file, desc.data_offset, desc.data_size)?;
             let bytes = self.stream.clone_htod(&raw).map_err(failure)?;
+            let kind = match desc.codec {
+                crate::plt1::Codec::Q8_0 => 8,
+                crate::plt1::Codec::Q6K => 14,
+                crate::plt1::Codec::Q4K => 12,
+                _ => 8,
+            };
             Ok(DeviceTensor {
                 bytes,
-                kind: 8, // Q8_0
+                kind,
                 width: desc.cols as i32,
                 rows: desc.rows as i32,
                 #[cfg(feature = "qtip-research")]
@@ -125,15 +133,15 @@ impl CudaBackend {
             self.stream.clone_htod(&raw).map_err(failure)
         };
 
-        let fc = load_q8(&mut file, "fc.weight")?;
-        let q_proj = load_q8(&mut file, "midlayer.self_attn.q_proj.weight")?;
-        let k_proj = load_q8(&mut file, "midlayer.self_attn.k_proj.weight")?;
-        let v_proj = load_q8(&mut file, "midlayer.self_attn.v_proj.weight")?;
-        let o_proj = load_q8(&mut file, "midlayer.self_attn.o_proj.weight")?;
-        let gate_proj = load_q8(&mut file, "midlayer.mlp.gate_proj.weight")?;
-        let up_proj = load_q8(&mut file, "midlayer.mlp.up_proj.weight")?;
-        let down_proj = load_q8(&mut file, "midlayer.mlp.down_proj.weight")?;
-        let lm_head = load_q8(&mut file, "lm_head.weight")?;
+        let fc = load_proj(&mut file, "fc.weight")?;
+        let q_proj = load_proj(&mut file, "midlayer.self_attn.q_proj.weight")?;
+        let k_proj = load_proj(&mut file, "midlayer.self_attn.k_proj.weight")?;
+        let v_proj = load_proj(&mut file, "midlayer.self_attn.v_proj.weight")?;
+        let o_proj = load_proj(&mut file, "midlayer.self_attn.o_proj.weight")?;
+        let gate_proj = load_proj(&mut file, "midlayer.mlp.gate_proj.weight")?;
+        let up_proj = load_proj(&mut file, "midlayer.mlp.up_proj.weight")?;
+        let down_proj = load_proj(&mut file, "midlayer.mlp.down_proj.weight")?;
+        let lm_head = load_proj(&mut file, "lm_head.weight")?;
 
         let input_layernorm = load_norm(&mut file, "midlayer.input_layernorm.weight")?;
         let hidden_norm = load_norm(&mut file, "midlayer.hidden_norm.weight")?;
@@ -179,6 +187,8 @@ impl CudaBackend {
             values: alloc(context * kv_width)?,
             fc_in: alloc(3 * width)?,
             g: alloc(width)?,
+            g_save0: alloc(width)?,
+            g_save1: alloc(width)?,
             emb: alloc(width)?,
             inp_cat: alloc(2 * width)?,
             q: alloc(width)?,
@@ -600,6 +610,236 @@ impl CudaBackend {
         };
         let offset = self.eagle3.as_ref().unwrap().d2t[draft_id];
         Ok(draft_id as i32 + offset)
+    }
+
+    /// Projects `eagle.g` -> `norm` -> `lm_head (32k)` and returns the top-`k`
+    /// target vocabulary token IDs (`k <= 4`).
+    fn eagle3_sample_topk(&mut self, k: usize) -> Result<Vec<i32>> {
+        let width_i = self.weights.spec.width as i32;
+        let matvec_fn = self.functions["matvec"].clone();
+        let norm_fn = self.functions["normalize"].clone();
+        let matmul = self.matmul;
+        let draft_vocab = self
+            .eagle3
+            .as_ref()
+            .ok_or_else(|| invalid("EAGLE-3 not loaded"))?
+            .draft_vocab;
+
+        {
+            let e = self.eagle3.as_mut().unwrap();
+            let eps = e.eps;
+            let mut nb = self.stream.launch_builder(&norm_fn);
+            nb.arg(&e.g)
+                .arg(&e.norm)
+                .arg(&mut e.norm_buf)
+                .arg(&width_i)
+                .arg(&eps);
+            unsafe {
+                nb.launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(failure)?;
+
+            let zero = 0i32;
+            let mut lb = self.stream.launch_builder(&matvec_fn);
+            lb.arg(&e.lm_head.bytes)
+                .arg(&e.lm_head.kind)
+                .arg(&e.norm_buf)
+                .arg(&mut e.draft_logits)
+                .arg(&e.lm_head.width)
+                .arg(&e.lm_head.rows)
+                .arg(&self.work.ids)
+                .arg(&zero)
+                .arg(&zero);
+            unsafe {
+                lb.launch(cudarc::driver::LaunchConfig {
+                    grid_dim: matvec_grid(
+                        matmul,
+                        e.lm_head.kind,
+                        e.lm_head.rows,
+                        1,
+                        e.lm_head.width,
+                    ),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(failure)?;
+        }
+
+        let e = self.eagle3.as_ref().unwrap();
+        let mut host_logits = vec![0.0f32; draft_vocab];
+        self.stream
+            .memcpy_dtoh(&e.draft_logits, &mut host_logits)
+            .map_err(failure)?;
+        self.stream.synchronize().map_err(failure)?;
+
+        let mut best: Vec<(f32, usize)> = Vec::with_capacity(k + 1);
+        for (idx, &val) in host_logits.iter().enumerate() {
+            if best.len() < k || val > best.last().unwrap().0 {
+                best.push((val, idx));
+                best.sort_by(|a, b| b.0.total_cmp(&a.0));
+                if best.len() > k {
+                    best.pop();
+                }
+            }
+        }
+        Ok(best
+            .into_iter()
+            .map(|(_, idx)| idx as i32 + e.d2t[idx])
+            .collect())
+    }
+
+    /// Generates a 16-node depth-6 EAGLE-3 draft tree rooted at `root` (with
+    /// `eagle.g` already populated by `eagle3_ingest_tapped`), branching top-3
+    /// at depth 1 and top-2 at depth 2 for high acceptance length `tau`.
+    pub fn eagle3_draft_tree(
+        &mut self,
+        root: i32,
+        start_pos: usize,
+    ) -> Result<crate::speculative::SpecTree> {
+        let mut nodes: Vec<(u32, i8)> = Vec::with_capacity(16);
+        nodes.push((root as u32, -1)); // node 0
+
+        // Save root g_0 into g_save0.
+        {
+            let e = self.eagle3.as_mut().unwrap();
+            self.stream
+                .memcpy_dtod(&e.g, &mut e.g_save0)
+                .map_err(failure)?;
+        }
+
+        // Depth 1: top-3 children of root (0 extra midlayer steps!).
+        let top3 = self.eagle3_sample_topk(3)?;
+        let (c0, c1, c2) = (top3[0], top3[1], top3[2]);
+        nodes.push((c0 as u32, 0)); // node 1
+        nodes.push((c1 as u32, 0)); // node 2
+        nodes.push((c2 as u32, 0)); // node 3
+
+        // Branch 1: c0 -> top-2 (nodes 4, 5)
+        self.eagle3_midlayer_step(c0, start_pos)?;
+        {
+            let e = self.eagle3.as_mut().unwrap();
+            self.stream
+                .memcpy_dtod(&e.g, &mut e.g_save1)
+                .map_err(failure)?;
+        }
+        let b1_top2 = self.eagle3_sample_topk(2)?;
+        let (c00, c01) = (b1_top2[0], b1_top2[1]);
+        nodes.push((c00 as u32, 1)); // node 4
+        nodes.push((c01 as u32, 1)); // node 5
+
+        // Extend c00 greedily 4 more steps (depths 3, 4, 5, 6 -> nodes 6, 7, 8, 9).
+        let mut cur_tok = c00;
+        let mut cur_parent = 4i8;
+        for step in 0..4usize {
+            self.eagle3_midlayer_step(cur_tok, start_pos + 1 + step)?;
+            let next = self.eagle3_sample_greedy()?;
+            let idx = nodes.len() as i8;
+            nodes.push((next as u32, cur_parent));
+            cur_tok = next;
+            cur_parent = idx;
+        }
+
+        // Restore g_save1 (after c0 at start_pos) -> extend c01 greedily 2 steps (nodes 10, 11).
+        {
+            let e = self.eagle3.as_mut().unwrap();
+            self.stream
+                .memcpy_dtod(&e.g_save1, &mut e.g)
+                .map_err(failure)?;
+        }
+        cur_tok = c01;
+        cur_parent = 5i8;
+        for step in 0..2usize {
+            self.eagle3_midlayer_step(cur_tok, start_pos + 1 + step)?;
+            let next = self.eagle3_sample_greedy()?;
+            let idx = nodes.len() as i8;
+            nodes.push((next as u32, cur_parent));
+            cur_tok = next;
+            cur_parent = idx;
+        }
+
+        // Branch 2: restore g_save0 -> c1 -> top-2 (nodes 12, 13) + 1 greedy step on c10 (node 14).
+        {
+            let e = self.eagle3.as_mut().unwrap();
+            self.stream
+                .memcpy_dtod(&e.g_save0, &mut e.g)
+                .map_err(failure)?;
+        }
+        self.eagle3_midlayer_step(c1, start_pos)?;
+        let b2_top2 = self.eagle3_sample_topk(2)?;
+        let (c10, c11) = (b2_top2[0], b2_top2[1]);
+        nodes.push((c10 as u32, 2)); // node 12
+        nodes.push((c11 as u32, 2)); // node 13
+        self.eagle3_midlayer_step(c10, start_pos + 1)?;
+        let c100 = self.eagle3_sample_greedy()?;
+        nodes.push((c100 as u32, 12)); // node 14
+
+        // Branch 3: restore g_save0 -> c2 -> top-1 (node 15).
+        {
+            let e = self.eagle3.as_mut().unwrap();
+            self.stream
+                .memcpy_dtod(&e.g_save0, &mut e.g)
+                .map_err(failure)?;
+        }
+        self.eagle3_midlayer_step(c2, start_pos)?;
+        let c20 = self.eagle3_sample_greedy()?;
+        nodes.push((c20 as u32, 3)); // node 15
+
+        Ok(crate::speculative::SpecTree::from_nodes(&nodes))
+    }
+
+    /// Compact 8-node depth-5 EAGLE-3 draft tree (only 5 midlayer steps +
+    /// 1 single `mma.m16n8k16` verify pass on the target model!).
+    /// Topology: root (0) -> top-2 (1, 2); extend 1 greedily to depth 5 (3, 4, 5, 6);
+    /// extend 2 greedily 1 step (7).
+    pub fn eagle3_draft_tree_8(
+        &mut self,
+        root: i32,
+        start_pos: usize,
+    ) -> Result<crate::speculative::SpecTree> {
+        let mut nodes: Vec<(u32, i8)> = Vec::with_capacity(8);
+        nodes.push((root as u32, -1)); // node 0
+
+        {
+            let e = self.eagle3.as_mut().unwrap();
+            self.stream
+                .memcpy_dtod(&e.g, &mut e.g_save0)
+                .map_err(failure)?;
+        }
+
+        let top2 = self.eagle3_sample_topk(2)?;
+        let (c0, c1) = (top2[0], top2[1]);
+        nodes.push((c0 as u32, 0)); // node 1
+        nodes.push((c1 as u32, 0)); // node 2
+
+        // Extend c0 greedily 4 steps (depths 2, 3, 4, 5 -> nodes 3, 4, 5, 6).
+        let mut cur_tok = c0;
+        let mut cur_parent = 1i8;
+        for step in 0..4usize {
+            self.eagle3_midlayer_step(cur_tok, start_pos + step)?;
+            let next = self.eagle3_sample_greedy()?;
+            let idx = nodes.len() as i8;
+            nodes.push((next as u32, cur_parent));
+            cur_tok = next;
+            cur_parent = idx;
+        }
+
+        // Restore g_save0 -> extend c1 1 step (node 7).
+        {
+            let e = self.eagle3.as_mut().unwrap();
+            self.stream
+                .memcpy_dtod(&e.g_save0, &mut e.g)
+                .map_err(failure)?;
+        }
+        self.eagle3_midlayer_step(c1, start_pos)?;
+        let c10 = self.eagle3_sample_greedy()?;
+        nodes.push((c10 as u32, 2)); // node 7
+
+        Ok(crate::speculative::SpecTree::from_nodes(&nodes))
     }
 
     /// Ingests `tokens.len()` accepted tokens paired with the target's tapped

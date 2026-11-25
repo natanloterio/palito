@@ -28,6 +28,7 @@ SEC_EAGLE3_SPEC_HEAD = 7
 
 CODEC_F16 = 0
 CODEC_Q8_0 = 1
+CODEC_Q4_K = 3
 FLAG_HAS_EAGLE3 = 1 << 4
 
 
@@ -52,12 +53,62 @@ def quantize_q8_0(t: torch.Tensor) -> bytes:
     return out.tobytes()
 
 
+def quantize_q4_k(t: torch.Tensor) -> bytes:
+    """Vectorized Q4_K quantization: [rows, cols] -> bytes (144 bytes per 256 weights).
+    Matches Palito's `q4k_wide_block` kernel bit-for-bit."""
+    arr = t.detach().float().numpy()
+    assert arr.ndim == 2 and arr.shape[1] % 256 == 0, f"bad shape {arr.shape}"
+    # Reshape to [num_superblocks, 8 groups, 32 elements]
+    sb = arr.reshape(-1, 8, 32)
+    n_sb = sb.shape[0]
+
+    # Per-group min (as positive offset m = max(0, -min)) and scale s = (max + m) / 15
+    g_min = np.minimum(np.min(sb, axis=2), 0.0)   # <= 0
+    g_max = np.max(sb, axis=2)
+    m_raw = -g_min                                # >= 0, shape [n_sb, 8]
+    s_raw = (g_max - g_min) / 15.0                # >= 0, shape [n_sb, 8]
+
+    # Superblock f16 scales d, dm quantizing s_raw, m_raw into 6-bit [0..63]
+    d = (np.max(s_raw, axis=1, keepdims=True) / 63.0).astype(np.float16)
+    dm = (np.max(m_raw, axis=1, keepdims=True) / 63.0).astype(np.float16)
+    d_f32 = d.astype(np.float32)
+    dm_f32 = dm.astype(np.float32)
+
+    sc = np.clip(np.rint(np.where(d_f32 > 0, s_raw / d_f32, 0.0)), 0, 63).astype(np.uint8)
+    mn = np.clip(np.rint(np.where(dm_f32 > 0, m_raw / dm_f32, 0.0)), 0, 63).astype(np.uint8)
+
+    # Quantize elements using reconstructed ds = d * sc, ms = dm * mn
+    ds = (d_f32 * sc.astype(np.float32))[:, :, None]
+    ms = (dm_f32 * mn.astype(np.float32))[:, :, None]
+    q = np.clip(np.rint(np.where(ds > 0, (sb + ms) / ds, 0.0)), 0, 15).astype(np.uint8)
+
+    out = np.zeros((n_sb, 144), dtype=np.uint8)
+    out[:, 0:2] = d.view(np.uint8).reshape(n_sb, 2)
+    out[:, 2:4] = dm.view(np.uint8).reshape(n_sb, 2)
+
+    # Pack 12 scale bytes matching q4k_wide_block:
+    # bytes 0..4: sc[0..4] | ((sc[4..8] >> 4) << 6)
+    # bytes 4..8: mn[0..4] | ((mn[4..8] >> 4) << 6)
+    # bytes 8..12: (sc[4..8] & 15) | ((mn[4..8] & 15) << 4)
+    out[:, 4:8] = (sc[:, 0:4] & 63) | ((sc[:, 4:8] >> 4) << 6)
+    out[:, 8:12] = (mn[:, 0:4] & 63) | ((mn[:, 4:8] >> 4) << 6)
+    out[:, 12:16] = (sc[:, 4:8] & 15) | ((mn[:, 4:8] & 15) << 4)
+
+    # Pack 128 nibble bytes: 4 pairs of 32 bytes (low=group 2*p, high=group 2*p+1)
+    for pair in range(4):
+        out[:, 16 + pair * 32 : 16 + (pair + 1) * 32] = (
+            (q[:, 2 * pair, :] & 15) | ((q[:, 2 * pair + 1, :] & 15) << 4)
+        )
+    return out.tobytes()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", type=Path, required=True, help="Path to pytorch_model.bin")
     ap.add_argument("--config", type=Path, required=True, help="Path to config.json")
     ap.add_argument("--output", type=Path, required=True, help="Output .palito file")
     ap.add_argument("--tap-layers", type=str, default="2,16,29")
+    ap.add_argument("--quant", type=str, default="q4_k", choices=["q8_0", "q4_k"])
     args = ap.parse_args()
 
     cfg = json.loads(args.config.read_text())
@@ -108,12 +159,13 @@ def main():
     ]
 
     tensor_blobs = []
+    q_fn, q_codec = (quantize_q4_k, CODEC_Q4_K) if args.quant == "q4_k" else (quantize_q8_0, CODEC_Q8_0)
     for name in q8_names:
         t = sd[name]
         rows, cols = int(t.shape[0]), int(t.shape[1])
-        blob = quantize_q8_0(t)
-        tensor_blobs.append((name, rows, cols, CODEC_Q8_0, blob))
-        print(f"  Q8_0 {name:42} {rows:6}x{cols:<6} -> {len(blob)/1e6:6.2f} MB")
+        blob = q_fn(t)
+        tensor_blobs.append((name, rows, cols, q_codec, blob))
+        print(f"  {args.quant.upper():4} {name:42} {rows:6}x{cols:<6} -> {len(blob)/1e6:6.2f} MB")
 
     for name in norm_names:
         t = sd[name].detach().float().numpy()

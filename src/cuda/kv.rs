@@ -77,6 +77,36 @@ pub(super) enum KvBuffer {
 }
 
 impl KvBuffer {
+    /// Copies one KV row (`src_row` -> `dst_row`, `dst_row < src_row`) in-place
+    /// during speculative tree compaction.
+    pub(super) fn copy_row(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        src_row: usize,
+        dst_row: usize,
+        row_width: usize,
+    ) -> Result<()> {
+        if src_row == dst_row {
+            return Ok(());
+        }
+        let src_start = src_row * row_width;
+        let dst_start = dst_row * row_width;
+        match self {
+            Self::F32(buf) => {
+                let (mut left, right) = buf.split_at_mut(src_start);
+                let src = right.slice(0..row_width);
+                let mut dst = left.slice_mut(dst_start..dst_start + row_width);
+                stream.memcpy_dtod(&src, &mut dst).map_err(failure)
+            }
+            Self::F16(buf) => {
+                let (mut left, right) = buf.split_at_mut(src_start);
+                let src = right.slice(0..row_width);
+                let mut dst = left.slice_mut(dst_start..dst_start + row_width);
+                stream.memcpy_dtod(&src, &mut dst).map_err(failure)
+            }
+        }
+    }
+
     pub(super) fn zeros(
         stream: &Arc<CudaStream>,
         elements: usize,

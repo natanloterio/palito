@@ -311,6 +311,26 @@ impl CudaBackend {
         position: usize,
         output_logits: bool,
     ) -> Result<()> {
+        self.batched_prefill_inner(tokens, position, output_logits, None)
+    }
+
+    pub(super) fn batched_prefill_tree(
+        &mut self,
+        tokens: &[i32],
+        position: usize,
+        tree_pos: &CudaSlice<i32>,
+        tree_mask: &CudaSlice<u64>,
+    ) -> Result<()> {
+        self.batched_prefill_inner(tokens, position, false, Some((tree_pos, tree_mask)))
+    }
+
+    fn batched_prefill_inner(
+        &mut self,
+        tokens: &[i32],
+        position: usize,
+        output_logits: bool,
+        tree: Option<(&CudaSlice<i32>, &CudaSlice<u64>)>,
+    ) -> Result<()> {
         let s = &self.weights.spec;
         let n = tokens.len() as i32;
         let (projection, grouped_projection, row_tile, token_tile, group_row_tile) = match self
@@ -602,7 +622,16 @@ impl CudaBackend {
                     continue;
                 }
                 let grid = (((size / 2) as u32).div_ceil(256), n as u32, 1);
-                if s.rotary_dim != s.dim {
+                if let Some((tree_pos, _)) = tree {
+                    if let Some(factors) = &self.weights.rope_factors {
+                        launch!(self, "rotary_factored_tree", grid;
+                            256, values, &size, &dim, tree_pos, &rope_base, &neox, &factors.bytes, &s.rope_attn_factor);
+                    } else {
+                        launch!(
+                            self, "rotary_tree", grid, values, &size, &dim, tree_pos, &rope_base, &neox
+                        );
+                    }
+                } else if s.rotary_dim != s.dim {
                     let rotary_dim = s.rotary_dim as i32;
                     launch!(self, "rotary_partial_neox", grid;
                         256, values, &size, &dim, &pos, &rope_base, &rotary_dim);
@@ -661,7 +690,29 @@ impl CudaBackend {
                 return Err(invalid("prefill score workspace too small for this chunk"));
             }
             // Future KV rows are already written; each query can only see its prefix.
-            if embedding_norm.is_some() {
+            if let Some((_, tree_mask)) = tree {
+                let smem = ((position + tokens.len()) * std::mem::size_of::<f32>()) as u32;
+                let func = self.functions["attention_tree"].clone();
+                let mut b = self.stream.launch_builder(&func);
+                b.arg(&self.work.q)
+                    .arg(&self.keys[index])
+                    .arg(&self.values[index])
+                    .arg(&mut self.work.attended)
+                    .arg(&dim)
+                    .arg(&heads)
+                    .arg(&kv_heads)
+                    .arg(&pos)
+                    .arg(&n)
+                    .arg(tree_mask);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (heads as u32, n as u32, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: smem,
+                    })
+                }
+                .map_err(failure)?;
+            } else if embedding_norm.is_some() {
                 alibi_attention!(self, index, heads, kv_heads, dim, context, count, n);
             } else if let Some((window, _, scale)) = gemma_attention {
                 gemma_attention!(

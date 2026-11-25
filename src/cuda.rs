@@ -933,6 +933,10 @@ pub struct CudaBackend {
     /// Optional PLT1 HYB Q=5 projection overlay (loaded via `load_plt1_projections`).
     #[cfg(feature = "qtip-research")]
     plt1_hyb: Option<plt1::Plt1HybRuntime>,
+    /// Evaluated token history for automatic EAGLE-3 + SuffixDecoding in `sample_decode_tokens`.
+    prompt_history: Vec<i32>,
+    /// Start position of the last evaluated chunk still sitting in `eagle3.tap_hidden`.
+    eagle3_pending_start: usize,
 }
 
 /// Warps sharing one output row in `matvec_packed_rows` (mirrors the device
@@ -1214,14 +1218,6 @@ impl CudaBackend {
             "combine",
             "prefill_matmul",
             "prefill_matmul_8",
-            "matvec_q6k_multi8",
-            "matvec_q6k_multi16",
-            "matvec_q4k_multi8",
-            "greedy_batch_argmax",
-            "eagle3_argmax_d2t",
-            "eagle3_concat3",
-            "eagle3_norm_cat",
-            "residual_unit_norm",
             "rotary_factored_cache_kv_batch",
             "rotary_tree",
             "rotary_factored_tree",
@@ -1245,6 +1241,12 @@ impl CudaBackend {
         }
         if options.matmul.f32_tiled() {
             for name in [
+                "matvec_q6k_multi8",
+                "matvec_q6k_multi16",
+                "matvec_q4k_multi8",
+                "eagle3_concat3",
+                "eagle3_norm_cat",
+                "residual_unit_norm",
                 "group_experts_reg32",
                 "grouped_matmul_reg32x32",
                 "grouped_matmul_reg32_counted",
@@ -1400,6 +1402,8 @@ impl CudaBackend {
                 "gemma_attention_values_decode",
                 "greedy_partials",
                 "greedy_finish",
+                "greedy_batch_argmax",
+                "eagle3_argmax_d2t",
             ] {
                 functions.insert(name, module.load_function(name).map_err(failure)?);
             }
@@ -1586,6 +1590,8 @@ impl CudaBackend {
             eagle3: None,
             #[cfg(feature = "qtip-research")]
             plt1_hyb: None,
+            prompt_history: Vec::new(),
+            eagle3_pending_start: 0,
         };
         #[cfg(feature = "qtip-research")]
         if has_qtip {
@@ -1618,7 +1624,21 @@ impl CudaBackend {
                         && gate.is_some_and(|g| g.kind == l.up.kind)
                 });
         }
-        if options.decode_graph {
+        let is_plt1 = crate::plt1::is_plt1_file(path);
+        #[cfg(feature = "qtip-research")]
+        if is_plt1 {
+            backend.load_plt1_projections(path)?;
+            let mut f = std::fs::File::open(path)?;
+            let idx = crate::plt1::Plt1Index::read_from(&mut f)?;
+            if idx
+                .sections
+                .iter()
+                .any(|s| s.kind == crate::plt1::SectionKind::Eagle3SpecHead)
+            {
+                backend.load_eagle3(path)?;
+            }
+        }
+        if options.decode_graph && !is_plt1 {
             backend.capture_decode_graph()?;
         }
         Ok(backend)
@@ -1708,6 +1728,10 @@ impl CudaBackend {
                 let src = self.work.x.slice(0..s.width);
                 let mut dst = eagle.tap_hidden[slot].slice_mut(0..s.width);
                 self.stream.memcpy_dtod(&src, &mut dst).map_err(failure)?;
+                #[cfg(feature = "qtip-research")]
+                if let Some(plt1) = &self.plt1_hyb {
+                    plt1.r1_exit(&mut eagle.tap_hidden[slot], s.width, 1)?;
+                }
             }
             let gemma_attention = gemma.map(|g| g.attention(s, index));
             let rope_base = gemma_attention.map_or(s.rope_base, |(_, base, _)| base);
@@ -2889,6 +2913,8 @@ impl Backend for CudaBackend {
         if let Some(decode) = &mut self.decode {
             decode.sampled = None;
         }
+        self.prompt_history.clear();
+        self.eagle3_pending_start = 0;
         Ok(())
     }
     fn evaluate(&mut self, tokens: &[i32], position: u32) -> Result<()> {
@@ -3342,6 +3368,13 @@ impl CudaBackend {
             } else {
                 self.step(chunk[0], position as usize + offset, output_logits, false)?;
             }
+            // For non-final prefill chunks, ingest tapped hidden states into EAGLE-3 KV cache now.
+            if self.eagle3.is_some() && !output_logits {
+                let next_toks = &tokens[offset + 1..offset + 1 + chunk.len()];
+                self.eagle3_ingest_tapped_opt(next_toks, position as usize + offset, false)?;
+            } else if self.eagle3.is_some() {
+                self.eagle3_pending_start = position as usize + offset;
+            }
         }
         if host_logits {
             self.finish_evaluation()?;
@@ -3355,6 +3388,15 @@ impl CudaBackend {
             self.decode.as_mut().unwrap().sampled = Some(sampled);
         }
         self.state.finish(tokens.len());
+        if self.eagle3.is_some() {
+            let pos = position as usize;
+            if pos < self.prompt_history.len() {
+                self.prompt_history.truncate(pos);
+            }
+            if pos == self.prompt_history.len() {
+                self.prompt_history.extend_from_slice(tokens);
+            }
+        }
         if let Some(prefix) = &mut self.prefix {
             prefix.evaluated(tokens, position as usize);
         }

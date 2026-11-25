@@ -215,6 +215,27 @@ impl CudaBackend {
         if count == 1 {
             return Ok(vec![first]);
         }
+        // Automatic Hybrid EAGLE-3 + SuffixDecoding when a `.palito` bundle with
+        // an embedded EAGLE-3 draft head is loaded (100% lossless greedy parity).
+        if self.eagle3.is_some() && !self.prompt_history.is_empty() {
+            return self.sample_eagle3_hybrid_tokens(first, count, until_eog, sink);
+        }
+        // Uncaptured PLT1 without EAGLE-3: step token-by-token.
+        if self.decode.as_ref().and_then(|d| d.graph.as_ref()).is_none() {
+            let mut tokens = vec![first];
+            let mut cur = first;
+            while tokens.len() < count {
+                let pos = self.state.position as u32;
+                self.evaluate_for_sampling(&[cur], pos)?;
+                cur = self.sample_greedy()?;
+                sink(cur)?;
+                tokens.push(cur);
+                if until_eog && self.is_eog(cur) {
+                    break;
+                }
+            }
+            return Ok(tokens);
+        }
         self.state.valid = false;
         self.state.failed = true;
         if let Some(prefix) = &mut self.prefix {
@@ -275,6 +296,93 @@ impl CudaBackend {
             self.state.valid = false;
             decode.sampled = None;
         } else {
+            decode.sampled = tokens.last().copied();
+        }
+        Ok(tokens)
+    }
+
+    /// Automatic zero-sync Hybrid EAGLE-3 + SuffixDecoding generation loop used
+    /// whenever a `.palito` bundle with an embedded EAGLE-3 head is loaded.
+    /// Produces 100% identical greedy output while streaming every accepted token.
+    fn sample_eagle3_hybrid_tokens(
+        &mut self,
+        first: i32,
+        count: usize,
+        until_eog: bool,
+        sink: &mut dyn FnMut(i32) -> Result<()>,
+    ) -> Result<Vec<i32>> {
+        use crate::speculative::{SpecTree, SuffixDrafter};
+        const DRAFT_LEN: usize = 7;
+
+        let mut suffix = SuffixDrafter::new(8);
+        let hist_u32: Vec<u32> = self.prompt_history.iter().map(|&t| t as u32).collect();
+        suffix.push_tokens(&hist_u32);
+        suffix.push_tokens(&[first as u32]);
+
+        let mut pos = self.state.position as u32;
+        let pending_start = self.eagle3_pending_start;
+        let pending_len = self.prompt_history.len().saturating_sub(pending_start);
+        if pending_len > 0 {
+            let mut init_toks = Vec::with_capacity(pending_len);
+            if pending_len > 1 {
+                init_toks.extend_from_slice(&self.prompt_history[pending_start + 1..]);
+            }
+            init_toks.push(first);
+            self.eagle3_ingest_tapped_to_dev(&init_toks, pending_start)?;
+        }
+        let mut eagle_pos = self.prompt_history.len();
+        let mut tokens = vec![first];
+        let mut root = first;
+
+        while tokens.len() < count {
+            let remaining = count - tokens.len();
+            let k = DRAFT_LEN.min(remaining);
+            let suffix_draft = suffix.draft(k);
+            let tree = if suffix_draft.len() >= 3 {
+                SpecTree::from_chain(root as u32, &suffix_draft)
+            } else {
+                let draft = self.eagle3_draft_chain_from_slot0(eagle_pos, k)?;
+                let draft_u32: Vec<u32> = draft.iter().map(|&t| t as u32).collect();
+                SpecTree::from_chain(root as u32, &draft_u32)
+            };
+            let chain_i32: Vec<i32> = tree.tokens.iter().map(|&t| t as i32).collect();
+            let target_i32 = self.verify_chain_greedy(&chain_i32, pos)?;
+            let target_u32: Vec<u32> = target_i32.iter().map(|&t| t as u32).collect();
+            let (accepted_u32, _) = tree.verify_greedy(&target_u32);
+
+            let mut accepted_i32 = Vec::with_capacity(accepted_u32.len());
+            let mut hit_eog = false;
+            for &tok_u32 in &accepted_u32 {
+                if tokens.len() >= count {
+                    break;
+                }
+                let tok = tok_u32 as i32;
+                tokens.push(tok);
+                sink(tok)?;
+                suffix.push_tokens(&[tok_u32]);
+                accepted_i32.push(tok);
+                root = tok;
+                if until_eog && self.is_eog(tok) {
+                    hit_eog = true;
+                    break;
+                }
+            }
+            let pushed = accepted_i32.len();
+            pos += pushed as u32;
+            self.rewind_to(pos)?;
+            self.prompt_history.extend_from_slice(&accepted_i32);
+            if hit_eog || tokens.len() >= count {
+                break;
+            }
+            let need_eagle_next = suffix.draft(DRAFT_LEN.min(count - tokens.len())).len() < 3;
+            if need_eagle_next {
+                self.eagle3_ingest_tapped_to_dev(&accepted_i32, eagle_pos)?;
+            } else {
+                self.eagle3_ingest_tapped_opt(&accepted_i32, eagle_pos, false)?;
+            }
+            eagle_pos += pushed;
+        }
+        if let Some(decode) = &mut self.decode {
             decode.sampled = tokens.last().copied();
         }
         Ok(tokens)

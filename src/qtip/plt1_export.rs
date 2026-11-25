@@ -224,20 +224,35 @@ pub fn export_gguf_to_plt1(
                     *w *= g;
                 }
             }
+            let mut valid_diags = Vec::with_capacity(cols);
             let inv: Vec<f64> = gamma
                 .iter()
-                .map(|&g| {
+                .enumerate()
+                .map(|(i, &g)| {
                     if g.abs() >= 1e-2 {
-                        1.0 / f64::from(g)
+                        let iv = 1.0 / f64::from(g);
+                        valid_diags.push(h_raw[i * cols + i] * iv * iv);
+                        iv
                     } else {
                         0.0
                     }
                 })
                 .collect();
+            valid_diags.sort_by(|a, b| a.total_cmp(b));
+            let floor_diag = if valid_diags.is_empty() {
+                1.0
+            } else {
+                valid_diags[valid_diags.len() / 2].max(1e-6)
+            };
             for r in 0..cols {
                 let ir = inv[r];
                 for c in 0..cols {
                     h_raw[r * cols + c] *= ir * inv[c];
+                }
+                if ir == 0.0 {
+                    // Keep unit-norm diagonal weight on near-zero gamma channels so LDLQ
+                    // does not dump quantization error onto them (x_unit still has ~1.0 RMS).
+                    h_raw[r * cols + r] = floor_diag;
                 }
             }
             let mean_diag = (0..cols).map(|i| h_raw[i * cols + i]).sum::<f64>() / cols as f64;
@@ -377,4 +392,29 @@ pub fn export_gguf_to_plt1(
     let mut verify_file = File::open(output)?;
     let index = Plt1Index::read_from(&mut verify_file)?;
     Ok((reports, index))
+}
+
+/// Writes a compact skeleton GGUF copying all metadata, tokenizer, embeddings,
+/// LM head, and layer norms from `input` while omitting the 7 per-layer linear
+/// projections (and any `.qtip` companion vectors) that live in `PLT1`'s `LayerSlabs`.
+pub fn strip_projections_to_skeleton_gguf(input: &Path, output: &Path) -> Result<()> {
+    let original = std::fs::read(input)?;
+    let directory = crate::gguf::Directory::read(&original)?;
+    let mut kept: Vec<(String, Vec<usize>, u32, &[u8])> = Vec::new();
+    for entry in &directory.tensors {
+        let base_name = entry
+            .name
+            .strip_suffix(crate::gguf::QTIP3_COMPANION)
+            .unwrap_or(&entry.name);
+        if is_quantized_proj(base_name) {
+            continue;
+        }
+        kept.push((
+            entry.name.clone(),
+            entry.dims.clone(),
+            entry.kind,
+            &original[entry.data.clone()],
+        ));
+    }
+    crate::gguf::write_gguf(output, &original, &directory, &kept)
 }

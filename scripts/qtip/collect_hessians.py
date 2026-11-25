@@ -115,7 +115,8 @@ def chunks(tokenizer, text_path: Path, context: int, limit: int):
     if count == 0:
         sys.exit(f"{text_path} is shorter than one chunk of {context} tokens")
     windows = torch.tensor(ids[: count * context]).view(count, context)
-    windows[:, 0] = tokenizer.bos_token_id
+    if tokenizer.bos_token_id is not None:
+        windows[:, 0] = tokenizer.bos_token_id
     return windows
 
 

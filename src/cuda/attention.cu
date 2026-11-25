@@ -99,6 +99,65 @@ extern "C" __global__ void attention_fused(const float *q, const float *keys,
     attention_fused_impl(q, keys, values, output, dim, heads, kv_heads, count);
 }
 
+// Tree-masked causal attention for speculative tree verification (tree_len <= 64).
+// Grid: (heads, tree_len, 1), Block: 256 threads.
+// All prefix positions [0, prefix_len) are visible; tree positions
+// [prefix_len, prefix_len + tree_len) are visible iff (tree_mask[token] >> k) & 1.
+extern "C" __global__ void attention_tree(const float *q, const float *keys,
+                                          const float *values, float *output,
+                                          int dim, int heads, int kv_heads,
+                                          int prefix_len, int tree_len,
+                                          const unsigned long long *tree_mask) {
+    extern __shared__ float scores[];
+    __shared__ float maxima[256];
+    int head = blockIdx.x, token = blockIdx.y, thread = threadIdx.x;
+    int kv_head = head * kv_heads / heads;
+    int total_kv = prefix_len + tree_len;
+    unsigned long long mask = tree_mask[token];
+    const float *query = q + ((u64)token * heads + head) * dim;
+    float scale = rsqrtf((float)dim);
+    float maximum = -1.0e30f;
+    for (int time = thread; time < total_kv; time += 256) {
+        bool visible = (time < prefix_len) || (((mask >> (time - prefix_len)) & 1ULL) != 0ULL);
+        float score = -1.0e30f;
+        if (visible) {
+            const float *key = keys + ((u64)time * kv_heads + kv_head) * dim;
+            float dot = 0.0f;
+            for (int i = 0; i < dim; i++) dot += query[i] * key[i];
+            score = dot * scale;
+        }
+        scores[time] = score;
+        if (score > maximum) maximum = score;
+    }
+    maxima[thread] = maximum;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride /= 2) {
+        if (thread < stride && maxima[thread + stride] > maxima[thread])
+            maxima[thread] = maxima[thread + stride];
+        __syncthreads();
+    }
+    maximum = maxima[0];
+    float total = 0.0f;
+    for (int time = thread; time < total_kv; time += 256) {
+        bool visible = (time < prefix_len) || (((mask >> (time - prefix_len)) & 1ULL) != 0ULL);
+        float w = visible ? expf(scores[time] - maximum) : 0.0f;
+        scores[time] = w;
+        total += w;
+    }
+    total = sum_block(total);
+    float inv_total = 1.0f / total;
+    for (int i = thread; i < dim; i += 256) {
+        float value = 0.0f;
+        for (int time = 0; time < total_kv; time++) {
+            float w = scores[time];
+            if (w != 0.0f) {
+                value += w * values[((u64)time * kv_heads + kv_head) * dim + i];
+            }
+        }
+        output[((u64)token * heads + head) * dim + i] = value * inv_total;
+    }
+}
+
 extern "C" __global__ void attention_fused_decode(const float *q, const float *keys,
                                                  const float *values, float *output,
                                                  int dim, int heads, int kv_heads,

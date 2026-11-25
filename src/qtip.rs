@@ -9,11 +9,13 @@
 
 pub mod codebook;
 pub mod hessian;
+pub mod hyb;
 pub mod incoherence;
 pub mod ldlq;
 pub mod matrix;
 pub mod model;
 pub mod packed;
+pub mod plt1_export;
 pub mod scalar;
 pub mod trellis;
 

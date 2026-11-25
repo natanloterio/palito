@@ -205,6 +205,7 @@ struct Workspace {
     probabilities: CudaSlice<f32>,
     status: CudaSlice<i32>,
     logits: CudaSlice<f32>,
+    batch_logits: Option<CudaSlice<f32>>,
     tokens: Option<CudaSlice<i32>>,
     groups: Option<CudaSlice<i32>>,
     /// int8-fast mixed expert tiles: (slots, element offset) of the 128-, 64- and
@@ -518,6 +519,7 @@ impl Workspace {
                 .map_err(failure)?,
             status: stream.alloc_zeros(1).map_err(failure)?,
             logits: alloc(spec.info.vocab_tokens as usize)?,
+            batch_logits: None,
             tokens: if prefill_capacity(spec) > 1 {
                 Some(
                     stream
@@ -862,6 +864,9 @@ macro_rules! affine_ffn {
 #[cfg(test)]
 mod arithmetic;
 mod batch;
+mod eagle3;
+#[cfg(feature = "qtip-research")]
+pub mod plt1;
 mod cache;
 mod decode;
 #[cfg(test)]
@@ -917,6 +922,8 @@ pub struct CudaBackend {
     /// q/k/v and gate/up, fuses SwiGLU into down, and each launch zeroes the
     /// next projection's output instead of a memset.
     qtip_chain: bool,
+    /// Optional embedded EAGLE-3 speculative draft head (loaded from PLT1).
+    eagle3: Option<eagle3::Eagle3State>,
 }
 
 /// Warps sharing one output row in `matvec_packed_rows` (mirrors the device
@@ -925,7 +932,11 @@ pub struct CudaBackend {
 fn matvec_warps_per_row(kind: i32, rows: u32, selections: u32, width: u32) -> u32 {
     let blocks = (width / 256).max(1);
     if matches!(kind, 12 | 13) && width % 256 == 0 {
-        let mut warps = (blocks / 8).clamp(1, 8);
+        let mut warps = 1u32;
+        let target = (blocks / 8).clamp(1, 8);
+        while warps * 2 <= target {
+            warps *= 2;
+        }
         while warps < 8 && warps * 4 < blocks && rows * selections * warps < 2048 {
             warps *= 2;
         }
@@ -1193,6 +1204,13 @@ impl CudaBackend {
             "residual",
             "combine",
             "prefill_matmul",
+            "prefill_matmul_8",
+            "matvec_q6k_multi8",
+            "matvec_q6k_multi16",
+            "matvec_q4k_multi8",
+            "rotary_tree",
+            "rotary_factored_tree",
+            "attention_tree",
             "prefill_embedding",
             "group_experts",
             "grouped_matmul",
@@ -1549,6 +1567,7 @@ impl CudaBackend {
             #[cfg(feature = "qtip-research")]
             qtip: None,
             qtip_chain: false,
+            eagle3: None,
         };
         #[cfg(feature = "qtip-research")]
         if has_qtip {
@@ -1661,6 +1680,13 @@ impl CudaBackend {
         // attention RMSNorm into work.normalized.
         let mut attention_normalized = false;
         for (index, l) in self.weights.layers.iter().enumerate() {
+            if let Some(eagle) = &mut self.eagle3
+                && let Some(slot) = eagle.tap_layers.iter().position(|&tl| tl == index)
+            {
+                let src = self.work.x.slice(0..s.width);
+                let mut dst = eagle.tap_hidden[slot].slice_mut(0..s.width);
+                self.stream.memcpy_dtod(&src, &mut dst).map_err(failure)?;
+            }
             let gemma_attention = gemma.map(|g| g.attention(s, index));
             let rope_base = gemma_attention.map_or(s.rope_base, |(_, base, _)| base);
             let affine = l.affine.as_ref();
@@ -2799,6 +2825,296 @@ impl Backend for CudaBackend {
 }
 
 impl CudaBackend {
+    /// Evaluates a speculative chain `[root, draft_0, ..., draft_{k-1}]` (`1 <= k <= 8`)
+    /// at `position` in a single batched forward pass and returns the greedy argmax
+    /// next-token prediction for every position `0..k`.
+    ///
+    /// Leaves the KV cache populated at `position..position + k`; call
+    /// `rewind_to(position + accepted)` so the next step starts cleanly right
+    /// after the accepted prefix.
+    pub fn verify_chain_greedy(&mut self, tokens: &[i32], position: u32) -> Result<Vec<i32>> {
+        if tokens.is_empty() || tokens.len() > 8 {
+            return Err(invalid(
+                "verify_chain_greedy requires between 1 and 8 tokens",
+            ));
+        }
+        if tokens.len() == 1 {
+            self.evaluate_for_sampling(tokens, position)?;
+            return Ok(vec![self.sample_greedy()?]);
+        }
+        self.state
+            .begin(tokens, position, &self.weights.spec.info)?;
+        if let Some(prefix) = &mut self.prefix {
+            prefix.overwrite(position as usize);
+        }
+        if let Some(decode) = &mut self.decode {
+            decode.sampled = None;
+        }
+        self.batched_prefill(tokens, position as usize, false)?;
+        let n = tokens.len();
+        let n_i32 = n as i32;
+        let width_i32 = self.weights.spec.width as i32;
+        let vocab = self.weights.spec.info.vocab_tokens as usize;
+
+        // Normalize all `n` token hidden states in one launch.
+        transformer_norm!(
+            self,
+            &self.work.x,
+            self.weights.output_norm.as_ref(),
+            self.weights.output_norm_bias.as_ref(),
+            n_i32,
+            width_i32,
+            self.weights.spec.epsilon
+        );
+
+        // Single-read batched LM head for all `n <= 8` tokens.
+        if self.work.batch_logits.is_none() {
+            self.work.batch_logits = Some(
+                self.stream
+                    .alloc_zeros(8 * vocab)
+                    .map_err(failure)?,
+            );
+        }
+        let t = self
+            .weights
+            .output
+            .as_ref()
+            .unwrap_or(&self.weights.embedding);
+        let batch_logits = self.work.batch_logits.as_mut().unwrap();
+        if t.kind == 14 && t.width % 256 == 0 {
+            launch!(
+                self,
+                "matvec_q6k_multi8",
+                ((t.rows as u32).div_ceil(8), 1, 1),
+                &t.bytes,
+                &self.work.normalized,
+                batch_logits,
+                &t.width,
+                &t.rows,
+                &n_i32
+            );
+        } else {
+            launch!(
+                self,
+                "prefill_matmul_8",
+                (t.rows as u32, 1, 1),
+                &t.bytes,
+                &t.kind,
+                &self.work.normalized,
+                batch_logits,
+                &t.width,
+                &t.rows,
+                &n_i32
+            );
+        }
+
+        let out = if self.decode.is_some() {
+            for tok_idx in 0..n {
+                self.prepare_decode(0, position as usize + tok_idx, tok_idx as i32)?;
+                self.device_sample_batch_slot(tok_idx * vocab)?;
+            }
+            self.read_decode_tokens(n)?
+        } else {
+            let mut argmax = Vec::with_capacity(n);
+            for tok_idx in 0..n {
+                let logits_slice = self
+                    .work
+                    .batch_logits
+                    .as_ref()
+                    .unwrap()
+                    .slice(tok_idx * vocab..(tok_idx + 1) * vocab);
+                self.stream
+                    .memcpy_dtoh(&logits_slice, &mut self.logits)
+                    .map_err(failure)?;
+                self.stream.synchronize().map_err(failure)?;
+                argmax.push(greedy(&self.logits)?);
+            }
+            argmax
+        };
+        self.state.finish(tokens.len());
+        Ok(out)
+    }
+
+    /// Evaluates a speculative tree (`1 <= tree.len() <= 16`) rooted at
+    /// `position` using depth-indexed RoPE and `[u64; 64]` bitmask causal
+    /// attention, returning the greedy argmax next-token prediction for every
+    /// tree node `0..tree.len()`.
+    ///
+    /// After calling `tree.verify_greedy(&target_argmax)` to get `(accepted, path_nodes)`,
+    /// call `compact_tree_kv(position, &path_nodes)` to compact accepted KV rows
+    /// and EAGLE-3 tapped features into contiguous positions `position..position+accepted.len()`.
+    pub fn verify_tree_greedy(
+        &mut self,
+        tree: &crate::speculative::SpecTree,
+        position: u32,
+    ) -> Result<Vec<i32>> {
+        let n = tree.len();
+        if n == 0 || n > 16 {
+            return Err(invalid("verify_tree_greedy requires between 1 and 16 nodes"));
+        }
+        let tokens_i32: Vec<i32> = tree.tokens.iter().map(|&t| t as i32).collect();
+        if n == 1 {
+            self.evaluate_for_sampling(&tokens_i32, position)?;
+            return Ok(vec![self.sample_greedy()?]);
+        }
+        self.state
+            .begin(&tokens_i32, position, &self.weights.spec.info)?;
+        if let Some(prefix) = &mut self.prefix {
+            prefix.overwrite(position as usize);
+        }
+        if let Some(decode) = &mut self.decode {
+            decode.sampled = None;
+        }
+        let tree_pos_host: Vec<i32> = tree
+            .depths
+            .iter()
+            .map(|&d| position as i32 + i32::from(d))
+            .collect();
+        let tree_mask_host: Vec<u64> = tree.attn_mask[..n].to_vec();
+        let d_tree_pos = self.stream.clone_htod(&tree_pos_host).map_err(failure)?;
+        let d_tree_mask = self.stream.clone_htod(&tree_mask_host).map_err(failure)?;
+
+        self.batched_prefill_tree(&tokens_i32, position as usize, &d_tree_pos, &d_tree_mask)?;
+
+        let n_i32 = n as i32;
+        let width_i32 = self.weights.spec.width as i32;
+        let vocab = self.weights.spec.info.vocab_tokens as usize;
+
+        transformer_norm!(
+            self,
+            &self.work.x,
+            self.weights.output_norm.as_ref(),
+            self.weights.output_norm_bias.as_ref(),
+            n_i32,
+            width_i32,
+            self.weights.spec.epsilon
+        );
+
+        if self
+            .work
+            .batch_logits
+            .as_ref()
+            .is_none_or(|b| b.len() < 16 * vocab)
+        {
+            self.work.batch_logits = Some(
+                self.stream
+                    .alloc_zeros(16 * vocab)
+                    .map_err(failure)?,
+            );
+        }
+        let t = self
+            .weights
+            .output
+            .as_ref()
+            .unwrap_or(&self.weights.embedding);
+        let batch_logits = self.work.batch_logits.as_mut().unwrap();
+        if t.kind == 14 && t.width % 256 == 0 {
+            let kernel = if n <= 8 {
+                "matvec_q6k_multi8"
+            } else {
+                "matvec_q6k_multi16"
+            };
+            launch!(
+                self,
+                kernel,
+                ((t.rows as u32).div_ceil(8), 1, 1),
+                &t.bytes,
+                &self.work.normalized,
+                batch_logits,
+                &t.width,
+                &t.rows,
+                &n_i32
+            );
+        } else {
+            launch!(
+                self,
+                "prefill_matmul_8",
+                (t.rows as u32, (n as u32).div_ceil(8), 1),
+                &t.bytes,
+                &t.kind,
+                &self.work.normalized,
+                batch_logits,
+                &t.width,
+                &t.rows,
+                &n_i32
+            );
+        }
+
+        let mut out = Vec::with_capacity(n);
+        if self.decode.is_some() {
+            for chunk_start in (0..n).step_by(8) {
+                let chunk_len = (n - chunk_start).min(8);
+                for slot in 0..chunk_len {
+                    let tok_idx = chunk_start + slot;
+                    self.prepare_decode(0, position as usize + tok_idx, slot as i32)?;
+                    self.device_sample_batch_slot(tok_idx * vocab)?;
+                }
+                out.extend(self.read_decode_tokens(chunk_len)?);
+            }
+        } else {
+            for tok_idx in 0..n {
+                let logits_slice = self
+                    .work
+                    .batch_logits
+                    .as_ref()
+                    .unwrap()
+                    .slice(tok_idx * vocab..(tok_idx + 1) * vocab);
+                self.stream
+                    .memcpy_dtoh(&logits_slice, &mut self.logits)
+                    .map_err(failure)?;
+                self.stream.synchronize().map_err(failure)?;
+                out.push(greedy(&self.logits)?);
+            }
+        }
+        self.state.finish(n);
+        Ok(out)
+    }
+
+    /// Compacts accepted tree nodes `path_nodes` (where `path_nodes[0] == 0`)
+    /// from `position + path_nodes[i]` into contiguous KV rows `position + i`
+    /// across all layers (and EAGLE-3 tapped hidden states), then rewinds
+    /// `self.state.position` to `position + path_nodes.len()`.
+    pub fn compact_tree_kv(&mut self, position: u32, path_nodes: &[usize]) -> Result<()> {
+        let base = position as usize;
+        let kv_width = self.weights.spec.kv_heads * self.weights.spec.dim;
+        let width = self.weights.spec.width;
+        // path_nodes is strictly increasing (parent < child), so in-place copy
+        // from src = base + node_idx to dst = base + i (dst <= src) never clobbers.
+        for (i, &node_idx) in path_nodes.iter().enumerate() {
+            if node_idx == i {
+                continue;
+            }
+            for layer in 0..self.keys.len() {
+                self.keys[layer].copy_row(&self.stream, base + node_idx, base + i, kv_width)?;
+                self.values[layer].copy_row(&self.stream, base + node_idx, base + i, kv_width)?;
+            }
+            if let Some(eagle) = &mut self.eagle3 {
+                for slot in 0..3 {
+                    let src_start = node_idx * width;
+                    let dst_start = i * width;
+                    // Disjoint ranges since dst_start < src_start.
+                    let (mut left, right) = eagle.tap_hidden[slot].split_at_mut(src_start);
+                    let src = right.slice(0..width);
+                    let mut dst = left.slice_mut(dst_start..dst_start + width);
+                    self.stream.memcpy_dtod(&src, &mut dst).map_err(failure)?;
+                }
+            }
+        }
+        self.state.position = base + path_nodes.len();
+        Ok(())
+    }
+
+    /// Rewinds the logical KV position after speculative verification rejects
+    /// trailing draft tokens.
+    pub fn rewind_to(&mut self, position: u32) -> Result<()> {
+        let pos = position as usize;
+        if pos > self.state.position {
+            return Err(invalid("rewind_to cannot advance past current position"));
+        }
+        self.state.position = pos;
+        Ok(())
+    }
+
     fn evaluate_inner(&mut self, tokens: &[i32], position: u32, host_logits: bool) -> Result<()> {
         self.state
             .begin(tokens, position, &self.weights.spec.info)?;

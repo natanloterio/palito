@@ -1,0 +1,299 @@
+//! GGUF -> PLT1 (`.palito`) converter with offline RMSNorm + residual-stream
+//! Hadamard folding (`FOLDED_RMSNORM | FOLDED_RESIDUAL_RHT`) and MMA-swizzled
+//! QTIP HYB (`L=12/16, Q=5..9, V=2`) BlockLDLQ quantization.
+
+use super::{
+    hessian::Hessians,
+    hyb::{HybCodebook, HybQuantizer, decode_hyb_tile_mma_l, swizzle_tile_to_mma},
+    incoherence::Incoherence,
+    ldlq::{block_feedback, cholesky_upper, ldlq_with, proxy_error},
+    matrix::{distortion, rms},
+    model::{TensorReport, matrix},
+};
+use crate::{
+    Error, Result,
+    gguf::Gguf,
+    plt1::{
+        Codec, PLT1_VERSION, Plt1Header, Plt1Index, Plt1Writer, SectionKind, TensorDesc, flags,
+        tensor_flags,
+    },
+};
+use std::{fs::File, io::BufWriter, path::Path};
+
+const RHT_BLOCK: usize = 256;
+
+#[derive(Clone, Debug)]
+pub struct Plt1ExportOptions {
+    pub state_bits: u32,
+    pub pair_bits: u32,
+    pub lut_bits: u32,
+    pub damping: f32,
+    pub seed: u64,
+    pub fold_residual_rht: bool,
+    /// Optional layer limit (e.g. `Some(1)` for fast 1-layer quality/size probe).
+    pub max_layers: Option<usize>,
+}
+
+impl Default for Plt1ExportOptions {
+    fn default() -> Self {
+        Self {
+            state_bits: 12,
+            pair_bits: 4, // 2.0 bpw
+            lut_bits: 5,  // Q=5 zero-SMEM warp-register LUT
+            damping: 0.01,
+            seed: 0x5041_4C49_544F_3031,
+            fold_residual_rht: true,
+            max_layers: None,
+        }
+    }
+}
+
+fn layer_index(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("blk.")?;
+    let (idx, _) = rest.split_once('.')?;
+    idx.parse().ok()
+}
+
+fn is_residual_input_proj(name: &str) -> bool {
+    name.ends_with("attn_q.weight")
+        || name.ends_with("attn_k.weight")
+        || name.ends_with("attn_v.weight")
+        || name.ends_with("ffn_gate.weight")
+        || name.ends_with("ffn_up.weight")
+}
+
+fn is_residual_output_proj(name: &str) -> bool {
+    name.ends_with("attn_output.weight") || name.ends_with("ffn_down.weight")
+}
+
+fn is_quantized_proj(name: &str) -> bool {
+    name.starts_with("blk.") && (is_residual_input_proj(name) || is_residual_output_proj(name))
+}
+
+fn rmsnorm_name_for(proj: &str) -> Option<String> {
+    let idx = layer_index(proj)?;
+    if proj.ends_with("attn_q.weight")
+        || proj.ends_with("attn_k.weight")
+        || proj.ends_with("attn_v.weight")
+    {
+        Some(format!("blk.{idx}.attn_norm.weight"))
+    } else if proj.ends_with("ffn_gate.weight") || proj.ends_with("ffn_up.weight") {
+        Some(format!("blk.{idx}.ffn_norm.weight"))
+    } else {
+        None
+    }
+}
+
+/// Converts an F16 GGUF into a 128B-aligned `.palito` (`PLT1`) container with
+/// MMA-swizzled HYB tiles, optional offline RMSNorm + residual-stream RHT
+/// folding, and BlockLDLQ Hessian-guided quantization.
+pub fn export_gguf_to_plt1(
+    input: &Path,
+    output: &Path,
+    hessians: &Hessians,
+    opts: &Plt1ExportOptions,
+    mut progress: impl FnMut(&TensorReport, usize, usize),
+) -> Result<(Vec<TensorReport>, Plt1Index)> {
+    let model = Gguf::open(input, false)?;
+    let codebook = HybCodebook::gaussian_for_q(opts.lut_bits);
+    let quantizer = HybQuantizer::new(opts.state_bits, opts.pair_bits, codebook.clone())?;
+
+    let mut names: Vec<String> = model
+        .tensors
+        .keys()
+        .filter(|n| {
+            is_quantized_proj(n)
+                && opts
+                    .max_layers
+                    .is_none_or(|max| layer_index(n).is_some_and(|i| i < max))
+        })
+        .cloned()
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        return Err(Error::Invalid("no projections selected for PLT1 export".into()));
+    }
+
+    // Infer model dimensions from the first layer.
+    let d_model = model
+        .tensors
+        .get("blk.0.attn_q.weight")
+        .map_or(0, |t| t.dims[0] as u32);
+    let d_ff = model
+        .tensors
+        .get("blk.0.ffn_gate.weight")
+        .map_or(0, |t| t.dims[1] as u32);
+    let vocab_size = model
+        .tensors
+        .get("token_embd.weight")
+        .map_or(0, |t| t.dims[1] as u32);
+    let n_layers = names
+        .iter()
+        .filter_map(|n| layer_index(n))
+        .max()
+        .map_or(0, |m| (m + 1) as u32);
+
+    let mut hdr_flags = flags::MMA_M16N8K16_SWIZZLED;
+    if opts.fold_residual_rht {
+        hdr_flags |= flags::FOLDED_RMSNORM | flags::FOLDED_RESIDUAL_RHT;
+    }
+
+    let header = Plt1Header {
+        version: PLT1_VERSION,
+        target_sm: 1200,
+        flags: hdr_flags,
+        num_sections: 0,
+        section_dir_offset: 0,
+        n_layers,
+        d_model,
+        d_ff,
+        vocab_size,
+    };
+
+    let mut writer = Plt1Writer::new(header);
+    let meta_json = format!(
+        "{{\"source\":\"{}\",\"codec\":\"hyb\",\"state_bits\":{},\"pair_bits\":{},\"lut_bits\":{},\"folded_rht\":{}}}",
+        input.file_name().and_then(|s| s.to_str()).unwrap_or("unknown"),
+        opts.state_bits,
+        opts.pair_bits,
+        opts.lut_bits,
+        opts.fold_residual_rht
+    );
+    writer.add_section(SectionKind::MetadataJson, 0, meta_json.into_bytes());
+
+    let codec = if opts.lut_bits == 5 {
+        Codec::QtipHybQ5
+    } else {
+        Codec::QtipHybSmem
+    };
+
+    let mut reports = Vec::with_capacity(names.len());
+    for (idx, name) in names.iter().enumerate() {
+        let tensor = &model.tensors[name];
+        let (mut weights, rows, cols) = matrix(tensor);
+        if rows % RHT_BLOCK != 0 || cols % RHT_BLOCK != 0 {
+            return Err(Error::Invalid(format!(
+                "{name}: PLT1 HYB requires {RHT_BLOCK}-aligned shapes, got {rows}x{cols}"
+            )));
+        }
+
+        // Offline RMSNorm folding for residual-input projections when enabled:
+        // load undamped H first so scaling by diag(1/gamma) does not amplify
+        // damping on tiny-gamma channels, then damp H' cleanly.
+        let h = if opts.fold_residual_rht
+            && let Some(norm_name) = rmsnorm_name_for(name)
+            && let Some(norm_tensor) = model.tensors.get(&norm_name)
+        {
+            let mut h_raw = hessians.load(name, cols, 0.0)?;
+            let mut gamma = vec![0.0f32; cols];
+            norm_tensor.row(0, &mut gamma);
+            for row in weights.chunks_exact_mut(cols) {
+                for (w, &g) in row.iter_mut().zip(&gamma) {
+                    *w *= g;
+                }
+            }
+            let inv: Vec<f64> = gamma
+                .iter()
+                .map(|&g| {
+                    if g.abs() >= 1e-2 {
+                        1.0 / f64::from(g)
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            for r in 0..cols {
+                let ir = inv[r];
+                for c in 0..cols {
+                    h_raw[r * cols + c] *= ir * inv[c];
+                }
+            }
+            let mean_diag = (0..cols).map(|i| h_raw[i * cols + i]).sum::<f64>() / cols as f64;
+            let damp = f64::from(opts.damping) * mean_diag.max(1e-12);
+            for i in 0..cols {
+                h_raw[i * cols + i] += damp;
+            }
+            h_raw
+        } else {
+            hessians.load(name, cols, f64::from(opts.damping))?
+        };
+
+        let tensor_seed = opts.seed ^ (idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let rht = Incoherence::with_block(rows, cols, tensor_seed, Some(RHT_BLOCK))?;
+        let rotated = rht.forward(&weights);
+        let u = block_feedback(&cholesky_upper(&rht.transform_hessian(&h), cols)?, cols)?;
+        let sigma = rms(&rotated);
+
+        let (quantized, tiles) = ldlq_with(&rotated, rows, cols, &u, |tile| {
+            let swizzled = swizzle_tile_to_mma(tile);
+            let norm: Vec<f32> = swizzled.iter().map(|&v| v / sigma).collect();
+            let words = quantizer.quantize_normalized(&norm);
+            let decoded = match &words {
+                Ok(w) => {
+                    decode_hyb_tile_mma_l(w, opts.state_bits, opts.pair_bits, &codebook, sigma)
+                        .to_vec()
+                }
+                Err(_) => vec![0.0; tile.len()],
+            };
+            (decoded, words)
+        })?;
+
+        let reconstructed = rht.inverse(&quantized);
+        let report = TensorReport {
+            name: name.clone(),
+            relative_error: distortion(&weights, &reconstructed).relative,
+            proxy_error: Some(proxy_error(&weights, &reconstructed, rows, cols, &h)),
+        };
+        progress(&report, idx + 1, names.len());
+        reports.push(report);
+
+        let tile_bytes: Vec<u8> = tiles
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+            .concat()
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+
+        let mut tflags = tensor_flags::MMA_SWIZZLED;
+        if opts.fold_residual_rht {
+            if is_residual_input_proj(name) {
+                tflags |= tensor_flags::SKIP_IN_RHT;
+            }
+            if is_residual_output_proj(name) {
+                tflags |= tensor_flags::SKIP_OUT_RHT;
+            }
+        }
+
+        writer.add_tensor(
+            TensorDesc {
+                name: name.clone(),
+                rows: rows as u32,
+                cols: cols as u32,
+                codec,
+                flags: tflags,
+                pair_bits: opts.pair_bits as u8,
+                lut_bits: opts.lut_bits as u8,
+                scale: sigma,
+                teal_thresholds: [0.0; 4],
+                data_offset: 0,
+                data_size: 0,
+                lut_offset: 0,
+            },
+            tile_bytes,
+            Some(codebook.lut_f16x2.clone()),
+        );
+    }
+
+    let partial = output.with_extension("palito.partial");
+    {
+        let file = File::create(&partial)?;
+        let mut bw = BufWriter::new(file);
+        writer.write_to(&mut bw)?;
+    }
+    std::fs::rename(&partial, output)?;
+
+    let mut verify_file = File::open(output)?;
+    let index = Plt1Index::read_from(&mut verify_file)?;
+    Ok((reports, index))
+}

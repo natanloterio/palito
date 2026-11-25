@@ -4,9 +4,9 @@ use cudarc::driver::{CudaGraph, PinnedHostSlice};
 pub(super) struct DecodeState {
     graph: Option<CudaGraph>,
     pub control: CudaSlice<i32>,
-    scores: CudaSlice<f32>,
-    ids: CudaSlice<i32>,
-    tokens: CudaSlice<i32>,
+    pub(super) scores: CudaSlice<f32>,
+    pub(super) ids: CudaSlice<i32>,
+    pub(super) tokens: CudaSlice<i32>,
     /// Pinned copies of `tokens` taken after each pipelined replay (see
     /// `sample_decode_tokens`); one more slot than replays allowed in flight.
     ring: Vec<PinnedHostSlice<i32>>,
@@ -116,6 +116,44 @@ impl CudaBackend {
             "greedy_partials",
             (blocks as u32, 1, 1),
             &self.work.logits,
+            &count,
+            &mut decode.scores,
+            &mut decode.ids,
+            &mut self.work.status
+        );
+        launch!(
+            self,
+            "greedy_finish",
+            (1, 1, 1),
+            &decode.scores,
+            &decode.ids,
+            &blocks,
+            &mut decode.control,
+            &mut decode.tokens,
+            &mut self.work.status
+        );
+        Ok(())
+    }
+
+    pub(super) fn device_sample_batch_slot(&mut self, offset: usize) -> Result<()> {
+        let count = self.weights.spec.info.vocab_tokens as i32;
+        let vocab = count as usize;
+        let logits_slice = self
+            .work
+            .batch_logits
+            .as_ref()
+            .ok_or_else(|| failure("batch_logits missing"))?
+            .slice(offset..offset + vocab);
+        let decode = self
+            .decode
+            .as_mut()
+            .ok_or_else(|| failure("decode state missing"))?;
+        let blocks = (count as u32).div_ceil(256) as i32;
+        launch!(
+            self,
+            "greedy_partials",
+            (blocks as u32, 1, 1),
+            &logits_slice,
             &count,
             &mut decode.scores,
             &mut decode.ids,

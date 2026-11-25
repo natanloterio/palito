@@ -83,6 +83,11 @@ path = "examples/plt1_8b_bench.rs"
 required-features = ["cuda", "qtip-research"]
 
 [[example]]
+name = "pack-palito"
+path = "examples/pack_palito.rs"
+required-features = ["qtip-research"]
+
+[[example]]
 name = "perplexity"
 path = "examples/perplexity.rs"
 

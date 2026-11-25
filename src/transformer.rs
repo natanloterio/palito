@@ -162,33 +162,38 @@ impl Weights<Tensor> {
     )]
     pub fn open(path: &Path, config: &Config) -> Result<Self> {
         config.validate()?;
-        Self::from_gguf(Gguf::open(path, false)?, config)
+        Self::from_gguf_inner(Gguf::open(path, false)?, config, crate::plt1::is_plt1_file(path))
     }
 
     /// Rejects QTIP3 tensors: only the CUDA backend executes them (open_qtip3).
     pub(crate) fn from_gguf(model: Gguf, config: &Config) -> Result<Self> {
+        Self::from_gguf_inner(model, config, false)
+    }
+
+    fn from_gguf_inner(model: Gguf, config: &Config, allow_plt1_stubs: bool) -> Result<Self> {
         if model.has_qtip3() {
             return Err(invalid(
                 "QTIP3 tensors need the CUDA backend built with the qtip-research feature",
             ));
         }
-        Self::from_gguf_any(model, config)
+        Self::from_gguf_any(model, config, allow_plt1_stubs)
     }
 
-    /// Like `open`, but accepts QTIP3 projections (research, Llama only).
+    /// Like `open`, but accepts QTIP3 projections (research, Llama only) and PLT1 bundles.
     #[cfg(feature = "qtip-research")]
     pub(crate) fn open_qtip3(path: &Path, config: &Config) -> Result<Self> {
         config.validate()?;
+        let is_plt1 = crate::plt1::is_plt1_file(path);
         let model = Gguf::open(path, false)?;
         if model.has_qtip3() && model.text("general.architecture")? != "llama" {
             return Err(invalid(
                 "QTIP3 tensors are supported for the llama architecture only",
             ));
         }
-        Self::from_gguf_any(model, config)
+        Self::from_gguf_any(model, config, is_plt1)
     }
 
-    fn from_gguf_any(mut model: Gguf, config: &Config) -> Result<Self> {
+    fn from_gguf_any(mut model: Gguf, config: &Config, allow_plt1_stubs: bool) -> Result<Self> {
         let arch = model.text("general.architecture")?.to_owned();
         let (qwen, moe) = match arch.as_str() {
             "llama" => (false, false),
@@ -656,8 +661,25 @@ impl Weights<Tensor> {
             } else {
                 None
             };
-            let mut tensor =
-                |name: &str, dims: &[usize]| model.tensor(&format!("blk.{i}.{name}.weight"), dims);
+            let mut tensor = |name: &str, dims: &[usize]| {
+                let full = format!("blk.{i}.{name}.weight");
+                if allow_plt1_stubs
+                    && !model.tensors.contains_key(&full)
+                    && matches!(
+                        name,
+                        "attn_q"
+                            | "attn_k"
+                            | "attn_v"
+                            | "attn_output"
+                            | "ffn_gate"
+                            | "ffn_up"
+                            | "ffn_down"
+                    )
+                {
+                    return Ok(Tensor::plt1_placeholder(dims));
+                }
+                model.tensor(&full, dims)
+            };
             let (q, k, v) = if phi || gpt2 || bloom || gptneox {
                 let (q, kv) =
                     tensor("attn_qkv", &[width, q_width + 2 * kv_width])?.split_rows(q_width)?;

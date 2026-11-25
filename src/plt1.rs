@@ -48,6 +48,8 @@ pub enum SectionKind {
     VocabFreqMap = 6,
     Eagle3SpecHead = 7,
     StaticSuffixTrie = 8,
+    /// Embedded skeleton GGUF (metadata, tokenizer, embeddings, LM head, norms).
+    BaseGguf = 9,
 }
 
 impl SectionKind {
@@ -61,9 +63,31 @@ impl SectionKind {
             6 => Ok(Self::VocabFreqMap),
             7 => Ok(Self::Eagle3SpecHead),
             8 => Ok(Self::StaticSuffixTrie),
+            9 => Ok(Self::BaseGguf),
             _ => Err(Error::Invalid(format!("unknown PLT1 section kind {v}"))),
         }
     }
+}
+
+/// Returns true if `path` starts with the `PALITO1\0` magic header.
+pub fn is_plt1_file(path: &std::path::Path) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 8];
+    f.read_exact(&mut magic).is_ok() && magic == PLT1_MAGIC
+}
+
+/// Returns `(offset, size)` of the embedded `BaseGguf` section in a `.palito` file.
+pub fn base_gguf_range(path: &std::path::Path) -> Result<(u64, u64)> {
+    let mut f = std::fs::File::open(path)?;
+    let index = Plt1Index::read_from(&mut f)?;
+    let sec = index
+        .sections
+        .iter()
+        .find(|s| s.kind == SectionKind::BaseGguf)
+        .ok_or_else(|| Error::Invalid("PLT1 file has no BaseGguf section".into()))?;
+    Ok((sec.offset, sec.size))
 }
 
 /// Weight encoding codecs supported by PLT1.

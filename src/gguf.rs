@@ -31,6 +31,17 @@ pub(crate) enum Storage {
 }
 
 impl Tensor {
+    /// Tiny 4-byte placeholder tensor for PLT1 bundles whose layer projections
+    /// live in `LayerSlabs` (HYB Q=5) rather than the embedded `BaseGguf`.
+    pub(crate) fn plt1_placeholder(dims: &[usize]) -> Self {
+        Self {
+            dims: dims.to_vec(),
+            storage: Storage::F32(vec![0.0f32; 1]),
+            accelerated: false,
+            block_elements: 1,
+        }
+    }
+
     pub fn split_vector(mut self, count: usize) -> Result<(Self, Self)> {
         let [total] = self.dims[..] else {
             return Err(invalid("vector split requires one dimension"));
@@ -642,6 +653,17 @@ impl Gguf {
     }
 
     pub fn open(path: &Path, expand: bool) -> Result<Self> {
+        if crate::plt1::is_plt1_file(path) {
+            use std::io::{Read, Seek, SeekFrom};
+            let (offset, size) = crate::plt1::base_gguf_range(path)?;
+            let mut file = fs::File::open(path)?;
+            file.seek(SeekFrom::Start(offset))?;
+            let mut bytes = vec![0u8; size as usize];
+            file.read_exact(&mut bytes)?;
+            let mut gguf = Self::parse(&bytes, expand)?;
+            gguf.file_bytes = fs::metadata(path)?.len();
+            return Ok(gguf);
+        }
         Self::parse(&fs::read(path)?, expand)
     }
 
@@ -678,13 +700,21 @@ impl Gguf {
         path: &Path,
         read: impl Fn(&mut Reader<'_>) -> Result<T>,
     ) -> Result<T> {
-        use std::io::Read;
-        let length = fs::metadata(path)?.len();
+        use std::io::{Read, Seek, SeekFrom};
+        let (base_offset, length) = if crate::plt1::is_plt1_file(path) {
+            crate::plt1::base_gguf_range(path)?
+        } else {
+            (0, fs::metadata(path)?.len())
+        };
         let mut size: u64 = 16 << 20;
         loop {
             let take = size.min(length);
             let mut bytes = Vec::with_capacity(take as usize);
-            fs::File::open(path)?.take(take).read_to_end(&mut bytes)?;
+            let mut file = fs::File::open(path)?;
+            if base_offset > 0 {
+                file.seek(SeekFrom::Start(base_offset))?;
+            }
+            file.take(take).read_to_end(&mut bytes)?;
             let mut reader = Reader {
                 bytes: &bytes,
                 position: 0,

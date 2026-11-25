@@ -453,6 +453,12 @@ impl CudaBackend {
                 let src = self.work.x.slice(0..count);
                 let mut dst = eagle.tap_hidden[slot].slice_mut(0..count);
                 self.stream.memcpy_dtod(&src, &mut dst).map_err(failure)?;
+                #[cfg(feature = "qtip-research")]
+                if let Some(plt1) = &self.plt1_hyb
+                    && tokens.len() <= 16
+                {
+                    plt1.r1_exit(&mut eagle.tap_hidden[slot], s.width, tokens.len())?;
+                }
             }
             let gate = l.gate.as_ref();
             let affine = l.affine.as_ref();
@@ -1091,6 +1097,7 @@ impl CudaBackend {
                 .as_ref()
                 .is_some_and(|p| p.folded_rmsnorm)
                 && tokens.len() <= 16
+                && self.functions.contains_key("residual_unit_norm")
                 && !olmo2
                 && affine.is_none()
                 && l.post_norms.is_none()

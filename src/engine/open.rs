@@ -125,7 +125,11 @@ fn open_cuda_profiles<B: Backend + ?Sized>(
     open_backend: impl Fn(&Path, &Config, crate::cuda::CudaOptions) -> Result<Box<B>>,
 ) -> Result<Opened<B>> {
     use crate::cuda::{CudaMatmul, CudaOptions};
-    let attempts = cuda_attempts(options);
+    let attempts = if options.cuda_matmul.is_none() && crate::plt1::is_plt1_file(path) {
+        vec![(CudaMatmul::F32Tiled, true), (CudaMatmul::F32, false)]
+    } else {
+        cuda_attempts(options)
+    };
     let mut notices = Vec::new();
     let mut first_error = None;
     for (index, &(matmul, graph)) in attempts.iter().enumerate() {

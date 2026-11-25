@@ -127,8 +127,9 @@ const DEFAULT_PREFILL_CHUNK: u32 = 64;
 /// Backend, model and execution-plan options shared by every local model command.
 #[derive(Args)]
 pub(crate) struct RuntimeArgs {
-    #[arg(long, value_enum, env = "PALITO_BACKEND", default_value_t = LocalBackend::Cpu)]
-    backend: LocalBackend,
+    /// Execution backend (defaults to CUDA automatically for .palito files, CPU for GGUF).
+    #[arg(long, value_enum, env = "PALITO_BACKEND")]
+    backend: Option<LocalBackend>,
     #[arg(long, env = "PALITO_MODEL")]
     pub(crate) model: PathBuf,
     /// Context tokens [default: 512; chat: the model's trained context (GGUF
@@ -306,10 +307,23 @@ impl RuntimeArgs {
         }
     }
 
+    fn resolved_backend(&self) -> LocalBackend {
+        if let Some(backend) = self.backend {
+            return backend;
+        }
+        #[cfg(feature = "cuda")]
+        if palito::plt1::is_plt1_file(&self.model) {
+            return LocalBackend::Cuda;
+        }
+        LocalBackend::Cpu
+    }
+
     pub(crate) fn open(&self) -> Result<Box<dyn Backend>> {
+        #[allow(unused_variables)]
+        let backend = self.resolved_backend();
         #[cfg(feature = "cuda")]
         {
-            if self.backend != LocalBackend::Cuda
+            if backend != LocalBackend::Cuda
                 && (self.cuda_device.is_some()
                     || self.gpu_memory_limit_bytes.is_some()
                     || self.cuda_kernel_cache.is_some()
@@ -325,7 +339,7 @@ impl RuntimeArgs {
                 ));
             }
             self.check_cpu_policy()?;
-            match self.backend {
+            match backend {
                 LocalBackend::Cuda => {
                     return palito::cuda::open_backend(
                         &self.model,
@@ -349,13 +363,13 @@ impl RuntimeArgs {
             }
         }
         #[cfg(feature = "vulkan")]
-        if self.backend == LocalBackend::Vulkan {
+        if backend == LocalBackend::Vulkan {
             self.check_cpu_policy()?;
             let options = palito::vulkan::VulkanOptions::default();
             return palito::vulkan::open_backend(&self.model, &self.config(), options);
         }
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        if self.backend == LocalBackend::Metal {
+        if backend == LocalBackend::Metal {
             self.check_cpu_policy()?;
             let options = palito::metal::MetalOptions::default();
             return palito::metal::open_backend(&self.model, &self.config(), options);
@@ -404,20 +418,20 @@ impl RuntimeArgs {
                 .filter(|dir| !dir.is_empty())
                 .map(PathBuf::from)
         });
-        options.matmul = self.cuda_matmul();
-        options.decode_graph = self.cuda_decode_graph;
+        let is_plt1 = palito::plt1::is_plt1_file(&self.model);
+        options.matmul = self.cuda_matmul.unwrap_or(if is_plt1 {
+            palito::cuda::CudaMatmul::F32Tiled
+        } else {
+            palito::cuda::CudaMatmul::default()
+        });
+        options.decode_graph = self.cuda_decode_graph || (is_plt1 && !self.no_cuda_decode_graph);
         options.fit_context = self.model_context;
         options
     }
 
-    #[cfg(feature = "cuda")]
-    fn cuda_matmul(&self) -> palito::cuda::CudaMatmul {
-        self.cuda_matmul.unwrap_or_default()
-    }
-
     #[cfg(any(feature = "cuda", feature = "vulkan", all(feature = "metal", target_os = "macos")))]
     fn check_cpu_policy(&self) -> Result<()> {
-        if self.backend != LocalBackend::Cpu
+        if self.resolved_backend() != LocalBackend::Cpu
             && (self.f32_weights
                 || self.sequential_prefill
                 || self.memory_limit_bytes.is_some()
@@ -463,7 +477,7 @@ impl RuntimeArgs {
     pub(crate) fn is_cuda(&self) -> bool {
         #[cfg(feature = "cuda")]
         {
-            self.backend == LocalBackend::Cuda
+            self.resolved_backend() == LocalBackend::Cuda
         }
         #[cfg(not(feature = "cuda"))]
         false
@@ -472,7 +486,7 @@ impl RuntimeArgs {
     /// "cpu" or "cpu-reference".
     pub(crate) fn cpu_profile(&self) -> &'static str {
         #[cfg(feature = "cuda")]
-        if self.backend == LocalBackend::Reference {
+        if self.resolved_backend() == LocalBackend::Reference {
             return "cpu-reference";
         }
         "cpu"
@@ -498,7 +512,7 @@ impl RuntimeArgs {
         if self.context.is_none() {
             let trained = palito::model_context_tokens(&self.model)?;
             #[cfg(feature = "cuda")]
-            let cap = if self.backend == LocalBackend::Cuda {
+            let cap = if self.resolved_backend() == LocalBackend::Cuda {
                 CUDA_CONTEXT_MAX
             } else {
                 u32::MAX
@@ -523,8 +537,10 @@ impl RuntimeArgs {
         if info.backend == "rust-cpu-transformer-reference" {
             return json!({"backend": "cpu-reference", "prefill": "sequential token steps"});
         }
+        #[allow(unused_variables)]
+        let backend = self.resolved_backend();
         #[cfg(feature = "cuda")]
-        match self.backend {
+        match backend {
             LocalBackend::Cuda => {
                 return json!({
                     "backend": "cuda", "options": self.cuda_options(),
@@ -543,7 +559,7 @@ impl RuntimeArgs {
             LocalBackend::Cpu => {}
         }
         #[cfg(feature = "vulkan")]
-        if self.backend == LocalBackend::Vulkan {
+        if backend == LocalBackend::Vulkan {
             return json!({
                 "backend": "vulkan",
                 "options": palito::vulkan::VulkanOptions::default(),
@@ -553,7 +569,7 @@ impl RuntimeArgs {
             });
         }
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        if self.backend == LocalBackend::Metal {
+        if backend == LocalBackend::Metal {
             return json!({
                 "backend": "metal",
                 "options": palito::metal::MetalOptions::default(),

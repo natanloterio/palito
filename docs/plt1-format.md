@@ -32,28 +32,30 @@ export NVRTC_LIB_DIR=/usr/local/cuda-13/lib64
 export LD_LIBRARY_PATH="$NVRTC_LIB_DIR:$LD_LIBRARY_PATH"
 ```
 
-### Step 1 — Build the `PLT1` & Speculative Binaries
+### Step 1 — Build the `PLT1` & Bundler Binaries
 
 ```sh
 cargo build --release --features cuda,qtip-research \
+  --bin palito \
   --example gguf-to-plt1 \
-  --example eagle3-spec-bench \
-  --example suffix-spec-bench
+  --example pack-palito \
+  --example eagle3-spec-bench
 ```
 
-### Step 2 — Convert an F16 GGUF Model to `PLT1` (`1.75 GB`)
+### Step 2 — Convert an F16 GGUF Model to `PLT1`
 
 Using calibration Hessians collected with `scripts/qtip/collect_hessians.py`:
 
 ```sh
+# Recommended 3.0 bpw (high quality, ~2.6 GB layers, ~3.7 GB full bundle)
 ./target/release/examples/gguf-to-plt1 \
   --input models/Llama-3.1-8B-Instruct-f16.gguf \
-  --output models/plt1-hyb-q5-2bpw.palito \
+  --output models/plt1-hyb-q5-3bpw.palito \
   --hessians models/hessians-mix-256x512 \
-  --state-bits 12 --pair-bits 4 --lut-bits 5
+  --state-bits 10 --pair-bits 6 --lut-bits 5
 ```
 
-- `--pair-bits`: `3` (1.5 bpw), `4` (2.0 bpw), `5` (2.5 bpw), `6` (3.0 bpw).
+- `--pair-bits`: `4` (2.0 bpw), `6` (3.0 bpw — recommended for full quality without fine-tuning).
 - `--lut-bits 5`: zero-SMEM warp-register LUT (`Q=5`).
 
 ### Step 3 — Pack an `EAGLE-3` Draft Head into `PLT1` (`Q4_K`, `239 MB`)
@@ -68,24 +70,27 @@ python3 scripts/qtip/pack_eagle3_plt1.py \
   --quant q4_k --tap-layers 2,16,29
 ```
 
-### Step 4 — Run at 1,000+ tok/s (Hybrid `EAGLE-3` + `SuffixDecoding`)
+### Step 4 — Bundle into a Single Self-Contained `.palito` File
+
+`pack-palito` strips the redundant GGUF layer weights (keeping only tokenizer, metadata, embeddings, norms, and LM head), merges the `PLT1` layers and `EAGLE-3` draft head, and writes **one** `.palito` file:
 
 ```sh
-./target/release/examples/eagle3-spec-bench \
-  --model models/Llama-3.1-8B-Instruct-Q6_K.gguf \
-  --plt1 models/plt1-hyb-q5-2bpw.palito \
+./target/release/examples/pack-palito \
+  --base-gguf models/Llama-3.1-8B-Instruct-Q6_K.gguf \
+  --plt1-layers models/plt1-hyb-q5-3bpw.palito \
   --eagle3 models/eagle3/eagle3-q4_k.palito \
-  --tokens 128 --draft-len 7 --hybrid
+  --output models/llama-3.1-8b.palito
 ```
 
-Or run **zero-weight `SuffixDecoding`** without any draft head (works on any GGUF or `PLT1` model):
+### Step 5 — Run with One Command (Auto CUDA + Speculative Decoding)
 
 ```sh
-./target/release/examples/suffix-spec-bench \
-  --model models/Llama-3.1-8B-Instruct-Q6_K.gguf \
-  --plt1 models/plt1-hyb-q5-2bpw.palito \
-  --matmul f32-tiled --tokens 256 --max-draft 7
+palito chat --model models/llama-3.1-8b.palito --stats
+# Or OpenAI-compatible server:
+palito serve --model models/llama-3.1-8b.palito
 ```
+
+*(You can still run the standalone `eagle3-spec-bench` or `suffix-spec-bench` harnesses directly for microbenchmarking.)*
 
 ---
 

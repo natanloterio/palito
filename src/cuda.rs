@@ -1760,6 +1760,7 @@ impl CudaBackend {
             #[cfg(feature = "qtip-research")]
             let ran_plt1_qkv = if let Some(plt1) = &self.plt1_hyb {
                 let pl = &plt1.layers[index];
+                let zero_self = index == 0 || plt1.layers[index - 1].moe_ffn;
                 plt1.run_multi(
                     &[
                         (&pl.q, &mut self.work.q),
@@ -1770,7 +1771,7 @@ impl CudaBackend {
                     None,
                     1,
                     &[(&mut self.work.projected, pl.o.desc.rows as usize)],
-                    index == 0,
+                    zero_self,
                 )?;
                 true
             } else {
@@ -2260,17 +2261,28 @@ impl CudaBackend {
             #[cfg(feature = "qtip-research")]
             let ran_plt1_o = if let Some(plt1) = &self.plt1_hyb {
                 let pl = &plt1.layers[index];
-                plt1.run_multi(
-                    &[(&pl.o, &mut self.work.projected)],
-                    &self.work.attended,
-                    None,
-                    1,
-                    &[
-                        (&mut self.work.gate, pl.gate.desc.rows as usize),
-                        (&mut self.work.up, pl.up.desc.rows as usize),
-                    ],
-                    false,
-                )?;
+                if pl.moe_ffn {
+                    plt1.run_multi(
+                        &[(&pl.o, &mut self.work.projected)],
+                        &self.work.attended,
+                        None,
+                        1,
+                        &[],
+                        false,
+                    )?;
+                } else {
+                    plt1.run_multi(
+                        &[(&pl.o, &mut self.work.projected)],
+                        &self.work.attended,
+                        None,
+                        1,
+                        &[
+                            (&mut self.work.gate, pl.gate.desc.rows as usize),
+                            (&mut self.work.up, pl.up.desc.rows as usize),
+                        ],
+                        false,
+                    )?;
+                }
                 true
             } else {
                 false
@@ -2443,17 +2455,30 @@ impl CudaBackend {
             #[cfg(feature = "qtip-research")]
             let ran_plt1_gu = if let Some(plt1) = &self.plt1_hyb {
                 let pl = &plt1.layers[index];
-                plt1.run_multi(
-                    &[
-                        (&pl.gate, &mut self.work.gate),
-                        (&pl.up, &mut self.work.up),
-                    ],
-                    &self.work.normalized,
-                    None,
-                    1,
-                    &[(&mut self.work.down, pl.down.desc.rows as usize)],
-                    false,
-                )?;
+                if pl.moe_ffn {
+                    plt1.run_moe_gate_up(
+                        &pl.gate,
+                        &pl.up,
+                        &self.work.normalized,
+                        &self.work.ids,
+                        &mut self.work.gate,
+                        &mut self.work.up,
+                        1,
+                        s.used,
+                    )?;
+                } else {
+                    plt1.run_multi(
+                        &[
+                            (&pl.gate, &mut self.work.gate),
+                            (&pl.up, &mut self.work.up),
+                        ],
+                        &self.work.normalized,
+                        None,
+                        1,
+                        &[(&mut self.work.down, pl.down.desc.rows as usize)],
+                        false,
+                    )?;
+                }
                 true
             } else {
                 false
@@ -2556,7 +2581,17 @@ impl CudaBackend {
             #[cfg(feature = "qtip-research")]
             let ran_plt1_down = if let Some(plt1) = &self.plt1_hyb {
                 let pl = &plt1.layers[index];
-                if let Some(next_pl) = plt1.layers.get(index + 1) {
+                if pl.moe_ffn {
+                    plt1.run_moe_down(
+                        &pl.down,
+                        &self.work.gate,
+                        &self.work.up,
+                        &self.work.ids,
+                        &mut self.work.down,
+                        1,
+                        s.used,
+                    )?;
+                } else if let Some(next_pl) = plt1.layers.get(index + 1) {
                     plt1.run_multi(
                         &[(&pl.down, &mut self.work.down)],
                         &self.work.gate,
@@ -3305,11 +3340,62 @@ impl CudaBackend {
         }
         if rt.folded_rmsnorm {
             let width = self.weights.spec.width;
+            let r1_host: Option<Vec<f32>> = rt
+                .r1_signs
+                .as_ref()
+                .map(|s| self.stream.clone_dtoh(s).map_err(failure))
+                .transpose()?;
             let ones: Vec<u8> = vec![1.0f32; width]
                 .into_iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
             for layer in &mut self.weights.layers {
+                // For MoE routers (F32), fold ffn_norm * R_1 into W_router once at load time
+                // so the router runs directly on R_1-rotated unit-norm activations with zero overhead.
+                if let (Some(router), Some(ffn_norm), Some(r1)) =
+                    (&mut layer.router, &layer.ffn_norm, &r1_host)
+                    && router.kind == 0
+                    && width % 256 == 0
+                {
+                    let gamma_bytes = self.stream.clone_dtoh(&ffn_norm.bytes).map_err(failure)?;
+                    let gamma: Vec<f32> = gamma_bytes
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                        .collect();
+                    let w_bytes = self.stream.clone_dtoh(&router.bytes).map_err(failure)?;
+                    let mut w_f32: Vec<f32> = w_bytes
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                        .collect();
+                    let scale = 1.0f32 / 16.0;
+                    for row in w_f32.chunks_exact_mut(width) {
+                        for ((v, &g), &s) in row.iter_mut().zip(&gamma).zip(r1) {
+                            *v *= g * s;
+                        }
+                        for chunk in row.chunks_exact_mut(256) {
+                            let mut h = 1usize;
+                            while h < 256 {
+                                for base in (0..256).step_by(h * 2) {
+                                    for j in 0..h {
+                                        let a = chunk[base + j];
+                                        let b = chunk[base + j + h];
+                                        chunk[base + j] = a + b;
+                                        chunk[base + j + h] = a - b;
+                                    }
+                                }
+                                h *= 2;
+                            }
+                            for v in chunk.iter_mut() {
+                                *v *= scale;
+                            }
+                        }
+                    }
+                    let out_bytes: Vec<u8> =
+                        w_f32.into_iter().flat_map(|v| v.to_le_bytes()).collect();
+                    self.stream
+                        .memcpy_htod(&out_bytes, &mut router.bytes)
+                        .map_err(failure)?;
+                }
                 if let Some(n) = &mut layer.norm {
                     self.stream
                         .memcpy_htod(&ones, &mut n.bytes)

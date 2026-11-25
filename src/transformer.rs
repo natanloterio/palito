@@ -674,6 +674,9 @@ impl Weights<Tensor> {
                             | "ffn_gate"
                             | "ffn_up"
                             | "ffn_down"
+                            | "ffn_gate_exps"
+                            | "ffn_up_exps"
+                            | "ffn_down_exps"
                     )
                 {
                     return Ok(Tensor::plt1_placeholder(dims));

@@ -154,7 +154,8 @@ impl CudaBackend {
 
         let s = &self.weights.spec;
         let width = s.width;
-        let kv_width = s.kv_heads * s.dim;
+        let q_width = q_proj.rows as usize;
+        let kv_width = k_proj.rows as usize;
         let inter = gate_proj.rows as usize;
         let context = s.info.context_tokens as usize;
         let batch_cap = self.work.x.len() / width;
@@ -199,10 +200,10 @@ impl CudaBackend {
             g_save1: alloc(width)?,
             emb: alloc(8 * width)?,
             inp_cat: alloc(8 * 2 * width)?,
-            q: alloc(8 * width)?,
+            q: alloc(8 * q_width)?,
             k: alloc(8 * kv_width)?,
             v: alloc(8 * kv_width)?,
-            attn: alloc(8 * width)?,
+            attn: alloc(8 * q_width)?,
             proj: alloc(8 * width)?,
             norm_buf: alloc(8 * width)?,
             gate: alloc(8 * inter)?,

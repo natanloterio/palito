@@ -437,6 +437,12 @@ impl CudaBackend {
                 &scale
             );
         }
+        #[cfg(feature = "qtip-research")]
+        if let Some(plt1) = &self.plt1_hyb
+            && tokens.len() <= 16
+        {
+            plt1.r1_enter(&mut self.work.x, s.width, tokens.len())?;
+        }
         for (index, l) in self.weights.layers.iter().enumerate() {
             if let Some(eagle) = &mut self.eagle3
                 && let Some(slot) = eagle.tap_layers.iter().position(|&tl| tl == index)
@@ -514,7 +520,29 @@ impl CudaBackend {
                 prepare_residual!(self, &self.work.normalized, n * w, true);
             }
             #[cfg(feature = "qtip-research")]
-            let fused_small_qkv = self.qtip_chain
+            let ran_plt1_qkv = if let Some(plt1) = &self.plt1_hyb
+                && tokens.len() <= 16
+            {
+                let pl = &plt1.layers[index];
+                plt1.run_multi(
+                    &[
+                        (&pl.q, &mut self.work.q),
+                        (&pl.k, &mut self.work.k),
+                        (&pl.v, &mut self.work.v),
+                    ],
+                    &self.work.normalized,
+                    None,
+                    tokens.len(),
+                )?;
+                true
+            } else {
+                false
+            };
+            #[cfg(not(feature = "qtip-research"))]
+            let ran_plt1_qkv = false;
+            #[cfg(feature = "qtip-research")]
+            let fused_small_qkv = !ran_plt1_qkv
+                && self.qtip_chain
                 && (2..=16).contains(&tokens.len())
                 && l.qkv_bias.is_none()
                 && self.qtip.is_some()
@@ -522,7 +550,8 @@ impl CudaBackend {
                 && l.k.kind == l.v.kind;
             #[cfg(not(feature = "qtip-research"))]
             let fused_small_qkv = false;
-            if fused_small_qkv {
+            if ran_plt1_qkv {
+            } else if fused_small_qkv {
                 #[cfg(feature = "qtip-research")]
                 self.qtip.as_ref().unwrap().matmul_small_k_multi(
                     &self.stream,
@@ -942,7 +971,25 @@ impl CudaBackend {
                 &self.work.attended,
                 t.width as usize
             );
-            if residual_projection(matmul, t, n) {
+            #[cfg(feature = "qtip-research")]
+            let ran_plt1_o = if let Some(plt1) = &self.plt1_hyb
+                && tokens.len() <= 16
+            {
+                let pl = &plt1.layers[index];
+                plt1.run_multi(
+                    &[(&pl.o, &mut self.work.projected)],
+                    &self.work.attended,
+                    None,
+                    tokens.len(),
+                )?;
+                true
+            } else {
+                false
+            };
+            #[cfg(not(feature = "qtip-research"))]
+            let ran_plt1_o = false;
+            if ran_plt1_o {
+            } else if residual_projection(matmul, t, n) {
                 prepare_residual!(self, &self.work.attended, n * t.width, true);
                 project_residual!(
                     self,
@@ -1206,7 +1253,34 @@ impl CudaBackend {
                 prepare_residual!(self, &self.work.normalized, n * w);
             }
             #[cfg(feature = "qtip-research")]
-            let fused_small_ffn = self.qtip_chain
+            let ran_plt1_ffn = if let Some(plt1) = &self.plt1_hyb
+                && tokens.len() <= 16
+            {
+                let pl = &plt1.layers[index];
+                plt1.run_multi(
+                    &[
+                        (&pl.gate, &mut self.work.gate),
+                        (&pl.up, &mut self.work.up),
+                    ],
+                    &self.work.normalized,
+                    None,
+                    tokens.len(),
+                )?;
+                plt1.run_multi(
+                    &[(&pl.down, &mut self.work.down)],
+                    &self.work.gate,
+                    Some(&self.work.up),
+                    tokens.len(),
+                )?;
+                true
+            } else {
+                false
+            };
+            #[cfg(not(feature = "qtip-research"))]
+            let ran_plt1_ffn = false;
+            #[cfg(feature = "qtip-research")]
+            let fused_small_ffn = !ran_plt1_ffn
+                && self.qtip_chain
                 && (2..=16).contains(&tokens.len())
                 && gemma.is_none()
                 && self.work.groups.is_none()
@@ -1214,7 +1288,8 @@ impl CudaBackend {
                 && gate.kind == l.up.kind;
             #[cfg(not(feature = "qtip-research"))]
             let fused_small_ffn = false;
-            if fused_small_ffn {
+            if ran_plt1_ffn {
+            } else if fused_small_ffn {
                 #[cfg(feature = "qtip-research")]
                 {
                     let qtip = self.qtip.as_ref().unwrap();
@@ -1451,6 +1526,12 @@ impl CudaBackend {
                 &self.work.x,
                 s.width
             );
+        }
+        #[cfg(feature = "qtip-research")]
+        if let Some(plt1) = &self.plt1_hyb
+            && tokens.len() <= 16
+        {
+            plt1.r1_exit(&mut self.work.x, s.width, tokens.len())?;
         }
         launch!(
             self,

@@ -928,6 +928,9 @@ pub struct CudaBackend {
     qtip_chain: bool,
     /// Optional embedded EAGLE-3 speculative draft head (loaded from PLT1).
     eagle3: Option<eagle3::Eagle3State>,
+    /// Optional PLT1 HYB Q=5 projection overlay (loaded via `load_plt1_projections`).
+    #[cfg(feature = "qtip-research")]
+    plt1_hyb: Option<plt1::Plt1HybRuntime>,
 }
 
 /// Warps sharing one output row in `matvec_packed_rows` (mirrors the device
@@ -1572,6 +1575,8 @@ impl CudaBackend {
             qtip: None,
             qtip_chain: false,
             eagle3: None,
+            #[cfg(feature = "qtip-research")]
+            plt1_hyb: None,
         };
         #[cfg(feature = "qtip-research")]
         if has_qtip {
@@ -1680,6 +1685,10 @@ impl CudaBackend {
                 &scale
             );
         }
+        #[cfg(feature = "qtip-research")]
+        if let Some(plt1) = &self.plt1_hyb {
+            plt1.r1_enter(&mut self.work.x, s.width, 1)?;
+        }
         // Set when the previous layer's fused combine already wrote this layer's
         // attention RMSNorm into work.normalized.
         let mut attention_normalized = false;
@@ -1715,7 +1724,27 @@ impl CudaBackend {
                     s.epsilon
                 );
             }
-            if self.qtip_chain {
+            #[cfg(feature = "qtip-research")]
+            let ran_plt1_qkv = if let Some(plt1) = &self.plt1_hyb {
+                let pl = &plt1.layers[index];
+                plt1.run_multi(
+                    &[
+                        (&pl.q, &mut self.work.q),
+                        (&pl.k, &mut self.work.k),
+                        (&pl.v, &mut self.work.v),
+                    ],
+                    &self.work.normalized,
+                    None,
+                    1,
+                )?;
+                true
+            } else {
+                false
+            };
+            #[cfg(not(feature = "qtip-research"))]
+            let ran_plt1_qkv = false;
+            if ran_plt1_qkv {
+            } else if self.qtip_chain {
                 // The previous layer's down launch zeroed q, k and v.
                 qtip_multi!(
                     self,
@@ -2193,7 +2222,23 @@ impl CudaBackend {
                 );
             }
             let t = &l.output;
-            if self.qtip_chain {
+            #[cfg(feature = "qtip-research")]
+            let ran_plt1_o = if let Some(plt1) = &self.plt1_hyb {
+                let pl = &plt1.layers[index];
+                plt1.run_multi(
+                    &[(&pl.o, &mut self.work.projected)],
+                    &self.work.attended,
+                    None,
+                    1,
+                )?;
+                true
+            } else {
+                false
+            };
+            #[cfg(not(feature = "qtip-research"))]
+            let ran_plt1_o = false;
+            if ran_plt1_o {
+            } else if self.qtip_chain {
                 let gate = l.gate.as_ref().expect("QTIP3 chain layers are gated");
                 qtip_multi!(
                     self,
@@ -2355,7 +2400,26 @@ impl CudaBackend {
             }
             let moe = i32::from(l.router.is_some());
             let gate = l.gate.as_ref().expect("gated CUDA layer");
-            if self.qtip_chain {
+            #[cfg(feature = "qtip-research")]
+            let ran_plt1_gu = if let Some(plt1) = &self.plt1_hyb {
+                let pl = &plt1.layers[index];
+                plt1.run_multi(
+                    &[
+                        (&pl.gate, &mut self.work.gate),
+                        (&pl.up, &mut self.work.up),
+                    ],
+                    &self.work.normalized,
+                    None,
+                    1,
+                )?;
+                true
+            } else {
+                false
+            };
+            #[cfg(not(feature = "qtip-research"))]
+            let ran_plt1_gu = false;
+            if ran_plt1_gu {
+            } else if self.qtip_chain {
                 // SwiGLU happens inside the down launch below.
                 qtip_multi!(
                     self,
@@ -2447,7 +2511,23 @@ impl CudaBackend {
                 );
             }
             let t = &l.down;
-            if cfg!(feature = "cuda-packed-down-research")
+            #[cfg(feature = "qtip-research")]
+            let ran_plt1_down = if let Some(plt1) = &self.plt1_hyb {
+                let pl = &plt1.layers[index];
+                plt1.run_multi(
+                    &[(&pl.down, &mut self.work.down)],
+                    &self.work.gate,
+                    Some(&self.work.up),
+                    1,
+                )?;
+                true
+            } else {
+                false
+            };
+            #[cfg(not(feature = "qtip-research"))]
+            let ran_plt1_down = false;
+            if ran_plt1_down {
+            } else if cfg!(feature = "cuda-packed-down-research")
                 && self.matmul == CudaMatmul::ResidualMma3Research
                 && moe != 0
                 && t.width == 768
@@ -2536,6 +2616,10 @@ impl CudaBackend {
                     &used
                 );
             }
+        }
+        #[cfg(feature = "qtip-research")]
+        if let Some(plt1) = &self.plt1_hyb {
+            plt1.r1_exit(&mut self.work.x, s.width, 1)?;
         }
         if !output_logits {
             // Skipped logits must not hide a failed intermediate token's numerical state.
@@ -3133,6 +3217,43 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// Loads all attention & MLP projections from a `.palito` (`PLT1 HYB Q=5`)
+    /// file onto the GPU, replacing the GGUF projections at runtime. When
+    /// `FOLDED_RMSNORM` is set in the PLT1 header, layer RMSNorm weights are set
+    /// to 1.0 (unit-variance RMSNorm) since gamma was folded offline.
+    #[cfg(feature = "qtip-research")]
+    pub fn load_plt1_projections(&mut self, path: &Path) -> Result<()> {
+        let rt = plt1::Plt1HybRuntime::open(path, self.stream.context(), self.stream.clone())?;
+        if rt.layers.len() != self.weights.layers.len() {
+            return Err(invalid(format!(
+                "PLT1 has {} layers but target model has {}",
+                rt.layers.len(),
+                self.weights.layers.len()
+            )));
+        }
+        if rt.folded_rmsnorm {
+            let width = self.weights.spec.width;
+            let ones: Vec<u8> = vec![1.0f32; width]
+                .into_iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            for layer in &mut self.weights.layers {
+                if let Some(n) = &mut layer.norm {
+                    self.stream
+                        .memcpy_htod(&ones, &mut n.bytes)
+                        .map_err(failure)?;
+                }
+                if let Some(n) = &mut layer.ffn_norm {
+                    self.stream
+                        .memcpy_htod(&ones, &mut n.bytes)
+                        .map_err(failure)?;
+                }
+            }
+        }
+        self.plt1_hyb = Some(rt);
+        Ok(())
+    }
+
     /// Rewinds the logical KV position after speculative verification rejects
     /// trailing draft tokens.
     pub fn rewind_to(&mut self, position: u32) -> Result<()> {
@@ -3156,13 +3277,21 @@ impl CudaBackend {
         if let Some(decode) = &mut self.decode {
             decode.sampled = None;
         }
-        let capacity = prefill_capacity(&self.weights.spec);
+        let mut capacity = prefill_capacity(&self.weights.spec);
+        #[cfg(feature = "qtip-research")]
+        if self.plt1_hyb.is_some() {
+            capacity = capacity.min(16);
+        }
+        #[cfg(feature = "qtip-research")]
+        let use_decode_graph = self.decode.is_some() && self.plt1_hyb.is_none();
+        #[cfg(not(feature = "qtip-research"))]
+        let use_decode_graph = self.decode.is_some();
         for (index, chunk) in tokens.chunks(capacity).enumerate() {
             let offset = index * capacity;
             let output_logits = offset + chunk.len() == tokens.len();
             if chunk.len() > 1 {
                 self.batched_prefill(chunk, position as usize + offset, output_logits)?;
-            } else if self.decode.is_some() && output_logits {
+            } else if use_decode_graph && output_logits {
                 self.replay_decode(chunk[0], position as usize + offset)?;
             } else {
                 self.step(chunk[0], position as usize + offset, output_logits, false)?;
@@ -3171,8 +3300,8 @@ impl CudaBackend {
         if host_logits {
             self.finish_evaluation()?;
         } else {
-            // Batched prefill is not captured, so run its final device reduction here.
-            if tokens.len() != 1 {
+            // Batched prefill (or uncaptured PLT1 step) runs its final device reduction here.
+            if tokens.len() != 1 || !use_decode_graph {
                 self.prepare_decode(0, position as usize + tokens.len() - 1, 0)?;
                 self.device_sample()?;
             }

@@ -167,6 +167,38 @@ pub fn export_gguf_to_plt1(
         Codec::QtipHybSmem
     };
 
+    // Shared global residual-stream sign diagonal S_res (d_model floats) when
+    // fold_residual_rht is enabled: Q = H_256 * S_res cancels across all 32 layers.
+    let r1_signs: Vec<f32> = Incoherence::with_block(
+        d_model as usize,
+        d_model as usize,
+        opts.seed ^ 0x5231_5349_474E_5331,
+        Some(RHT_BLOCK),
+    )?
+    .col_signs()
+    .to_vec();
+    if opts.fold_residual_rht {
+        let r1_bytes: Vec<u8> = r1_signs.iter().flat_map(|v| v.to_le_bytes()).collect();
+        writer.add_tensor(
+            TensorDesc {
+                name: "plt1.r1_signs".into(),
+                rows: 1,
+                cols: d_model,
+                codec: Codec::F16, // raw f32 sign vector
+                flags: 0,
+                pair_bits: 0,
+                lut_bits: 0,
+                scale: 1.0,
+                teal_thresholds: [0.0; 4],
+                data_offset: 0,
+                data_size: 0,
+                lut_offset: 0,
+            },
+            r1_bytes,
+            None,
+        );
+    }
+
     let mut reports = Vec::with_capacity(names.len());
     for (idx, name) in names.iter().enumerate() {
         let tensor = &model.tensors[name];
@@ -219,7 +251,26 @@ pub fn export_gguf_to_plt1(
         };
 
         let tensor_seed = opts.seed ^ (idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let rht = Incoherence::with_block(rows, cols, tensor_seed, Some(RHT_BLOCK))?;
+        let base_rht = Incoherence::with_block(rows, cols, tensor_seed, Some(RHT_BLOCK))?;
+        let rht = if opts.fold_residual_rht && is_residual_input_proj(name) {
+            Incoherence::with_signs(
+                rows,
+                cols,
+                base_rht.row_signs().to_vec(),
+                r1_signs.clone(),
+                Some(RHT_BLOCK),
+            )?
+        } else if opts.fold_residual_rht && is_residual_output_proj(name) {
+            Incoherence::with_signs(
+                rows,
+                cols,
+                r1_signs.clone(),
+                base_rht.col_signs().to_vec(),
+                Some(RHT_BLOCK),
+            )?
+        } else {
+            base_rht
+        };
         let rotated = rht.forward(&weights);
         let u = block_feedback(&cholesky_upper(&rht.transform_hessian(&h), cols)?, cols)?;
         let sigma = rms(&rotated);
@@ -256,14 +307,19 @@ pub fn export_gguf_to_plt1(
             .collect();
 
         let mut tflags = tensor_flags::MMA_SWIZZLED;
-        if opts.fold_residual_rht {
+        let gpu_scale = if opts.fold_residual_rht {
             if is_residual_input_proj(name) {
                 tflags |= tensor_flags::SKIP_IN_RHT;
             }
             if is_residual_output_proj(name) {
                 tflags |= tensor_flags::SKIP_OUT_RHT;
             }
-        }
+            // Only one unnormalized H_256 runs online (factor 16).
+            sigma / 16.0
+        } else {
+            // Both unnormalized H_256 run online (factor 256).
+            sigma / 256.0
+        };
 
         writer.add_tensor(
             TensorDesc {
@@ -274,7 +330,7 @@ pub fn export_gguf_to_plt1(
                 flags: tflags,
                 pair_bits: opts.pair_bits as u8,
                 lut_bits: opts.lut_bits as u8,
-                scale: sigma,
+                scale: gpu_scale,
                 teal_thresholds: [0.0; 4],
                 data_offset: 0,
                 data_size: 0,
@@ -282,6 +338,31 @@ pub fn export_gguf_to_plt1(
             },
             tile_bytes,
             Some(codebook.lut_f16x2.clone()),
+        );
+        // Store [row_signs, col_signs] companion vector for the non-folded side.
+        let signs_bytes: Vec<u8> = rht
+            .row_signs()
+            .iter()
+            .chain(rht.col_signs().iter())
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        writer.add_tensor(
+            TensorDesc {
+                name: format!("{name}.signs"),
+                rows: 1,
+                cols: (rows + cols) as u32,
+                codec: Codec::F16,
+                flags: 0,
+                pair_bits: 0,
+                lut_bits: 0,
+                scale: 1.0,
+                teal_thresholds: [0.0; 4],
+                data_offset: 0,
+                data_size: 0,
+                lut_offset: 0,
+            },
+            signs_bytes,
+            None,
         );
     }
 

@@ -40,6 +40,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         /// CUDA matmul profile: f32-tiled or int8-fast.
         #[arg(long, default_value = "int8-fast")]
         matmul: String,
+        /// Optional PLT1 (.palito) HYB Q=5 projection overlay.
+        #[arg(long)]
+        plt1: Option<PathBuf>,
     }
 
     let args = Args::parse();
@@ -64,6 +67,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         },
     )?;
+    #[cfg(feature = "qtip-research")]
+    if let Some(plt1_path) = &args.plt1 {
+        backend.load_plt1_projections(plt1_path)?;
+        println!("Loaded PLT1 HYB Q=5 overlay: {}", plt1_path.display());
+    }
 
     // Realistic coding/refactoring prompt where SuffixDecoding shines (repeating struct/API names).
     let prompt_text = "\

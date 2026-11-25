@@ -443,6 +443,8 @@ impl CudaBackend {
         {
             plt1.r1_enter(&mut self.work.x, s.width, tokens.len())?;
         }
+        let n_layers = self.weights.layers.len();
+        let mut plt1_attn_normed = false;
         for (index, l) in self.weights.layers.iter().enumerate() {
             if let Some(eagle) = &mut self.eagle3
                 && let Some(slot) = eagle.tap_layers.iter().position(|&tl| tl == index)
@@ -486,7 +488,8 @@ impl CudaBackend {
             };
             let olmo2 = s.info.architecture == "olmo2";
             let olmoe = s.info.architecture == "olmoe";
-            if olmo2 {
+            if std::mem::take(&mut plt1_attn_normed) {
+            } else if olmo2 {
                 self.stream
                     .memcpy_dtod(
                         &self.work.x.slice(..total_width as usize),
@@ -524,6 +527,7 @@ impl CudaBackend {
                 && tokens.len() <= 16
             {
                 let pl = &plt1.layers[index];
+                let nt = tokens.len();
                 plt1.run_multi(
                     &[
                         (&pl.q, &mut self.work.q),
@@ -532,7 +536,9 @@ impl CudaBackend {
                     ],
                     &self.work.normalized,
                     None,
-                    tokens.len(),
+                    nt,
+                    &[(&mut self.work.projected, nt * pl.o.desc.rows as usize)],
+                    index == 0,
                 )?;
                 true
             } else {
@@ -629,6 +635,36 @@ impl CudaBackend {
                 }
             }
             }
+            let fused_rope_kv = tree.is_none()
+                && self.diagnostic.is_none()
+                && l.q_norm.is_none()
+                && l.k_norm.is_none()
+                && position_embedding.is_none()
+                && embedding_norm.is_none()
+                && s.rotary_dim == s.dim
+                && self.weights.rope_factors.is_some();
+            if fused_rope_kv {
+                let factors = self.weights.rope_factors.as_ref().unwrap();
+                let total_pairs = ((qw / 2 + kw / 2) as u32).div_ceil(256);
+                launch!(
+                    self,
+                    "rotary_factored_cache_kv_batch",
+                    (total_pairs, n as u32, 1),
+                    &mut self.work.q,
+                    &qw,
+                    &mut self.work.k,
+                    &self.work.v,
+                    &mut self.keys[index],
+                    &mut self.values[index],
+                    &kw,
+                    &dim,
+                    &pos,
+                    &rope_base,
+                    &neox,
+                    &factors.bytes,
+                    &s.rope_attn_factor
+                );
+            } else {
             for (norm, values, size) in [
                 (&l.q_norm, &mut self.work.q, qw),
                 (&l.k_norm, &mut self.work.k, kw),
@@ -735,6 +771,7 @@ impl CudaBackend {
                 &kw,
                 &pos
             );
+            }
             // Score rows exist per prefill token only without flash attention
             // (flash_prefill_attention sizes the workspace).
             if (embedding_norm.is_some() || gemma_attention.is_some())
@@ -976,11 +1013,17 @@ impl CudaBackend {
                 && tokens.len() <= 16
             {
                 let pl = &plt1.layers[index];
+                let nt = tokens.len();
                 plt1.run_multi(
                     &[(&pl.o, &mut self.work.projected)],
                     &self.work.attended,
                     None,
-                    tokens.len(),
+                    nt,
+                    &[
+                        (&mut self.work.gate, nt * pl.gate.desc.rows as usize),
+                        (&mut self.work.up, nt * pl.up.desc.rows as usize),
+                    ],
+                    false,
                 )?;
                 true
             } else {
@@ -1042,6 +1085,31 @@ impl CudaBackend {
                     &w
                 );
             }
+            #[cfg(feature = "qtip-research")]
+            let plt1_fused_norm = self
+                .plt1_hyb
+                .as_ref()
+                .is_some_and(|p| p.folded_rmsnorm)
+                && tokens.len() <= 16
+                && !olmo2
+                && affine.is_none()
+                && l.post_norms.is_none()
+                && !s.parallel_residual
+                && s.used == 1;
+            #[cfg(not(feature = "qtip-research"))]
+            let plt1_fused_norm = false;
+            if plt1_fused_norm {
+                launch!(
+                    self,
+                    "residual_unit_norm",
+                    (n as u32, 1, 1),
+                    &mut self.work.x,
+                    &self.work.projected,
+                    &mut self.work.normalized,
+                    &w,
+                    &s.epsilon
+                );
+            } else {
             if let Some([post_attn, _]) = &l.post_norms {
                 gemma_post_norm!(self, projected, post_attn, n, w, s.epsilon);
             } else if !s.parallel_residual {
@@ -1080,6 +1148,7 @@ impl CudaBackend {
                     w,
                     s.epsilon
                 );
+            }
             }
             capture_projection!(
                 self,
@@ -1257,6 +1326,7 @@ impl CudaBackend {
                 && tokens.len() <= 16
             {
                 let pl = &plt1.layers[index];
+                let nt = tokens.len();
                 plt1.run_multi(
                     &[
                         (&pl.gate, &mut self.work.gate),
@@ -1264,14 +1334,33 @@ impl CudaBackend {
                     ],
                     &self.work.normalized,
                     None,
-                    tokens.len(),
+                    nt,
+                    &[(&mut self.work.down, nt * pl.down.desc.rows as usize)],
+                    false,
                 )?;
-                plt1.run_multi(
-                    &[(&pl.down, &mut self.work.down)],
-                    &self.work.gate,
-                    Some(&self.work.up),
-                    tokens.len(),
-                )?;
+                if let Some(next_pl) = plt1.layers.get(index + 1) {
+                    plt1.run_multi(
+                        &[(&pl.down, &mut self.work.down)],
+                        &self.work.gate,
+                        Some(&self.work.up),
+                        nt,
+                        &[
+                            (&mut self.work.q, nt * next_pl.q.desc.rows as usize),
+                            (&mut self.work.k, nt * next_pl.k.desc.rows as usize),
+                            (&mut self.work.v, nt * next_pl.v.desc.rows as usize),
+                        ],
+                        false,
+                    )?;
+                } else {
+                    plt1.run_multi(
+                        &[(&pl.down, &mut self.work.down)],
+                        &self.work.gate,
+                        Some(&self.work.up),
+                        nt,
+                        &[],
+                        false,
+                    )?;
+                }
                 true
             } else {
                 false
@@ -1503,7 +1592,19 @@ impl CudaBackend {
                 &self.work.down,
                 s.width * s.used
             );
-            if let Some([_, post_ffn]) = &l.post_norms {
+            if plt1_fused_norm && index + 1 < n_layers {
+                launch!(
+                    self,
+                    "residual_unit_norm",
+                    (n as u32, 1, 1),
+                    &mut self.work.x,
+                    &self.work.down,
+                    &mut self.work.normalized,
+                    &w,
+                    &s.epsilon
+                );
+                plt1_attn_normed = true;
+            } else if let Some([_, post_ffn]) = &l.post_norms {
                 gemma_post_norm!(self, down, post_ffn, n, w, s.epsilon);
             } else {
                 launch!(

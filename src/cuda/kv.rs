@@ -18,6 +18,10 @@ pub(super) const F16_KERNELS: &[(&str, &str)] = &[
         "rotary_factored_cache_kv_decode_f16",
     ),
     (
+        "rotary_factored_cache_kv_batch",
+        "rotary_factored_cache_kv_batch_f16",
+    ),
+    (
         "olmoe_qk_norm_rope_cache_decode",
         "olmoe_qk_norm_rope_cache_decode_f16",
     ),
@@ -33,6 +37,7 @@ pub(super) const F16_KERNELS: &[(&str, &str)] = &[
     ("gemma_attention_scores_decode", "gemma_attention_scores_decode_f16"),
     ("gemma_attention_values_decode", "gemma_attention_values_decode_f16"),
     ("attention_fused", "attention_fused_f16"),
+    ("attention_warp128", "attention_warp128_f16"),
     ("attention_fused_decode", "attention_fused_decode_f16"),
     ("attention_split", "attention_split_f16"),
     ("attention_split_decode", "attention_split_decode_f16"),

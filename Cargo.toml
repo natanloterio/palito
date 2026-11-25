@@ -73,6 +73,11 @@ path = "examples/gguf_to_plt1.rs"
 required-features = ["qtip-research"]
 
 [[example]]
+name = "eagle3-spec-bench"
+path = "examples/eagle3_spec_bench.rs"
+required-features = ["cuda"]
+
+[[example]]
 name = "perplexity"
 path = "examples/perplexity.rs"
 

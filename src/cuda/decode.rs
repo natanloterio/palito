@@ -4,9 +4,9 @@ use cudarc::driver::{CudaGraph, PinnedHostSlice};
 pub(super) struct DecodeState {
     graph: Option<CudaGraph>,
     pub control: CudaSlice<i32>,
-    scores: CudaSlice<f32>,
-    ids: CudaSlice<i32>,
-    tokens: CudaSlice<i32>,
+    pub(super) scores: CudaSlice<f32>,
+    pub(super) ids: CudaSlice<i32>,
+    pub(super) tokens: CudaSlice<i32>,
     /// Pinned copies of `tokens` taken after each pipelined replay (see
     /// `sample_decode_tokens`); one more slot than replays allowed in flight.
     ring: Vec<PinnedHostSlice<i32>>,

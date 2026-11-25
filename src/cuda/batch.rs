@@ -418,6 +418,14 @@ impl CudaBackend {
             );
         }
         for (index, l) in self.weights.layers.iter().enumerate() {
+            if let Some(eagle) = &mut self.eagle3
+                && let Some(slot) = eagle.tap_layers.iter().position(|&tl| tl == index)
+            {
+                let count = tokens.len() * s.width;
+                let src = self.work.x.slice(0..count);
+                let mut dst = eagle.tap_hidden[slot].slice_mut(0..count);
+                self.stream.memcpy_dtod(&src, &mut dst).map_err(failure)?;
+            }
             let gate = l.gate.as_ref();
             let affine = l.affine.as_ref();
             let gemma_attention = gemma.map(|g| g.attention(s, index));

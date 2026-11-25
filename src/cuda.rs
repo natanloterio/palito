@@ -864,6 +864,7 @@ macro_rules! affine_ffn {
 #[cfg(test)]
 mod arithmetic;
 mod batch;
+mod eagle3;
 mod cache;
 mod decode;
 #[cfg(test)]
@@ -919,6 +920,8 @@ pub struct CudaBackend {
     /// q/k/v and gate/up, fuses SwiGLU into down, and each launch zeroes the
     /// next projection's output instead of a memset.
     qtip_chain: bool,
+    /// Optional embedded EAGLE-3 speculative draft head (loaded from PLT1).
+    eagle3: Option<eagle3::Eagle3State>,
 }
 
 /// Warps sharing one output row in `matvec_packed_rows` (mirrors the device
@@ -1553,6 +1556,7 @@ impl CudaBackend {
             #[cfg(feature = "qtip-research")]
             qtip: None,
             qtip_chain: false,
+            eagle3: None,
         };
         #[cfg(feature = "qtip-research")]
         if has_qtip {
@@ -1665,6 +1669,13 @@ impl CudaBackend {
         // attention RMSNorm into work.normalized.
         let mut attention_normalized = false;
         for (index, l) in self.weights.layers.iter().enumerate() {
+            if let Some(eagle) = &mut self.eagle3
+                && let Some(slot) = eagle.tap_layers.iter().position(|&tl| tl == index)
+            {
+                let src = self.work.x.slice(0..s.width);
+                let mut dst = eagle.tap_hidden[slot].slice_mut(0..s.width);
+                self.stream.memcpy_dtod(&src, &mut dst).map_err(failure)?;
+            }
             let gemma_attention = gemma.map(|g| g.attention(s, index));
             let rope_base = gemma_attention.map_or(s.rope_base, |(_, base, _)| base);
             let affine = l.affine.as_ref();

@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
     Error, Result,
-    gguf::{Directory, Gguf, QTIP3_COMPANION, QTIP3_KIND, Tensor, write_gguf},
+    gguf::{Directory, Gguf, QTIP2_KIND, QTIP3_COMPANION, QTIP3_KIND, Tensor, write_gguf},
 };
 use half::f16;
 use std::{
@@ -252,22 +252,35 @@ pub fn quantize_gguf(
     Ok(reports)
 }
 
-/// Trellis bits of the QTIP3 tensor type (`gguf::QTIP3_KIND`).
-const QTIP3_TRELLIS: (u32, u32) = (12, 3);
-/// Hadamard block of the QTIP3 tensor type.
+/// State bits (L) of the packed QTIP tensor types (`gguf::QTIP3_KIND` with
+/// K = 3, `gguf::QTIP2_KIND` with K = 2).
+const QTIP_STATE_BITS: u32 = 12;
+/// Hadamard block of the packed QTIP tensor types.
 const QTIP3_BLOCK: usize = 256;
 
-/// One matrix as QTIP3: the packed tiles (little-endian words, row-group
-/// order), the companion `[sigma, row signs, column signs]`, and the dense
-/// reconstruction for the report.
+/// The packed tensor type for `symbol_bits` (K) trellis bits per weight.
+pub fn packed_kind(symbol_bits: u32) -> Result<u32> {
+    match symbol_bits {
+        3 => Ok(QTIP3_KIND),
+        2 => Ok(QTIP2_KIND),
+        _ => Err(Error::Invalid(format!(
+            "packed QTIP supports 2 or 3 bits per weight, not {symbol_bits}"
+        ))),
+    }
+}
+
+/// One matrix as packed QTIP with `symbol_bits` (K): the packed tiles
+/// (little-endian words, row-group order), the companion `[sigma, row signs,
+/// column signs]`, and the dense reconstruction for the report.
 fn qtip3_matrix(
     weights: &[f32],
     rows: usize,
     cols: usize,
     seed: u64,
     h: &[f64],
+    symbol_bits: u32,
 ) -> Result<(Vec<u8>, Vec<f32>, Vec<f32>)> {
-    let (state_bits, symbol_bits) = QTIP3_TRELLIS;
+    let state_bits = QTIP_STATE_BITS;
     let rht = Incoherence::with_block(rows, cols, seed, Some(QTIP3_BLOCK))?;
     let rotated = rht.forward(weights);
     let trellis = Trellis::new(state_bits, symbol_bits, 1.0)?;
@@ -299,8 +312,9 @@ fn qtip3_matrix(
 }
 
 /// Writes `output` with every attention and MLP matrix of `input` (F16) as a
-/// QTIP3 tensor (BlockLDLQ, L12 K3, 256-block Hadamards) plus its F32
+/// packed QTIP tensor (BlockLDLQ, L12, 256-block Hadamards) plus its F32
 /// companion vector; other tensors and all metadata are copied unchanged.
+/// `bits_for(name)` picks each matrix's K: 3 (QTIP3) or 2 (QTIP2).
 /// Only Palito's CUDA backend with `qtip-research` reads the result.
 pub fn quantize_gguf_qtip3(
     input: &Path,
@@ -308,6 +322,7 @@ pub fn quantize_gguf_qtip3(
     seed: u64,
     hessians: &Hessians,
     damping: f32,
+    bits_for: impl Fn(&str) -> u32,
     mut progress: impl FnMut(&TensorReport, usize, usize),
 ) -> Result<Vec<TensorReport>> {
     if output.exists() {
@@ -326,6 +341,10 @@ pub fn quantize_gguf_qtip3(
             "no attention or MLP matrices to quantize".into(),
         ));
     }
+    let kinds = names
+        .iter()
+        .map(|n| packed_kind(bits_for(n)))
+        .collect::<Result<Vec<_>>>()?;
     let mut packed = std::collections::HashMap::new();
     let mut reports = Vec::with_capacity(names.len());
     for (index, name) in names.iter().enumerate() {
@@ -342,8 +361,10 @@ pub fn quantize_gguf_qtip3(
         // Same per-tensor seed as quantize_gguf, so the probe and this file match.
         let tensor_seed = seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let h = hessians.load(name, cols, f64::from(damping))?;
+        let kind = kinds[index];
+        let symbol_bits = if kind == QTIP3_KIND { 3 } else { 2 };
         let (bytes, companion, reconstructed) =
-            qtip3_matrix(&weights, rows, cols, tensor_seed, &h)?;
+            qtip3_matrix(&weights, rows, cols, tensor_seed, &h, symbol_bits)?;
         let report = TensorReport {
             name: (*name).clone(),
             relative_error: distortion(&weights, &reconstructed).relative,
@@ -352,12 +373,12 @@ pub fn quantize_gguf_qtip3(
         progress(&report, index + 1, names.len());
         reports.push(report);
         let companion: Vec<u8> = companion.iter().flat_map(|v| v.to_le_bytes()).collect();
-        packed.insert((*name).clone(), (bytes, companion));
+        packed.insert((*name).clone(), (kind, bytes, companion));
     }
     let mut tensors: Vec<(String, Vec<usize>, u32, &[u8])> = Vec::new();
     for entry in &directory.tensors {
-        if let Some((bytes, companion)) = packed.get(&entry.name) {
-            tensors.push((entry.name.clone(), entry.dims.clone(), QTIP3_KIND, bytes));
+        if let Some((kind, bytes, companion)) = packed.get(&entry.name) {
+            tensors.push((entry.name.clone(), entry.dims.clone(), *kind, bytes));
             let length = companion.len() / 4;
             tensors.push((
                 format!("{}{QTIP3_COMPANION}", entry.name),

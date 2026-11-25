@@ -169,8 +169,8 @@ impl DeviceTensor {
         let width = tensor.dims[0];
         let rows = tensor.dims.get(1).copied().unwrap_or(1);
         #[cfg(feature = "qtip-research")]
-        let qtip = (kind == crate::gguf::QTIP3_KIND as i32)
-            .then(|| qtip::QtipTensor::upload(&mut bytes, width, rows, stream))
+        let qtip = crate::gguf::qtip_symbol_bits(kind as u32)
+            .map(|_| qtip::QtipTensor::upload(&mut bytes, kind as u32, width, rows, stream))
             .transpose()?;
         Ok(Self {
             bytes: stream.clone_htod(&bytes).map_err(failure)?,
@@ -182,9 +182,9 @@ impl DeviceTensor {
         })
     }
 
-    /// Whether this projection is QTIP3 (always false without the feature).
+    /// Whether this projection is QTIP3 or QTIP2 (always false without the feature).
     fn is_qtip(&self) -> bool {
-        cfg!(feature = "qtip-research") && self.kind == 200
+        cfg!(feature = "qtip-research") && matches!(self.kind, 200 | 201)
     }
 }
 
@@ -1382,7 +1382,11 @@ impl CudaBackend {
         #[cfg(not(feature = "qtip-research"))]
         let mut weights = Weights::open(path, config)?;
         let s = &weights.spec;
-        let has_qtip = s.info.tensor_types.iter().any(|kind| kind == "QTIP3");
+        let has_qtip = s
+            .info
+            .tensor_types
+            .iter()
+            .any(|kind| kind == "QTIP3" || kind == "QTIP2");
         if has_qtip
             && !matches!(
                 options.matmul,
@@ -1571,6 +1575,10 @@ impl CudaBackend {
                             .all(|t| t.is_qtip())
                         && l.q.width == l.k.width
                         && l.k.width == l.v.width
+                        // One multi launch runs one trellis width.
+                        && l.q.kind == l.k.kind
+                        && l.k.kind == l.v.kind
+                        && gate.is_some_and(|g| g.kind == l.up.kind)
                 });
         }
         if options.decode_graph {

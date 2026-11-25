@@ -206,6 +206,8 @@ struct Workspace {
     status: CudaSlice<i32>,
     logits: CudaSlice<f32>,
     batch_logits: Option<CudaSlice<f32>>,
+    tree_pos: Option<CudaSlice<i32>>,
+    tree_mask: Option<CudaSlice<u64>>,
     tokens: Option<CudaSlice<i32>>,
     groups: Option<CudaSlice<i32>>,
     /// int8-fast mixed expert tiles: (slots, element offset) of the 128-, 64- and
@@ -520,6 +522,8 @@ impl Workspace {
             status: stream.alloc_zeros(1).map_err(failure)?,
             logits: alloc(spec.info.vocab_tokens as usize)?,
             batch_logits: None,
+            tree_pos: None,
+            tree_mask: None,
             tokens: if prefill_capacity(spec) > 1 {
                 Some(
                     stream
@@ -2893,6 +2897,18 @@ impl CudaBackend {
                 &t.rows,
                 &n_i32
             );
+        } else if t.kind == 12 && t.width % 256 == 0 {
+            launch!(
+                self,
+                "matvec_q4k_multi8",
+                ((t.rows as u32).div_ceil(8), 1, 1),
+                &t.bytes,
+                &self.work.normalized,
+                batch_logits,
+                &t.width,
+                &t.rows,
+                &n_i32
+            );
         } else {
             launch!(
                 self,
@@ -2971,10 +2987,23 @@ impl CudaBackend {
             .map(|&d| position as i32 + i32::from(d))
             .collect();
         let tree_mask_host: Vec<u64> = tree.attn_mask[..n].to_vec();
-        let d_tree_pos = self.stream.clone_htod(&tree_pos_host).map_err(failure)?;
-        let d_tree_mask = self.stream.clone_htod(&tree_mask_host).map_err(failure)?;
+        if self.work.tree_pos.is_none() {
+            self.work.tree_pos = Some(self.stream.alloc_zeros(16).map_err(failure)?);
+            self.work.tree_mask = Some(self.stream.alloc_zeros(16).map_err(failure)?);
+        }
+        let mut d_tree_pos = self.work.tree_pos.take().unwrap();
+        let mut d_tree_mask = self.work.tree_mask.take().unwrap();
+        self.stream
+            .memcpy_htod(&tree_pos_host, &mut d_tree_pos.slice_mut(0..n))
+            .map_err(failure)?;
+        self.stream
+            .memcpy_htod(&tree_mask_host, &mut d_tree_mask.slice_mut(0..n))
+            .map_err(failure)?;
 
-        self.batched_prefill_tree(&tokens_i32, position as usize, &d_tree_pos, &d_tree_mask)?;
+        let res = self.batched_prefill_tree(&tokens_i32, position as usize, &d_tree_pos, &d_tree_mask);
+        self.work.tree_pos = Some(d_tree_pos);
+        self.work.tree_mask = Some(d_tree_mask);
+        res?;
 
         let n_i32 = n as i32;
         let width_i32 = self.weights.spec.width as i32;

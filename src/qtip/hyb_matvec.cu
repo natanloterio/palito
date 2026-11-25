@@ -6,12 +6,16 @@
 //    reads and decodes each weight ONCE and applies it to k activation vectors
 //    in registers — solving the short-prefill / speculative verification bottleneck.
 
+#ifndef HYB_L
+#define HYB_L 16
+#endif
 #ifndef HYB_B
 #define HYB_B 4
 #endif
 #ifndef HYB_Q
 #define HYB_Q 5
 #endif
+#define HYB_STATE_MASK ((1u << HYB_L) - 1u)
 #ifndef HYB_UNROLL
 #define HYB_UNROLL 4
 #endif
@@ -476,4 +480,239 @@ hyb_matvec_mma(const unsigned* __restrict__ tiles,
         atomicAdd(&y[(size_t)tok0 * rows + row1], d2[nc] * scale);
         atomicAdd(&y[(size_t)tok1 * rows + row1], d3[nc] * scale);
     }
+}
+
+// Fused small-batch (2 <= tokens <= 16) HYB Q=5 Tensor-Core verification block:
+// Zero-SMEM warp-register LUT (Q=5), MMA-swizzled circular tiles (48/64/80/96B),
+// optional offline-folded RHT (HYB_SKIP_IN_RHT / HYB_SKIP_OUT_RHT), and optional
+// fused SwiGLU. 1-2 mma.sync.aligned.m16n8k16 instructions compute up to 16 tokens
+// directly from decoded half2 LUT registers with ZERO weight cvt!
+template <bool SwiGLU>
+__device__ __forceinline__ void hyb_small_k_block(
+    const unsigned* __restrict__ tiles, const unsigned* __restrict__ lut_global,
+    const float* __restrict__ x, const float* __restrict__ x_up,
+    const float* __restrict__ col_signs, const float* __restrict__ row_signs,
+    float* __restrict__ y, int rows, int cols, int tokens, int chunks_per_split,
+    float scale, int row_block, int split) {
+    __shared__ unsigned xs_h2[16][HYB_CHUNK / 2]; // 8 KB
+    __shared__ float partial[16][HYB_CHUNK];      // 16 KB
+
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    const int group_id = lane >> 2;
+    const int tid = lane & 3;
+    const unsigned reg_lut = __ldg(lut_global + lane);
+
+    const int col_tiles = cols / HYB_TILE;
+    const int total_chunks = cols / HYB_CHUNK;
+    const int ch0 = split * chunks_per_split;
+    const int ch1 = min(ch0 + chunks_per_split, total_chunks);
+
+    const int group = row_block * HYB_FUSED_WARPS + warp;
+    const int bit = lane * 4 * HYB_B;
+    const int w0_idx = (bit / 32) % HYB_WORDS;
+    const int w1_idx = (w0_idx + 1) % HYB_WORDS;
+#if HYB_B == 6
+    const int w2_idx = (w0_idx + 2) % HYB_WORDS;
+#endif
+    const int shift = bit & 31;
+
+    const unsigned* base = tiles + (size_t)group * col_tiles * HYB_WORDS;
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+    float e0 = 0.0f, e1 = 0.0f, e2 = 0.0f, e3 = 0.0f;
+    const bool has_hi = tokens > 8;
+
+    for (int ch = ch0; ch < ch1; ++ch) {
+        const int c = ch * HYB_CHUNK;
+        if (warp < tokens) {
+            float v[8];
+            const float* xt = x + (size_t)warp * cols + c;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                v[e] = __ldg(xt + lane + 32 * e);
+            }
+            if (SwiGLU) {
+                const float* ut = x_up + (size_t)warp * cols + c;
+                float up[8];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    up[e] = __ldg(ut + lane + 32 * e);
+                }
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    v[e] = v[e] / (1.0f + expf(-v[e])) * up[e];
+                }
+            }
+#if !HYB_SKIP_IN_RHT
+            float sign[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                sign[e] = __ldg(col_signs + c + lane + 32 * e);
+            }
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                v[e] *= sign[e];
+            }
+            hyb_fwht256_warp(v);
+#endif
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                partial[warp][lane + 32 * e] = v[e];
+            }
+            __syncwarp();
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int j = lane + 32 * e;
+                const float x0 = partial[warp][2 * j];
+                const float x1 = partial[warp][2 * j + 1];
+                unsigned h2;
+                asm("cvt.rn.f16x2.f32 %0, %2, %1;" : "=r"(h2) : "f"(x0), "f"(x1));
+                xs_h2[warp][j] = h2;
+            }
+        }
+        __syncthreads();
+
+        const int k0 = ch * 16;
+        for (int tk = 0; tk < 16; tk += HYB_UNROLL) {
+            unsigned words[HYB_UNROLL];
+#pragma unroll
+            for (int u = 0; u < HYB_UNROLL; ++u) {
+                const int kk = k0 + tk + u;
+                words[u] = (lane < HYB_WORDS) ? __ldg(base + (size_t)kk * HYB_WORDS + lane) : 0u;
+            }
+#pragma unroll
+            for (int u = 0; u < HYB_UNROLL; ++u) {
+                const unsigned r0 = __shfl_sync(0xffffffffu, words[u], w0_idx);
+                const unsigned r1 = __shfl_sync(0xffffffffu, words[u], w1_idx);
+#if HYB_B == 6
+                const unsigned r2 = __shfl_sync(0xffffffffu, words[u], w2_idx);
+#endif
+                const unsigned bits0 = __funnelshift_r(r0, r1, shift);
+#if HYB_B == 6
+                const unsigned bits1 = __funnelshift_r(r1, r2, shift);
+#endif
+                unsigned a[4];
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+#if HYB_B == 6
+                    const unsigned state = (p < 3)
+                        ? ((bits0 >> (p * 6)) & HYB_STATE_MASK)
+                        : (((bits0 >> 18) | (bits1 << 14)) & HYB_STATE_MASK);
+#else
+                    const unsigned state = (bits0 >> (p * HYB_B)) & HYB_STATE_MASK;
+#endif
+                    const unsigned h = state * HYB_HASH_MULT;
+                    a[p] = __shfl_sync(0xffffffffu, reg_lut, (h >> 5) & 31u) ^ (h & 0x80008000u);
+                }
+
+                const int xoff = (tk + u) * 8 + tid;
+                const unsigned b0 = (group_id < tokens) ? xs_h2[group_id][xoff] : 0u;
+                const unsigned b1 = (group_id < tokens) ? xs_h2[group_id][xoff + 4] : 0u;
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                    "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                    : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                if (has_hi) {
+                    const int g_hi = 8 + group_id;
+                    const unsigned b2 = (g_hi < tokens) ? xs_h2[g_hi][xoff] : 0u;
+                    const unsigned b3 = (g_hi < tokens) ? xs_h2[g_hi][xoff + 4] : 0u;
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                        : "+f"(e0), "+f"(e1), "+f"(e2), "+f"(e3)
+                        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b2), "r"(b3));
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    const int tok0 = 2 * tid;
+    const int tok1 = tok0 + 1;
+    if (tok0 < tokens) {
+        partial[tok0][warp * HYB_TILE + group_id] = d0;
+        partial[tok0][warp * HYB_TILE + group_id + 8] = d2;
+    }
+    if (tok1 < tokens) {
+        partial[tok1][warp * HYB_TILE + group_id] = d1;
+        partial[tok1][warp * HYB_TILE + group_id + 8] = d3;
+    }
+    if (has_hi) {
+        if (8 + tok0 < tokens) {
+            partial[8 + tok0][warp * HYB_TILE + group_id] = e0;
+            partial[8 + tok0][warp * HYB_TILE + group_id + 8] = e2;
+        }
+        if (8 + tok1 < tokens) {
+            partial[8 + tok1][warp * HYB_TILE + group_id] = e1;
+            partial[8 + tok1][warp * HYB_TILE + group_id + 8] = e3;
+        }
+    }
+    __syncthreads();
+
+    if (warp < tokens) {
+        float v[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            v[e] = partial[warp][lane + 32 * e];
+        }
+#if !HYB_SKIP_OUT_RHT
+        hyb_fwht256_warp(v);
+#endif
+        float* yt = y + (size_t)warp * rows;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int row = row_block * HYB_CHUNK + lane + 32 * e;
+#if !HYB_SKIP_OUT_RHT
+            atomicAdd(&yt[row], v[e] * __ldg(row_signs + row) * scale);
+#else
+            atomicAdd(&yt[row], v[e] * scale);
+#endif
+        }
+    }
+}
+
+#define HYB_SMALL_K_MULTI_PARAMS                                                            \
+    const unsigned* __restrict__ t0, const unsigned* __restrict__ t1,                       \
+        const unsigned* __restrict__ t2, const unsigned* __restrict__ l0,                   \
+        const unsigned* __restrict__ l1, const unsigned* __restrict__ l2,                   \
+        const float* __restrict__ c0, const float* __restrict__ c1,                         \
+        const float* __restrict__ c2, const float* __restrict__ r0,                         \
+        const float* __restrict__ r1, const float* __restrict__ r2, float* __restrict__ y0, \
+        float* __restrict__ y1, float* __restrict__ y2, float s0, float s1, float s2,       \
+        int rows0, int rows1, int rows2, int rb0, int rb1, const float* __restrict__ x,     \
+        const float* __restrict__ x_up, int cols, int tokens, int chunks_per_split
+
+template <bool SwiGLU>
+__device__ __forceinline__ void hyb_small_k_multi_body(HYB_SMALL_K_MULTI_PARAMS) {
+    int row_block = blockIdx.x;
+    const unsigned *tiles = t0, *lut = l0;
+    const float *col_signs = c0, *row_signs = r0;
+    float* y = y0;
+    float scale = s0;
+    int rows = rows0;
+    if (row_block >= rb0) {
+        row_block -= rb0;
+        tiles = t1, lut = l1, col_signs = c1, row_signs = r1, y = y1, scale = s1, rows = rows1;
+        if (row_block >= rb1) {
+            row_block -= rb1;
+            tiles = t2, lut = l2, col_signs = c2, row_signs = r2, y = y2, scale = s2, rows = rows2;
+        }
+    }
+    hyb_small_k_block<SwiGLU>(tiles, lut, x, SwiGLU ? x_up : nullptr, col_signs, row_signs, y,
+                              rows, cols, tokens, chunks_per_split, scale, row_block, blockIdx.y);
+}
+
+#define HYB_SMALL_K_MULTI_ARGS                                                              \
+    t0, t1, t2, l0, l1, l2, c0, c1, c2, r0, r1, r2, y0, y1, y2, s0, s1, s2, rows0, rows1,   \
+        rows2, rb0, rb1, x, x_up, cols, tokens, chunks_per_split
+
+extern "C" __global__ void __launch_bounds__(512)
+hyb_small_k_multi(HYB_SMALL_K_MULTI_PARAMS) {
+    hyb_small_k_multi_body<false>(HYB_SMALL_K_MULTI_ARGS);
+}
+
+extern "C" __global__ void __launch_bounds__(512)
+hyb_small_k_multi_swiglu(HYB_SMALL_K_MULTI_PARAMS) {
+    hyb_small_k_multi_body<true>(HYB_SMALL_K_MULTI_ARGS);
 }

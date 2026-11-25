@@ -513,6 +513,29 @@ impl CudaBackend {
             {
                 prepare_residual!(self, &self.work.normalized, n * w, true);
             }
+            #[cfg(feature = "qtip-research")]
+            let fused_small_qkv = self.qtip_chain
+                && (2..=16).contains(&tokens.len())
+                && l.qkv_bias.is_none()
+                && self.qtip.is_some()
+                && l.q.kind == l.k.kind
+                && l.k.kind == l.v.kind;
+            #[cfg(not(feature = "qtip-research"))]
+            let fused_small_qkv = false;
+            if fused_small_qkv {
+                #[cfg(feature = "qtip-research")]
+                self.qtip.as_ref().unwrap().matmul_small_k_multi(
+                    &self.stream,
+                    &[
+                        (&l.q, &mut self.work.q),
+                        (&l.k, &mut self.work.k),
+                        (&l.v, &mut self.work.v),
+                    ],
+                    &self.work.normalized,
+                    None,
+                    tokens.len(),
+                )?;
+            } else {
             for (component, (tensor, output, stage)) in [
                 (&l.q, &mut self.work.q, "Qproj"),
                 (&l.k, &mut self.work.k, "Kproj"),
@@ -575,6 +598,7 @@ impl CudaBackend {
                         tensor.rows as usize,
                     )?;
                 }
+            }
             }
             for (norm, values, size) in [
                 (&l.q_norm, &mut self.work.q, qw),
@@ -1181,6 +1205,35 @@ impl CudaBackend {
             {
                 prepare_residual!(self, &self.work.normalized, n * w);
             }
+            #[cfg(feature = "qtip-research")]
+            let fused_small_ffn = self.qtip_chain
+                && (2..=16).contains(&tokens.len())
+                && gemma.is_none()
+                && self.work.groups.is_none()
+                && self.qtip.is_some()
+                && gate.kind == l.up.kind;
+            #[cfg(not(feature = "qtip-research"))]
+            let fused_small_ffn = false;
+            if fused_small_ffn {
+                #[cfg(feature = "qtip-research")]
+                {
+                    let qtip = self.qtip.as_ref().unwrap();
+                    qtip.matmul_small_k_multi(
+                        &self.stream,
+                        &[(gate, &mut self.work.gate), (&l.up, &mut self.work.up)],
+                        &self.work.normalized,
+                        None,
+                        tokens.len(),
+                    )?;
+                    qtip.matmul_small_k_multi(
+                        &self.stream,
+                        &[(&l.down, &mut self.work.down)],
+                        &self.work.gate,
+                        Some(&self.work.up),
+                        tokens.len(),
+                    )?;
+                }
+            } else {
             for (t, out) in [(gate, &mut self.work.gate), (&l.up, &mut self.work.up)] {
                 if integer_groups || (s.experts == 0 && residual_projection(matmul, t, n)) {
                     project_residual!(
@@ -1363,6 +1416,7 @@ impl CudaBackend {
                         &n
                     );
                 });
+            }
             }
 
             capture_projection!(

@@ -429,6 +429,74 @@ __device__ __forceinline__ float q4k_wide_row_part(const u8 *w, const float *x, 
     return warp_sum(fold_parts(parts));
 }
 
+// Vectorized Q4_K multi-vector product (1 <= tokens <= 8):
+// 1 warp per output row (8 rows/block), reads each 144-byte Q4_K superblock ONCE
+// and multiplies by all `tokens <= 8` input vectors in registers.
+extern "C" __global__ void matvec_q4k_multi8(const u8 *w, const float *x, float *y,
+                                             int width, int rows, int tokens) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int row = blockIdx.x * 8 + warp;
+    if (row >= rows) return;
+
+    u64 offset = (u64)row * width;
+    int sub = lane & 7;
+    int pair = sub >> 1;
+
+    float acc[8];
+    #pragma unroll
+    for (int t = 0; t < 8; t++) acc[t] = 0.0f;
+
+    for (int first = (lane >> 3) * 256; first < width; first += 1024) {
+        const u8 *p = w + ((offset + first) / 256) * 144;
+        uint4 qv = *(const uint4 *)(p + 16 + sub * 16);
+        unsigned int dd = *(const unsigned int *)p;
+        float d = half_value_bits(dd & 0xffff), dm = half_value_bits(dd >> 16);
+        const unsigned int *sw = (const unsigned int *)(p + 4);
+        unsigned int s0 = sw[0], s1 = sw[1], s2 = sw[2];
+        unsigned int qw[4] = {qv.x, qv.y, qv.z, qv.w};
+
+        #pragma unroll
+        for (int half = 0; half < 2; half++) {
+            int group = 2 * pair + half, shift = 8 * (group & 3);
+            unsigned int lo = (s0 >> shift) & 255, mid = (s1 >> shift) & 255;
+            unsigned int hi = (s2 >> shift) & 255;
+            int scale = group < 4 ? lo & 63 : (hi & 15) | ((lo >> 6) << 4);
+            int minimum = group < 4 ? mid & 63 : (hi >> 4) | ((mid >> 6) << 4);
+            float ds = d * (float)scale, ms = dm * (float)minimum;
+            int xbase = first + 32 * group + (sub & 1) * 16;
+
+            #pragma unroll
+            for (int word = 0; word < 4; word++) {
+                float wd[4];
+                #pragma unroll
+                for (int b = 0; b < 4; b++) {
+                    wd[b] = ds * small_uint_float((qw[word] >> (8 * b + 4 * half)) & 15) - ms;
+                }
+                int xoff = xbase + 4 * word;
+                #pragma unroll
+                for (int t = 0; t < 8; t++) {
+                    if (t < tokens) {
+                        float4 xv = __ldg((const float4 *)(x + (u64)t * width + xoff));
+                        acc[t] = fmaf(wd[0], xv.x, acc[t]);
+                        acc[t] = fmaf(wd[1], xv.y, acc[t]);
+                        acc[t] = fmaf(wd[2], xv.z, acc[t]);
+                        acc[t] = fmaf(wd[3], xv.w, acc[t]);
+                    }
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < 8; t++) {
+        if (t < tokens) {
+            float sum = warp_sum(acc[t]);
+            if (lane == 0) y[(u64)t * rows + row] = sum;
+        }
+    }
+}
+
 // Q5_K with 8 lanes per 256-value block: same layout as q4k_wide_block plus the
 // 32-byte high-bit array `qh` at p + 16.
 __device__ __forceinline__ void q5k_wide_block(const u8 *p, const float *x, int sub,

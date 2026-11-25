@@ -479,25 +479,15 @@ extern "C" __global__ void __launch_bounds__(512) qtip_matvec_multi_swiglu(QTIP_
     qtip_multi_body<true>(QTIP_MULTI_ARGS);
 }
 
-// Fused small-batch (2 <= tokens <= 16) QTIP Tensor-Core verification kernel:
-// 1 single launch per projection (24 KB static SMEM => 100% occupancy on SM_120),
-// fused input+output 256-block FWHT, and direct register-to-Tensor-Core
-// mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 (1 MMA for <=8 tokens,
-// 2 MMAs reusing the exact same decoded weights for 9..=16 tokens!).
-// Grid: (rows / 256, splits), Block: 512 threads (16 warps).
-// `chunks_per_split` is in 256-column chunks (16 tiles per chunk).
-// `y` must be zeroed before launch (atomicAdd across splits).
-extern "C" __global__ void __launch_bounds__(512)
-qtip_matvec_small_k(const unsigned* __restrict__ tiles,
-                    const float* __restrict__ x,
-                    const float* __restrict__ col_signs,
-                    const float* __restrict__ row_signs,
-                    float* __restrict__ y,
-                    int rows,
-                    int cols,
-                    int tokens,
-                    int chunks_per_split,
-                    float scale) {
+// Core block for fused small-batch (2 <= tokens <= 16) QTIP Tensor-Core verification.
+// With SwiGLU=true, computes SiLU(x) * x_up while loading input chunks (fusing SwiGLU
+// directly into down_proj).
+template <bool SwiGLU>
+__device__ __forceinline__ void qtip_small_k_block(
+    const unsigned* __restrict__ tiles, const float* __restrict__ x,
+    const float* __restrict__ x_up, const float* __restrict__ col_signs,
+    const float* __restrict__ row_signs, float* __restrict__ y, int rows, int cols, int tokens,
+    int chunks_per_split, float scale, int row_block, int split) {
     __shared__ unsigned xs_h2[16][QTIP_CHUNK / 2]; // 8 KB: 128 half2 per token
     __shared__ float partial[16][QTIP_CHUNK];      // 16 KB: scratch + output partial
 
@@ -507,10 +497,10 @@ qtip_matvec_small_k(const unsigned* __restrict__ tiles,
     const int tid = lane & 3;         // 0..3
     const int col_tiles = cols / QTIP_TILE;
     const int total_chunks = cols / QTIP_CHUNK;
-    const int ch0 = blockIdx.y * chunks_per_split;
+    const int ch0 = split * chunks_per_split;
     const int ch1 = min(ch0 + chunks_per_split, total_chunks);
 
-    const int group = blockIdx.x * QTIP_FUSED_WARPS + warp;
+    const int group = row_block * QTIP_FUSED_WARPS + warp;
     const unsigned* base = tiles + (size_t)group * col_tiles * QTIP_WORDS;
 
     const int t_idx[4] = {
@@ -534,7 +524,6 @@ qtip_matvec_small_k(const unsigned* __restrict__ tiles,
 
     for (int ch = ch0; ch < ch1; ++ch) {
         const int c = ch * QTIP_CHUNK;
-        // One warp per token (all 16 warps in parallel for up to 16 tokens!).
         if (warp < tokens) {
             float v[8], sign[8];
             const float* xt = x + (size_t)warp * cols + c;
@@ -543,6 +532,18 @@ qtip_matvec_small_k(const unsigned* __restrict__ tiles,
                 const int idx = lane + 32 * e;
                 v[e] = __ldg(xt + idx);
                 sign[e] = __ldg(col_signs + c + idx);
+            }
+            if (SwiGLU) {
+                const float* ut = x_up + (size_t)warp * cols + c;
+                float up[8];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    up[e] = __ldg(ut + lane + 32 * e);
+                }
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    v[e] = v[e] / (1.0f + expf(-v[e])) * up[e];
+                }
             }
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
@@ -643,8 +644,67 @@ qtip_matvec_small_k(const unsigned* __restrict__ tiles,
         float* yt = y + (size_t)warp * rows;
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
-            const int row = blockIdx.x * QTIP_CHUNK + lane + 32 * e;
+            const int row = row_block * QTIP_CHUNK + lane + 32 * e;
             atomicAdd(&yt[row], v[e] * __ldg(row_signs + row) * scale);
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(512)
+qtip_matvec_small_k(const unsigned* __restrict__ tiles,
+                    const float* __restrict__ x,
+                    const float* __restrict__ col_signs,
+                    const float* __restrict__ row_signs,
+                    float* __restrict__ y,
+                    int rows,
+                    int cols,
+                    int tokens,
+                    int chunks_per_split,
+                    float scale) {
+    qtip_small_k_block<false>(tiles, x, nullptr, col_signs, row_signs, y, rows, cols, tokens,
+                              chunks_per_split, scale, blockIdx.x, blockIdx.y);
+}
+
+#define QTIP_SMALL_K_MULTI_PARAMS                                                           \
+    const unsigned* __restrict__ t0, const unsigned* __restrict__ t1,                       \
+        const unsigned* __restrict__ t2, const float* __restrict__ c0,                      \
+        const float* __restrict__ c1, const float* __restrict__ c2,                         \
+        const float* __restrict__ r0, const float* __restrict__ r1,                         \
+        const float* __restrict__ r2, float* __restrict__ y0, float* __restrict__ y1,       \
+        float* __restrict__ y2, float s0, float s1, float s2, int rows0, int rows1,         \
+        int rows2, int rb0, int rb1, const float* __restrict__ x,                           \
+        const float* __restrict__ x_up, int cols, int tokens, int chunks_per_split
+
+template <bool SwiGLU>
+__device__ __forceinline__ void qtip_small_k_multi_body(QTIP_SMALL_K_MULTI_PARAMS) {
+    int row_block = blockIdx.x;
+    const unsigned* tiles = t0;
+    const float *col_signs = c0, *row_signs = r0;
+    float* y = y0;
+    float scale = s0;
+    int rows = rows0;
+    if (row_block >= rb0) {
+        row_block -= rb0;
+        tiles = t1, col_signs = c1, row_signs = r1, y = y1, scale = s1, rows = rows1;
+        if (row_block >= rb1) {
+            row_block -= rb1;
+            tiles = t2, col_signs = c2, row_signs = r2, y = y2, scale = s2, rows = rows2;
+        }
+    }
+    qtip_small_k_block<SwiGLU>(tiles, x, SwiGLU ? x_up : nullptr, col_signs, row_signs, y, rows,
+                               cols, tokens, chunks_per_split, scale, row_block, blockIdx.y);
+}
+
+#define QTIP_SMALL_K_MULTI_ARGS                                                             \
+    t0, t1, t2, c0, c1, c2, r0, r1, r2, y0, y1, y2, s0, s1, s2, rows0, rows1, rows2, rb0,   \
+        rb1, x, x_up, cols, tokens, chunks_per_split
+
+extern "C" __global__ void __launch_bounds__(512)
+qtip_matvec_small_k_multi(QTIP_SMALL_K_MULTI_PARAMS) {
+    qtip_small_k_multi_body<false>(QTIP_SMALL_K_MULTI_ARGS);
+}
+
+extern "C" __global__ void __launch_bounds__(512)
+qtip_matvec_small_k_multi_swiglu(QTIP_SMALL_K_MULTI_PARAMS) {
+    qtip_small_k_multi_body<true>(QTIP_SMALL_K_MULTI_ARGS);
 }

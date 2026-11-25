@@ -138,6 +138,8 @@ struct Variant {
     multi: CudaFunction,
     multi_swiglu: CudaFunction,
     small_k: CudaFunction,
+    small_k_multi: CudaFunction,
+    small_k_multi_swiglu: CudaFunction,
     rotate_input: CudaFunction,
     rotate_output: CudaFunction,
     product: CudaFunction,
@@ -212,6 +214,8 @@ impl Variant {
             multi: load("qtip_matvec_multi")?,
             multi_swiglu: load("qtip_matvec_multi_swiglu")?,
             small_k: load("qtip_matvec_small_k")?,
+            small_k_multi: load("qtip_matvec_small_k_multi")?,
+            small_k_multi_swiglu: load("qtip_matvec_small_k_multi_swiglu")?,
             rotate_input: load("qtip_rotate_input")?,
             rotate_output: load("qtip_rotate_output")?,
             product: load("qtip_matmul_mma")?,
@@ -399,6 +403,99 @@ impl QtipKernel {
         // QTIP_MULTI_PARAMS order. Pointers come from live slices checked
         // above; the zero buffers are disjoint from this launch's inputs and
         // outputs, and rb0/rb1 keep the grid on the `count` real matrices.
+        unsafe { args.launch(config) }.map_err(failure)?;
+        Ok(())
+    }
+
+    /// Fused small-batch (`2 <= tokens <= 16`) multi-matrix launch for Q/K/V,
+    /// Gate/Up, or Down+SwiGLU (1 single launch instead of 2–3 + swiglu).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn matmul_small_k_multi(
+        &self,
+        stream: &Arc<CudaStream>,
+        matrices: &[(&DeviceTensor, &mut CudaSlice<f32>)],
+        x: &CudaSlice<f32>,
+        x_up: Option<&CudaSlice<f32>>,
+        tokens: usize,
+    ) -> Result<()> {
+        if matrices.is_empty() || matrices.len() > 3 || !(2..=16).contains(&tokens) {
+            return Err(invalid("matmul_small_k_multi needs 1..=3 matrices and 2..=16 tokens"));
+        }
+        let kind = matrices[0].0.kind;
+        let cols = matrices[0].0.width as usize;
+        let variant = Self::variant(&self.variants, kind)?;
+        let mut tiles = [0u64; 3];
+        let mut col_signs = [0u64; 3];
+        let mut row_signs = [0u64; 3];
+        let mut ys = [0u64; 3];
+        let mut scales = [0.0f32; 3];
+        let mut rows_arr = [0i32; 3];
+        let mut row_blocks = [0usize; 3];
+
+        // Zero output slices and gather raw pointers.
+        let mut total_rb = 0usize;
+        for (i, (t, y)) in matrices.iter().enumerate() {
+            let q = t
+                .qtip
+                .as_ref()
+                .ok_or_else(|| invalid("matmul_small_k_multi needs QTIP tensors"))?;
+            let r = t.rows as usize;
+            let mut y_mut = y.slice(0..tokens * r);
+            // SAFETY: each y in `matrices` is a distinct output buffer; zeroing via raw ptr below.
+            let y_ptr = pointer(y, stream);
+            unsafe {
+                cudarc::driver::result::memset_d8_async(
+                    y_ptr,
+                    0,
+                    tokens * r * std::mem::size_of::<f32>(),
+                    stream.cu_stream(),
+                )
+                .map_err(failure)?;
+            }
+            let _ = &mut y_mut;
+            tiles[i] = pointer(&t.bytes, stream);
+            row_signs[i] = pointer(&q.signs, stream);
+            col_signs[i] = row_signs[i] + (r * std::mem::size_of::<f32>()) as u64;
+            ys[i] = y_ptr;
+            scales[i] = q.scale;
+            rows_arr[i] = r as i32;
+            row_blocks[i] = r / CHUNK;
+            total_rb += row_blocks[i];
+        }
+        let rb0 = row_blocks[0] as i32;
+        let rb1 = if matrices.len() >= 2 {
+            row_blocks[1] as i32
+        } else {
+            total_rb as i32
+        };
+        let total_chunks = cols / CHUNK;
+        let splits = 340usize.div_ceil(total_rb).clamp(1, total_chunks);
+        let chunks_per_split = total_chunks.div_ceil(splits);
+        let splits = total_chunks.div_ceil(chunks_per_split);
+        let x_ptr = pointer(x, stream);
+        let x_up_ptr = x_up.map_or(0u64, |u| pointer(u, stream));
+        let cols_i = cols as i32;
+        let tokens_i = tokens as i32;
+        let cps_i = chunks_per_split as i32;
+
+        let func = if x_up.is_some() {
+            &variant.small_k_multi_swiglu
+        } else {
+            &variant.small_k_multi
+        };
+        let config = LaunchConfig {
+            grid_dim: (total_rb as u32, splits as u32, 1),
+            block_dim: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = stream.launch_builder(func);
+        for g in [&tiles, &col_signs, &row_signs, &ys] {
+            args.arg(&g[0]).arg(&g[1]).arg(&g[2]);
+        }
+        args.arg(&scales[0]).arg(&scales[1]).arg(&scales[2]);
+        args.arg(&rows_arr[0]).arg(&rows_arr[1]).arg(&rows_arr[2]);
+        args.arg(&rb0).arg(&rb1).arg(&x_ptr).arg(&x_up_ptr);
+        args.arg(&cols_i).arg(&tokens_i).arg(&cps_i);
         unsafe { args.launch(config) }.map_err(failure)?;
         Ok(())
     }

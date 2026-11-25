@@ -1207,6 +1207,7 @@ impl CudaBackend {
             "prefill_matmul_8",
             "matvec_q6k_multi8",
             "matvec_q6k_multi16",
+            "matvec_q4k_multi8",
             "rotary_tree",
             "rotary_factored_tree",
             "attention_tree",

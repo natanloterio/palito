@@ -185,20 +185,20 @@ impl CudaBackend {
             norm,
             keys: alloc(context * kv_width)?,
             values: alloc(context * kv_width)?,
-            fc_in: alloc(3 * width)?,
-            g: alloc(width)?,
+            fc_in: alloc(8 * 3 * width)?,
+            g: alloc(8 * width)?,
             g_save0: alloc(width)?,
             g_save1: alloc(width)?,
-            emb: alloc(width)?,
-            inp_cat: alloc(2 * width)?,
-            q: alloc(width)?,
-            k: alloc(kv_width)?,
-            v: alloc(kv_width)?,
-            attn: alloc(width)?,
-            proj: alloc(width)?,
-            norm_buf: alloc(width)?,
-            gate: alloc(inter)?,
-            up: alloc(inter)?,
+            emb: alloc(8 * width)?,
+            inp_cat: alloc(8 * 2 * width)?,
+            q: alloc(8 * width)?,
+            k: alloc(8 * kv_width)?,
+            v: alloc(8 * kv_width)?,
+            attn: alloc(8 * width)?,
+            proj: alloc(8 * width)?,
+            norm_buf: alloc(8 * width)?,
+            gate: alloc(8 * inter)?,
+            up: alloc(8 * inter)?,
             draft_logits: alloc(draft_vocab)?,
         });
         Ok(())
@@ -706,9 +706,11 @@ impl CudaBackend {
 
         // Save root g_0 into g_save0.
         {
+            let width = self.weights.spec.width;
             let e = self.eagle3.as_mut().unwrap();
+            let src = e.g.slice(0..width);
             self.stream
-                .memcpy_dtod(&e.g, &mut e.g_save0)
+                .memcpy_dtod(&src, &mut e.g_save0)
                 .map_err(failure)?;
         }
 
@@ -722,9 +724,11 @@ impl CudaBackend {
         // Branch 1: c0 -> top-2 (nodes 4, 5)
         self.eagle3_midlayer_step(c0, start_pos)?;
         {
+            let width = self.weights.spec.width;
             let e = self.eagle3.as_mut().unwrap();
+            let src = e.g.slice(0..width);
             self.stream
-                .memcpy_dtod(&e.g, &mut e.g_save1)
+                .memcpy_dtod(&src, &mut e.g_save1)
                 .map_err(failure)?;
         }
         let b1_top2 = self.eagle3_sample_topk(2)?;
@@ -746,9 +750,11 @@ impl CudaBackend {
 
         // Restore g_save1 (after c0 at start_pos) -> extend c01 greedily 2 steps (nodes 10, 11).
         {
+            let width = self.weights.spec.width;
             let e = self.eagle3.as_mut().unwrap();
+            let mut dst = e.g.slice_mut(0..width);
             self.stream
-                .memcpy_dtod(&e.g_save1, &mut e.g)
+                .memcpy_dtod(&e.g_save1, &mut dst)
                 .map_err(failure)?;
         }
         cur_tok = c01;
@@ -764,9 +770,11 @@ impl CudaBackend {
 
         // Branch 2: restore g_save0 -> c1 -> top-2 (nodes 12, 13) + 1 greedy step on c10 (node 14).
         {
+            let width = self.weights.spec.width;
             let e = self.eagle3.as_mut().unwrap();
+            let mut dst = e.g.slice_mut(0..width);
             self.stream
-                .memcpy_dtod(&e.g_save0, &mut e.g)
+                .memcpy_dtod(&e.g_save0, &mut dst)
                 .map_err(failure)?;
         }
         self.eagle3_midlayer_step(c1, start_pos)?;
@@ -780,9 +788,11 @@ impl CudaBackend {
 
         // Branch 3: restore g_save0 -> c2 -> top-1 (node 15).
         {
+            let width = self.weights.spec.width;
             let e = self.eagle3.as_mut().unwrap();
+            let mut dst = e.g.slice_mut(0..width);
             self.stream
-                .memcpy_dtod(&e.g_save0, &mut e.g)
+                .memcpy_dtod(&e.g_save0, &mut dst)
                 .map_err(failure)?;
         }
         self.eagle3_midlayer_step(c2, start_pos)?;
@@ -805,9 +815,11 @@ impl CudaBackend {
         nodes.push((root as u32, -1)); // node 0
 
         {
+            let width = self.weights.spec.width;
             let e = self.eagle3.as_mut().unwrap();
+            let src = e.g.slice(0..width);
             self.stream
-                .memcpy_dtod(&e.g, &mut e.g_save0)
+                .memcpy_dtod(&src, &mut e.g_save0)
                 .map_err(failure)?;
         }
 
@@ -830,9 +842,11 @@ impl CudaBackend {
 
         // Restore g_save0 -> extend c1 1 step (node 7).
         {
+            let width = self.weights.spec.width;
             let e = self.eagle3.as_mut().unwrap();
+            let mut dst = e.g.slice_mut(0..width);
             self.stream
-                .memcpy_dtod(&e.g_save0, &mut e.g)
+                .memcpy_dtod(&e.g_save0, &mut dst)
                 .map_err(failure)?;
         }
         self.eagle3_midlayer_step(c1, start_pos)?;
@@ -842,14 +856,399 @@ impl CudaBackend {
         Ok(crate::speculative::SpecTree::from_nodes(&nodes))
     }
 
+    /// Batched EAGLE-3 midlayer pass for `2 <= n <= 8` Q4_K tokens already loaded
+    /// into `eagle.g[0..n*H]`, writing KV at `start_pos..start_pos+n` and copying
+    /// the last token's output `g[n-1]` into `eagle.g[0..H]`.
+    fn eagle3_midlayer_batch(&mut self, tokens: &[i32], start_pos: usize) -> Result<()> {
+        let n = tokens.len();
+        let n_i = n as i32;
+        let s = &self.weights.spec;
+        let width = s.width;
+        let width_i = width as i32;
+        let heads = s.heads as i32;
+        let kv_heads = s.kv_heads as i32;
+        let dim = s.dim as i32;
+        let qw = (s.heads * s.dim) as i32;
+        let kw = (s.kv_heads * s.dim) as i32;
+        let pos_i = start_pos as i32;
+        let count_i = (start_pos + 1) as i32;
+        let neox = 1i32;
+
+        // 1. Embeddings for all `n` tokens via prefill_embedding.
+        let d_toks = self.stream.clone_htod(tokens).map_err(failure)?;
+        {
+            let e = self.eagle3.as_mut().unwrap();
+            let emb_w = &self.weights.embedding;
+            let func = self.functions["prefill_embedding"].clone();
+            let mut b = self.stream.launch_builder(&func);
+            b.arg(&emb_w.bytes)
+                .arg(&emb_w.kind)
+                .arg(&d_toks)
+                .arg(&mut e.emb)
+                .arg(&width_i);
+            unsafe {
+                b.launch(cudarc::driver::LaunchConfig {
+                    grid_dim: ((width as u32).div_ceil(256), n as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(failure)?;
+        }
+
+        // 2. Normalize emb and g for all `n` tokens, packing [e_norm, g_norm] into inp_cat[t * 2H ..].
+        {
+            let e = self.eagle3.as_mut().unwrap();
+            let norm_fn = self.functions["normalize"].clone();
+            let eps = e.eps;
+            for t in 0..n {
+                {
+                    let src = e.emb.slice(t * width..(t + 1) * width);
+                    let mut dst = e.inp_cat.slice_mut(t * 2 * width..t * 2 * width + width);
+                    let mut b = self.stream.launch_builder(&norm_fn);
+                    b.arg(&src)
+                        .arg(&e.input_layernorm)
+                        .arg(&mut dst)
+                        .arg(&width_i)
+                        .arg(&eps);
+                    unsafe {
+                        b.launch(cudarc::driver::LaunchConfig {
+                            grid_dim: (1, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                    }
+                    .map_err(failure)?;
+                }
+                {
+                    let src = e.g.slice(t * width..(t + 1) * width);
+                    let mut dst = e
+                        .inp_cat
+                        .slice_mut(t * 2 * width + width..(t + 1) * 2 * width);
+                    let mut b = self.stream.launch_builder(&norm_fn);
+                    b.arg(&src)
+                        .arg(&e.hidden_norm)
+                        .arg(&mut dst)
+                        .arg(&width_i)
+                        .arg(&eps);
+                    unsafe {
+                        b.launch(cudarc::driver::LaunchConfig {
+                            grid_dim: (1, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                    }
+                    .map_err(failure)?;
+                }
+            }
+        }
+
+        // 3. Q, K, V projections (single weight read across all `n` tokens via matvec_q4k_multi8!).
+        let q4k_fn = self.functions["matvec_q4k_multi8"].clone();
+        {
+            let e = self.eagle3.as_mut().unwrap();
+            for (proj, out) in [
+                (&e.q_proj, &mut e.q),
+                (&e.k_proj, &mut e.k),
+                (&e.v_proj, &mut e.v),
+            ] {
+                let mut b = self.stream.launch_builder(&q4k_fn);
+                b.arg(&proj.bytes)
+                    .arg(&e.inp_cat)
+                    .arg(out)
+                    .arg(&proj.width)
+                    .arg(&proj.rows)
+                    .arg(&n_i);
+                unsafe {
+                    b.launch(cudarc::driver::LaunchConfig {
+                        grid_dim: ((proj.rows as u32).div_ceil(8), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(failure)?;
+            }
+        }
+
+        // 4. Batched RoPE + cache_kv + causal attention_fused across all `n` tokens.
+        {
+            let e = self.eagle3.as_mut().unwrap();
+            let rotary_fn = self.functions["rotary"].clone();
+            let theta = e.rope_theta;
+            for (buf, n_el) in [(&mut e.q, qw), (&mut e.k, kw)] {
+                let mut b = self.stream.launch_builder(&rotary_fn);
+                b.arg(buf)
+                    .arg(&n_el)
+                    .arg(&dim)
+                    .arg(&pos_i)
+                    .arg(&theta)
+                    .arg(&neox);
+                unsafe {
+                    b.launch(cudarc::driver::LaunchConfig {
+                        grid_dim: (((n_el / 2) as u32).div_ceil(256), n as u32, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(failure)?;
+            }
+            let cache_fn = self.functions["cache_kv"].clone();
+            {
+                let mut b = self.stream.launch_builder(&cache_fn);
+                b.arg(&e.k)
+                    .arg(&e.v)
+                    .arg(&mut e.keys)
+                    .arg(&mut e.values)
+                    .arg(&kw)
+                    .arg(&pos_i);
+                unsafe {
+                    b.launch(cudarc::driver::LaunchConfig {
+                        grid_dim: ((kw as u32).div_ceil(256), n as u32, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(failure)?;
+            }
+            let attn_fn = self.functions["attention_fused"].clone();
+            {
+                let mut b = self.stream.launch_builder(&attn_fn);
+                b.arg(&e.q)
+                    .arg(&e.keys)
+                    .arg(&e.values)
+                    .arg(&mut e.attn)
+                    .arg(&dim)
+                    .arg(&heads)
+                    .arg(&kv_heads)
+                    .arg(&count_i);
+                unsafe {
+                    b.launch(cudarc::driver::LaunchConfig {
+                        grid_dim: (heads as u32, n as u32, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(failure)?;
+            }
+        }
+
+        // 5. O_proj + residual + post_attention_layernorm + MLP (gate/up/swiglu/down) + residual.
+        let total_w = (n * width) as i32;
+        {
+            let e = self.eagle3.as_mut().unwrap();
+            let mut ob = self.stream.launch_builder(&q4k_fn);
+            ob.arg(&e.o_proj.bytes)
+                .arg(&e.attn)
+                .arg(&mut e.proj)
+                .arg(&e.o_proj.width)
+                .arg(&e.o_proj.rows)
+                .arg(&n_i);
+            unsafe {
+                ob.launch(cudarc::driver::LaunchConfig {
+                    grid_dim: ((e.o_proj.rows as u32).div_ceil(8), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(failure)?;
+
+            let res_fn = self.functions["residual"].clone();
+            {
+                let mut rb = self.stream.launch_builder(&res_fn);
+                rb.arg(&mut e.g).arg(&e.proj).arg(&total_w);
+                unsafe {
+                    rb.launch(cudarc::driver::LaunchConfig {
+                        grid_dim: vector(total_w),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(failure)?;
+            }
+
+            let norm_fn = self.functions["normalize"].clone();
+            let eps = e.eps;
+            {
+                let mut nb = self.stream.launch_builder(&norm_fn);
+                nb.arg(&e.g)
+                    .arg(&e.post_attention_layernorm)
+                    .arg(&mut e.norm_buf)
+                    .arg(&width_i)
+                    .arg(&eps);
+                unsafe {
+                    nb.launch(cudarc::driver::LaunchConfig {
+                        grid_dim: (n as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(failure)?;
+            }
+
+            for (proj, out) in [(&e.gate_proj, &mut e.gate), (&e.up_proj, &mut e.up)] {
+                let mut b = self.stream.launch_builder(&q4k_fn);
+                b.arg(&proj.bytes)
+                    .arg(&e.norm_buf)
+                    .arg(out)
+                    .arg(&proj.width)
+                    .arg(&proj.rows)
+                    .arg(&n_i);
+                unsafe {
+                    b.launch(cudarc::driver::LaunchConfig {
+                        grid_dim: ((proj.rows as u32).div_ceil(8), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(failure)?;
+            }
+
+            let total_inter = (n * e.gate_proj.rows as usize) as i32;
+            let swiglu_fn = self.functions["swiglu"].clone();
+            {
+                let mut sb = self.stream.launch_builder(&swiglu_fn);
+                sb.arg(&mut e.gate).arg(&e.up).arg(&total_inter);
+                unsafe {
+                    sb.launch(cudarc::driver::LaunchConfig {
+                        grid_dim: vector(total_inter),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(failure)?;
+            }
+
+            {
+                let mut db = self.stream.launch_builder(&q4k_fn);
+                db.arg(&e.down_proj.bytes)
+                    .arg(&e.gate)
+                    .arg(&mut e.proj)
+                    .arg(&e.down_proj.width)
+                    .arg(&e.down_proj.rows)
+                    .arg(&n_i);
+                unsafe {
+                    db.launch(cudarc::driver::LaunchConfig {
+                        grid_dim: ((e.down_proj.rows as u32).div_ceil(8), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(failure)?;
+            }
+
+            {
+                let mut rb = self.stream.launch_builder(&res_fn);
+                rb.arg(&mut e.g).arg(&e.proj).arg(&total_w);
+                unsafe {
+                    rb.launch(cudarc::driver::LaunchConfig {
+                        grid_dim: vector(total_w),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(failure)?;
+            }
+
+            // Copy last token's hidden state g[n-1] into g[0] for subsequent drafting.
+            let last_off = (n - 1) * width;
+            let (mut left, right) = e.g.split_at_mut(last_off);
+            let src = right.slice(0..width);
+            let mut dst = left.slice_mut(0..width);
+            self.stream.memcpy_dtod(&src, &mut dst).map_err(failure)?;
+        }
+
+        Ok(())
+    }
+
     /// Ingests `tokens.len()` accepted tokens paired with the target's tapped
     /// 3-layer hidden states (`tap_hidden[0..3][0..tokens.len()]`) starting at
     /// EAGLE-3 KV position `start_pos`, returning the first drafted token.
     pub fn eagle3_ingest_tapped(&mut self, tokens: &[i32], start_pos: usize) -> Result<i32> {
         let width = self.weights.spec.width;
+        let is_q4k = self
+            .eagle3
+            .as_ref()
+            .is_some_and(|e| e.fc.kind == 12);
+
+        if is_q4k {
+            let q4k_fn = self.functions["matvec_q4k_multi8"].clone();
+            let mut offset = 0usize;
+            while offset < tokens.len() {
+                let chunk_len = (tokens.len() - offset).min(8);
+                if chunk_len == 1 {
+                    let j = offset;
+                    let matvec_fn = self.functions["matvec"].clone();
+                    let matmul = self.matmul;
+                    {
+                        let e = self.eagle3.as_mut().unwrap();
+                        for slot in 0..3 {
+                            let src = e.tap_hidden[slot].slice(j * width..(j + 1) * width);
+                            let mut dst = e.fc_in.slice_mut(slot * width..(slot + 1) * width);
+                            self.stream.memcpy_dtod(&src, &mut dst).map_err(failure)?;
+                        }
+                        let zero = 0i32;
+                        let mut fb = self.stream.launch_builder(&matvec_fn);
+                        fb.arg(&e.fc.bytes)
+                            .arg(&e.fc.kind)
+                            .arg(&e.fc_in)
+                            .arg(&mut e.g)
+                            .arg(&e.fc.width)
+                            .arg(&e.fc.rows)
+                            .arg(&self.work.ids)
+                            .arg(&zero)
+                            .arg(&zero);
+                        unsafe {
+                            fb.launch(cudarc::driver::LaunchConfig {
+                                grid_dim: matvec_grid(matmul, e.fc.kind, e.fc.rows, 1, e.fc.width),
+                                block_dim: (256, 1, 1),
+                                shared_mem_bytes: 0,
+                            })
+                        }
+                        .map_err(failure)?;
+                    }
+                    self.eagle3_midlayer_step(tokens[j], start_pos + j)?;
+                } else {
+                    {
+                        let e = self.eagle3.as_mut().unwrap();
+                        for t in 0..chunk_len {
+                            let j = offset + t;
+                            for slot in 0..3 {
+                                let src = e.tap_hidden[slot].slice(j * width..(j + 1) * width);
+                                let mut dst = e.fc_in.slice_mut(
+                                    (t * 3 + slot) * width..(t * 3 + slot + 1) * width,
+                                );
+                                self.stream.memcpy_dtod(&src, &mut dst).map_err(failure)?;
+                            }
+                        }
+                        let n_i = chunk_len as i32;
+                        let mut fb = self.stream.launch_builder(&q4k_fn);
+                        fb.arg(&e.fc.bytes)
+                            .arg(&e.fc_in)
+                            .arg(&mut e.g)
+                            .arg(&e.fc.width)
+                            .arg(&e.fc.rows)
+                            .arg(&n_i);
+                        unsafe {
+                            fb.launch(cudarc::driver::LaunchConfig {
+                                grid_dim: ((e.fc.rows as u32).div_ceil(8), 1, 1),
+                                block_dim: (256, 1, 1),
+                                shared_mem_bytes: 0,
+                            })
+                        }
+                        .map_err(failure)?;
+                    }
+                    self.eagle3_midlayer_batch(
+                        &tokens[offset..offset + chunk_len],
+                        start_pos + offset,
+                    )?;
+                }
+                offset += chunk_len;
+            }
+            return self.eagle3_sample_greedy();
+        }
+
         let matvec_fn = self.functions["matvec"].clone();
         let matmul = self.matmul;
-
         for (j, &tok) in tokens.iter().enumerate() {
             // Concatenate [tap0[j], tap1[j], tap2[j]] into eagle.fc_in -> fc -> eagle.g.
             {

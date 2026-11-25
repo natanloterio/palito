@@ -58,6 +58,21 @@ path = "examples/qtip_matvec_bench.rs"
 required-features = ["cuda", "qtip-research"]
 
 [[example]]
+name = "hyb-bench"
+path = "examples/hyb_bench.rs"
+required-features = ["cuda", "qtip-research"]
+
+[[example]]
+name = "suffix-spec-bench"
+path = "examples/suffix_spec_bench.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "gguf-to-plt1"
+path = "examples/gguf_to_plt1.rs"
+required-features = ["qtip-research"]
+
+[[example]]
 name = "perplexity"
 path = "examples/perplexity.rs"
 

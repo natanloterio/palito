@@ -2799,6 +2799,64 @@ impl Backend for CudaBackend {
 }
 
 impl CudaBackend {
+    /// Evaluates a speculative chain `[root, draft_0, ..., draft_{k-1}]` (`1 <= k <= 8`)
+    /// at `position` in a single batched forward pass and returns the greedy argmax
+    /// next-token prediction for every position `0..k`.
+    ///
+    /// Leaves the KV cache populated at `position..position + k`; call
+    /// `rewind_to(position + accepted)` so the next step starts cleanly right
+    /// after the accepted prefix.
+    pub fn verify_chain_greedy(&mut self, tokens: &[i32], position: u32) -> Result<Vec<i32>> {
+        if tokens.is_empty() || tokens.len() > 8 {
+            return Err(invalid(
+                "verify_chain_greedy requires between 1 and 8 tokens",
+            ));
+        }
+        if tokens.len() == 1 {
+            self.evaluate_for_sampling(tokens, position)?;
+            return Ok(vec![self.sample_greedy()?]);
+        }
+        self.state
+            .begin(tokens, position, &self.weights.spec.info)?;
+        if let Some(prefix) = &mut self.prefix {
+            prefix.overwrite(position as usize);
+        }
+        if let Some(decode) = &mut self.decode {
+            decode.sampled = None;
+        }
+        self.batched_prefill(tokens, position as usize, false)?;
+        let width = self.weights.spec.width;
+        let out = if self.decode.is_some() {
+            for t in 0..tokens.len() {
+                self.project_logits(t * width)?;
+                self.prepare_decode(0, position as usize + t, t as i32)?;
+                self.device_sample()?;
+            }
+            self.read_decode_tokens(tokens.len())?
+        } else {
+            let mut argmax = Vec::with_capacity(tokens.len());
+            for t in 0..tokens.len() {
+                self.project_logits(t * width)?;
+                self.finish_evaluation()?;
+                argmax.push(greedy(&self.logits)?);
+            }
+            argmax
+        };
+        self.state.finish(tokens.len());
+        Ok(out)
+    }
+
+    /// Rewinds the logical KV position after speculative verification rejects
+    /// trailing draft tokens.
+    pub fn rewind_to(&mut self, position: u32) -> Result<()> {
+        let pos = position as usize;
+        if pos > self.state.position {
+            return Err(invalid("rewind_to cannot advance past current position"));
+        }
+        self.state.position = pos;
+        Ok(())
+    }
+
     fn evaluate_inner(&mut self, tokens: &[i32], position: u32, host_logits: bool) -> Result<()> {
         self.state
             .begin(tokens, position, &self.weights.spec.info)?;

@@ -1196,6 +1196,7 @@ impl CudaBackend {
             "combine",
             "prefill_matmul",
             "prefill_matmul_8",
+            "matvec_q6k_multi8",
             "prefill_embedding",
             "group_experts",
             "grouped_matmul",
@@ -2858,18 +2859,32 @@ impl CudaBackend {
             .as_ref()
             .unwrap_or(&self.weights.embedding);
         let batch_logits = self.work.batch_logits.as_mut().unwrap();
-        launch!(
-            self,
-            "prefill_matmul_8",
-            (t.rows as u32, 1, 1),
-            &t.bytes,
-            &t.kind,
-            &self.work.normalized,
-            batch_logits,
-            &t.width,
-            &t.rows,
-            &n_i32
-        );
+        if t.kind == 14 && t.width % 256 == 0 {
+            launch!(
+                self,
+                "matvec_q6k_multi8",
+                ((t.rows as u32).div_ceil(8), 1, 1),
+                &t.bytes,
+                &self.work.normalized,
+                batch_logits,
+                &t.width,
+                &t.rows,
+                &n_i32
+            );
+        } else {
+            launch!(
+                self,
+                "prefill_matmul_8",
+                (t.rows as u32, 1, 1),
+                &t.bytes,
+                &t.kind,
+                &self.work.normalized,
+                batch_logits,
+                &t.width,
+                &t.rows,
+                &n_i32
+            );
+        }
 
         let out = if self.decode.is_some() {
             for tok_idx in 0..n {

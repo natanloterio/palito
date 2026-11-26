@@ -32,65 +32,50 @@ export NVRTC_LIB_DIR=/usr/local/cuda-13/lib64
 export LD_LIBRARY_PATH="$NVRTC_LIB_DIR:$LD_LIBRARY_PATH"
 ```
 
-### Step 1 — Build the `PLT1` & Bundler Binaries
+### Step 1 — Build `palito` with `PLT1` & CUDA Support
 
 ```sh
-cargo build --release --features cuda,qtip-research \
-  --bin palito \
-  --example gguf-to-plt1 \
-  --example pack-palito \
-  --example eagle3-spec-bench
+cargo build --release --features cuda,qtip-research --bin palito
 ```
 
-### Step 2 — Convert an F16 GGUF Model to `PLT1`
+### Step 2 — Convert Any GGUF Model to `.palito` in One Command
 
-Using calibration Hessians collected with `scripts/qtip/collect_hessians.py`:
+`palito convert` automatically collects calibration Hessians on CUDA, quantizes all layers (`3.0 bpw` `HYB Q=5` with GPU Viterbi), strips the base GGUF to a compact skeleton, optionally embeds an `EAGLE-3` head, and writes **one** self-contained `.palito` file:
 
 ```sh
-# Recommended 3.0 bpw (high quality, ~2.6 GB layers, ~3.7 GB full bundle)
-./target/release/examples/gguf-to-plt1 \
-  --input models/Llama-3.1-8B-Instruct-f16.gguf \
-  --output models/plt1-hyb-q5-3bpw.palito \
-  --hessians models/hessians-mix-256x512 \
-  --state-bits 10 --pair-bits 6 --lut-bits 5
+# One-command conversion (uses built-in calibration corpus automatically):
+palito convert \
+  --input models/Qwen3-8B-Q6_K.gguf \
+  --output models/qwen3-8b.palito
+
+# With full WikiText-2 calibration and an EAGLE-3 draft head (1,155+ tok/s):
+palito convert \
+  --input models/Qwen3-8B-Q6_K.gguf \
+  --calibration-text models/wikitext-2-raw/wiki.train.raw \
+  --eagle3 models/eagle3/eagle3-q4_k.palito \
+  --output models/qwen3-8b.palito
 ```
 
-- `--pair-bits`: `4` (2.0 bpw), `6` (3.0 bpw — recommended for full quality without fine-tuning).
-- `--lut-bits 5`: zero-SMEM warp-register LUT (`Q=5`).
-
-### Step 3 — Pack an `EAGLE-3` Draft Head into `PLT1` (`Q4_K`, `239 MB`)
+*(To pack an `EAGLE-3` checkpoint from Hugging Face first:)*
 
 ```sh
-hf download yuhuili/EAGLE3-LLaMA3.1-Instruct-8B --local-dir models/eagle3
-
+hf download AngelSlim/Qwen3-8B_eagle3 --local-dir models/eagle3
 python3 scripts/qtip/pack_eagle3_plt1.py \
   --input models/eagle3/pytorch_model.bin \
   --config models/eagle3/config.json \
   --output models/eagle3/eagle3-q4_k.palito \
-  --quant q4_k --tap-layers 2,16,29
+  --quant q4_k --tap-layers 2,18,33
 ```
 
-### Step 4 — Bundle into a Single Self-Contained `.palito` File
-
-`pack-palito` strips the redundant GGUF layer weights (keeping only tokenizer, metadata, embeddings, norms, and LM head), merges the `PLT1` layers and `EAGLE-3` draft head, and writes **one** `.palito` file:
+### Step 3 — Run with One Command (Auto CUDA + Speculative Decoding)
 
 ```sh
-./target/release/examples/pack-palito \
-  --base-gguf models/Llama-3.1-8B-Instruct-Q6_K.gguf \
-  --plt1-layers models/plt1-hyb-q5-3bpw.palito \
-  --eagle3 models/eagle3/eagle3-q4_k.palito \
-  --output models/llama-3.1-8b.palito
-```
-
-### Step 5 — Run with One Command (Auto CUDA + Speculative Decoding)
-
-```sh
-palito chat --model models/llama-3.1-8b.palito --stats
+palito chat --model models/qwen3-8b.palito --stats
 # Or OpenAI-compatible server:
-palito serve --model models/llama-3.1-8b.palito
+palito serve --model models/qwen3-8b.palito
 ```
 
-*(You can still run the standalone `eagle3-spec-bench` or `suffix-spec-bench` harnesses directly for microbenchmarking.)*
+*(For step-by-step control or microbenchmarking, the standalone `collect-hessians-cuda`, `gguf-to-plt1`, `pack-palito`, `eagle3-spec-bench`, and `suffix-spec-bench` examples remain available.)*
 
 ---
 

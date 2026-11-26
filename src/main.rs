@@ -9,12 +9,13 @@ use serde_json::json;
 use std::{ffi::OsString, fs, io::Write, path::PathBuf, time::Instant};
 
 mod chat_repl;
+mod convert;
 mod server;
 
 #[derive(Parser)]
 #[command(
     version,
-    about = "Independent Rust GGUF inference with optional CUDA and KTransformers adapters"
+    about = "Fast local LLM inference in Rust (.palito GPU-native format & GGUF) with CUDA, Vulkan, and Metal"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -29,7 +30,7 @@ enum Command {
         #[command(flatten)]
         args: RemoteArgs,
     },
-    /// Interactive multi-turn chat using the model's GGUF chat template (greedy).
+    /// Interactive multi-turn chat using the model's chat template (supports .palito & GGUF).
     Chat {
         #[command(flatten)]
         args: chat_repl::ChatArgs,
@@ -38,6 +39,11 @@ enum Command {
     Serve {
         #[command(flatten)]
         args: server::ServeArgs,
+    },
+    /// Convert a GGUF model into a single self-contained `.palito` (`PLT1`) file.
+    Convert {
+        #[command(flatten)]
+        args: convert::ConvertArgs,
     },
     /// Greedy completion, stopping at EOG. No chat template is applied.
     Generate {
@@ -624,6 +630,7 @@ fn execute() -> Result<()> {
         Command::Remote { args } => remote(args)?,
         Command::Chat { args } => chat_repl::run(args)?,
         Command::Serve { args } => server::run(args)?,
+        Command::Convert { args } => convert::run(args)?,
         Command::Tokenize { model, text } => {
             let tokenizer = Tokenizer::open(&model)?;
             let input = text_input(&text.prompt, &text.prompt_file)?;

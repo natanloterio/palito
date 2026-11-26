@@ -21,9 +21,10 @@ impl Drop for Server {
     }
 }
 
+const SMOL_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/SmolLM2-135M-Instruct-Q4_K_M.gguf");
+
 fn start(port: u16, extra: &[&str]) -> Server {
-    let model = concat!(env!("CARGO_MANIFEST_DIR"), "/models/SmolLM2-135M-Instruct-Q4_K_M.gguf");
-    launch(port, &["--backend", "cpu", "--context", "512", "--model", model], extra)
+    launch(port, &["--backend", "cpu", "--context", "512", "--model", SMOL_MODEL], extra)
 }
 
 fn launch(port: u16, model_args: &[&str], extra: &[&str]) -> Server {
@@ -110,7 +111,7 @@ fn client_disconnect_during_a_call_frees_the_engine() {
 #[test]
 fn parallel_on_cpu_fails_at_startup() {
     let output = Command::new(env!("CARGO_BIN_EXE_palito"))
-        .args(["serve", "--backend", "cpu", "--model", "unused.gguf", "--parallel", "2"])
+        .args(["serve", "--backend", "cpu", "--model", SMOL_MODEL, "--parallel", "2"])
         .env_remove("PALITO_API_KEY")
         .output()
         .unwrap();

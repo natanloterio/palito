@@ -54,6 +54,100 @@ pub(crate) struct ConvertArgs {
     /// CPU threads for tokenization and host math.
     #[arg(long, default_value_t = 8)]
     pub(crate) threads: u32,
+    /// Overwrite --output if it already exists.
+    #[arg(short, long)]
+    pub(crate) force: bool,
+}
+
+/// Files a conversion creates: temporaries (kept with --keep-temp) and the
+/// output while it is being written. Whatever is still listed is deleted when
+/// the guard drops (error or panic) or on Ctrl-C, so a failed conversion does
+/// not leave gigabytes of `.tmp` data or a truncated `.palito` behind.
+#[cfg(feature = "qtip-research")]
+#[derive(Clone)]
+struct Cleanup {
+    state: std::sync::Arc<std::sync::Mutex<CleanupState>>,
+}
+
+#[cfg(feature = "qtip-research")]
+#[derive(Default)]
+struct CleanupState {
+    temps: Vec<PathBuf>,
+    partial: Option<PathBuf>,
+    keep_temps: bool,
+}
+
+#[cfg(feature = "qtip-research")]
+impl CleanupState {
+    fn run(&mut self) {
+        if let Some(path) = self.partial.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        for path in self.temps.drain(..) {
+            if self.keep_temps {
+                eprintln!("Kept {}", path.display());
+                continue;
+            }
+            let _ = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+        }
+    }
+}
+
+#[cfg(feature = "qtip-research")]
+impl Cleanup {
+    fn install(keep_temps: bool) -> CleanupGuard {
+        let cleanup = Self {
+            state: std::sync::Arc::new(std::sync::Mutex::new(CleanupState {
+                keep_temps,
+                ..CleanupState::default()
+            })),
+        };
+        let on_interrupt = cleanup.clone();
+        let _ = ctrlc::set_handler(move || {
+            eprintln!("\nInterrupted; removing partial files.");
+            if let Ok(mut state) = on_interrupt.state.lock() {
+                state.run();
+            }
+            std::process::exit(130);
+        });
+        CleanupGuard(cleanup)
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&mut CleanupState) -> T) -> T {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(&mut state)
+    }
+
+    fn temp(&self, path: PathBuf) {
+        self.with(|state| state.temps.push(path));
+    }
+
+    fn writing(&self, path: Option<PathBuf>) {
+        self.with(|state| state.partial = path);
+    }
+}
+
+/// The handle `run` owns; dropping it (success, error or panic) cleans up.
+#[cfg(feature = "qtip-research")]
+struct CleanupGuard(Cleanup);
+
+#[cfg(feature = "qtip-research")]
+impl std::ops::Deref for CleanupGuard {
+    type Target = Cleanup;
+    fn deref(&self) -> &Cleanup {
+        &self.0
+    }
+}
+
+#[cfg(feature = "qtip-research")]
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        self.0.with(CleanupState::run);
+    }
 }
 
 #[cfg(not(feature = "qtip-research"))]
@@ -78,6 +172,13 @@ pub(crate) fn run(args: ConvertArgs) -> Result<()> {
             args.input.display()
         )));
     }
+    if args.output.exists() && !args.force {
+        return Err(Error::Invalid(format!(
+            "{} already exists\n  hint: pass --force to overwrite it",
+            args.output.display()
+        )));
+    }
+    let cleanup = Cleanup::install(args.keep_temp);
     if let Some(parent) = args.output.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -91,7 +192,6 @@ pub(crate) fn run(args: ConvertArgs) -> Result<()> {
     };
 
     // Step 1/3: Calibration Hessians.
-    let mut temp_hessians_dir: Option<PathBuf> = None;
     let hessians = if args.no_hessians {
         eprintln!("[1/3] Skipping Hessian calibration (--no-hessians: using identity H = I)");
         Hessians::empty()
@@ -105,7 +205,11 @@ pub(crate) fn run(args: ConvertArgs) -> Result<()> {
             use palito::qtip::hessian_cuda::{CudaHessianOptions, collect_hessians_cuda};
 
             let dir = args.output.with_extension("hessians.tmp");
-            let _ = std::fs::remove_dir_all(&dir);
+            if dir.exists() {
+                eprintln!("Removing stale {}", dir.display());
+                std::fs::remove_dir_all(&dir)?;
+            }
+            cleanup.temp(dir.clone());
             let chunks = args.chunks.unwrap_or(if args.calibration_text.is_some() {
                 64
             } else {
@@ -127,7 +231,6 @@ pub(crate) fn run(args: ConvertArgs) -> Result<()> {
                 matmul: CudaMatmul::F32,
                 threads: args.threads,
             })?;
-            temp_hessians_dir = Some(dir.clone());
             Hessians::open(&dir)?
         }
         #[cfg(not(feature = "cuda"))]
@@ -141,6 +244,7 @@ pub(crate) fn run(args: ConvertArgs) -> Result<()> {
 
     // Step 2/3: Quantize layers into PLT1 HYB Q=5.
     let layers_tmp = args.output.with_extension("layers.palito.tmp");
+    cleanup.temp(layers_tmp.clone());
     let opts = Plt1ExportOptions {
         state_bits,
         pair_bits,
@@ -182,6 +286,7 @@ pub(crate) fn run(args: ConvertArgs) -> Result<()> {
 
     // Step 3/3: Bundle skeleton GGUF + PLT1 layers + optional EAGLE-3 into one `.palito` file.
     eprintln!("[3/3] Bundling self-contained {}...", args.output.display());
+    cleanup.writing(Some(args.output.clone()));
     let bundle = pack_palito_bundle(
         &args.input,
         &layers_tmp,
@@ -189,12 +294,8 @@ pub(crate) fn run(args: ConvertArgs) -> Result<()> {
         &args.output,
     )?;
 
-    if !args.keep_temp {
-        let _ = std::fs::remove_file(&layers_tmp);
-        if let Some(dir) = &temp_hessians_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
+    cleanup.writing(None);
+    drop(cleanup);
 
     eprintln!(
         "Done in {:.1}s -> {} ({:.2} MB total | skeleton {:.2} MB | EAGLE-3: {} tensors)",

@@ -23,7 +23,7 @@ use axum::{
     routing::{get, post},
 };
 use crate::chat_repl::SamplingArgs;
-use clap::{Args, ValueEnum};
+use clap::{Args, ValueEnum, ValueHint};
 use openai::{ChatRequest, CompletionRequest, Usage, error_body};
 use palito::{
     chat::{Message, ToolFormat},
@@ -39,38 +39,49 @@ use worker::{Event, ModelReport, Prompt, Reply, ReplyCall, SubmitError, Worker};
 /// Request bodies above this are refused (a 65k-token prompt is well below it).
 const BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
+/// Only the backends this binary was built with.
 #[derive(Clone, Copy, ValueEnum)]
 enum ServeBackend {
     Cpu,
+    #[cfg(feature = "cuda")]
     Cuda,
+    #[cfg(feature = "vulkan")]
     Vulkan,
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     Metal,
 }
 
 #[derive(Args)]
 pub(crate) struct ServeArgs {
-    #[arg(long, env = "PALITO_MODEL")]
+    /// Model file (.palito or .gguf).
+    #[arg(short, long, env = "PALITO_MODEL", value_name = "FILE", value_hint = ValueHint::FilePath)]
     model: PathBuf,
     /// Address to listen on. Use 0.0.0.0 to accept other machines (set --api-key).
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "127.0.0.1", help_heading = "Network")]
     host: IpAddr,
-    #[arg(long, default_value_t = 8080)]
+    /// TCP port to listen on.
+    #[arg(long, default_value_t = 8080, help_heading = "Network")]
     port: u16,
-    /// [default: cuda when built with CUDA, else cpu]
-    #[arg(long, env = "PALITO_BACKEND", value_enum)]
+    /// Execution backend [default: cuda when built with CUDA, else cpu].
+    #[arg(long, env = "PALITO_BACKEND", value_enum, help_heading = "Backend")]
     backend: Option<ServeBackend>,
     /// Total context tokens, split between the --parallel slots [default: the
     /// model's trained context, fitted to GPU memory].
-    #[arg(long)]
+    #[arg(long, value_name = "N")]
     context: Option<u32>,
-    #[arg(long, default_value_t = 4)]
+    /// CPU threads for host-side work.
+    #[arg(long, default_value_t = 4, value_name = "N", help_heading = "Backend")]
     threads: u32,
-    #[arg(long, default_value_t = 0)]
+    /// GPU index to run on.
+    #[arg(long, alias = "cuda-device", default_value_t = 0, value_name = "INDEX", help_heading = "Backend")]
     gpu_device: usize,
-    #[arg(long)]
+    /// Device-buffer limit (e.g. 20GiB); excludes driver/JIT overhead.
+    #[arg(long, alias = "gpu-memory-limit", value_name = "SIZE",
+        value_parser = crate::cli_ui::parse_size, help_heading = "Backend")]
     gpu_memory_limit_bytes: Option<u64>,
-    /// [default: $PALITO_CUDA_KERNEL_CACHE or ~/.cache/palito/kernels]
-    #[arg(long, env = "PALITO_CUDA_KERNEL_CACHE")]
+    /// Directory for the persistent CUDA kernel cache [default: ~/.cache/palito/kernels].
+    #[arg(long, env = "PALITO_CUDA_KERNEL_CACHE", value_name = "DIR",
+        value_hint = ValueHint::DirPath, help_heading = "Backend", hide_short_help = true)]
     cuda_kernel_cache: Option<PathBuf>,
     /// Require `Authorization: Bearer <key>` on /v1 routes.
     #[arg(long, env = "PALITO_API_KEY", hide_env_values = true)]
@@ -113,8 +124,11 @@ pub(crate) fn run(args: ServeArgs) -> palito::Result<()> {
     let options = EngineOptions {
         device: match args.backend {
             Some(ServeBackend::Cpu) => Device::Cpu,
+            #[cfg(feature = "cuda")]
             Some(ServeBackend::Cuda) => Device::Cuda,
+            #[cfg(feature = "vulkan")]
             Some(ServeBackend::Vulkan) => Device::Vulkan,
+            #[cfg(all(feature = "metal", target_os = "macos"))]
             Some(ServeBackend::Metal) => Device::Metal,
             None => EngineOptions::default().device,
         },
@@ -133,6 +147,20 @@ pub(crate) fn run(args: ServeArgs) -> palito::Result<()> {
             .file_stem()
             .map_or("model".into(), |stem| stem.to_string_lossy().into_owned())
     });
+    crate::cli_ui::check_model(&args.model)?;
+    if args.parallel > 1 && (options.device != Device::Cuda || !cfg!(feature = "cuda")) {
+        return Err(palito::Error::Invalid(
+            "--parallel above 1 requires the CUDA backend".into(),
+        ));
+    }
+    // Bind before loading: a busy port should fail in milliseconds, not after
+    // loading a 30B model.
+    let listener = bind(args.host, args.port)?;
+    crate::banner::print();
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        let size = std::fs::metadata(&args.model).map_or(0, |m| m.len());
+        eprintln!("Loading {} ({})...", args.model.display(), crate::cli_ui::human_size(size));
+    }
     let start = Instant::now();
     let (worker, report) = Worker::start(args.model.clone(), options, args.queue.max(1), args.parallel)?;
     eprintln!(
@@ -160,10 +188,28 @@ pub(crate) fn run(args: ServeArgs) -> palito::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(serve(state, args.host, args.port))
+    runtime.block_on(serve(state, listener))
 }
 
-async fn serve(state: AppState, host: IpAddr, port: u16) -> palito::Result<()> {
+fn bind(host: IpAddr, port: u16) -> palito::Result<std::net::TcpListener> {
+    let listener = std::net::TcpListener::bind((host, port)).map_err(|error| {
+        let hint = match error.kind() {
+            std::io::ErrorKind::AddrInUse => format!(
+                "port {port} is already in use\n  hint: stop the other server or pick another port, e.g. --port {}",
+                port.wrapping_add(1).max(1)
+            ),
+            std::io::ErrorKind::PermissionDenied => format!(
+                "no permission to listen on {host}:{port}\n  hint: ports below 1024 need privileges; try --port 8080"
+            ),
+            _ => format!("cannot listen on {host}:{port}: {error}"),
+        };
+        palito::Error::Invalid(hint)
+    })?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+async fn serve(state: AppState, listener: std::net::TcpListener) -> palito::Result<()> {
     let v1 = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
@@ -174,7 +220,7 @@ async fn serve(state: AppState, host: IpAddr, port: u16) -> palito::Result<()> {
         .merge(v1)
         .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind((host, port)).await?;
+    let listener = tokio::net::TcpListener::from_std(listener)?;
     let address = listener.local_addr()?;
     eprintln!("Serving the OpenAI API at http://{address}/v1 (Ctrl-C stops).");
     axum::serve(listener, app)

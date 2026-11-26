@@ -851,8 +851,9 @@ extern "C" __global__ void attention_split_group_decode(const float *q, const fl
 
 // Batched chain/tree variant of attention_split_group (grid = (kv_heads, chunks, tokens)).
 // Bit-exact with attention_split_group for every token in a speculative chain or tree.
+template<typename KV>
 __device__ __forceinline__ void attention_split_group_batch_impl(
-    const float *q, const float *keys, const float *values, float *partial, int dim,
+    const float *q, const KV *keys, const KV *values, float *partial, int dim,
     int heads, int kv_heads, int prefix_len, const unsigned long long *tree_mask) {
     int kv_head = blockIdx.x, tok = blockIdx.z, group = heads / kv_heads;
     int lane = threadIdx.x % 32, head = kv_head * group + threadIdx.x / 32;
@@ -976,6 +977,20 @@ extern "C" __global__ void attention_split_group_decode_f16(const float *q, cons
                                                            int dim, int heads, int kv_heads,
                                                            const int *control) {
     attention_split_group_impl(q, keys, values, partial, dim, heads, kv_heads, control[1] + 1);
+}
+
+extern "C" __global__ void attention_split_group_batch_f16(
+    const float *q, const kv_f16 *keys, const kv_f16 *values, float *partial, int dim,
+    int heads, int kv_heads, int prefix_len, const unsigned long long *tree_mask) {
+    attention_split_group_batch_impl(q, keys, values, partial, dim, heads, kv_heads, prefix_len,
+                                     tree_mask);
+}
+
+extern "C" __global__ void attention_split_group_batch_graph_f16(
+    const float *q, const kv_f16 *keys, const kv_f16 *values, float *partial, int dim,
+    int heads, int kv_heads, const int *control, const unsigned long long *tree_mask) {
+    attention_split_group_batch_impl(q, keys, values, partial, dim, heads, kv_heads, control[1],
+                                     tree_mask);
 }
 #endif
 

@@ -22,6 +22,10 @@ pub(super) const F16_KERNELS: &[(&str, &str)] = &[
         "rotary_factored_cache_kv_batch_f16",
     ),
     (
+        "rotary_factored_cache_kv_batch_graph",
+        "rotary_factored_cache_kv_batch_graph_f16",
+    ),
+    (
         "olmoe_qk_norm_rope_cache_decode",
         "olmoe_qk_norm_rope_cache_decode_f16",
     ),
@@ -29,6 +33,14 @@ pub(super) const F16_KERNELS: &[(&str, &str)] = &[
     (
         "qkv_head_norm_rope_cache_decode",
         "qkv_head_norm_rope_cache_decode_f16",
+    ),
+    (
+        "qkv_head_norm_rope_cache_batch",
+        "qkv_head_norm_rope_cache_batch_f16",
+    ),
+    (
+        "qkv_head_norm_rope_cache_batch_graph",
+        "qkv_head_norm_rope_cache_batch_graph_f16",
     ),
     ("attention_scores", "attention_scores_f16"),
     ("attention_values", "attention_values_f16"),
@@ -55,6 +67,14 @@ pub(super) const F16_KERNELS: &[(&str, &str)] = &[
     (
         "attention_split_group_decode",
         "attention_split_group_decode_f16",
+    ),
+    (
+        "attention_split_group_batch",
+        "attention_split_group_batch_f16",
+    ),
+    (
+        "attention_split_group_batch_graph",
+        "attention_split_group_batch_graph_f16",
     ),
     ("attention_prefill_flash4", "attention_prefill_flash4_f16"),
     (

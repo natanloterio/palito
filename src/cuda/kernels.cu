@@ -1522,6 +1522,15 @@ extern "C" __global__ void rotary_factored_cache_kv_batch_f16(
                                   v + (u64)tok * k_size, keys, values, k_size, dim,
                                   position + tok, base, neox, factors, magnitude);
 }
+
+extern "C" __global__ void rotary_factored_cache_kv_batch_graph_f16(
+    float *q, int q_size, float *k, const float *v, kv_f16 *keys, kv_f16 *values, int k_size,
+    int dim, const int *control, float base, int neox, const float *factors, float magnitude) {
+    int tok = blockIdx.y;
+    rotary_factored_cache_kv_impl(q + (u64)tok * q_size, q_size, k + (u64)tok * k_size,
+                                  v + (u64)tok * k_size, keys, values, k_size, dim,
+                                  control[1] + tok, base, neox, factors, magnitude);
+}
 #endif
 
 #ifdef CUDA_PACKED_DECODE
@@ -2114,6 +2123,32 @@ extern "C" __global__ void qkv_head_norm_rope_cache_decode_f16(
     float epsilon, const int *control, float base, int neox) {
     qkv_head_norm_rope_cache_impl(
         q, q_norm, heads, k, k_norm, v, keys, values, kv_heads, epsilon, control[1], base, neox);
+}
+
+extern "C" __global__ void qkv_head_norm_rope_cache_batch_f16(
+    float *q, const u8 *q_norm, int heads,
+    float *k, const u8 *k_norm, const float *v,
+    kv_f16 *keys, kv_f16 *values, int kv_heads,
+    float epsilon, int position, float base, int neox) {
+    int tok = blockIdx.y;
+    qkv_head_norm_rope_cache_impl(
+        q + (u64)tok * heads * 128, q_norm, heads,
+        k + (u64)tok * kv_heads * 128, k_norm,
+        v + (u64)tok * kv_heads * 128,
+        keys, values, kv_heads, epsilon, position + tok, base, neox);
+}
+
+extern "C" __global__ void qkv_head_norm_rope_cache_batch_graph_f16(
+    float *q, const u8 *q_norm, int heads,
+    float *k, const u8 *k_norm, const float *v,
+    kv_f16 *keys, kv_f16 *values, int kv_heads,
+    float epsilon, const int *control, float base, int neox) {
+    int tok = blockIdx.y;
+    qkv_head_norm_rope_cache_impl(
+        q + (u64)tok * heads * 128, q_norm, heads,
+        k + (u64)tok * kv_heads * 128, k_norm,
+        v + (u64)tok * kv_heads * 128,
+        keys, values, kv_heads, epsilon, control[1] + tok, base, neox);
 }
 #endif
 #endif

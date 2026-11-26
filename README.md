@@ -92,6 +92,14 @@ Pure decode on an RTX 5090, against `llama.cpp` CUDA:
 | Llama 3.1 8B (`.palito`, 3.5 GiB) | **347 tok/s** | 341 tok/s (`IQ3_XXS`) |
 | Llama 3.2 1B (3.0 bpw, 0.9 GiB) | **1,361 tok/s** | 1,053 tok/s (`IQ3_XXS`) |
 
+Long-context pure decode on `.palito` (`3.0 bpw`, `--cuda-matmul int8-fast` FP16 KV cache + Tensor Core attention, 50% less KV VRAM vs F32 KV):
+
+| Model (`.palito`, `3.0 bpw`) | Prompt | KV F32 (`f32-tiled`) | KV FP16 (`int8-fast`) | Speedup |
+| :--- | ---: | ---: | ---: | ---: |
+| Qwen3-30B-A3B MoE | 9.3k / 22.9k tok | 246.7 / 141.0 tok/s | **328.9 / 242.3 tok/s** | **+33% / +72%** |
+| Llama 3.1 8B | 9.0k / 22.2k tok | 220.8 / 135.5 tok/s | **253.9 / 207.8 tok/s** | **+15% / +53%** |
+| Qwen 3 8B | 9.3k / 22.9k tok | 200.2 / 120.0 tok/s | **241.5 / 190.3 tok/s** | **+21% / +59%** |
+
 With speculative decoding, Llama 3.1 8B reaches 1,017 tok/s on code refactoring. Full tables and methodology: [performance](docs/performance.md) and [reproducible benchmarks](benchmarks/vs-llama-cpp/README.md).
 
 ## Supported models

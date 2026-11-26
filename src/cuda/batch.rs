@@ -898,8 +898,7 @@ impl CudaBackend {
                 && dim % 4 == 0
                 && kv_heads > 0
                 && heads % kv_heads == 0
-                && (2..=8).contains(&(heads / kv_heads))
-                && !self.matmul.kv_f16();
+                && (2..=8).contains(&(heads / kv_heads));
             #[cfg(not(feature = "qtip-research"))]
             let plt1_split_group_attn = false;
             if plt1_split_group_attn {

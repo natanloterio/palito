@@ -1,11 +1,14 @@
 //! Independent dense transformer execution on CPU with packed weights and causal batched prefill.
 //! Consumes the shared `transformer::Weights` normalized representation used by CUDA, Metal, and Vulkan.
+pub mod plt1;
+pub mod plt1_simd;
+
 use crate::{
     Config, Error, GenerationMode, Result,
     backend::{Backend, MemoryUsage, ModelInfo, SpeculationStats},
-    gguf::{Gguf, Tensor},
+    gguf::{Gguf, Storage, Tensor},
     tokenizer::Tokenizer,
-    transformer::{Gemma, Weights},
+    transformer::{Gemma, Weights, route, route_softmax},
 };
 use rayon::prelude::*;
 use serde::Serialize;
@@ -35,10 +38,12 @@ struct Workspace {
     scores: Vec<f32>,
     saved_logits: Vec<f32>,
     verification: Vec<f32>,
+    routed: Vec<f32>,
+    moe_expert: Vec<f32>,
 }
 
 impl Workspace {
-    fn new(sizes: [usize; 13]) -> Self {
+    fn new(sizes: [usize; 15]) -> Self {
         let [
             state,
             normalized,
@@ -53,6 +58,8 @@ impl Workspace {
             scores,
             saved_logits,
             verification,
+            routed,
+            moe_expert,
         ] = sizes.map(|size| vec![0.0; size]);
         Self {
             state,
@@ -68,6 +75,8 @@ impl Workspace {
             scores,
             saved_logits,
             verification,
+            routed,
+            moe_expert,
         }
     }
 
@@ -86,6 +95,8 @@ impl Workspace {
             &self.scores,
             &self.saved_logits,
             &self.verification,
+            &self.routed,
+            &self.moe_expert,
         ]
         .iter()
         .map(|buffer| buffer.capacity() as u64 * 4)
@@ -103,6 +114,7 @@ struct Layer {
     k_norm: Option<Tensor>,
     attention_output: Tensor,
     ffn_norm: Option<Tensor>,
+    router: Option<Tensor>,
     gate: Tensor,
     up: Tensor,
     down: Tensor,
@@ -144,6 +156,7 @@ pub struct CpuBackend {
     pool: Arc<rayon::ThreadPool>,
     embedding: Tensor,
     layers: Vec<Layer>,
+    plt1: Option<plt1::Plt1CpuRuntime>,
     output_norm: Option<Tensor>,
     output: Option<Tensor>,
     rope_factors: Option<Tensor>,
@@ -152,6 +165,8 @@ pub struct CpuBackend {
     heads: usize,
     kv_heads: usize,
     head_dim: usize,
+    experts: usize,
+    used: usize,
     epsilon: f32,
     rope_base: f32,
     rope_attn_factor: f32,
@@ -317,6 +332,9 @@ pub(crate) fn attend_with_divisor(
 /// Whether the fast packed CPU path can run this model. Other layouts (MoE,
 /// affine FFN, recurrent/hybrid) use the reference backend.
 pub fn has_fast_path(path: &Path) -> Result<bool> {
+    if crate::plt1::is_plt1_file(path) {
+        return Ok(true);
+    }
     let (metadata, _tensors) = Gguf::read_layout(path)?;
     let arch = match metadata.get("general.architecture") {
         Some(crate::gguf::Value::Text(arch)) => arch.as_str(),
@@ -340,16 +358,33 @@ impl CpuBackend {
         if options.speculative_window > config.batch_tokens {
             return Err(invalid("speculative window exceeds batch capacity"));
         }
+        let is_plt1 = crate::plt1::is_plt1_file(path);
         let mut model = Gguf::open(path, options.expand_weights)?;
         if options.scalar_kernels {
             for tensor in model.tensors.values_mut() {
                 tensor.accelerated = false;
             }
         }
-        let weights_allocated_bytes: u64 =
+        let mut weights_allocated_bytes: u64 =
             model.tensors.values().map(Tensor::allocated_bytes).sum();
-        let weights = Weights::from_gguf(model, config)?;
-        if weights.spec.experts > 0
+        let weights = Weights::from_gguf_with_plt1(model, config, is_plt1)?;
+        let plt1 = if is_plt1 {
+            let rt = plt1::Plt1CpuRuntime::open(path)?;
+            if rt.layers.len() != weights.layers.len() {
+                return Err(invalid(format!(
+                    "PLT1 has {} layers but target model has {}",
+                    rt.layers.len(),
+                    weights.layers.len()
+                )));
+            }
+            weights_allocated_bytes = weights_allocated_bytes
+                .checked_add(rt.allocated_bytes())
+                .ok_or_else(|| invalid("weights byte overflow"))?;
+            Some(rt)
+        } else {
+            None
+        };
+        if (!is_plt1 && weights.spec.experts > 0)
             || weights.position_embedding.is_some()
             || weights.embedding_norm.is_some()
             || weights.output_norm_bias.is_some()
@@ -369,6 +404,8 @@ impl CpuBackend {
         let heads = s.heads;
         let kv_heads = s.kv_heads;
         let head_dim = s.dim;
+        let experts = s.experts;
+        let used = s.used;
         let q_width = heads * head_dim;
         let kv_width = kv_heads * head_dim;
         let layer_count = weights.layers.len();
@@ -398,6 +435,8 @@ impl CpuBackend {
             context,
             vocab,
             product(options.speculative_window as usize, vocab)?,
+            experts,
+            if experts > 0 { width } else { 0 },
         ];
         let workspace_bytes = sizes
             .iter()
@@ -444,13 +483,17 @@ impl CpuBackend {
             .checked_mul(kv_width)
             .ok_or_else(|| invalid("KV cache size overflow"))?;
         let mut info = weights.spec.info;
-        info.backend = match (
-            options.expand_weights,
-            !options.scalar_kernels && crate::kernels::avx2_available(),
-        ) {
-            (true, _) => "rust-cpu-f32-reference",
-            (false, true) => "rust-cpu-packed-avx2",
-            (false, false) => "rust-cpu-packed-portable",
+        info.backend = if plt1.is_some() {
+            "rust-cpu-plt1-hyb"
+        } else {
+            match (
+                options.expand_weights,
+                !options.scalar_kernels && crate::kernels::avx2_available(),
+            ) {
+                (true, _) => "rust-cpu-f32-reference",
+                (false, true) => "rust-cpu-packed-avx2",
+                (false, false) => "rust-cpu-packed-portable",
+            }
         }
         .into();
         let epsilon = weights.spec.epsilon;
@@ -459,7 +502,7 @@ impl CpuBackend {
         let neox = weights.spec.neox;
         let eog = weights.spec.eog;
         let tokenizer = weights.spec.tokenizer;
-        let layers = weights
+        let mut layers: Vec<Layer> = weights
             .layers
             .into_iter()
             .map(|l| Layer {
@@ -472,6 +515,7 @@ impl CpuBackend {
                 k_norm: l.k_norm,
                 attention_output: l.output,
                 ffn_norm: l.ffn_norm,
+                router: l.router,
                 gate: l.gate.expect("dense gated layer"),
                 up: l.up,
                 down: l.down,
@@ -480,6 +524,28 @@ impl CpuBackend {
                 values: vec![0.0; cache_elements],
             })
             .collect();
+        if let Some(rt) = &plt1
+            && rt.folded_rmsnorm
+        {
+            for layer in &mut layers {
+                if let (Some(router), Some(ffn_norm), Some(r1)) =
+                    (&mut layer.router, &layer.ffn_norm, &rt.r1_signs)
+                    && let Storage::F32(w_f32) = &mut router.storage
+                {
+                    plt1::fold_router_rmsnorm_r1(w_f32, ffn_norm.floats(), r1, width);
+                }
+                if let Some(n) = &mut layer.attention_norm
+                    && let Storage::F32(vals) = &mut n.storage
+                {
+                    vals.fill(1.0f32);
+                }
+                if let Some(n) = &mut layer.ffn_norm
+                    && let Storage::F32(vals) = &mut n.storage
+                {
+                    vals.fill(1.0f32);
+                }
+            }
+        }
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(config.threads as usize)
             .build()
@@ -491,6 +557,7 @@ impl CpuBackend {
             pool: Arc::new(pool),
             embedding: weights.embedding,
             layers,
+            plt1,
             output_norm: weights.output_norm,
             output: weights.output,
             rope_factors: weights.rope_factors,
@@ -499,6 +566,8 @@ impl CpuBackend {
             heads,
             kv_heads,
             head_dim,
+            experts,
+            used,
             epsilon,
             rope_base,
             rope_attn_factor,
@@ -540,8 +609,10 @@ impl CpuBackend {
         let count = tokens.len();
         let hidden = self.layers[0].gate.dims[1];
         let olmo2 = self.info.architecture == "olmo2";
+        let olmoe = self.info.architecture == "olmoe";
         let gemma_arch = self.info.architecture == "gemma3";
         let factors = self.rope_factors.as_ref().map(Tensor::floats);
+        let plt1 = self.plt1.as_ref();
         let w = &mut self.workspace;
         for (&token, output) in tokens.iter().zip(w.state.chunks_mut(width)) {
             self.embedding.row(token as usize, output);
@@ -551,6 +622,9 @@ impl CpuBackend {
                     *v *= scale;
                 }
             }
+        }
+        if let Some(plt1) = plt1 {
+            plt1.r1_enter(&mut w.state[..count * width], width, count);
         }
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let gemma_attn = self.gemma.as_ref().map(|g| {
@@ -578,24 +652,31 @@ impl CpuBackend {
                     .for_each(|(output, input)| norm(input, attn_norm, self.epsilon, output));
                 &w.normalized[..count * width]
             };
-            layer.query.multiply(
-                attn_input,
-                count,
-                &mut w.query[..count * q_width],
-                &mut w.columns,
-            );
-            layer.key.multiply(
-                attn_input,
-                count,
-                &mut w.key[..count * kv_width],
-                &mut w.columns,
-            );
-            layer.value.multiply(
-                attn_input,
-                count,
-                &mut w.value[..count * kv_width],
-                &mut w.columns,
-            );
+            if let Some(plt1) = plt1 {
+                let pl = &plt1.layers[layer_idx];
+                plt1.matmul(&pl.q, attn_input, count, &mut w.query[..count * q_width]);
+                plt1.matmul(&pl.k, attn_input, count, &mut w.key[..count * kv_width]);
+                plt1.matmul(&pl.v, attn_input, count, &mut w.value[..count * kv_width]);
+            } else {
+                layer.query.multiply(
+                    attn_input,
+                    count,
+                    &mut w.query[..count * q_width],
+                    &mut w.columns,
+                );
+                layer.key.multiply(
+                    attn_input,
+                    count,
+                    &mut w.key[..count * kv_width],
+                    &mut w.columns,
+                );
+                layer.value.multiply(
+                    attn_input,
+                    count,
+                    &mut w.value[..count * kv_width],
+                    &mut w.columns,
+                );
+            }
             if let Some([qb, kb, vb]) = &layer.qkv_bias {
                 for time in 0..count {
                     for (dst, b) in w.query[time * q_width..(time + 1) * q_width]
@@ -691,12 +772,22 @@ impl CpuBackend {
                     &mut w.scores,
                 );
             }
-            layer.attention_output.multiply(
-                &w.attention[..count * q_width],
-                count,
-                &mut w.projected[..count * width],
-                &mut w.columns,
-            );
+            if let Some(plt1) = plt1 {
+                let pl = &plt1.layers[layer_idx];
+                plt1.matmul(
+                    &pl.o,
+                    &w.attention[..count * q_width],
+                    count,
+                    &mut w.projected[..count * width],
+                );
+            } else {
+                layer.attention_output.multiply(
+                    &w.attention[..count * q_width],
+                    count,
+                    &mut w.projected[..count * width],
+                    &mut w.columns,
+                );
+            }
             if let Some([post_attn, _]) = &layer.post_norms {
                 w.normalized[..count * width]
                     .par_chunks_mut(width)
@@ -730,35 +821,112 @@ impl CpuBackend {
                     .for_each(|(output, input)| norm(input, ffn_norm, self.epsilon, output));
                 &w.normalized[..count * width]
             };
-            layer.gate.multiply(
-                ffn_input,
-                count,
-                &mut w.gate[..count * hidden],
-                &mut w.columns,
-            );
-            layer.up.multiply(
-                ffn_input,
-                count,
-                &mut w.up[..count * hidden],
-                &mut w.columns,
-            );
-            if self.gemma.is_some() {
-                for (g, u) in w.gate.iter_mut().zip(&w.up).take(count * hidden) {
-                    let gelu =
-                        0.5 * *g * (1.0 + (0.797_884_6 * *g * (1.0 + 0.044715 * *g * *g)).tanh());
-                    *g = gelu * u;
+            if let Some(plt1) = plt1 {
+                let pl = &plt1.layers[layer_idx];
+                if pl.moe_ffn {
+                    let router = layer
+                        .router
+                        .as_ref()
+                        .ok_or_else(|| invalid("MoE PLT1 layer missing router"))?;
+                    for t in 0..count {
+                        let x_tok = &ffn_input[t * width..(t + 1) * width];
+                        router.multiply(
+                            x_tok,
+                            1,
+                            &mut w.routed[..self.experts],
+                            &mut w.columns,
+                        );
+                        let selected = if olmoe {
+                            route_softmax(&w.routed[..self.experts], self.used, false)?
+                        } else {
+                            route(&w.routed[..self.experts], self.used)?
+                        };
+                        let out_tok = &mut w.projected[t * width..(t + 1) * width];
+                        out_tok.fill(0.0);
+                        for (expert, probability) in selected {
+                            plt1.matmul_moe_expert(
+                                &pl.gate,
+                                expert,
+                                x_tok,
+                                1,
+                                &mut w.gate[..hidden],
+                            );
+                            plt1.matmul_moe_expert(
+                                &pl.up,
+                                expert,
+                                x_tok,
+                                1,
+                                &mut w.up[..hidden],
+                            );
+                            for (g, u) in w.gate.iter_mut().zip(&w.up).take(hidden) {
+                                *g = *g / (1.0 + (-*g).exp()) * u;
+                            }
+                            plt1.matmul_moe_expert(
+                                &pl.down,
+                                expert,
+                                &w.gate[..hidden],
+                                1,
+                                &mut w.moe_expert[..width],
+                            );
+                            for (dst, &val) in out_tok.iter_mut().zip(&w.moe_expert[..width]) {
+                                *dst += probability * val;
+                            }
+                        }
+                    }
+                } else {
+                    plt1.matmul(&pl.gate, ffn_input, count, &mut w.gate[..count * hidden]);
+                    plt1.matmul(&pl.up, ffn_input, count, &mut w.up[..count * hidden]);
+                    if self.gemma.is_some() {
+                        for (g, u) in w.gate.iter_mut().zip(&w.up).take(count * hidden) {
+                            let gelu = 0.5
+                                * *g
+                                * (1.0 + (0.797_884_6 * *g * (1.0 + 0.044715 * *g * *g)).tanh());
+                            *g = gelu * u;
+                        }
+                    } else {
+                        for (g, u) in w.gate.iter_mut().zip(&w.up).take(count * hidden) {
+                            *g = *g / (1.0 + (-*g).exp()) * u;
+                        }
+                    }
+                    plt1.matmul(
+                        &pl.down,
+                        &w.gate[..count * hidden],
+                        count,
+                        &mut w.projected[..count * width],
+                    );
                 }
             } else {
-                for (g, u) in w.gate.iter_mut().zip(&w.up).take(count * hidden) {
-                    *g = *g / (1.0 + (-*g).exp()) * u;
+                layer.gate.multiply(
+                    ffn_input,
+                    count,
+                    &mut w.gate[..count * hidden],
+                    &mut w.columns,
+                );
+                layer.up.multiply(
+                    ffn_input,
+                    count,
+                    &mut w.up[..count * hidden],
+                    &mut w.columns,
+                );
+                if self.gemma.is_some() {
+                    for (g, u) in w.gate.iter_mut().zip(&w.up).take(count * hidden) {
+                        let gelu = 0.5
+                            * *g
+                            * (1.0 + (0.797_884_6 * *g * (1.0 + 0.044715 * *g * *g)).tanh());
+                        *g = gelu * u;
+                    }
+                } else {
+                    for (g, u) in w.gate.iter_mut().zip(&w.up).take(count * hidden) {
+                        *g = *g / (1.0 + (-*g).exp()) * u;
+                    }
                 }
+                layer.down.multiply(
+                    &w.gate[..count * hidden],
+                    count,
+                    &mut w.projected[..count * width],
+                    &mut w.columns,
+                );
             }
-            layer.down.multiply(
-                &w.gate[..count * hidden],
-                count,
-                &mut w.projected[..count * width],
-                &mut w.columns,
-            );
             if let Some([_, post_ffn]) = &layer.post_norms {
                 w.normalized[..count * width]
                     .par_chunks_mut(width)
@@ -783,6 +951,10 @@ impl CpuBackend {
             }
         }
         let start = if verify { 0 } else { (count - 1) * width };
+        if let Some(plt1) = plt1 {
+            let n_exit = if verify { count } else { 1 };
+            plt1.r1_exit(&mut w.state[start..count * width], width, n_exit);
+        }
         let final_input = if let Some(output_norm) = &self.output_norm {
             for (input, output) in w.state[start..count * width]
                 .chunks(width)

@@ -100,7 +100,7 @@ Long-context pure decode on `.palito` (`3.0 bpw`, `--cuda-matmul int8-fast` FP16
 | Llama 3.1 8B | 9.0k / 22.2k tok | 220.8 / 135.5 tok/s | **253.9 / 207.8 tok/s** | **+15% / +53%** |
 | Qwen 3 8B | 9.3k / 22.9k tok | 200.2 / 120.0 tok/s | **241.5 / 190.3 tok/s** | **+21% / +59%** |
 
-With speculative decoding, Llama 3.1 8B reaches 1,017 tok/s on code refactoring. Full tables and methodology: [performance](docs/performance.md) and [reproducible benchmarks](benchmarks/vs-llama-cpp/README.md).
+With speculative decoding (automatically gated above 4k context so long-context decode stays at full CUDA Graph speed), Llama 3.1 8B reaches **1,119 tok/s** on code refactoring, Qwen 3 8B reaches **763 tok/s**, and Qwen3-30B-A3B reaches **590 tok/s** (`exact_parity=true`). Full tables and methodology: [performance](docs/performance.md) and [reproducible benchmarks](benchmarks/vs-llama-cpp/README.md).
 
 ## Supported models
 

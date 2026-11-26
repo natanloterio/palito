@@ -1262,7 +1262,7 @@ __device__ __forceinline__ void hyb_b1_preload_chunks(const float* __restrict__ 
             }
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                v[e] = v[e] / (1.0f + __expf(-v[e])) * up[e];
+                v[e] = v[e] / (1.0f + expf(-v[e])) * up[e];
             }
         }
 #if !HYB_SKIP_IN_RHT

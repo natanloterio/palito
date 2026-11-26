@@ -986,11 +986,16 @@ extern "C" __global__ void residual_unit_norm(float *x, const float *delta, floa
 }
 
 // Fused MoE combine + unit-variance RMSNorm for PLT1 folded-RMSNorm MoE layers.
-// Grid: (1, 1, 1), Block: up to 1024 threads; float4 vectorized when aligned.
+// Grid: (n, 1, 1), Block: up to 1024 threads; float4 vectorized when aligned.
 extern "C" __global__ void combine_unit_norm(float *x, const float *experts,
                                              const float *weights, float *norm_out,
                                              int width, int used, float epsilon) {
     __shared__ float partial[32];
+    int tok = blockIdx.x;
+    float *xt = x + (u64)tok * width;
+    const float *et = experts + (u64)tok * used * width;
+    const float *wt = weights + (u64)tok * used;
+    float *yt = norm_out + (u64)tok * width;
     int tid = threadIdx.x;
     int warp = tid >> 5;
     int lane = tid & 31;
@@ -1001,11 +1006,11 @@ extern "C" __global__ void combine_unit_norm(float *x, const float *experts,
         float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         float sum = 0.0f;
         if (tid < n4) {
-            float4 xv = reinterpret_cast<const float4 *>(x)[tid];
+            float4 xv = reinterpret_cast<const float4 *>(xt)[tid];
             float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
-            const float4 *e4 = reinterpret_cast<const float4 *>(experts);
+            const float4 *e4 = reinterpret_cast<const float4 *>(et);
             for (int s = 0; s < used; s++) {
-                float w = __ldg(weights + s);
+                float w = __ldg(wt + s);
                 float4 ev = __ldg(e4 + (u64)s * n4 + tid);
                 c0 = fmaf(w, ev.x, c0);
                 c1 = fmaf(w, ev.y, c1);
@@ -1013,7 +1018,7 @@ extern "C" __global__ void combine_unit_norm(float *x, const float *experts,
                 c3 = fmaf(w, ev.w, c3);
             }
             v = make_float4(xv.x + c0, xv.y + c1, xv.z + c2, xv.w + c3);
-            reinterpret_cast<float4 *>(x)[tid] = v;
+            reinterpret_cast<float4 *>(xt)[tid] = v;
             sum = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
         }
         sum = warp_sum(sum);
@@ -1023,7 +1028,7 @@ extern "C" __global__ void combine_unit_norm(float *x, const float *experts,
         total = warp_sum(total);
         float inverse = rsqrtf(total / (float)width + epsilon);
         if (tid < n4) {
-            reinterpret_cast<float4 *>(norm_out)[tid] =
+            reinterpret_cast<float4 *>(yt)[tid] =
                 make_float4(v.x * inverse, v.y * inverse, v.z * inverse, v.w * inverse);
         }
         return;
@@ -1032,9 +1037,9 @@ extern "C" __global__ void combine_unit_norm(float *x, const float *experts,
     float sum = 0.0f;
     for (int i = tid; i < width; i += blockDim.x) {
         float c = 0.0f;
-        for (int s = 0; s < used; s++) c += weights[s] * experts[(u64)s * width + i];
-        float v = x[i] + c;
-        x[i] = v;
+        for (int s = 0; s < used; s++) c += wt[s] * et[(u64)s * width + i];
+        float v = xt[i] + c;
+        xt[i] = v;
         sum += v * v;
     }
     sum = warp_sum(sum);
@@ -1044,7 +1049,7 @@ extern "C" __global__ void combine_unit_norm(float *x, const float *experts,
     total = warp_sum(total);
     float inverse = rsqrtf(total / (float)width + epsilon);
     for (int i = tid; i < width; i += blockDim.x) {
-        norm_out[i] = x[i] * inverse;
+        yt[i] = xt[i] * inverse;
     }
 }
 

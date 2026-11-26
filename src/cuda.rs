@@ -3629,6 +3629,7 @@ impl CudaBackend {
             capacity = capacity.min(16);
         }
         let use_decode_graph = self.decode.as_ref().is_some_and(|d| d.has_graph());
+        let eagle3_active = self.auto_eagle3_active(position as usize + tokens.len());
         for (index, chunk) in tokens.chunks(capacity).enumerate() {
             let offset = index * capacity;
             let output_logits = offset + chunk.len() == tokens.len();
@@ -3640,10 +3641,10 @@ impl CudaBackend {
                 self.step(chunk[0], position as usize + offset, output_logits, false)?;
             }
             // For non-final prefill chunks, ingest tapped hidden states into EAGLE-3 KV cache now.
-            if self.eagle3.is_some() && !output_logits {
+            if eagle3_active && !output_logits {
                 let next_toks = &tokens[offset + 1..offset + 1 + chunk.len()];
                 self.eagle3_ingest_tapped_opt(next_toks, position as usize + offset, false)?;
-            } else if self.eagle3.is_some() {
+            } else if eagle3_active {
                 self.eagle3_pending_start = position as usize + offset;
             }
         }

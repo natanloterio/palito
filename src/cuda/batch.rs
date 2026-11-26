@@ -1314,15 +1314,19 @@ impl CudaBackend {
                 && !olmo2
                 && affine.is_none()
                 && l.post_norms.is_none()
-                && !s.parallel_residual
-                && s.used == 1;
+                && !s.parallel_residual;
             #[cfg(not(feature = "qtip-research"))]
             let plt1_fused_norm = false;
+            let unit_norm_threads = if s.width % 4 == 0 && s.width <= 4096 {
+                ((s.width / 4).next_power_of_two().clamp(32, 1024)) as u32
+            } else {
+                256
+            };
             if plt1_fused_norm {
                 launch!(
                     self,
                     "residual_unit_norm",
-                    (n as u32, 1, 1),
+                    (n as u32, 1, 1); unit_norm_threads,
                     &mut self.work.x,
                     &self.work.projected,
                     &mut self.work.normalized,
@@ -1488,11 +1492,10 @@ impl CudaBackend {
                     &self.work.router,
                     s.experts
                 );
-                if cfg!(feature = "cuda-decode-fusion-research")
-                    && matmul == CudaMatmul::ResidualMma3Research
-                    && experts == 128
-                    && used <= 32
-                {
+                let warp_router = (self.matmul.f32_tiled() && !olmoe)
+                    || (cfg!(feature = "cuda-decode-fusion-research")
+                        && matmul == CudaMatmul::ResidualMma3Research);
+                if warp_router && experts == 128 && used <= 32 {
                     launch!(
                         self,
                         "router_warp128",
@@ -1888,15 +1891,33 @@ impl CudaBackend {
                 &self.work.down,
                 s.width * s.used
             );
-            if plt1_fused_norm && index + 1 < n_layers {
+            if plt1_fused_norm && s.used == 1 && index + 1 < n_layers {
                 launch!(
                     self,
                     "residual_unit_norm",
-                    (n as u32, 1, 1),
+                    (n as u32, 1, 1); unit_norm_threads,
                     &mut self.work.x,
                     &self.work.down,
                     &mut self.work.normalized,
                     &w,
+                    &s.epsilon
+                );
+                plt1_attn_normed = true;
+            } else if plt1_fused_norm
+                && s.used > 1
+                && index + 1 < n_layers
+                && self.functions.contains_key("combine_unit_norm")
+            {
+                launch!(
+                    self,
+                    "combine_unit_norm",
+                    (n as u32, 1, 1); unit_norm_threads,
+                    &mut self.work.x,
+                    &self.work.down,
+                    &self.work.probabilities,
+                    &mut self.work.normalized,
+                    &w,
+                    &used,
                     &s.epsilon
                 );
                 plt1_attn_normed = true;

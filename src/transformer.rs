@@ -170,6 +170,14 @@ impl Weights<Tensor> {
         Self::from_gguf_inner(model, config, false)
     }
 
+    pub(crate) fn from_gguf_with_plt1(
+        model: Gguf,
+        config: &Config,
+        allow_plt1_stubs: bool,
+    ) -> Result<Self> {
+        Self::from_gguf_inner(model, config, allow_plt1_stubs)
+    }
+
     fn from_gguf_inner(model: Gguf, config: &Config, allow_plt1_stubs: bool) -> Result<Self> {
         if model.has_qtip3() {
             return Err(invalid(

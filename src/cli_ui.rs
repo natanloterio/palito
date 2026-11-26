@@ -8,7 +8,10 @@ use std::{
     fs,
     io::{IsTerminal, Read},
     path::Path,
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicI32, Ordering},
+    },
 };
 
 /// Path argument meaning "read standard input".
@@ -18,6 +21,19 @@ const MODEL_HINT: &str =
     "pass a .gguf or .palito file with --model (or set PALITO_MODEL)";
 
 static COLOR: OnceLock<bool> = OnceLock::new();
+/// Process exit code for the error being returned (1 unless `fail` set one).
+static EXIT_CODE: AtomicI32 = AtomicI32::new(1);
+
+/// An error that should end the process with `code` (see `hub::exit`).
+pub(crate) fn fail(code: i32, text: String) -> Error {
+    EXIT_CODE.store(code, Ordering::Relaxed);
+    Error::Invalid(text)
+}
+
+/// Exit code for the error `main` is about to report.
+pub(crate) fn exit_code() -> i32 {
+    EXIT_CODE.load(Ordering::Relaxed)
+}
 
 /// `--color` from the raw arguments, before clap parses (clap needs it to style
 /// its own errors).

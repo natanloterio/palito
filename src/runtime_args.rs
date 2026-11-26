@@ -42,9 +42,12 @@ pub(crate) struct RuntimeArgs {
     /// Execution backend [default: cuda for .palito files, cpu for GGUF].
     #[arg(long, value_enum, env = "PALITO_BACKEND", help_heading = "Backend")]
     backend: Option<LocalBackend>,
-    /// Model file (.palito or .gguf).
-    #[arg(short, long, env = "PALITO_MODEL", value_name = "FILE", value_hint = ValueHint::FilePath)]
+    /// Model: a .palito/.gguf file or a downloaded model name (see 'palito list').
+    #[arg(short, long, env = "PALITO_MODEL", value_name = "MODEL", value_hint = ValueHint::FilePath)]
     pub(crate) model: PathBuf,
+    /// Download the model first if it is a name that is not downloaded yet, without asking.
+    #[arg(long)]
+    pub(crate) pull: bool,
     /// Context tokens [default: 512; chat: the model's trained context].
     #[arg(
         long,
@@ -139,8 +142,10 @@ pub(crate) struct RuntimeArgs {
 }
 
 impl RuntimeArgs {
-    /// Fails with the path and a hint when --model is missing or not a model.
-    pub(crate) fn check_model(&self) -> Result<()> {
+    /// Resolves a model name to its downloaded file (pulling it if needed),
+    /// then fails with the path and a hint when --model is not a model.
+    pub(crate) fn check_model(&mut self) -> Result<()> {
+        crate::hub::commands::resolve_model(&mut self.model, self.pull)?;
         cli_ui::check_model(&self.model)
     }
 

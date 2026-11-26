@@ -1955,6 +1955,32 @@ extern "C" __global__ void qkv_head_norm_rope_cache_decode(
         q, q_norm, heads, k, k_norm, v, keys, values, kv_heads, epsilon, control[1], base, neox);
 }
 
+extern "C" __global__ void qkv_head_norm_rope_cache_batch(
+    float *q, const u8 *q_norm, int heads,
+    float *k, const u8 *k_norm, const float *v,
+    float *keys, float *values, int kv_heads,
+    float epsilon, int position, float base, int neox) {
+    int tok = blockIdx.y;
+    qkv_head_norm_rope_cache_impl(
+        q + (u64)tok * heads * 128, q_norm, heads,
+        k + (u64)tok * kv_heads * 128, k_norm,
+        v + (u64)tok * kv_heads * 128,
+        keys, values, kv_heads, epsilon, position + tok, base, neox);
+}
+
+extern "C" __global__ void qkv_head_norm_rope_cache_batch_graph(
+    float *q, const u8 *q_norm, int heads,
+    float *k, const u8 *k_norm, const float *v,
+    float *keys, float *values, int kv_heads,
+    float epsilon, const int *control, float base, int neox) {
+    int tok = blockIdx.y;
+    qkv_head_norm_rope_cache_impl(
+        q + (u64)tok * heads * 128, q_norm, heads,
+        k + (u64)tok * kv_heads * 128, k_norm,
+        v + (u64)tok * kv_heads * 128,
+        keys, values, kv_heads, epsilon, control[1] + tok, base, neox);
+}
+
 #ifdef CUDA_KV_F16
 extern "C" __global__ void qkv_head_norm_rope_cache_f16(
     float *q, const u8 *q_norm, int heads,

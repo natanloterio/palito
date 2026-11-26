@@ -653,6 +653,18 @@ impl CudaBackend {
                 && embedding_norm.is_none()
                 && s.rotary_dim == s.dim
                 && self.weights.rope_factors.is_some();
+            let fused_qwen_head_rope_kv = tree.is_none()
+                && self.diagnostic.is_none()
+                && !olmo2
+                && !olmoe
+                && l.q_norm.is_some()
+                && l.k_norm.is_some()
+                && position_embedding.is_none()
+                && embedding_norm.is_none()
+                && s.rotary_dim == s.dim
+                && dim == 128
+                && self.weights.rope_factors.is_none()
+                && self.functions.contains_key("qkv_head_norm_rope_cache_batch");
             if fused_rope_kv {
                 let factors = self.weights.rope_factors.as_ref().unwrap();
                 let total_pairs = ((qw / 2 + kw / 2) as u32).div_ceil(256);
@@ -694,6 +706,50 @@ impl CudaBackend {
                         &neox,
                         &factors.bytes,
                         &s.rope_attn_factor
+                    );
+                }
+            } else if fused_qwen_head_rope_kv {
+                let qn = l.q_norm.as_ref().unwrap();
+                let kn = l.k_norm.as_ref().unwrap();
+                let grid = ((heads + kv_heads) as u32, n as u32, 1);
+                if device_pos {
+                    let control = &self.verify_control;
+                    launch!(
+                        self,
+                        "qkv_head_norm_rope_cache_batch_graph",
+                        grid,
+                        &mut self.work.q,
+                        &qn.bytes,
+                        &heads,
+                        &mut self.work.k,
+                        &kn.bytes,
+                        &self.work.v,
+                        &mut self.keys[index],
+                        &mut self.values[index],
+                        &kv_heads,
+                        &s.epsilon,
+                        control,
+                        &rope_base,
+                        &neox
+                    );
+                } else {
+                    launch!(
+                        self,
+                        "qkv_head_norm_rope_cache_batch",
+                        grid,
+                        &mut self.work.q,
+                        &qn.bytes,
+                        &heads,
+                        &mut self.work.k,
+                        &kn.bytes,
+                        &self.work.v,
+                        &mut self.keys[index],
+                        &mut self.values[index],
+                        &kv_heads,
+                        &s.epsilon,
+                        &pos,
+                        &rope_base,
+                        &neox
                     );
                 }
             } else {

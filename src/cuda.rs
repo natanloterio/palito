@@ -1292,6 +1292,8 @@ impl CudaBackend {
                 "attention_combine_chunks_decode",
                 "qkv_head_norm_rope_cache",
                 "qkv_head_norm_rope_cache_decode",
+                "qkv_head_norm_rope_cache_batch",
+                "qkv_head_norm_rope_cache_batch_graph",
                 "matvec_packed_qkv_rows",
                 "residual_rmsnorm",
                 "combine_rmsnorm",

@@ -2,7 +2,7 @@
   <img src="docs/palito_logo.png" alt="Palito: fast local LLM inference" width="640">
 </p>
 
-**Fast local LLM inference in a single Rust binary** — custom CUDA, Vulkan, and Metal kernels, GPU-native `.palito` (`PLT1`, `3.0 bpw`) quantization, and built-in `EAGLE-3` + `SuffixDecoding` speculative decoding (up to **1,361 tok/s** on 1B and **1,017+ tok/s** on 8B code refactoring, up to **1.7× faster than `llama.cpp`** with up to 40% less GPU memory) — no Python or `llama.cpp` required.
+**Fast local LLM inference in a single Rust binary** — custom CUDA, Vulkan, and Metal kernels, GPU-native `.palito` (`PLT1`, `3.0 bpw`) quantization, and built-in `EAGLE-3` + `SuffixDecoding` speculative decoding: **1,017–1,045 tok/s on Llama 3.1 8B**, **1,361 tok/s on Llama 3.2 1B**, **726 tok/s on Qwen 3 8B**, and **557 tok/s on Qwen3-30B-A3B MoE** (up to **1.7× faster than `llama.cpp`** with up to 40% less GPU memory) — no Python or `llama.cpp` required.
 
 ---
 
@@ -26,7 +26,7 @@ Palito introduces **`.palito` (`PLT1`)** — a single-file model format built sp
 | :--- | :---: | :--- | :---: | :---: | :---: |
 | **Llama 3.1 8B** (`llama-3.1-8b.palito`, `3.0 bpw`) | **3.5 GiB** | General / Coding / Refactor | **417 / 445 / 1,017 tok/s** | 394 / 390 / 608 tok/s (`IQ3_XXS + EAGLE-3`) | **1.06× / 1.14× / 1.67×** |
 | **Qwen 3 8B** (`qwen3-8b.palito`, `3.0 bpw`) | **3.7 GiB** | General / Coding / Refactor | **296 / 379 / 726 tok/s** | 306 / 310 / 459 tok/s (`Q3_K_M + EAGLE-3`) | **0.97× / 1.22× / 1.58×** |
-| **Qwen3-30B-A3B MoE** (`qwen3-30b-a3b.palito`, `3.0 bpw`) | **11.1 GiB** | Single-stream / Refactor | **349 / 535 tok/s** | 340 tok/s (`Q4_K_M`, 18.6 GiB) | **1.57× refactor, 40% smaller** |
+| **Qwen3-30B-A3B MoE** (`qwen3-30b-a3b.palito`, `3.0 bpw`) | **11.1 GiB** | Single-stream / Refactor | **349 / 557 tok/s** | 340 tok/s (`Q4_K_M`, 18.6 GiB) | **1.64× refactor, 40% smaller** |
 | **Llama 3.2 1B** (`QTIP3`) | **0.9 GiB** | Single-stream decode | **1,361 tok/s** | 1,053 tok/s (`IQ3_XXS`) | **1.29× faster** |
 
 *All speculative runs are verified 100% bit-exact (`exact_parity=true`) against standard token-by-token generation and checked for coherent, non-degenerate output. See [reproducible benchmarks](benchmarks/vs-llama-cpp/README.md).*

@@ -32,19 +32,24 @@ pub enum CudaMatmul {
     #[default]
     F32,
     /// Experimental reduced-precision projections; failed long-MoE quality gates.
+    #[value(hide = true)]
     Tf32,
     /// Experimental three-product TF32; tested for long MoE, slower on small/dense prompts.
+    #[value(hide = true)]
     Tf32x3,
     /// Experimental staged/register F32 experts and packed decode; no activation quantization.
     #[serde(rename = "f32-tiled")]
     F32Tiled,
     /// Experimental staged three-product TF32 experts; failed strict MoE quality gates.
+    #[value(hide = true)]
     #[serde(rename = "tf32x3-tiled")]
     Tf32x3Tiled,
     /// Research-only residual INT8 prefill; full-model quality is not admitted.
+    #[value(hide = true)]
     #[serde(rename = "residual-int8-research")]
     ResidualInt8Research,
     /// Research-only three-component integer MMA prefill; no production promotion.
+    #[value(hide = true)]
     #[serde(rename = "residual-mma3-research")]
     ResidualMma3Research,
     /// f32-tiled decode with approximate tensor-core prefill: INT8 MMA projections on

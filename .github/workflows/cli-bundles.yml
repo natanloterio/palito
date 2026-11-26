@@ -24,6 +24,9 @@ on:
     paths:
       - "scripts/package.sh"
       - "scripts/test_package.py"
+      - "install.sh"
+      - "install.ps1"
+      - "scripts/test_install.py"
       - "src/hub/**"
       - "src/metal.rs"
       - "src/metal/**"
@@ -129,3 +132,52 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$TAG" "target/dist/${{ steps.package.outputs.name }}.${{ matrix.archive }}" --clobber
+
+  # The one-line installers, run as users run them, against the release just
+  # built (or the latest release on pull requests).
+  install:
+    needs: bundle
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG || github.ref }}
+      - name: Installer tests
+        if: runner.os != 'Windows'
+        run: python3 -m unittest discover -s scripts -p 'test_install.py'
+      - name: install.sh (piped to sh, as in the README)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          export PALITO_VERSION="${TAG#v}"
+          [ -n "$PALITO_VERSION" ] || unset PALITO_VERSION
+          cat install.sh | SHELL=/bin/zsh sh
+          grep -q 'added by the palito installer' ~/.zshrc
+          ~/.local/bin/palito --version
+          ~/.local/bin/palito list --available | grep qwen3-8b
+          # A second run upgrades in place without duplicating the PATH line.
+          cat install.sh | SHELL=/bin/zsh sh
+          [ "$(grep -c 'added by the palito installer' ~/.zshrc)" = 1 ]
+      - name: install.ps1 (Windows PowerShell 5.1, piped to iex as in the README)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          if ($env:TAG) { $env:PALITO_VERSION = $env:TAG.TrimStart('v') }
+          Get-Content -Raw install.ps1 | Invoke-Expression
+          palito --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if ($userPath -notlike "*$env:LOCALAPPDATA\palito\*") { throw "user PATH not updated: $userPath" }
+      - name: install.ps1 (PowerShell 7)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ($env:TAG) { $env:PALITO_VERSION = $env:TAG.TrimStart('v') }
+          & ./install.ps1
+          if (-not (palito list --available | Select-String qwen3-8b)) { throw 'registry not listed' }
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if (([regex]::Matches($userPath, 'palito')).Count -ne 1) { throw "duplicate palito PATH entries: $userPath" }

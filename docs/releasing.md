@@ -31,7 +31,7 @@ One version for everything: `Cargo.toml` `[package] version`. The bindings follo
    gh release create vX.Y.Z target/dist/palito-X.Y.Z-linux-x86_64.tar.gz --title "Palito X.Y.Z"
    ```
 
-   Publishing the release starts the `cli-bundles` workflow, which builds the macOS (Apple Silicon, Metal) and Windows (x86_64, Vulkan) bundles with the same `scripts/package.sh`, smoke-tests them (pull a small GGUF from Hugging Face, generate on the CPU) and attaches them to the release. To add them to an older release: Actions > cli-bundles > Run workflow with its tag. Update the version in the README's download links (they are not synced by `sync_versions.py`).
+   Publishing the release starts the `cli-bundles` workflow, which builds the macOS (Apple Silicon, Metal) and Windows (x86_64, Vulkan) bundles with the same `scripts/package.sh`, smoke-tests them (pull a small GGUF from Hugging Face, generate on the CPU) and attaches them to the release. To add them to an older release: Actions > cli-bundles > Run workflow with its tag. The README installs with `install.sh` / `install.ps1`, which always take the latest release, so it needs no version change.
 
    Hosted macOS runners are sometimes cancelled for capacity; rerun the failed jobs on the same tag (`gh run rerun <run> --failed`). Maven Central can take 20 minutes or more to validate a deployment.
 

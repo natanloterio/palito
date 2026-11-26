@@ -40,9 +40,9 @@ Palito introduces **`.palito` (`PLT1`)** — a single-file model format built sp
 Download the latest Linux release from the [Releases page](https://github.com/natanloterio/palito/releases):
 
 ```sh
-tar xzf palito-0.14.0-linux-x86_64.tar.gz
+tar xzf palito-0.15.0-linux-x86_64.tar.gz
 mkdir -p ~/.local/bin
-ln -sf "$PWD/palito-0.14.0-linux-x86_64/palito" ~/.local/bin/palito
+ln -sf "$PWD/palito-0.15.0-linux-x86_64/palito" ~/.local/bin/palito
 palito --version
 ```
 

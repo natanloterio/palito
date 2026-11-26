@@ -1651,17 +1651,21 @@ impl CudaBackend {
         #[cfg(feature = "qtip-research")]
         if is_plt1 {
             backend.load_plt1_projections(path)?;
-            let mut f = std::fs::File::open(path)?;
-            let idx = crate::plt1::Plt1Index::read_from(&mut f)?;
-            if idx
-                .sections
-                .iter()
-                .any(|s| s.kind == crate::plt1::SectionKind::Eagle3SpecHead)
-            {
-                backend.load_eagle3(path)?;
+            let disable_eagle3 = std::env::var("PALITO_NO_EAGLE3")
+                .is_ok_and(|v| !v.is_empty() && v != "0");
+            if !disable_eagle3 {
+                let mut f = std::fs::File::open(path)?;
+                let idx = crate::plt1::Plt1Index::read_from(&mut f)?;
+                if idx
+                    .sections
+                    .iter()
+                    .any(|s| s.kind == crate::plt1::SectionKind::Eagle3SpecHead)
+                {
+                    backend.load_eagle3(path)?;
+                }
             }
         }
-        if options.decode_graph && !is_plt1 {
+        if options.decode_graph {
             backend.capture_decode_graph()?;
         }
         Ok(backend)
@@ -2364,17 +2368,21 @@ impl CudaBackend {
                 && !olmo2
                 && affine.is_none()
                 && l.post_norms.is_none()
-                && !s.parallel_residual
-                && s.used == 1;
+                && !s.parallel_residual;
             #[cfg(not(feature = "qtip-research"))]
             let plt1_fused_norm = false;
+            let unit_norm_threads = if s.width % 4 == 0 && s.width <= 4096 {
+                ((s.width / 4).next_power_of_two().clamp(32, 1024)) as u32
+            } else {
+                256
+            };
             let fused_norm =
                 !plt1_active && self.matmul.f32_tiled() && s.width <= FUSED_NORM_MAX_WIDTH;
             let fused_ffn_norm = if plt1_fused_norm {
                 launch!(
                     self,
                     "residual_unit_norm",
-                    (1, 1, 1),
+                    (1, 1, 1); unit_norm_threads,
                     &mut self.work.x,
                     &self.work.projected,
                     &mut self.work.normalized,
@@ -2732,11 +2740,11 @@ impl CudaBackend {
                 .get(index + 1)
                 .filter(|next| next.affine.is_none() && !olmo2)
                 .and_then(|next| next.norm.as_ref());
-            if plt1_fused_norm && index + 1 < self.weights.layers.len() {
+            if plt1_fused_norm && s.used == 1 && index + 1 < self.weights.layers.len() {
                 launch!(
                     self,
                     "residual_unit_norm",
-                    (1, 1, 1),
+                    (1, 1, 1); unit_norm_threads,
                     &mut self.work.x,
                     &self.work.down,
                     &mut self.work.normalized,
@@ -2746,7 +2754,12 @@ impl CudaBackend {
                 attention_normalized = true;
             } else if let Some([_, post_ffn]) = &l.post_norms {
                 gemma_post_norm!(self, down, post_ffn, 1, w, s.epsilon);
-            } else if let Some(norm) = next_norm.filter(|_| fused_norm) {
+            } else if let Some(norm) = next_norm.filter(|_| {
+                fused_norm
+                    || (plt1_fused_norm
+                        && self.matmul.f32_tiled()
+                        && s.width <= FUSED_NORM_MAX_WIDTH)
+            }) {
                 launch!(
                     self,
                     "combine_rmsnorm",
@@ -3557,6 +3570,9 @@ impl CudaBackend {
         self.plt1_hyb = Some(rt);
         self.plt1_path = Some(canonical);
         self.verify_graphs.clear();
+        if self.decode.as_ref().is_some_and(|d| d.has_graph()) {
+            self.capture_decode_graph()?;
+        }
         Ok(())
     }
 
@@ -3588,10 +3604,7 @@ impl CudaBackend {
         if self.plt1_hyb.is_some() {
             capacity = capacity.min(16);
         }
-        #[cfg(feature = "qtip-research")]
-        let use_decode_graph = self.decode.is_some() && self.plt1_hyb.is_none();
-        #[cfg(not(feature = "qtip-research"))]
-        let use_decode_graph = self.decode.is_some();
+        let use_decode_graph = self.decode.as_ref().is_some_and(|d| d.has_graph());
         for (index, chunk) in tokens.chunks(capacity).enumerate() {
             let offset = index * capacity;
             let output_logits = offset + chunk.len() == tokens.len();

@@ -911,7 +911,7 @@ extern "C" __global__ void eagle3_norm_cat(const float *emb, const float *g,
 // Fused residual add + unit-variance RMSNorm for PLT1 folded-RMSNorm layers:
 //   x[tok, i] += delta[tok, i]
 //   norm_out[tok, i] = x[tok, i] * rsqrt(mean(x[tok]^2) + eps)
-// Grid: (n, 1, 1), Block: 256 threads. Eliminates 63 launches + 63 global reads/step.
+// Grid: (n, 1, 1), Block: up to 1024 threads. Uses float4 + register caching when aligned.
 extern "C" __global__ void residual_unit_norm(float *x, const float *delta, float *norm_out,
                                               int width, float epsilon) {
     __shared__ float partial[32];
@@ -919,19 +919,48 @@ extern "C" __global__ void residual_unit_norm(float *x, const float *delta, floa
     float *xt = x + (u64)tok * width;
     const float *dt = delta + (u64)tok * width;
     float *yt = norm_out + (u64)tok * width;
+    int tid = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int nwarps = blockDim.x >> 5;
+
+    if ((width & 3) == 0 && width <= (int)blockDim.x * 4) {
+        int n4 = width >> 2;
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float sum = 0.0f;
+        if (tid < n4) {
+            float4 xv = reinterpret_cast<const float4 *>(xt)[tid];
+            float4 dv = reinterpret_cast<const float4 *>(dt)[tid];
+            v = make_float4(xv.x + dv.x, xv.y + dv.y, xv.z + dv.z, xv.w + dv.w);
+            reinterpret_cast<float4 *>(xt)[tid] = v;
+            sum = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+        sum = warp_sum(sum);
+        if (lane == 0) partial[warp] = sum;
+        __syncthreads();
+        float total = (lane < nwarps) ? partial[lane] : 0.0f;
+        total = warp_sum(total);
+        float inverse = rsqrtf(total / (float)width + epsilon);
+        if (tid < n4) {
+            reinterpret_cast<float4 *>(yt)[tid] =
+                make_float4(v.x * inverse, v.y * inverse, v.z * inverse, v.w * inverse);
+        }
+        return;
+    }
+
     float sum = 0.0f;
-    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+    for (int i = tid; i < width; i += blockDim.x) {
         float v = xt[i] + dt[i];
         xt[i] = v;
         sum += v * v;
     }
     sum = warp_sum(sum);
-    if ((threadIdx.x & 31) == 0) partial[threadIdx.x / 32] = sum;
+    if (lane == 0) partial[warp] = sum;
     __syncthreads();
-    float total = 0.0f;
-    for (int i = 0; i < (int)blockDim.x / 32; i++) total += partial[i];
+    float total = (lane < nwarps) ? partial[lane] : 0.0f;
+    total = warp_sum(total);
     float inverse = rsqrtf(total / (float)width + epsilon);
-    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+    for (int i = tid; i < width; i += blockDim.x) {
         yt[i] = xt[i] * inverse;
     }
 }
@@ -1849,17 +1878,19 @@ extern "C" __global__ void router_warp128(const float *scores, int used,
         if (lane == 0) atomicExch(status, 1);
         return;
     }
-    bool chosen[4] = {false, false, false, false};
-    float maximum = 0.0f, total = 0.0f, my_weight = 0.0f;
+    const float neg_inf = -__int_as_float(0x7f800000);
+    int my_id = 0;
+    float my_score = 0.0f;
+    float maximum = 0.0f;
     for (int s = 0; s < used; s++) {
         int best_id = -1;
-        float best_score = -__int_as_float(0x7f800000);
+        float best_score = neg_inf;
         #pragma unroll
         for (int k = 0; k < 4; k++) {
             int idx = lane + k * 32;
             float sc = val[k];
-            if (!chosen[k] && (best_id < 0 || sc > best_score
-                || (sc == best_score && idx < best_id))) {
+            if (sc > best_score || (sc == best_score && best_id >= 0 && idx < best_id)
+                || (best_id < 0 && sc != neg_inf)) {
                 best_id = idx;
                 best_score = sc;
             }
@@ -1876,19 +1907,21 @@ extern "C" __global__ void router_warp128(const float *scores, int used,
         }
         int win_id = __shfl_sync(0xffffffffu, best_id, 0);
         float win_score = __shfl_sync(0xffffffffu, best_score, 0);
-        #pragma unroll
-        for (int k = 0; k < 4; k++) {
-            if (lane + k * 32 == win_id) chosen[k] = true;
+        if ((win_id & 31) == lane) {
+            val[win_id >> 5] = neg_inf;
         }
         if (s == 0) maximum = win_score;
-        float w = expf(win_score - maximum);
-        total += w;
         if (lane == s) {
-            ids[s] = win_id;
-            my_weight = w;
+            my_id = win_id;
+            my_score = win_score;
         }
     }
-    if (lane < used) weights[lane] = my_weight / total;
+    float my_weight = (lane < used) ? expf(my_score - maximum) : 0.0f;
+    float total = warp_sum(my_weight);
+    if (lane < used) {
+        ids[lane] = my_id;
+        weights[lane] = my_weight / total;
+    }
 }
 #endif
 

@@ -69,6 +69,20 @@ impl SectionKind {
     }
 }
 
+/// Refuses a `.palito` file on a backend without PLT1 kernels (Vulkan, Metal).
+/// Opening it there would run only the bundle's GGUF skeleton and produce
+/// garbage, so this runs before any GPU work.
+pub fn reject_on_backend(path: &std::path::Path, backend: &str) -> Result<()> {
+    if !is_plt1_file(path) {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "{backend} cannot run .palito models yet (their GPU kernels are CUDA-only)\n  \
+         hint: use --backend cpu for this model, or a GGUF model with --backend {}",
+        backend.to_ascii_lowercase()
+    )))
+}
+
 /// Returns true if `path` starts with the `PALITO1\0` magic header.
 pub fn is_plt1_file(path: &std::path::Path) -> bool {
     let Ok(mut f) = std::fs::File::open(path) else {

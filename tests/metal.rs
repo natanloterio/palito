@@ -47,3 +47,17 @@ fn metal_matches_cpu_tokens_and_resets_cleanly() {
     mtl.evaluate(&prompt, 0).unwrap();
     assert_eq!(mtl.sample_greedy().unwrap(), mtl_tokens[0]);
 }
+
+/// `.palito` (PLT1) weights have only CUDA and CPU kernels: Metal must refuse
+/// them before touching the GPU instead of running the bundle's GGUF skeleton.
+#[test]
+fn metal_refuses_palito_models() {
+    let path = std::env::temp_dir().join(format!("palito-mtl-plt1-{}.palito", std::process::id()));
+    std::fs::write(&path, b"PALITO1\0not a real bundle").unwrap();
+    let cfg = Config { context_tokens: 512, batch_tokens: 128, prefill_chunk: 64, threads: 4 };
+    let result = MetalBackend::open(&path, &cfg, MetalOptions::default());
+    let _ = std::fs::remove_file(&path);
+    let Err(error) = result else { panic!("Metal opened a .palito model") };
+    let text = error.to_string();
+    assert!(text.contains(".palito") && text.contains("--backend cpu"), "{text}");
+}

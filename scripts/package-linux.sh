@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds a self-contained Linux x86_64 bundle of the CUDA CLI:
+# Builds a self-contained Linux x86_64 bundle of the CUDA CLI (with `convert`):
 #   target/dist/palito-<version>-linux-x86_64{/,.tar.gz}
 # The bundle carries NVRTC 13 (runtime kernel compiler); the NVIDIA driver
 # (libcuda) must come from the host. With --install it is copied to
@@ -27,7 +27,8 @@ nvrtc="${NVRTC_LIB_DIR:-$root/.venv-cuda-bench/lib/python3.11/site-packages/nvid
 # The bindings must carry the same version as the bundle.
 python3 scripts/sync_versions.py --check
 
-cargo build --release --features cuda
+# qtip-research brings `palito convert` (GGUF -> .palito); only the CLI binary is built.
+cargo build --release --features cuda,qtip-research --bin palito
 
 dist="$root/target/dist/$name"
 rm -rf "$dist"

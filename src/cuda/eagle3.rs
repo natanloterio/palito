@@ -211,6 +211,7 @@ impl CudaBackend {
             draft_logits: alloc(draft_vocab)?,
             batch_toks: self.stream.alloc_zeros::<i32>(8).map_err(failure)?,
         });
+        self.verify_graphs.clear();
         Ok(())
     }
 

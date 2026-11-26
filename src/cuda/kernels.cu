@@ -1385,6 +1385,15 @@ extern "C" __global__ void rotary_factored_cache_kv_batch(
                                   position + tok, base, neox, factors, magnitude);
 }
 
+extern "C" __global__ void rotary_factored_cache_kv_batch_graph(
+    float *q, int q_size, float *k, const float *v, float *keys, float *values, int k_size,
+    int dim, const int *control, float base, int neox, const float *factors, float magnitude) {
+    int tok = blockIdx.y;
+    rotary_factored_cache_kv_impl(q + (u64)tok * q_size, q_size, k + (u64)tok * k_size,
+                                  v + (u64)tok * k_size, keys, values, k_size, dim,
+                                  control[1] + tok, base, neox, factors, magnitude);
+}
+
 #ifdef CUDA_KV_F16
 extern "C" __global__ void rotary_factored_cache_kv_decode_f16(
     float *q, int q_size, float *k, const float *v, kv_f16 *keys, kv_f16 *values, int k_size,

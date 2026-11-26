@@ -936,6 +936,10 @@ pub struct CudaBackend {
     /// Canonical path of the loaded PLT1 projection overlay (guards against double-folding).
     #[cfg(feature = "qtip-research")]
     plt1_path: Option<std::path::PathBuf>,
+    /// Cached CUDA Graphs for `verify_chain_greedy` keyed by chain length `n` (`2..=16`).
+    verify_graphs: HashMap<usize, cudarc::driver::CudaGraph>,
+    /// Device-resident `[0, position, 0]` control buffer for `verify_graphs` (independent of `self.decode`).
+    verify_control: CudaSlice<i32>,
     /// Evaluated token history for automatic EAGLE-3 + SuffixDecoding in `sample_decode_tokens`.
     prompt_history: Vec<i32>,
     /// Start position of the last evaluated chunk still sitting in `eagle3.tap_hidden`.
@@ -1222,6 +1226,7 @@ impl CudaBackend {
             "prefill_matmul",
             "prefill_matmul_8",
             "rotary_factored_cache_kv_batch",
+            "rotary_factored_cache_kv_batch_graph",
             "rotary_tree",
             "rotary_factored_tree",
             "attention_tree",
@@ -1279,7 +1284,9 @@ impl CudaBackend {
                 "group_experts_fast32",
                 "attention_combine_group",
                 "attention_combine_group_decode",
+                "attention_split_group_batch_graph",
                 "attention_combine_group_batch",
+                "attention_combine_group_batch_graph",
                 "attention_combine_wide",
                 "attention_combine_wide_decode",
                 "attention_combine_chunks_decode",
@@ -1528,7 +1535,11 @@ impl CudaBackend {
             worker_scratch_bound_bytes: 0,
             numerical_reservation_bytes: reservation,
         };
-        let stream = if options.decode_graph {
+        #[cfg(feature = "qtip-research")]
+        let is_plt1 = crate::plt1::is_plt1_file(path);
+        #[cfg(not(feature = "qtip-research"))]
+        let is_plt1 = false;
+        let stream = if options.decode_graph || is_plt1 {
             // This backend owns one stream and never shares device buffers.
             unsafe {
                 context.disable_event_tracking();
@@ -1537,6 +1548,7 @@ impl CudaBackend {
         } else {
             context.default_stream()
         };
+        let verify_control = stream.alloc_zeros::<i32>(3).map_err(failure)?;
         let decode = if options.decode_graph {
             Some(decode::DecodeState::new(
                 &stream,
@@ -1597,6 +1609,8 @@ impl CudaBackend {
             plt1_hyb: None,
             #[cfg(feature = "qtip-research")]
             plt1_path: None,
+            verify_graphs: HashMap::new(),
+            verify_control,
             prompt_history: Vec::new(),
             eagle3_pending_start: 0,
         };
@@ -3061,34 +3075,13 @@ impl CudaBackend {
     /// next-token prediction for every position `0..k`.
     ///
     /// Leaves the KV cache populated at `position..position + k`; call
-    /// `rewind_to(position + accepted)` so the next step starts cleanly right
-    /// after the accepted prefix.
-    pub fn verify_chain_greedy(&mut self, tokens: &[i32], position: u32) -> Result<Vec<i32>> {
-        if tokens.is_empty() || tokens.len() > 16 {
-            return Err(invalid(
-                "verify_chain_greedy requires between 1 and 16 tokens",
-            ));
-        }
-        if tokens.len() == 1 {
-            self.evaluate_for_sampling(tokens, position)?;
-            return Ok(vec![self.sample_greedy()?]);
-        }
-        self.state
-            .begin(tokens, position, &self.weights.spec.info)?;
-        if let Some(prefix) = &mut self.prefix {
-            prefix.overwrite(position as usize);
-        }
-        if let Some(decode) = &mut self.decode {
-            decode.sampled = None;
-        }
-        self.batched_prefill(tokens, position as usize, false)?;
-        let n = tokens.len();
+    /// Runs output norm + batched LM head + batched greedy argmax for `n` tokens
+    /// into `self.work.batch_tokens[0..n]`. All output buffers must already be allocated.
+    fn verify_chain_tail(&mut self, n: usize) -> Result<()> {
         let n_i32 = n as i32;
         let width_i32 = self.weights.spec.width as i32;
-        let vocab = self.weights.spec.info.vocab_tokens as usize;
-        let vocab_i32 = vocab as i32;
+        let vocab_i32 = self.weights.spec.info.vocab_tokens as i32;
 
-        // Normalize all `n` token hidden states in one launch.
         transformer_norm!(
             self,
             &self.work.x,
@@ -3099,22 +3092,6 @@ impl CudaBackend {
             self.weights.spec.epsilon
         );
 
-        // Single-read batched LM head for all `n <= 16` tokens.
-        if self
-            .work
-            .batch_logits
-            .as_ref()
-            .is_none_or(|b| b.len() < 16 * vocab)
-        {
-            self.work.batch_logits = Some(
-                self.stream
-                    .alloc_zeros(16 * vocab)
-                    .map_err(failure)?,
-            );
-        }
-        if self.work.batch_tokens.is_none() {
-            self.work.batch_tokens = Some(self.stream.alloc_zeros(16).map_err(failure)?);
-        }
         let t = self
             .weights
             .output
@@ -3165,7 +3142,6 @@ impl CudaBackend {
             );
         }
 
-        // Single-launch batched greedy argmax across all `n` rows (0 H2D copies, 1 D2H read).
         let batch_logits_ref = self.work.batch_logits.as_ref().unwrap();
         let batch_tokens = self.work.batch_tokens.as_mut().unwrap();
         launch!(
@@ -3177,6 +3153,107 @@ impl CudaBackend {
             batch_tokens,
             &mut self.work.status
         );
+        Ok(())
+    }
+
+    fn capture_verify_graph(&mut self, n: usize) -> Result<()> {
+        self.stream.synchronize().map_err(failure)?;
+        self.stream
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .map_err(failure)?;
+        let submitted = self
+            .batched_prefill_graph(n)
+            .and_then(|()| self.verify_chain_tail(n));
+        let captured = self.stream.end_capture(
+            sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        );
+        submitted?;
+        let graph = captured
+            .map_err(failure)?
+            .ok_or_else(|| failure("verify graph capture was empty"))?;
+        self.verify_graphs.insert(n, graph);
+        Ok(())
+    }
+
+    /// `rewind_to(position + accepted)` so the next step starts cleanly right
+    /// after the accepted prefix.
+    pub fn verify_chain_greedy(&mut self, tokens: &[i32], position: u32) -> Result<Vec<i32>> {
+        if tokens.is_empty() || tokens.len() > 16 {
+            return Err(invalid(
+                "verify_chain_greedy requires between 1 and 16 tokens",
+            ));
+        }
+        if tokens.len() == 1 {
+            self.evaluate_for_sampling(tokens, position)?;
+            return Ok(vec![self.sample_greedy()?]);
+        }
+        self.state
+            .begin(tokens, position, &self.weights.spec.info)?;
+        if let Some(prefix) = &mut self.prefix {
+            prefix.overwrite(position as usize);
+        }
+        if let Some(decode) = &mut self.decode {
+            decode.sampled = None;
+        }
+        let n = tokens.len();
+        let vocab = self.weights.spec.info.vocab_tokens as usize;
+        if self
+            .work
+            .batch_logits
+            .as_ref()
+            .is_none_or(|b| b.len() < 16 * vocab)
+        {
+            self.work.batch_logits = Some(
+                self.stream
+                    .alloc_zeros(16 * vocab)
+                    .map_err(failure)?,
+            );
+        }
+        if self.work.batch_tokens.is_none() {
+            self.work.batch_tokens = Some(self.stream.alloc_zeros(16).map_err(failure)?);
+        }
+
+        #[cfg(feature = "qtip-research")]
+        let can_graph = self.plt1_hyb.is_some()
+            && self.matmul.f32_tiled()
+            && self.diagnostic.is_none()
+            && self.weights.gemma.is_none()
+            && self.weights.embedding_norm.is_none()
+            && self.weights.position_embedding.is_none()
+            && self.weights.spec.rotary_dim == self.weights.spec.dim
+            && self.work.tokens.is_some();
+        #[cfg(not(feature = "qtip-research"))]
+        let can_graph = false;
+
+        if can_graph && self.verify_graphs.contains_key(&n) {
+            let ids = self.work.tokens.as_mut().unwrap();
+            self.stream
+                .memcpy_htod(tokens, &mut ids.slice_mut(0..n))
+                .map_err(failure)?;
+            self.stream
+                .memcpy_htod(&[0i32, position as i32, 0], &mut self.verify_control)
+                .map_err(failure)?;
+            self.verify_graphs[&n].launch().map_err(failure)?;
+        } else {
+            self.batched_prefill(tokens, position as usize, false)?;
+            self.verify_chain_tail(n)?;
+            if can_graph {
+                let mut out = vec![0i32; n];
+                self.stream
+                    .memcpy_dtoh(
+                        &self.work.batch_tokens.as_ref().unwrap().slice(0..n),
+                        &mut out,
+                    )
+                    .map_err(failure)?;
+                self.stream.synchronize().map_err(failure)?;
+                if let Err(e) = self.capture_verify_graph(n) {
+                    eprintln!("verify_graph({n}) capture skipped: {e}");
+                }
+                self.state.finish(tokens.len());
+                return Ok(out);
+            }
+        }
+
         let mut out = vec![0i32; n];
         self.stream
             .memcpy_dtoh(
@@ -3477,6 +3554,7 @@ impl CudaBackend {
         }
         self.plt1_hyb = Some(rt);
         self.plt1_path = Some(canonical);
+        self.verify_graphs.clear();
         Ok(())
     }
 

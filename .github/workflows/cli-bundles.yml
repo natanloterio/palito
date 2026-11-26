@@ -6,7 +6,8 @@
 #   existing tag, e.g. to add the bundles to a release made before this workflow.
 # - Pull requests that touch the packaging only build and smoke-test; the
 #   archives are kept as workflow artifacts.
-# The Linux CUDA bundle stays manual (scripts/package-linux.sh needs NVRTC 13).
+# All three bundles come from scripts/package.sh; the Linux CUDA one stays
+# manual (`scripts/package.sh linux-x86_64` needs a local NVRTC 13).
 name: cli-bundles
 
 on:
@@ -19,8 +20,8 @@ on:
         required: true
   pull_request:
     paths:
-      - "scripts/package-cli.sh"
-      - "scripts/test_package_cli.py"
+      - "scripts/package.sh"
+      - "scripts/test_package.py"
       - ".github/workflows/cli-bundles.yml"
 
 permissions:
@@ -63,13 +64,11 @@ jobs:
       # On Windows, Python may start WSL's bash.exe; the smoke test covers it there.
       - name: Packaging script tests
         if: runner.os != 'Windows'
-        run: python3 -m unittest discover -s scripts -p 'test_package_cli.py'
-      - name: Build (${{ matrix.features }})
-        run: cargo build --release --locked --lib --bin palito --features ${{ matrix.features }}
-      - name: Package
+        run: python3 -m unittest discover -s scripts -p 'test_package.py'
+      - name: Build and package (${{ matrix.features }})
         id: package
         run: |
-          bash scripts/package-cli.sh ${{ matrix.platform }}
+          bash scripts/package.sh ${{ matrix.platform }}
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           echo "name=palito-$version-${{ matrix.platform }}" >> "$GITHUB_OUTPUT"
       - name: Smoke test (pull a small GGUF from Hugging Face, generate on the CPU)

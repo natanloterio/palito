@@ -2,21 +2,23 @@
 
 pub(crate) const ROOT_EXAMPLES: &str = "\
 Examples:
-  palito chat     --model qwen3-8b.palito
-  palito serve    --model qwen3-8b.palito --port 8080
+  palito pull     qwen3-8b
+  palito chat     --model qwen3-8b
+  palito serve    --model qwen3-8b --port 8080
+  palito list     --available
   palito generate --model model.gguf --prompt 'Once upon a time' --stream
   palito convert  -i qwen3-8b-Q8_0.gguf -o qwen3-8b.palito";
 
 pub(crate) const CHAT_EXAMPLES: &str = "\
 Examples:
-  palito chat --model qwen3-8b.palito
-  palito chat --model qwen3-8b.palito --system 'Be brief' --temperature 0.7
+  palito chat --model qwen3-8b
+  palito chat --model models/qwen3-8b.palito --system 'Be brief' --temperature 0.7
   echo 'What is 2+2?' | palito chat --model model.gguf --no-stream";
 
 pub(crate) const SERVE_EXAMPLES: &str = "\
 Examples:
-  palito serve --model qwen3-8b.palito
-  palito serve --model qwen3-8b.palito --host 0.0.0.0 --api-key \"$KEY\" -np 4
+  palito serve --model qwen3-8b --pull
+  palito serve --model models/qwen3-8b.palito --host 0.0.0.0 --api-key \"$KEY\" -np 4
   curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \\
     -d '{\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}'";
 
@@ -50,3 +52,24 @@ pub(crate) const LOGITS_EXAMPLES: &str = "\
 Examples:
   palito logits --model model.gguf --prompt 'The capital of France is'
   palito logits --model model.gguf --input-tokens-file ids.json";
+
+pub(crate) const PULL_EXAMPLES: &str = "\
+Examples:
+  palito pull qwen3-8b
+  palito pull loterio/Qwen3-8B-palito
+  palito pull user/repo:model.gguf --revision v1
+  palito chat --model \"$(palito pull -q llama-3.1-8b)\"
+
+Models are stored in $PALITO_MODELS (default ~/.local/share/palito/models).
+Gated repos use the token from 'hf auth login' or HF_TOKEN.";
+
+pub(crate) const LIST_EXAMPLES: &str = "\
+Examples:
+  palito list
+  palito list --available
+  palito list --json";
+
+pub(crate) const RM_EXAMPLES: &str = "\
+Examples:
+  palito rm qwen3-8b
+  palito rm llama-3.1-8b qwen3-8b --yes";

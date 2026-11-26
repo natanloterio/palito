@@ -53,9 +53,12 @@ enum ServeBackend {
 
 #[derive(Args)]
 pub(crate) struct ServeArgs {
-    /// Model file (.palito or .gguf).
-    #[arg(short, long, env = "PALITO_MODEL", value_name = "FILE", value_hint = ValueHint::FilePath)]
+    /// Model: a .palito/.gguf file or a downloaded model name (see 'palito list').
+    #[arg(short, long, env = "PALITO_MODEL", value_name = "MODEL", value_hint = ValueHint::FilePath)]
     model: PathBuf,
+    /// Download the model first if it is a name that is not downloaded yet, without asking.
+    #[arg(long)]
+    pull: bool,
     /// Address to listen on. Use 0.0.0.0 to accept other machines (set --api-key).
     #[arg(long, default_value = "127.0.0.1", help_heading = "Network")]
     host: IpAddr,
@@ -120,7 +123,7 @@ struct AppState {
     sampling: Sampling,
 }
 
-pub(crate) fn run(args: ServeArgs) -> palito::Result<()> {
+pub(crate) fn run(mut args: ServeArgs) -> palito::Result<()> {
     let options = EngineOptions {
         device: match args.backend {
             Some(ServeBackend::Cpu) => Device::Cpu,
@@ -142,20 +145,33 @@ pub(crate) fn run(args: ServeArgs) -> palito::Result<()> {
     };
     let sampling = args.sampling.sampling();
     sampling.validate()?;
-    let model = args.model_name.clone().unwrap_or_else(|| {
-        args.model
-            .file_stem()
-            .map_or("model".into(), |stem| stem.to_string_lossy().into_owned())
-    });
-    crate::cli_ui::check_model(&args.model)?;
     if args.parallel > 1 && (options.device != Device::Cuda || !cfg!(feature = "cuda")) {
         return Err(palito::Error::Invalid(
             "--parallel above 1 requires the CUDA backend".into(),
         ));
     }
+    // A local file is checked before binding, as before; a model name may need
+    // a download, which happens after binding so a busy port fails first.
+    let local = args.model.exists();
+    if local {
+        crate::cli_ui::check_model(&args.model)?;
+    }
     // Bind before loading: a busy port should fail in milliseconds, not after
     // loading a 30B model.
     let listener = bind(args.host, args.port)?;
+    if !local {
+        let name = args.model.clone();
+        crate::hub::commands::resolve_model(&mut args.model, args.pull)?;
+        crate::cli_ui::check_model(&args.model)?;
+        if args.model_name.is_none() && args.model != name {
+            args.model_name = name.to_str().map(str::to_owned);
+        }
+    }
+    let model = args.model_name.clone().unwrap_or_else(|| {
+        args.model
+            .file_stem()
+            .map_or("model".into(), |stem| stem.to_string_lossy().into_owned())
+    });
     crate::banner::print();
     if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         let size = std::fs::metadata(&args.model).map_or(0, |m| m.len());

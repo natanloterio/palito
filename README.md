@@ -28,7 +28,16 @@ Install with Cargo (`--features metal` for Apple Silicon, `vulkan` for AMD and I
 
 ## Get started
 
-Download a model and chat with it:
+Download a ready-made `.palito` model and chat with it (NVIDIA GPU):
+
+```sh
+palito pull qwen3-8b
+palito chat --model qwen3-8b
+```
+
+`palito list --available` shows every model you can pull (today `qwen3-8b` and `llama-3.1-8b`), `palito list` the ones you have, and `palito rm` deletes one. Models are stored in `~/.local/share/palito/models` (set `PALITO_MODELS` to use another disk); downloads resume where they stopped and are checked against their sha256. `palito pull user/repo:file.gguf` downloads any file from Hugging Face, using the token from `hf auth login` (or `HF_TOKEN`) for gated repos. The Llama model is Built with Llama and comes with the Llama 3.1 Community License.
+
+Or run any GGUF file:
 
 ```sh
 hf download Qwen/Qwen3-30B-A3B-GGUF Qwen3-30B-A3B-Q4_K_M.gguf --local-dir models

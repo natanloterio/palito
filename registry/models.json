@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "name": "qwen3-8b",
+      "aliases": [],
+      "description": "Qwen3 8B, PLT1 3.0 bpw + EAGLE-3",
+      "repo": "loterio/Qwen3-8B-palito",
+      "revision": "main",
+      "file": "qwen3-8b.palito",
+      "size": 3868771478,
+      "sha256": "4ad38e005570534d3423f9490019007be779576ebf6a4e48da9304c1ba43c4c8",
+      "extra_files": ["LICENSE", "NOTICE"],
+      "license": "Apache-2.0",
+      "notice": null,
+      "min_palito": "0.14.0"
+    },
+    {
+      "name": "llama-3.1-8b",
+      "aliases": ["llama3.1-8b"],
+      "description": "Llama 3.1 8B Instruct, PLT1 3.0 bpw + EAGLE-3",
+      "repo": "loterio/Llama-3.1-8B-Instruct-palito",
+      "revision": "main",
+      "file": "llama-3.1-8b.palito",
+      "size": 3737664550,
+      "sha256": "1cd0c3a3aaf2ef389a82ee382bd91d8103e281f17b970eaba6d644778e7da595",
+      "extra_files": ["LICENSE", "NOTICE", "USE_POLICY.md"],
+      "license": "Llama 3.1 Community License",
+      "notice": "Llama 3.1 is licensed under the Llama 3.1 Community License, Copyright © Meta Platforms, Inc. All Rights Reserved. Built with Llama.",
+      "min_palito": "0.14.0"
+    }
+  ]
+}

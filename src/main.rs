@@ -12,6 +12,7 @@ mod chat_repl;
 mod cli_ui;
 mod convert;
 mod help_text;
+mod hub;
 mod runtime_args;
 mod server;
 
@@ -52,6 +53,24 @@ enum Command {
         #[command(flatten)]
         args: server::ServeArgs,
     },
+    /// Download a ready-made model from Hugging Face (e.g. qwen3-8b).
+    #[command(after_help = PULL_EXAMPLES)]
+    Pull {
+        #[command(flatten)]
+        args: hub::commands::PullArgs,
+    },
+    /// List downloaded models (--available: every model you can pull).
+    #[command(visible_alias = "ls", after_help = LIST_EXAMPLES)]
+    List {
+        #[command(flatten)]
+        args: hub::commands::ListArgs,
+    },
+    /// Delete downloaded models.
+    #[command(visible_alias = "remove", after_help = RM_EXAMPLES)]
+    Rm {
+        #[command(flatten)]
+        args: hub::commands::RmArgs,
+    },
     /// Convert a GGUF model into a single self-contained `.palito` (`PLT1`) file.
     #[command(after_help = CONVERT_EXAMPLES)]
     Convert {
@@ -60,7 +79,7 @@ enum Command {
     },
     /// Greedy completion, stopping at EOG. No chat template is applied.
     #[command(after_help = GENERATE_EXAMPLES)]
-    #[command(override_usage = "palito generate --model <FILE> --prompt <TEXT> [OPTIONS]\n       palito generate --model <FILE> --prompt-file <FILE> [OPTIONS]\n       palito generate --model <FILE> --input-tokens-file <FILE> [OPTIONS]")]
+    #[command(override_usage = "palito generate --model <MODEL> --prompt <TEXT> [OPTIONS]\n       palito generate --model <MODEL> --prompt-file <FILE> [OPTIONS]\n       palito generate --model <MODEL> --input-tokens-file <FILE> [OPTIONS]")]
     Generate {
         #[command(flatten)]
         model: ModelArgs,
@@ -75,8 +94,8 @@ enum Command {
     /// Tokenize text offline without loading model weights.
     #[command(after_help = TOKENIZE_EXAMPLES)]
     Tokenize {
-        /// Model whose tokenizer to use (.gguf or .palito).
-        #[arg(long, env = "PALITO_MODEL", value_name = "FILE", value_hint = ValueHint::FilePath)]
+        /// Model whose tokenizer to use: a .gguf/.palito file or a downloaded model name.
+        #[arg(long, env = "PALITO_MODEL", value_name = "MODEL", value_hint = ValueHint::FilePath)]
         model: PathBuf,
         #[command(flatten)]
         text: TextArgs,
@@ -86,8 +105,8 @@ enum Command {
     #[command(group(ArgGroup::new("ids").required(true).multiple(false)
         .args(["input_tokens_file", "tokens"])))]
     Detokenize {
-        /// Model whose tokenizer to use (.gguf or .palito).
-        #[arg(long, env = "PALITO_MODEL", value_name = "FILE", value_hint = ValueHint::FilePath)]
+        /// Model whose tokenizer to use: a .gguf/.palito file or a downloaded model name.
+        #[arg(long, env = "PALITO_MODEL", value_name = "MODEL", value_hint = ValueHint::FilePath)]
         model: PathBuf,
         /// JSON array of token IDs; `-` reads standard input.
         #[arg(long, value_name = "FILE", value_hint = ValueHint::FilePath)]
@@ -98,7 +117,7 @@ enum Command {
     },
     /// Fixed-length generation with per-phase timing and full state reset per sample.
     #[command(after_help = BENCH_EXAMPLES)]
-    #[command(override_usage = "palito bench --model <FILE> --prompt <TEXT> [OPTIONS]\n       palito bench --model <FILE> --prompt-file <FILE> [OPTIONS]\n       palito bench --model <FILE> --input-tokens-file <FILE> [OPTIONS]")]
+    #[command(override_usage = "palito bench --model <MODEL> --prompt <TEXT> [OPTIONS]\n       palito bench --model <MODEL> --prompt-file <FILE> [OPTIONS]\n       palito bench --model <MODEL> --input-tokens-file <FILE> [OPTIONS]")]
     Bench {
         #[command(flatten)]
         model: ModelArgs,
@@ -111,7 +130,7 @@ enum Command {
     },
     /// Evaluate input IDs and emit F32 next-token logits for differential validation.
     #[command(after_help = LOGITS_EXAMPLES)]
-    #[command(override_usage = "palito logits --model <FILE> --prompt <TEXT> [OPTIONS]\n       palito logits --model <FILE> --prompt-file <FILE> [OPTIONS]\n       palito logits --model <FILE> --input-tokens-file <FILE> [OPTIONS]")]
+    #[command(override_usage = "palito logits --model <MODEL> --prompt <TEXT> [OPTIONS]\n       palito logits --model <MODEL> --prompt-file <FILE> [OPTIONS]\n       palito logits --model <MODEL> --input-tokens-file <FILE> [OPTIONS]")]
     #[command(mut_arg("tokens", |arg| arg.hide(true)))]
     #[cfg_attr(feature = "cuda", command(mut_arg("no_prefix_cache", |arg| arg.hide(true))))]
     Logits {
@@ -146,6 +165,12 @@ impl std::ops::Deref for ModelArgs {
     type Target = RuntimeArgs;
     fn deref(&self) -> &RuntimeArgs {
         &self.runtime
+    }
+}
+
+impl std::ops::DerefMut for ModelArgs {
+    fn deref_mut(&mut self) -> &mut RuntimeArgs {
+        &mut self.runtime
     }
 }
 
@@ -309,7 +334,11 @@ fn execute() -> Result<()> {
         Command::Chat { args } => chat_repl::run(args)?,
         Command::Serve { args } => server::run(args)?,
         Command::Convert { args } => convert::run(args)?,
-        Command::Tokenize { model, text } => {
+        Command::Pull { args } => hub::commands::pull(args)?,
+        Command::List { args } => hub::commands::list(args)?,
+        Command::Rm { args } => hub::commands::rm(args)?,
+        Command::Tokenize { mut model, text } => {
+            hub::commands::resolve_model(&mut model, false)?;
             cli_ui::check_model(&model)?;
             let tokenizer = Tokenizer::open(&model)?;
             let input = text_input(&text.prompt, &text.prompt_file)?;
@@ -323,10 +352,11 @@ fn execute() -> Result<()> {
             );
         }
         Command::Detokenize {
-            model,
+            mut model,
             input_tokens_file,
             tokens,
         } => {
+            hub::commands::resolve_model(&mut model, false)?;
             cli_ui::check_model(&model)?;
             let tokenizer = Tokenizer::open(&model)?;
             let tokens = match input_tokens_file {
@@ -339,7 +369,7 @@ fn execute() -> Result<()> {
             );
         }
         Command::Generate {
-            model,
+            mut model,
             stream: true,
             ..
         } => {
@@ -366,7 +396,7 @@ fn execute() -> Result<()> {
             result?;
         }
         Command::Generate {
-            model,
+            mut model,
             stream: false,
             ..
         } => {
@@ -393,7 +423,7 @@ fn execute() -> Result<()> {
             );
         }
         Command::Bench {
-            model,
+            mut model,
             warmups,
             repetitions,
         } => {
@@ -427,7 +457,7 @@ fn execute() -> Result<()> {
                 }))?
             );
         }
-        Command::Logits { model } => {
+        Command::Logits { mut model } => {
             model.check_model()?;
             let config = model.config();
             config.validate()?;
@@ -455,7 +485,7 @@ fn execute() -> Result<()> {
 fn main() {
     if let Err(error) = execute() {
         cli_ui::report(&error);
-        std::process::exit(1);
+        std::process::exit(cli_ui::exit_code());
     }
 }
 

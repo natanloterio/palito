@@ -10,8 +10,8 @@
 # release.yml; environments pypi and nuget; NuGet policy palito-release for
 # user natanloterio). npm adds provenance on its own.
 #
-# The GitHub release with the CUDA bundle stays manual (scripts/package-linux.sh
-# needs a local NVRTC 13).
+# The GitHub release with the CUDA bundle stays manual (scripts/package.sh
+# linux-x86_64 needs a local NVRTC 13); publishing it starts cli-bundles.yml.
 name: release
 
 on:

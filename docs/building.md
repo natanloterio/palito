@@ -45,12 +45,21 @@ cargo build --release --features cuda,qtip-research --bin palito
 | `qtip-research` | `palito convert` and the `.palito` quantizer |
 | `ktransformers` | `palito remote`, a client for a KTransformers server |
 
-## Build the Linux bundle
+## Build a bundle
 
-`scripts/package-linux.sh` builds the CUDA CLI with `convert` and packs it with NVRTC into `target/dist/palito-<version>-linux-x86_64.tar.gz`. With `--install` it also links it as `~/.local/bin/palito`:
+`scripts/package.sh <platform>` builds the CLI and the C library and packs them into `target/dist/palito-<version>-<platform>.tar.gz` (`.zip` on Windows):
+
+| Platform | Backend | Built on |
+|---|---|---|
+| `linux-x86_64` | CUDA, with `convert` and NVRTC 13 bundled | Linux (needs NVRTC 13) |
+| `macos-arm64` | Metal | macOS |
+| `windows-x86_64` | Vulkan | Windows (Git Bash) |
+
+With `--install` (Linux and macOS) it also links the bundle as `~/.local/bin/palito`; `--no-build` packs what is already in `target/release`:
 
 ```sh
-NVRTC_LIB_DIR=/usr/local/cuda-13/lib64 scripts/package-linux.sh --install
+NVRTC_LIB_DIR=/usr/local/cuda-13/lib64 scripts/package.sh linux-x86_64 --install
+scripts/package.sh macos-arm64 --install
 ```
 
 ## Run the tests

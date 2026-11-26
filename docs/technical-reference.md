@@ -1561,12 +1561,14 @@ Stop sequences (`src/stop.rs`, at most 16 of up to 256 bytes) are matched on the
 
 `palito::engine::Engine` opens a model with the `chat` defaults: the GGUF context, capped at 65,535 and fitted to free device memory on CUDA. It then tries the CUDA profiles in this order and uses the first that opens: `int8-fast` with the decode graph, `f32-tiled` with and then without the graph, then `f32`. It runs chat (the model's template, `enable_thinking` per call) or plain completion with streamed text and a finish reason (stop, length, context full, cancelled). `src/ffi.rs` wraps it as the C API declared in `include/palito.h`, built as `target/release/libpalito.so` (`crate-type = ["rlib", "cdylib"]`). Panics are caught at the boundary. Strings returned by the library are freed by the library. Tests: `cargo test --release --test engine -- --include-ignored` (needs the SmolLM2 fixture; the CUDA case needs `--features cuda`).
 
-## Linux CLI bundle
+## CLI bundles
 
-`scripts/package-linux.sh` builds `target/dist/palito-<version>-linux-x86_64.tar.gz`: the CUDA binary, bundled NVRTC 13 and a wrapper that defaults to `--backend cuda` with a kernel cache in `~/.cache/palito/kernels`. With `--install`, the script also links the wrapper as `~/.local/bin/palito`. The host needs an NVIDIA driver with CUDA 13 support.
+`scripts/package.sh linux-x86_64|macos-arm64|windows-x86_64` builds each platform's bundle: the CLI, `lib/` with the C library (where the bindings look for it), the header, the C example, the binding sources and a README. On macOS (Metal) and Windows (Vulkan) the command sits at the top of the bundle; the `cli-bundles` workflow builds both and attaches them to each GitHub release.
+
+For Linux, `scripts/package.sh linux-x86_64` builds `target/dist/palito-<version>-linux-x86_64.tar.gz`: the CUDA binary, bundled NVRTC 13 and a wrapper that defaults to `--backend cuda` with a kernel cache in `~/.cache/palito/kernels`. With `--install`, the script also links the wrapper as `~/.local/bin/palito`. The host needs an NVIDIA driver with CUDA 13 support.
 
 ```sh
-scripts/package-linux.sh --install
+scripts/package.sh linux-x86_64 --install
 palito chat --model /path/to/model.gguf
 ```
 

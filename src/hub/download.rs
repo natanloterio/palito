@@ -297,7 +297,8 @@ impl Hub {
                 ),
             ));
         }
-        File::open(&part)?.sync_all()?;
+        // Windows flushes only handles opened for writing (FlushFileBuffers).
+        OpenOptions::new().write(true).open(&part)?.sync_all()?;
         fs::rename(&part, dir.join(file))?;
         Ok(digest)
     }

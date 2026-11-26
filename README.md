@@ -2,7 +2,7 @@
   <img src="docs/palito_logo.png" alt="Palito: fast local LLM inference" width="640">
 </p>
 
-**Run AI models on your own computer at over 1,150 tokens per second** — up to **3.4× faster than `llama.cpp`**, using up to 40% less GPU memory, in a single fast Rust binary with no Python or `llama.cpp` required.
+**Fast local LLM inference in a single Rust binary** — custom CUDA, Vulkan, and Metal kernels, GPU-native `.palito` (`PLT1`, `3.0 bpw`) quantization, and built-in `EAGLE-3` + `SuffixDecoding` speculative decoding (up to **1,361 tok/s** on 1B and **789 tok/s** on 8B code refactoring, up to **1.58× faster than `llama.cpp`** with up to 40% less GPU memory) — no Python or `llama.cpp` required.
 
 ---
 
@@ -15,7 +15,7 @@ Palito introduces **`.palito` (`PLT1`)** — a single-file model format built sp
 - **Compact, high quality (`3.0 bpw`):** Fits a complete **Qwen 3 8B** in **3.7 GiB**, **Llama 3.1 8B** in **3.5 GiB** (`PPL = 7.64`), and **Qwen3-30B-A3B MoE** (128 experts) in **11.1 GiB** (down from 18.6 GiB `Q4_K_M`).
 - **One self-contained file, zero flags:** Tokenizer, GPU-native weights, and the built-in `EAGLE-3` predictor live in one `.palito` file — just run `palito chat --model qwen3-8b.palito`.
 - **GPU-ready on disk:** Weights are pre-arranged for NVIDIA Tensor Cores (`mma.m16n8k16`) with zero-SMEM warp-register lookup tables so the GPU streams and computes directly with minimal overhead.
-- **Generates multiple tokens at once (100% identical answers):** Bundles `EAGLE-3` and zero-weight `SuffixDecoding` that draft up to 7 tokens ahead and verify them in a single pass — giving **2×–3.6× speedups** with **zero quality loss** (`exact_parity=true`).
+- **Generates multiple tokens at once (100% identical answers):** Bundles `EAGLE-3` and zero-weight `SuffixDecoding` that draft up to 7 tokens ahead and verify them in a single pass — giving **1.3×–2.6× speedups** over single-token decode with **zero quality loss** (`exact_parity=true`).
 - **Works with GGUF too:** Already have GGUF models? Palito runs them out of the box with its own custom CUDA, Vulkan, and Metal kernels.
 
 ---
@@ -24,14 +24,12 @@ Palito introduces **`.palito` (`PLT1`)** — a single-file model format built sp
 
 | Model | File Size | Task | Palito | `llama.cpp` | Speedup |
 | :--- | :---: | :--- | :---: | :---: | :---: |
-| **Qwen 3 8B** (`qwen3-8b.palito`, `3.0 bpw`) | **3.7 GiB** | Coding | **1,155.8 tok/s** | ~340 tok/s (`IQ3_XXS`) | **~3.4× faster** |
-| **Qwen 3 8B** (`qwen3-8b.palito`, `3.0 bpw`) | **3.7 GiB** | Code refactoring | **1,015.2 tok/s** | ~340 tok/s (`IQ3_XXS`) | **~3.0× faster** |
-| **Qwen 3 8B** (`qwen3-8b.palito`, `3.0 bpw`) | **3.7 GiB** | General chat & writing | **872.7 tok/s** | ~340 tok/s (`IQ3_XXS`) | **~2.6× faster** |
-| **Llama 3.1 8B** (`llama-3.1-8b.palito`, `3.0 bpw`) | **3.5 GiB** | Code refactoring | **865.5 tok/s** | 341 tok/s (`IQ3_XXS`) | **2.54× faster** |
-| **Qwen3-30B-A3B MoE** (`qwen3-30b-a3b.palito`, `3.0 bpw`) | **11.1 GiB** | Single-stream / Refactor | **359.4 / 461.6 tok/s** | 340 tok/s (`Q4_K_M`, 18.6 GiB) | **1.36× faster, 40% smaller** |
-| **Llama 3.2 1B** (`QTIP3`) | 0.9 GiB | Single-stream decode | **1,361 tok/s** | 1,053 tok/s (`IQ3_XXS`) | **1.29× faster** |
+| **Llama 3.1 8B** (`llama-3.1-8b.palito`, `3.0 bpw`) | **3.5 GiB** | General / Coding / Refactor | **363 / 431 / 789 tok/s** | 394 / 390 / 608 tok/s (`IQ3_XXS + EAGLE-3`) | **0.92× / 1.11× / 1.30×** |
+| **Qwen 3 8B** (`qwen3-8b.palito`, `3.0 bpw`) | **3.7 GiB** | General / Coding / Refactor | **296 / 379 / 726 tok/s** | 306 / 310 / 459 tok/s (`Q3_K_M + EAGLE-3`) | **0.97× / 1.22× / 1.58×** |
+| **Qwen3-30B-A3B MoE** (`qwen3-30b-a3b.palito`, `3.0 bpw`) | **11.1 GiB** | Single-stream / Refactor | **349 / 533 tok/s** | 340 tok/s (`Q4_K_M`, 18.6 GiB) | **1.57× refactor, 40% smaller** |
+| **Llama 3.2 1B** (`QTIP3`) | **0.9 GiB** | Single-stream decode | **1,361 tok/s** | 1,053 tok/s (`IQ3_XXS`) | **1.29× faster** |
 
-*All speculative runs are verified 100% bit-exact (`exact_parity=true`) against standard token-by-token generation. See [reproducible benchmarks](benchmarks/vs-llama-cpp/README.md).*
+*All speculative runs are verified 100% bit-exact (`exact_parity=true`) against standard token-by-token generation and checked for coherent, non-degenerate output. See [reproducible benchmarks](benchmarks/vs-llama-cpp/README.md).*
 
 ---
 
@@ -88,7 +86,7 @@ print(reply.choices[0].message.content)
 
 ---
 
-## How to Run Models at 1,150+ tok/s (`.palito` Format)
+## How to Run Single-File `.palito` Models
 
 A single `.palito` file bundles everything — tokenizer, GPU-native model weights (dense or MoE), and the built-in `EAGLE-3` predictor — so you just pass it directly to `palito chat` or `palito serve` with **zero extra flags** (CUDA and speculative decoding turn on automatically):
 
@@ -106,7 +104,7 @@ To convert any GGUF model into a single `.palito` file in one command (with auto
 palito convert --input models/Qwen3-8B-Q6_K.gguf --output models/qwen3-8b.palito
 ```
 
-See the **[`.palito` (`PLT1`) Format & 1,000+ tok/s Guide](docs/plt1-format.md)** for optional `EAGLE-3` bundling and advanced options.
+See the **[`.palito` (`PLT1`) Format Guide](docs/plt1-format.md)** for optional `EAGLE-3` bundling and advanced options.
 
 ---
 
@@ -133,7 +131,7 @@ Works out of the box with **Llama 3 / 3.1 / 3.2**, **Qwen 2.5 / 3 / 3.5** (dense
 
 ## Deep-Dive Documentation
 
-- **[`.palito` (`PLT1`) Format & 1,000+ tok/s Guide](docs/plt1-format.md)** — How `PLT1` works under the hood, converting GGUF → `.palito`, building from source, full CLI/server flags, C API, and troubleshooting.
+- **[`.palito` (`PLT1`) Format Guide](docs/plt1-format.md)** — How `PLT1` works under the hood, converting GGUF → `.palito`, building from source, full CLI/server flags, C API, and troubleshooting.
 - **[Benchmarks vs `llama.cpp`](benchmarks/vs-llama-cpp/README.md)** — Reproducible benchmark scripts and raw measurements.
 - **[Language Bindings](bindings/README.md)** — Guides for Python, Node.js, Java, C#, and Go.
 - **[Technical Reference & Architecture](docs/technical-reference.md)** — Kernel architecture, tested models, and long-context numbers.

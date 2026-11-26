@@ -6,6 +6,134 @@
 //! verifies 100% bit-exact token parity (`exact_parity=true`), and reports
 //! wall-clock tok/s, acceptance length `tau`, and speedup.
 
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn format_text_preview(text: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(max_chars.min(text.len()) + 3);
+    let mut count = 0usize;
+    let mut truncated = false;
+    for ch in text.chars() {
+        let escaped: Option<&str> = match ch {
+            '\n' => Some("\\n"),
+            '\r' => Some("\\r"),
+            '\t' => Some("\\t"),
+            _ => None,
+        };
+        let add_len = escaped.map_or(1, str::len);
+        if count + add_len > max_chars {
+            truncated = true;
+            break;
+        }
+        if let Some(s) = escaped {
+            out.push_str(s);
+        } else {
+            out.push(ch);
+        }
+        count += add_len;
+    }
+    if truncated {
+        out.push_str("...");
+    }
+    out
+}
+
+/// Deterministic degeneracy detector for generated token sequences.
+///
+/// Returns `Some(reason)` when the output exhibits severe repetition or
+/// collapsed token diversity, and `None` for normal coherent output.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn check_output_degeneracy(tokens: &[i32]) -> Option<String> {
+    use std::collections::{HashMap, HashSet};
+
+    let len = tokens.len();
+    if len == 0 {
+        return Some("empty output (0 tokens)".to_string());
+    }
+
+    // 1. Consecutive single-token repetition (>= 12 identical tokens in a row).
+    let mut run = 1usize;
+    for i in 1..len {
+        if tokens[i] == tokens[i - 1] {
+            run += 1;
+            if run >= 12 {
+                return Some(format!(
+                    "token {} repeated {} times consecutively",
+                    tokens[i], run
+                ));
+            }
+        } else {
+            run = 1;
+        }
+    }
+
+    // 2. Consecutive n-gram repetition (n in 2..=6, >= 6 repeats covering >= 24 tokens).
+    for n in 2..=6usize {
+        if len < n * 6 {
+            continue;
+        }
+        let mut i = 0usize;
+        while i + n <= len {
+            let pat = &tokens[i..i + n];
+            let mut reps = 1usize;
+            while i + (reps + 1) * n <= len && &tokens[i + reps * n..i + (reps + 1) * n] == pat {
+                reps += 1;
+            }
+            if reps >= 6 && reps * n >= 24 {
+                return Some(format!(
+                    "{n}-gram {:?} repeated {reps} times consecutively ({} tokens)",
+                    pat,
+                    reps * n
+                ));
+            }
+            i += 1;
+        }
+    }
+
+    // 3. Non-overlapping single-token or 2..=6-gram coverage > 45% (for >= 32 tokens).
+    if len >= 32 {
+        for n in 1..=6usize {
+            if len < n * 2 {
+                continue;
+            }
+            let mut counts: HashMap<&[i32], (usize, usize)> = HashMap::new();
+            let mut best_gram: &[i32] = &[];
+            let mut best_count = 0usize;
+            for i in 0..=len - n {
+                let gram = &tokens[i..i + n];
+                let entry = counts.entry(gram).or_insert((0, 0));
+                if i >= entry.1 {
+                    entry.0 += 1;
+                    entry.1 = i + n;
+                    if entry.0 > best_count {
+                        best_count = entry.0;
+                        best_gram = gram;
+                    }
+                }
+            }
+            let covered = best_count * n;
+            if covered * 100 > len * 45 {
+                let pct = covered as f64 * 100.0 / len as f64;
+                return Some(format!(
+                    "{n}-gram {:?} covers {pct:.1}% of {len} tokens ({best_count} occurrences)",
+                    best_gram
+                ));
+            }
+        }
+    }
+
+    // 4. Low unique-token ratio (< 0.20 over >= 64 tokens).
+    if len >= 64 {
+        let unique = tokens.iter().copied().collect::<HashSet<_>>().len();
+        let ratio = unique as f64 / len as f64;
+        if ratio < 0.20 {
+            return Some(format!(
+                "unique-token ratio {ratio:.3} ({unique}/{len}) < 0.20"
+            ));
+        }
+    }
+
+    None
+}
+
 #[cfg(not(feature = "cuda"))]
 fn main() {
     eprintln!("eagle3-spec-bench requires the cuda feature");
@@ -142,8 +270,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     struct Args {
         #[arg(long)]
         model: PathBuf,
+        /// Optional external PLT1 EAGLE-3 draft head (omittable when --model is a .palito bundle with embedded EAGLE-3).
         #[arg(long)]
-        eagle3: PathBuf,
+        eagle3: Option<PathBuf>,
         #[arg(long, default_value_t = 128)]
         tokens: usize,
         #[arg(long, default_value_t = 1024)]
@@ -166,6 +295,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         /// CUDA matmul profile: f32-tiled or int8-fast (auto: f32-tiled with --plt1, int8-fast for MoE without --plt1, f32-tiled otherwise).
         #[arg(long)]
         matmul: Option<String>,
+        /// Do not exit with non-zero status when degenerate output is detected.
+        #[arg(long)]
+        allow_degenerate: bool,
     }
 
     let args = Args::parse();
@@ -285,8 +417,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 2. Load PLT1 EAGLE-3 draft head and run speculative decoding on the same prompts.
-    backend.load_eagle3(&args.eagle3)?;
+    if let Some(eagle3_path) = &args.eagle3 {
+        backend.load_eagle3(eagle3_path)?;
+    } else if !palito::plt1::is_plt1_file(&args.model) {
+        return Err("--eagle3 is required when --model is not a .palito bundle".into());
+    }
 
+    let mut degenerate_prompts: Vec<(&str, String)> = Vec::new();
     for (label, prompt, base_tokens, base_secs) in baselines {
         let base_tps = base_tokens.len() as f64 / base_secs;
         let run_eagle = |b: &mut CudaBackend| -> Result<(Vec<i32>, f64, usize), palito::Error> {
@@ -428,6 +565,93 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             spec_secs * 1e3,
             base_secs / spec_secs
         );
+        let decoded = backend
+            .detokenize(&spec_tokens)
+            .unwrap_or_else(|e| format!("<detokenize error: {e}>"));
+        println!(
+            "  [{label:7} preview] \"{}\"",
+            format_text_preview(&decoded, 160)
+        );
+        if let Some(reason) = check_output_degeneracy(&spec_tokens) {
+            eprintln!("DEGENERATE OUTPUT DETECTED [{label}]: {reason}");
+            degenerate_prompts.push((label, reason));
+        }
+    }
+    if !degenerate_prompts.is_empty() && !args.allow_degenerate {
+        eprintln!(
+            "Failing benchmark: {} prompt(s) produced degenerate output (pass --allow-degenerate to override).",
+            degenerate_prompts.len()
+        );
+        std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_output_degeneracy, format_text_preview};
+
+    #[test]
+    fn coherent_diverse_tokens_pass() {
+        let tokens: Vec<i32> = (0..128).map(|i| 1000 + (i % 97)).collect();
+        assert_eq!(check_output_degeneracy(&tokens), None);
+    }
+
+    #[test]
+    fn empty_tokens_are_degenerate() {
+        assert!(check_output_degeneracy(&[]).is_some());
+    }
+
+    #[test]
+    fn consecutive_single_token_loop_detected() {
+        let mut tokens: Vec<i32> = (1..20).collect();
+        tokens.extend(std::iter::repeat_n(636, 12));
+        let err = check_output_degeneracy(&tokens).expect("should detect single-token loop");
+        assert!(err.contains("repeated"), "unexpected msg: {err}");
+    }
+
+    #[test]
+    fn consecutive_bigram_loop_detected() {
+        // Mirrors the 2bpw Llama 3.1 8B failure (" get, get, get, ...").
+        let mut tokens = vec![10, 20, 30];
+        for _ in 0..30 {
+            tokens.push(636);
+            tokens.push(11);
+        }
+        let err = check_output_degeneracy(&tokens).expect("should detect bigram loop");
+        assert!(err.contains("2-gram"), "unexpected msg: {err}");
+    }
+
+    #[test]
+    fn non_consecutive_ngram_dominance_detected() {
+        // Interleave a 3-gram with single separator tokens so it covers > 45% without repeating consecutively.
+        let mut tokens = Vec::new();
+        for i in 0..20 {
+            tokens.extend_from_slice(&[7, 8, 9, 100 + i]);
+        }
+        let err = check_output_degeneracy(&tokens).expect("should detect >45% 3-gram coverage");
+        assert!(err.contains("covers"), "unexpected msg: {err}");
+    }
+
+    #[test]
+    fn low_unique_ratio_detected() {
+        // 128 tokens drawn pseudo-randomly from only 12 distinct values (unique ratio = 12/128 = 0.094 < 0.20),
+        // without any single 1..=6-gram repeating consecutively or covering > 45%.
+        let mut x: u32 = 1;
+        let tokens: Vec<i32> = (0..128)
+            .map(|_| {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((x >> 16) % 12) as i32
+            })
+            .collect();
+        let err = check_output_degeneracy(&tokens).expect("should detect low unique ratio");
+        assert!(err.contains("unique-token ratio"), "unexpected msg: {err}");
+    }
+
+    #[test]
+    fn preview_escapes_and_truncates() {
+        let s = "hello\nworld\tfoo\rbar";
+        assert_eq!(format_text_preview(s, 40), "hello\\nworld\\tfoo\\rbar");
+        assert_eq!(format_text_preview("abcdef", 4), "abcd...");
+    }
 }

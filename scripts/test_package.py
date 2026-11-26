@@ -90,7 +90,8 @@ class PackageTests(unittest.TestCase):
         self.assertIn(f"palito {self.version} (macOS, Apple Silicon)", readme)
         self.assertIn("--backend metal", readme)
         link = self.home / ".local" / "bin" / "palito"
-        self.assertEqual(link.resolve(), self.home / ".local/share/palito" / self.version / "palito")
+        # resolve() both sides: macOS temp dirs live under /var -> /private/var.
+        self.assertEqual(link.resolve(), (self.home / ".local/share/palito" / self.version / "palito").resolve())
 
     def test_windows_bundle_layout(self):
         self.fake_build("palito.exe", "palito.dll")

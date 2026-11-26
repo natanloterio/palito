@@ -155,6 +155,8 @@ jobs:
         run: |
           export PALITO_VERSION="${TAG#v}"
           [ -n "$PALITO_VERSION" ] || unset PALITO_VERSION
+          # Hosted runners already have ~/.local/bin on PATH; a new user does not.
+          PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vx "$HOME/.local/bin" | paste -sd: -)"
           cat install.sh | SHELL=/bin/zsh sh
           grep -q 'added by the palito installer' ~/.zshrc
           ~/.local/bin/palito --version

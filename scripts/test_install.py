@@ -5,6 +5,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -85,7 +86,9 @@ class InstallTests(unittest.TestCase):
 
     def test_bash_and_fish_profiles(self):
         self.assertEqual(self.run_install(shell="/bin/bash").returncode, 0)
-        self.assertIn(".local/bin", (self.home / ".bashrc").read_text())
+        # macOS login shells read ~/.bash_profile, not ~/.bashrc.
+        profile = ".bash_profile" if sys.platform == "darwin" else ".bashrc"
+        self.assertIn(".local/bin", (self.home / profile).read_text())
         self.assertEqual(self.run_install(shell="/usr/bin/fish").returncode, 0)
         self.assertIn("fish_add_path", (self.home / ".config/fish/conf.d/palito.fish").read_text())
 
@@ -119,7 +122,8 @@ class InstallTests(unittest.TestCase):
     def test_custom_directories(self):
         out = self.run_install(PALITO_INSTALL_DIR=str(self.home / "opt"), PALITO_BIN_DIR=str(self.home / "bin"))
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertTrue((self.home / "bin" / "palito").resolve().is_relative_to(self.home / "opt"))
+        # resolve() both sides: macOS temp dirs live under /var -> /private/var.
+        self.assertTrue((self.home / "bin" / "palito").resolve().is_relative_to((self.home / "opt").resolve()))
 
     def test_platform_detection_rejects_unknown_systems(self):
         env = {k: v for k, v in os.environ.items() if k != "PALITO_PLATFORM"}

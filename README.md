@@ -86,19 +86,15 @@ Qwen 3 8B fits in 3.7 GiB and Qwen3-30B-A3B in 11.1 GiB (down from 18.6 GiB as `
 
 Pure decode on an RTX 5090, against `llama.cpp` CUDA:
 
-| Model | Palito | `llama.cpp` |
-| :--- | ---: | ---: |
-| Qwen3-30B-A3B MoE (`.palito`, 11.1 GiB) | **412 tok/s** | 340 tok/s (`Q4_K_M`, 18.6 GiB) |
-| Llama 3.1 8B (`.palito`, 3.5 GiB) | **347 tok/s** | 341 tok/s (`IQ3_XXS`) |
-| Llama 3.2 1B (3.0 bpw, 0.9 GiB) | **1,361 tok/s** | 1,053 tok/s (`IQ3_XXS`) |
+<p align="center">
+  <img src="docs/charts/decode-vs-llama-cpp.svg" alt="Decode speed on RTX 5090: Qwen3-30B-A3B MoE 412 vs 340 tok/s, Llama 3.1 8B 347 vs 341, Llama 3.2 1B 1,361 vs 1,053 (Palito vs llama.cpp)" width="720">
+</p>
 
-Long-context pure decode on `.palito` (`3.0 bpw`, `--cuda-matmul int8-fast` FP16 KV cache + Tensor Core attention, 50% less KV VRAM vs F32 KV):
+Long-context decode on `.palito` with `--cuda-matmul int8-fast` (FP16 KV cache and Tensor Core attention, half the KV memory of F32):
 
-| Model (`.palito`, `3.0 bpw`) | Prompt | KV F32 (`f32-tiled`) | KV FP16 (`int8-fast`) | Speedup |
-| :--- | ---: | ---: | ---: | ---: |
-| Qwen3-30B-A3B MoE | 9.3k / 22.9k tok | 246.7 / 141.0 tok/s | **328.9 / 242.3 tok/s** | **+33% / +72%** |
-| Llama 3.1 8B | 9.0k / 22.2k tok | 220.8 / 135.5 tok/s | **253.9 / 207.8 tok/s** | **+15% / +53%** |
-| Qwen 3 8B | 9.3k / 22.9k tok | 200.2 / 120.0 tok/s | **241.5 / 190.3 tok/s** | **+21% / +59%** |
+<p align="center">
+  <img src="docs/charts/long-context-decode.svg" alt="Long-context decode, FP16 vs F32 KV cache: Qwen3-30B-A3B 328.9 vs 246.7 tok/s at 9.3k tokens and 242.3 vs 141.0 at 22.9k; Llama 3.1 8B 253.9 vs 220.8 and 207.8 vs 135.5; Qwen 3 8B 241.5 vs 200.2 and 190.3 vs 120.0" width="720">
+</p>
 
 With speculative decoding (automatically gated above 4k context so long-context decode stays at full CUDA Graph speed), Llama 3.1 8B reaches **1,119 tok/s** on code refactoring, Qwen 3 8B reaches **763 tok/s**, and Qwen3-30B-A3B reaches **590 tok/s** (`exact_parity=true`). Full tables and methodology: [performance](docs/performance.md) and [reproducible benchmarks](benchmarks/vs-llama-cpp/README.md).
 

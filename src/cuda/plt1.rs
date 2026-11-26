@@ -54,6 +54,19 @@ pub struct Plt1Layer {
 
 const MOE_MAX_ASSIGNS: usize = 256;
 
+struct Plt1KernelSet {
+    b1_plain: CudaFunction,
+    b1_swiglu: CudaFunction,
+    k8_plain: CudaFunction,
+    k8_swiglu: CudaFunction,
+    k16_plain: CudaFunction,
+    k16_swiglu: CudaFunction,
+    moe_b1_plain: CudaFunction,
+    moe_b1_swiglu: CudaFunction,
+    moe_plain: CudaFunction,
+    moe_swiglu: CudaFunction,
+}
+
 pub struct Plt1HybRuntime {
     pub index: Plt1Index,
     pub layers: Vec<Plt1Layer>,
@@ -73,18 +86,8 @@ pub struct Plt1HybRuntime {
     /// Tracks `(ids_ptr, total_assigns)` grouped by `run_moe_gate_up` so the paired
     /// `run_moe_down` skips redundant re-grouping on the same layer.
     last_moe_group: (AtomicU64, AtomicUsize),
-    /// `(pair_bits, skip_in, skip_out)` -> `(k8_plain, k8_swiglu, k16_plain, k16_swiglu, moe_plain, moe_swiglu)`.
-    kernels: HashMap<
-        (u8, bool, bool),
-        (
-            CudaFunction,
-            CudaFunction,
-            CudaFunction,
-            CudaFunction,
-            CudaFunction,
-            CudaFunction,
-        ),
-    >,
+    /// `(pair_bits, skip_in, skip_out)` -> compiled HYB Q=5 kernels.
+    kernels: HashMap<(u8, bool, bool), Plt1KernelSet>,
 }
 
 impl Plt1HybRuntime {
@@ -219,7 +222,14 @@ impl Plt1HybRuntime {
                 CudaFunction,
                 CudaFunction,
                 Option<(CudaFunction, CudaFunction, CudaFunction, CudaFunction)>,
-                Option<(CudaFunction, CudaFunction)>,
+                Option<(
+                    CudaFunction,
+                    CudaFunction,
+                    CudaFunction,
+                    CudaFunction,
+                    CudaFunction,
+                    CudaFunction,
+                )>,
             )> {
                 let src = format!(
                     "#define HYB_L {state_bits}\n#define HYB_B {pair_bits}\n#define HYB_Q 5\n#define HYB_UNROLL 4\n\
@@ -254,6 +264,14 @@ impl Plt1HybRuntime {
                 };
                 let moe = if want_moe {
                     Some((
+                        module.load_function("hyb_b1_multi").map_err(cuda_err)?,
+                        module
+                            .load_function("hyb_b1_multi_swiglu")
+                            .map_err(cuda_err)?,
+                        module.load_function("hyb_moe_b1").map_err(cuda_err)?,
+                        module
+                            .load_function("hyb_moe_b1_swiglu")
+                            .map_err(cuda_err)?,
                         module.load_function("hyb_moe_small_k").map_err(cuda_err)?,
                         module
                             .load_function("hyb_moe_small_k_swiglu")
@@ -271,21 +289,33 @@ impl Plt1HybRuntime {
                     moe,
                 ))
             };
-            let (k8_p, k8_s, r1, moe) = compile_max_k(8, r1_fns.is_none(), true)?;
+            let (k8_plain, k8_swiglu, r1, moe) = compile_max_k(8, r1_fns.is_none(), true)?;
             if r1_fns.is_none() {
                 r1_fns = r1;
             }
-            let (moe_p, moe_s) = moe.unwrap();
-            let (k16_p, k16_s, _, _) = compile_max_k(16, false, false)?;
+            let (b1_plain, b1_swiglu, moe_b1_plain, moe_b1_swiglu, moe_plain, moe_swiglu) =
+                moe.unwrap();
+            let (k16_plain, k16_swiglu, _, _) = compile_max_k(16, false, false)?;
             kernels.insert(
                 (pair_bits, skip_in, skip_out),
-                (k8_p, k8_s, k16_p, k16_s, moe_p, moe_s),
+                Plt1KernelSet {
+                    b1_plain,
+                    b1_swiglu,
+                    k8_plain,
+                    k8_swiglu,
+                    k16_plain,
+                    k16_swiglu,
+                    moe_b1_plain,
+                    moe_b1_swiglu,
+                    moe_plain,
+                    moe_swiglu,
+                },
             );
         }
         let (r1_enter_fn, r1_exit_fn, moe_group_fn, splitk_reduce_fn) =
             r1_fns.ok_or_else(|| Error::Invalid("PLT1 file contained no HYB layers".into()))?;
         let compute_splits = |denom: usize, total_chunks: usize| -> usize {
-            let s = (340usize / denom.max(1)).clamp(1, total_chunks);
+            let s = (510usize / denom.max(1)).clamp(1, total_chunks);
             let cps = total_chunks.div_ceil(s);
             total_chunks.div_ceil(cps)
         };
@@ -427,8 +457,8 @@ impl Plt1HybRuntime {
             .arg(&splits_i);
         unsafe {
             b.launch(LaunchConfig {
-                grid_dim: (total_rows.div_ceil(256), tokens as u32, 1),
-                block_dim: (256, 1, 1),
+                grid_dim: (total_rows.div_ceil(128), tokens as u32, 1),
+                block_dim: (32, 1, 1),
                 shared_mem_bytes: 0,
             })
         }
@@ -452,14 +482,7 @@ impl Plt1HybRuntime {
         let first = matrices[0].0;
         let skip_in = (first.desc.flags & tensor_flags::SKIP_IN_RHT) != 0;
         let skip_out = (first.desc.flags & tensor_flags::SKIP_OUT_RHT) != 0;
-        let (k8_p, k8_s, k16_p, k16_s, _, _) =
-            &self.kernels[&(first.desc.pair_bits, skip_in, skip_out)];
-        let func = match (tokens <= 8, x_up.is_some()) {
-            (true, false) => k8_p,
-            (true, true) => k8_s,
-            (false, false) => k16_p,
-            (false, true) => k16_s,
-        };
+        let kset = &self.kernels[&(first.desc.pair_bits, skip_in, skip_out)];
 
         let cols = first.desc.cols as usize;
         let mut tiles = [0u64; 3];
@@ -486,8 +509,6 @@ impl Plt1HybRuntime {
             rbs[i] = r / 256;
             total_rb += rbs[i];
         }
-        let zs = [0u64; 3];
-        let ns = [0i32; 3];
 
         let rb0 = rbs[0] as i32;
         let rb1 = if matrices.len() >= 2 {
@@ -496,8 +517,8 @@ impl Plt1HybRuntime {
             total_rb as i32
         };
         let total_chunks = cols / 256;
-        // Fit exact 2-wave multiples on RTX 5090's 170 SMs (avoid 3rd tail wave on Gate+Up!).
-        let splits = (340usize / total_rb).clamp(1, total_chunks);
+        // Target 3-block/SM full occupancy (510 blocks on RTX 5090's 170 SMs).
+        let splits = (510usize / total_rb).clamp(1, total_chunks);
         let cps = total_chunks.div_ceil(splits);
         let splits = total_chunks.div_ceil(cps);
 
@@ -510,24 +531,56 @@ impl Plt1HybRuntime {
         };
         let (cols_i, tokens_i, cps_i) = (cols as i32, tokens as i32, cps as i32);
 
-        let mut b = self.stream.launch_builder(func);
-        for g in [&tiles, &luts, &col_signs, &row_signs, &ys] {
-            b.arg(&g[0]).arg(&g[1]).arg(&g[2]);
+        if tokens == 1 {
+            let func = if x_up.is_some() {
+                &kset.b1_swiglu
+            } else {
+                &kset.b1_plain
+            };
+            let mut b = self.stream.launch_builder(func);
+            for g in [&tiles, &luts, &col_signs, &row_signs, &ys] {
+                b.arg(&g[0]).arg(&g[1]).arg(&g[2]);
+            }
+            b.arg(&scales[0]).arg(&scales[1]).arg(&scales[2]);
+            b.arg(&rows_arr[0]).arg(&rows_arr[1]).arg(&rows_arr[2]);
+            b.arg(&rb0).arg(&rb1).arg(&x_ptr).arg(&x_up_ptr);
+            b.arg(&cols_i).arg(&cps_i).arg(&partials_ptr);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (total_rb as u32, splits as u32, 1),
+                    block_dim: (512, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(cuda_err)?;
+        } else {
+            let func = match (tokens <= 8, x_up.is_some()) {
+                (true, false) => &kset.k8_plain,
+                (true, true) => &kset.k8_swiglu,
+                (false, false) => &kset.k16_plain,
+                (false, true) => &kset.k16_swiglu,
+            };
+            let zs = [0u64; 3];
+            let ns = [0i32; 3];
+            let mut b = self.stream.launch_builder(func);
+            for g in [&tiles, &luts, &col_signs, &row_signs, &ys] {
+                b.arg(&g[0]).arg(&g[1]).arg(&g[2]);
+            }
+            b.arg(&scales[0]).arg(&scales[1]).arg(&scales[2]);
+            b.arg(&rows_arr[0]).arg(&rows_arr[1]).arg(&rows_arr[2]);
+            b.arg(&rb0).arg(&rb1).arg(&x_ptr).arg(&x_up_ptr);
+            b.arg(&zs[0]).arg(&zs[1]).arg(&zs[2]);
+            b.arg(&ns[0]).arg(&ns[1]).arg(&ns[2]);
+            b.arg(&cols_i).arg(&tokens_i).arg(&cps_i).arg(&partials_ptr);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (total_rb as u32, splits as u32, 1),
+                    block_dim: (512, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(cuda_err)?;
         }
-        b.arg(&scales[0]).arg(&scales[1]).arg(&scales[2]);
-        b.arg(&rows_arr[0]).arg(&rows_arr[1]).arg(&rows_arr[2]);
-        b.arg(&rb0).arg(&rb1).arg(&x_ptr).arg(&x_up_ptr);
-        b.arg(&zs[0]).arg(&zs[1]).arg(&zs[2]);
-        b.arg(&ns[0]).arg(&ns[1]).arg(&ns[2]);
-        b.arg(&cols_i).arg(&tokens_i).arg(&cps_i).arg(&partials_ptr);
-        unsafe {
-            b.launch(LaunchConfig {
-                grid_dim: (total_rb as u32, splits as u32, 1),
-                block_dim: (512, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .map_err(cuda_err)?;
         if splits > 1 {
             self.launch_splitk_reduce(
                 partials_ptr,
@@ -589,15 +642,17 @@ impl Plt1HybRuntime {
     ) -> Result<()> {
         let total_assigns = tokens * used;
         let ids_ptr = ids.device_ptr(&self.stream).0;
-        self.group_moe_assignments(ids, total_assigns)?;
-        self.last_moe_group.0.store(ids_ptr, Ordering::Relaxed);
-        self.last_moe_group
-            .1
-            .store(total_assigns, Ordering::Relaxed);
+        if tokens > 1 {
+            self.group_moe_assignments(ids, total_assigns)?;
+            self.last_moe_group.0.store(ids_ptr, Ordering::Relaxed);
+            self.last_moe_group
+                .1
+                .store(total_assigns, Ordering::Relaxed);
+        }
 
         let skip_in = (gate.desc.flags & tensor_flags::SKIP_IN_RHT) != 0;
         let skip_out = (gate.desc.flags & tensor_flags::SKIP_OUT_RHT) != 0;
-        let (_, _, _, _, moe_p, _) = &self.kernels[&(gate.desc.pair_bits, skip_in, skip_out)];
+        let kset = &self.kernels[&(gate.desc.pair_bits, skip_in, skip_out)];
         let r0 = gate.desc.rows as usize;
         let r1 = up.desc.rows as usize;
         let cols = gate.desc.cols as usize;
@@ -606,7 +661,7 @@ impl Plt1HybRuntime {
         let total_chunks = cols / 256;
         // Keep split count independent of `tokens` so single-token decode (B=1) and
         // batched speculative verification (B=2..16) have identical FP32 accumulation order.
-        let splits = (340usize / (total_rb * used).max(1)).clamp(1, total_chunks);
+        let splits = (510usize / (total_rb * used).max(1)).clamp(1, total_chunks);
         let cps = total_chunks.div_ceil(splits);
         let splits = total_chunks.div_ceil(cps);
 
@@ -640,10 +695,6 @@ impl Plt1HybRuntime {
         let c0 = s0 + (r0 * std::mem::size_of::<f32>()) as u64;
         let c1 = s1 + (r1 * std::mem::size_of::<f32>()) as u64;
         let x_ptr = x.device_ptr(&self.stream).0;
-        let ge_ptr = self.moe_group_experts.device_ptr(&self.stream).0;
-        let go_ptr = self.moe_group_offsets.device_ptr(&self.stream).0;
-        let ga_ptr = self.moe_group_assigns.device_ptr(&self.stream).0;
-        let ng_ptr = self.moe_num_groups.device_ptr(&self.stream).0;
         let (rows0_i, rows1_i, cols_i, used_i, cps_i, splits_i) = (
             r0 as i32,
             r1 as i32,
@@ -653,29 +704,55 @@ impl Plt1HybRuntime {
             splits as i32,
         );
 
-        let mut b = self.stream.launch_builder(moe_p);
-        b.arg(&t0).arg(&t1).arg(&l0).arg(&l1);
-        b.arg(&sc0).arg(&sc1).arg(&c0).arg(&c1).arg(&s0).arg(&s1);
-        b.arg(&y0).arg(&y1).arg(&rows0_i).arg(&rows1_i).arg(&rb0);
-        b.arg(&x_ptr)
-            .arg(&ge_ptr)
-            .arg(&go_ptr)
-            .arg(&ga_ptr)
-            .arg(&ng_ptr)
-            .arg(&cols_i)
-            .arg(&used_i)
-            .arg(&cps_i)
-            .arg(&splits_i)
-            .arg(&partials_ptr)
-            .arg(&total_assigns_i);
-        unsafe {
-            b.launch(LaunchConfig {
-                grid_dim: (total_rb as u32, total_assigns as u32, splits as u32),
-                block_dim: (512, 1, 1),
-                shared_mem_bytes: 0,
-            })
+        if tokens == 1 {
+            let mut b = self.stream.launch_builder(&kset.moe_b1_plain);
+            b.arg(&t0).arg(&t1).arg(&l0).arg(&l1);
+            b.arg(&sc0).arg(&sc1).arg(&c0).arg(&c1).arg(&s0).arg(&s1);
+            b.arg(&y0).arg(&y1).arg(&rows0_i).arg(&rows1_i).arg(&rb0);
+            b.arg(&x_ptr)
+                .arg(&ids_ptr)
+                .arg(&cols_i)
+                .arg(&used_i)
+                .arg(&cps_i)
+                .arg(&splits_i)
+                .arg(&partials_ptr);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (total_rb as u32, used as u32, splits as u32),
+                    block_dim: (512, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(cuda_err)?;
+        } else {
+            let ge_ptr = self.moe_group_experts.device_ptr(&self.stream).0;
+            let go_ptr = self.moe_group_offsets.device_ptr(&self.stream).0;
+            let ga_ptr = self.moe_group_assigns.device_ptr(&self.stream).0;
+            let ng_ptr = self.moe_num_groups.device_ptr(&self.stream).0;
+            let mut b = self.stream.launch_builder(&kset.moe_plain);
+            b.arg(&t0).arg(&t1).arg(&l0).arg(&l1);
+            b.arg(&sc0).arg(&sc1).arg(&c0).arg(&c1).arg(&s0).arg(&s1);
+            b.arg(&y0).arg(&y1).arg(&rows0_i).arg(&rows1_i).arg(&rb0);
+            b.arg(&x_ptr)
+                .arg(&ge_ptr)
+                .arg(&go_ptr)
+                .arg(&ga_ptr)
+                .arg(&ng_ptr)
+                .arg(&cols_i)
+                .arg(&used_i)
+                .arg(&cps_i)
+                .arg(&splits_i)
+                .arg(&partials_ptr)
+                .arg(&total_assigns_i);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (total_rb as u32, total_assigns as u32, splits as u32),
+                    block_dim: (512, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(cuda_err)?;
         }
-        .map_err(cuda_err)?;
         if splits > 1 {
             self.launch_splitk_reduce(
                 partials_ptr,
@@ -706,21 +783,23 @@ impl Plt1HybRuntime {
     ) -> Result<()> {
         let total_assigns = tokens * used;
         let ids_ptr = ids.device_ptr(&self.stream).0;
-        let prev_ptr = self.last_moe_group.0.swap(0, Ordering::Relaxed);
-        let prev_n = self.last_moe_group.1.swap(0, Ordering::Relaxed);
-        if prev_ptr != ids_ptr || prev_n != total_assigns {
-            self.group_moe_assignments(ids, total_assigns)?;
+        if tokens > 1 {
+            let prev_ptr = self.last_moe_group.0.swap(0, Ordering::Relaxed);
+            let prev_n = self.last_moe_group.1.swap(0, Ordering::Relaxed);
+            if prev_ptr != ids_ptr || prev_n != total_assigns {
+                self.group_moe_assignments(ids, total_assigns)?;
+            }
         }
 
         let skip_in = (down.desc.flags & tensor_flags::SKIP_IN_RHT) != 0;
         let skip_out = (down.desc.flags & tensor_flags::SKIP_OUT_RHT) != 0;
-        let (_, _, _, _, _, moe_s) = &self.kernels[&(down.desc.pair_bits, skip_in, skip_out)];
+        let kset = &self.kernels[&(down.desc.pair_bits, skip_in, skip_out)];
         let r0 = down.desc.rows as usize;
         let cols = down.desc.cols as usize;
         let total_rb = r0 / 256;
         let total_chunks = cols / 256;
         // Keep split count independent of `tokens` for bit-exact B=1 vs B=2..16 parity.
-        let splits = (340usize / (total_rb * used).max(1)).clamp(1, total_chunks);
+        let splits = (510usize / (total_rb * used).max(1)).clamp(1, total_chunks);
         let cps = total_chunks.div_ceil(splits);
         let splits = total_chunks.div_ceil(cps);
 
@@ -744,10 +823,6 @@ impl Plt1HybRuntime {
         let c0 = s0 + (r0 * std::mem::size_of::<f32>()) as u64;
         let xg = x_gate.device_ptr(&self.stream).0;
         let xu = x_up.device_ptr(&self.stream).0;
-        let ge_ptr = self.moe_group_experts.device_ptr(&self.stream).0;
-        let go_ptr = self.moe_group_offsets.device_ptr(&self.stream).0;
-        let ga_ptr = self.moe_group_assigns.device_ptr(&self.stream).0;
-        let ng_ptr = self.moe_num_groups.device_ptr(&self.stream).0;
         let (rows0_i, cols_i, used_i, cps_i, splits_i) = (
             r0 as i32,
             cols as i32,
@@ -756,29 +831,55 @@ impl Plt1HybRuntime {
             splits as i32,
         );
 
-        let mut b = self.stream.launch_builder(moe_s);
-        b.arg(&t0).arg(&l0).arg(&sc0).arg(&c0).arg(&s0).arg(&y0);
-        b.arg(&rows0_i)
-            .arg(&xg)
-            .arg(&xu)
-            .arg(&ge_ptr)
-            .arg(&go_ptr)
-            .arg(&ga_ptr)
-            .arg(&ng_ptr)
-            .arg(&cols_i)
-            .arg(&used_i)
-            .arg(&cps_i)
-            .arg(&splits_i)
-            .arg(&partials_ptr)
-            .arg(&total_assigns_i);
-        unsafe {
-            b.launch(LaunchConfig {
-                grid_dim: (total_rb as u32, total_assigns as u32, splits as u32),
-                block_dim: (512, 1, 1),
-                shared_mem_bytes: 0,
-            })
+        if tokens == 1 {
+            let mut b = self.stream.launch_builder(&kset.moe_b1_swiglu);
+            b.arg(&t0).arg(&l0).arg(&sc0).arg(&c0).arg(&s0).arg(&y0);
+            b.arg(&rows0_i)
+                .arg(&xg)
+                .arg(&xu)
+                .arg(&ids_ptr)
+                .arg(&cols_i)
+                .arg(&used_i)
+                .arg(&cps_i)
+                .arg(&splits_i)
+                .arg(&partials_ptr);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (total_rb as u32, used as u32, splits as u32),
+                    block_dim: (512, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(cuda_err)?;
+        } else {
+            let ge_ptr = self.moe_group_experts.device_ptr(&self.stream).0;
+            let go_ptr = self.moe_group_offsets.device_ptr(&self.stream).0;
+            let ga_ptr = self.moe_group_assigns.device_ptr(&self.stream).0;
+            let ng_ptr = self.moe_num_groups.device_ptr(&self.stream).0;
+            let mut b = self.stream.launch_builder(&kset.moe_swiglu);
+            b.arg(&t0).arg(&l0).arg(&sc0).arg(&c0).arg(&s0).arg(&y0);
+            b.arg(&rows0_i)
+                .arg(&xg)
+                .arg(&xu)
+                .arg(&ge_ptr)
+                .arg(&go_ptr)
+                .arg(&ga_ptr)
+                .arg(&ng_ptr)
+                .arg(&cols_i)
+                .arg(&used_i)
+                .arg(&cps_i)
+                .arg(&splits_i)
+                .arg(&partials_ptr)
+                .arg(&total_assigns_i);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (total_rb as u32, total_assigns as u32, splits as u32),
+                    block_dim: (512, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(cuda_err)?;
         }
-        .map_err(cuda_err)?;
         if splits > 1 {
             self.launch_splitk_reduce(
                 partials_ptr,

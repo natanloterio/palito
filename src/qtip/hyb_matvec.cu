@@ -774,7 +774,8 @@ hyb_small_k_multi_swiglu(HYB_SMALL_K_MULTI_PARAMS) {
 }
 
 // Deterministic split-K reduction for both dense (hyb_small_k_multi) and MoE (hyb_moe_small_k).
-// Grid: (ceil(total_rows / 256), tokens, 1), Block: 256 threads.
+// Grid: (ceil(total_rows / 128), tokens, 1), Block: 32 threads (1 warp/block, float4 vectorized).
+// Spreading across 8x more SMs than 256-thread blocks avoids SM underutilization on small total_rows.
 extern "C" __global__ void hyb_splitk_reduce_multi(const float* __restrict__ partials,
                                                    float* __restrict__ y0,
                                                    float* __restrict__ y1,
@@ -784,24 +785,32 @@ extern "C" __global__ void hyb_splitk_reduce_multi(const float* __restrict__ par
                                                    int rows2,
                                                    int tokens,
                                                    int splits) {
-    const int total_rows = rows0 + rows1 + rows2;
-    const int g = blockIdx.x * 256 + threadIdx.x;
+    const int total_rows4 = (rows0 + rows1 + rows2) >> 2;
+    const int g4 = blockIdx.x * 32 + threadIdx.x;
     const int t = blockIdx.y;
-    if (g >= total_rows || t >= tokens) {
+    if (g4 >= total_rows4 || t >= tokens) {
         return;
     }
-    const size_t split_stride = (size_t)tokens * total_rows;
-    const float* base = partials + (size_t)t * total_rows + g;
-    float acc = 0.0f;
+    const size_t split_stride4 = (size_t)tokens * total_rows4;
+    const float4* base =
+        reinterpret_cast<const float4*>(partials) + (size_t)t * total_rows4 + g4;
+    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     for (int s = 0; s < splits; ++s) {
-        acc += base[(size_t)s * split_stride];
+        const float4 v = __ldg(base + (size_t)s * split_stride4);
+        acc.x += v.x;
+        acc.y += v.y;
+        acc.z += v.z;
+        acc.w += v.w;
     }
-    if (g < rows0) {
-        y0[(size_t)t * rows0 + g] = acc;
-    } else if (g < rows0 + rows1) {
-        y1[(size_t)t * rows1 + (g - rows0)] = acc;
+    const int r0_4 = rows0 >> 2;
+    const int r1_4 = rows1 >> 2;
+    if (g4 < r0_4) {
+        reinterpret_cast<float4*>(y0)[(size_t)t * r0_4 + g4] = acc;
+    } else if (g4 < r0_4 + r1_4) {
+        reinterpret_cast<float4*>(y1)[(size_t)t * r1_4 + (g4 - r0_4)] = acc;
     } else {
-        y2[(size_t)t * rows2 + (g - rows0 - rows1)] = acc;
+        const int r2_4 = rows2 >> 2;
+        reinterpret_cast<float4*>(y2)[(size_t)t * r2_4 + (g4 - r0_4 - r1_4)] = acc;
     }
 }
 
@@ -1214,5 +1223,352 @@ hyb_moe_small_k_swiglu(const unsigned* __restrict__ t0,
                         group_assigns, num_groups_ptr, y0, partials, rows0, rows0, total_assigns,
                         cols, used, chunks_per_split, splits, blockIdx.x, blockIdx.x, blockIdx.y,
                         blockIdx.z);
+}
+
+// ============================================================================
+// Dedicated B=1 (single-token pure decode) PLT1 HYB Q=5 kernels:
+// - Parallel 16-warp activation preload into xs_h2[16][128] using register
+//   __shfl_xor_sync(..., 1) for f16x2 packing (zero SMEM partial round-trip).
+// - Only ONE __syncthreads() per batch of up to 16 chunks (zero syncs inside
+//   the weight loop, eliminating 2*N_chunks serial warp-0 stalls).
+// - MoE B=1 reads expert = ids[blockIdx.y] directly, completely eliminating
+//   hyb_moe_group_assignments (48 launches/token on Qwen3-30B-A3B).
+// - Bit-for-bit identical mma.m16n8k16 + split-K accumulation order vs B=2..16.
+// ============================================================================
+
+#define HYB_B1_CHUNKS_PER_BATCH 16
+
+template <bool SwiGLU>
+__device__ __forceinline__ void hyb_b1_preload_chunks(const float* __restrict__ x,
+                                                      const float* __restrict__ x_up,
+                                                      const float* __restrict__ col_signs,
+                                                      unsigned (&xs_h2)[HYB_B1_CHUNKS_PER_BATCH][HYB_CHUNK / 2],
+                                                      int ch_base,
+                                                      int n_ch,
+                                                      int warp,
+                                                      int lane) {
+    if (warp < n_ch) {
+        const int c = (ch_base + warp) * HYB_CHUNK;
+        float v[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            v[e] = __ldg(x + c + lane + 32 * e);
+        }
+        if (SwiGLU) {
+            float up[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                up[e] = __ldg(x_up + c + lane + 32 * e);
+            }
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                v[e] = v[e] / (1.0f + __expf(-v[e])) * up[e];
+            }
+        }
+#if !HYB_SKIP_IN_RHT
+        float sign[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            sign[e] = __ldg(col_signs + c + lane + 32 * e);
+        }
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            v[e] *= sign[e];
+        }
+        hyb_fwht256_warp(v);
+#endif
+        // Pair adjacent elements (2*k, 2*k+1) via warp shuffle and pack f16x2 directly to SMEM.
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const float other = __shfl_xor_sync(0xffffffffu, v[e], 1);
+            if ((lane & 1) == 0) {
+                unsigned h2;
+                asm("cvt.rn.f16x2.f32 %0, %2, %1;" : "=r"(h2) : "f"(v[e]), "f"(other));
+                xs_h2[warp][(lane >> 1) + 16 * e] = h2;
+            }
+        }
+    }
+}
+
+template <bool SwiGLU>
+__device__ __forceinline__ void hyb_b1_core(const unsigned* __restrict__ tiles,
+                                            const unsigned* __restrict__ lut_global,
+                                            const float* __restrict__ x,
+                                            const float* __restrict__ x_up,
+                                            const float* __restrict__ col_signs,
+                                            const float* __restrict__ row_signs,
+                                            float* __restrict__ y,
+                                            float* __restrict__ partials,
+                                            int rows,
+                                            int total_rows,
+                                            int cols,
+                                            int chunks_per_split,
+                                            int splits,
+                                            float scale,
+                                            int row_block,
+                                            int global_row_block,
+                                            int split,
+                                            int out_slot,
+                                            int total_slots) {
+    __shared__ unsigned xs_h2[HYB_B1_CHUNKS_PER_BATCH][HYB_CHUNK / 2]; // 8 KB
+    __shared__ float out_buf[HYB_CHUNK];                               // 1 KB
+
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    const int group_id = lane >> 2;
+    const int tid = lane & 3;
+    const unsigned reg_lut = __ldg(lut_global + lane);
+
+    const int col_tiles = cols / HYB_TILE;
+    const int total_chunks = cols / HYB_CHUNK;
+    const int ch0 = split * chunks_per_split;
+    const int ch1 = min(ch0 + chunks_per_split, total_chunks);
+    if (ch0 >= ch1) {
+        return;
+    }
+
+    const int group = row_block * HYB_FUSED_WARPS + warp;
+    const int bit = lane * 4 * HYB_B;
+    const int w0_idx = (bit / 32) % HYB_WORDS;
+    const int w1_idx = (w0_idx + 1) % HYB_WORDS;
+#if HYB_B == 6
+    const int w2_idx = (w0_idx + 2) % HYB_WORDS;
+#endif
+    const int shift = bit & 31;
+
+    const unsigned* base = tiles + (size_t)group * col_tiles * HYB_WORDS;
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+
+    for (int ch_base = ch0; ch_base < ch1; ch_base += HYB_B1_CHUNKS_PER_BATCH) {
+        const int n_ch = min(HYB_B1_CHUNKS_PER_BATCH, ch1 - ch_base);
+        hyb_b1_preload_chunks<SwiGLU>(x, x_up, col_signs, xs_h2, ch_base, n_ch, warp, lane);
+        __syncthreads();
+
+        for (int lc = 0; lc < n_ch; ++lc) {
+            const int k0 = (ch_base + lc) * 16;
+            for (int tk = 0; tk < 16; tk += 8) {
+                unsigned words[8];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    const int kk = k0 + tk + u;
+                    words[u] = (lane < HYB_WORDS) ? __ldg(base + (size_t)kk * HYB_WORDS + lane) : 0u;
+                }
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    const unsigned r0 = __shfl_sync(0xffffffffu, words[u], w0_idx);
+                    const unsigned r1 = __shfl_sync(0xffffffffu, words[u], w1_idx);
+#if HYB_B == 6
+                    const unsigned r2 = __shfl_sync(0xffffffffu, words[u], w2_idx);
+#endif
+                    const unsigned bits0 = __funnelshift_r(r0, r1, shift);
+#if HYB_B == 6
+                    const unsigned bits1 = __funnelshift_r(r1, r2, shift);
+#endif
+                    unsigned a[4];
+#pragma unroll
+                    for (int p = 0; p < 4; ++p) {
+#if HYB_B == 6
+                        const unsigned state = (p < 3)
+                            ? ((bits0 >> (p * 6)) & HYB_STATE_MASK)
+                            : (((bits0 >> 18) | (bits1 << 14)) & HYB_STATE_MASK);
+#else
+                        const unsigned state = (bits0 >> (p * HYB_B)) & HYB_STATE_MASK;
+#endif
+                        const unsigned h = state * HYB_HASH_MULT;
+                        a[p] = __shfl_sync(0xffffffffu, reg_lut, (h >> 5) & 31u) ^ (h & 0x80008000u);
+                    }
+
+                    const int xoff = (tk + u) * 8 + tid;
+                    const unsigned b0 = (group_id == 0) ? xs_h2[lc][xoff] : 0u;
+                    const unsigned b1 = (group_id == 0) ? xs_h2[lc][xoff + 4] : 0u;
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                }
+            }
+        }
+        if (ch_base + HYB_B1_CHUNKS_PER_BATCH < ch1) {
+            __syncthreads();
+        }
+    }
+
+    if (tid == 0) {
+        out_buf[warp * HYB_TILE + group_id] = d0;
+        out_buf[warp * HYB_TILE + group_id + 8] = d2;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float v[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            v[e] = out_buf[lane + 32 * e];
+        }
+#if !HYB_SKIP_OUT_RHT
+        hyb_fwht256_warp(v);
+#endif
+        if (splits == 1) {
+            float* yt = y + (size_t)out_slot * rows;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int row = row_block * HYB_CHUNK + lane + 32 * e;
+#if !HYB_SKIP_OUT_RHT
+                yt[row] = v[e] * __ldg(row_signs + row) * scale;
+#else
+                yt[row] = v[e] * scale;
+#endif
+            }
+        } else {
+            float* pt = partials + ((size_t)split * total_slots + out_slot) * total_rows
+                + global_row_block * HYB_CHUNK;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int local_r = lane + 32 * e;
+#if !HYB_SKIP_OUT_RHT
+                const int row = row_block * HYB_CHUNK + local_r;
+                pt[local_r] = v[e] * __ldg(row_signs + row) * scale;
+#else
+                pt[local_r] = v[e] * scale;
+#endif
+            }
+        }
+    }
+}
+
+template <bool SwiGLU>
+__device__ __forceinline__ void hyb_b1_multi_body(
+    const unsigned* __restrict__ t0, const unsigned* __restrict__ t1,
+    const unsigned* __restrict__ t2, const unsigned* __restrict__ l0,
+    const unsigned* __restrict__ l1, const unsigned* __restrict__ l2,
+    const float* __restrict__ c0, const float* __restrict__ c1,
+    const float* __restrict__ c2, const float* __restrict__ r0,
+    const float* __restrict__ r1, const float* __restrict__ r2,
+    float* __restrict__ y0, float* __restrict__ y1, float* __restrict__ y2,
+    float s0, float s1, float s2,
+    int rows0, int rows1, int rows2, int rb0, int rb1,
+    const float* __restrict__ x, const float* __restrict__ x_up,
+    int cols, int chunks_per_split, float* __restrict__ partials) {
+    int row_block = blockIdx.x;
+    const unsigned *tiles = t0, *lut = l0;
+    const float *col_signs = c0, *row_signs = r0;
+    float* y = y0;
+    float scale = s0;
+    int rows = rows0;
+    if (row_block >= rb0) {
+        row_block -= rb0;
+        tiles = t1, lut = l1, col_signs = c1, row_signs = r1, y = y1, scale = s1, rows = rows1;
+        if (row_block >= rb1) {
+            row_block -= rb1;
+            tiles = t2, lut = l2, col_signs = c2, row_signs = r2, y = y2, scale = s2, rows = rows2;
+        }
+    }
+    const int total_rows = gridDim.x * HYB_CHUNK;
+    hyb_b1_core<SwiGLU>(tiles, lut, x, SwiGLU ? x_up : nullptr, col_signs, row_signs, y, partials,
+                        rows, total_rows, cols, chunks_per_split, gridDim.y, scale, row_block,
+                        blockIdx.x, blockIdx.y, 0, 1);
+}
+
+extern "C" __global__ void __launch_bounds__(512, 3)
+hyb_b1_multi(const unsigned* __restrict__ t0, const unsigned* __restrict__ t1,
+             const unsigned* __restrict__ t2, const unsigned* __restrict__ l0,
+             const unsigned* __restrict__ l1, const unsigned* __restrict__ l2,
+             const float* __restrict__ c0, const float* __restrict__ c1,
+             const float* __restrict__ c2, const float* __restrict__ r0,
+             const float* __restrict__ r1, const float* __restrict__ r2,
+             float* __restrict__ y0, float* __restrict__ y1, float* __restrict__ y2,
+             float s0, float s1, float s2,
+             int rows0, int rows1, int rows2, int rb0, int rb1,
+             const float* __restrict__ x, const float* __restrict__ x_up,
+             int cols, int chunks_per_split, float* __restrict__ partials) {
+    hyb_b1_multi_body<false>(t0, t1, t2, l0, l1, l2, c0, c1, c2, r0, r1, r2, y0, y1, y2, s0, s1,
+                             s2, rows0, rows1, rows2, rb0, rb1, x, x_up, cols, chunks_per_split,
+                             partials);
+}
+
+extern "C" __global__ void __launch_bounds__(512, 3)
+hyb_b1_multi_swiglu(const unsigned* __restrict__ t0, const unsigned* __restrict__ t1,
+                    const unsigned* __restrict__ t2, const unsigned* __restrict__ l0,
+                    const unsigned* __restrict__ l1, const unsigned* __restrict__ l2,
+                    const float* __restrict__ c0, const float* __restrict__ c1,
+                    const float* __restrict__ c2, const float* __restrict__ r0,
+                    const float* __restrict__ r1, const float* __restrict__ r2,
+                    float* __restrict__ y0, float* __restrict__ y1, float* __restrict__ y2,
+                    float s0, float s1, float s2,
+                    int rows0, int rows1, int rows2, int rb0, int rb1,
+                    const float* __restrict__ x, const float* __restrict__ x_up,
+                    int cols, int chunks_per_split, float* __restrict__ partials) {
+    hyb_b1_multi_body<true>(t0, t1, t2, l0, l1, l2, c0, c1, c2, r0, r1, r2, y0, y1, y2, s0, s1, s2,
+                            rows0, rows1, rows2, rb0, rb1, x, x_up, cols, chunks_per_split,
+                            partials);
+}
+
+extern "C" __global__ void __launch_bounds__(512, 3)
+hyb_moe_b1(const unsigned* __restrict__ t0,
+           const unsigned* __restrict__ t1,
+           const unsigned* __restrict__ l0,
+           const unsigned* __restrict__ l1,
+           const float* __restrict__ sc0,
+           const float* __restrict__ sc1,
+           const float* __restrict__ c0,
+           const float* __restrict__ c1,
+           const float* __restrict__ r0,
+           const float* __restrict__ r1,
+           float* __restrict__ y0,
+           float* __restrict__ y1,
+           int rows0,
+           int rows1,
+           int rb0,
+           const float* __restrict__ x,
+           const int* __restrict__ ids,
+           int cols,
+           int used,
+           int chunks_per_split,
+           int splits,
+           float* __restrict__ partials) {
+    const int rb = blockIdx.x;
+    const int assign = blockIdx.y;
+    const int expert = __ldg(ids + assign);
+    const int total_rows = rows0 + rows1;
+    const int col_tiles = cols / HYB_TILE;
+    if (rb < rb0) {
+        const size_t expert_stride = (size_t)(rows0 / HYB_TILE) * col_tiles * HYB_WORDS;
+        hyb_b1_core<false>(t0 + (size_t)expert * expert_stride, l0, x, nullptr, c0, r0, y0,
+                           partials, rows0, total_rows, cols, chunks_per_split, splits,
+                           __ldg(sc0 + expert), rb, rb, blockIdx.z, assign, used);
+    } else {
+        const size_t expert_stride = (size_t)(rows1 / HYB_TILE) * col_tiles * HYB_WORDS;
+        hyb_b1_core<false>(t1 + (size_t)expert * expert_stride, l1, x, nullptr, c1, r1, y1,
+                           partials, rows1, total_rows, cols, chunks_per_split, splits,
+                           __ldg(sc1 + expert), rb - rb0, rb, blockIdx.z, assign, used);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(512)
+hyb_moe_b1_swiglu(const unsigned* __restrict__ t0,
+                  const unsigned* __restrict__ l0,
+                  const float* __restrict__ sc0,
+                  const float* __restrict__ c0,
+                  const float* __restrict__ r0,
+                  float* __restrict__ y0,
+                  int rows0,
+                  const float* __restrict__ x_gate,
+                  const float* __restrict__ x_up,
+                  const int* __restrict__ ids,
+                  int cols,
+                  int used,
+                  int chunks_per_split,
+                  int splits,
+                  float* __restrict__ partials) {
+    const int assign = blockIdx.y;
+    const int expert = __ldg(ids + assign);
+    const int col_tiles = cols / HYB_TILE;
+    const size_t expert_stride = (size_t)(rows0 / HYB_TILE) * col_tiles * HYB_WORDS;
+    const float* xg = x_gate + (size_t)assign * cols;
+    const float* xu = x_up + (size_t)assign * cols;
+    hyb_b1_core<true>(t0 + (size_t)expert * expert_stride, l0, xg, xu, c0, r0, y0, partials, rows0,
+                      rows0, cols, chunks_per_split, splits, __ldg(sc0 + expert), blockIdx.x,
+                      blockIdx.x, blockIdx.z, assign, used);
 }
 

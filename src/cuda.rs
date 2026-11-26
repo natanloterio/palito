@@ -1255,6 +1255,7 @@ impl CudaBackend {
                 "eagle3_concat3",
                 "eagle3_norm_cat",
                 "residual_unit_norm",
+                "combine_unit_norm",
                 "group_experts_reg32",
                 "grouped_matmul_reg32x32",
                 "grouped_matmul_reg32_counted",
@@ -2749,6 +2750,24 @@ impl CudaBackend {
                     &self.work.down,
                     &mut self.work.normalized,
                     &w,
+                    &s.epsilon
+                );
+                attention_normalized = true;
+            } else if plt1_fused_norm
+                && s.used > 1
+                && index + 1 < self.weights.layers.len()
+                && self.functions.contains_key("combine_unit_norm")
+            {
+                launch!(
+                    self,
+                    "combine_unit_norm",
+                    (1, 1, 1); unit_norm_threads,
+                    &mut self.work.x,
+                    &self.work.down,
+                    &self.work.probabilities,
+                    &mut self.work.normalized,
+                    &w,
+                    &used,
                     &s.epsilon
                 );
                 attention_normalized = true;

@@ -774,7 +774,8 @@ hyb_small_k_multi_swiglu(HYB_SMALL_K_MULTI_PARAMS) {
 }
 
 // Deterministic split-K reduction for both dense (hyb_small_k_multi) and MoE (hyb_moe_small_k).
-// Grid: (ceil(total_rows / 1024), tokens, 1), Block: 256 threads (float4 vectorized; all rows are multiples of 256).
+// Grid: (ceil(total_rows / 128), tokens, 1), Block: 32 threads (1 warp/block, float4 vectorized).
+// Spreading across 8x more SMs than 256-thread blocks avoids SM underutilization on small total_rows.
 extern "C" __global__ void hyb_splitk_reduce_multi(const float* __restrict__ partials,
                                                    float* __restrict__ y0,
                                                    float* __restrict__ y1,
@@ -785,7 +786,7 @@ extern "C" __global__ void hyb_splitk_reduce_multi(const float* __restrict__ par
                                                    int tokens,
                                                    int splits) {
     const int total_rows4 = (rows0 + rows1 + rows2) >> 2;
-    const int g4 = blockIdx.x * 256 + threadIdx.x;
+    const int g4 = blockIdx.x * 32 + threadIdx.x;
     const int t = blockIdx.y;
     if (g4 >= total_rows4 || t >= tokens) {
         return;
@@ -1261,7 +1262,7 @@ __device__ __forceinline__ void hyb_b1_preload_chunks(const float* __restrict__ 
             }
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                v[e] = v[e] / (1.0f + expf(-v[e])) * up[e];
+                v[e] = v[e] / (1.0f + __expf(-v[e])) * up[e];
             }
         }
 #if !HYB_SKIP_IN_RHT
@@ -1469,7 +1470,7 @@ __device__ __forceinline__ void hyb_b1_multi_body(
                         blockIdx.x, blockIdx.y, 0, 1);
 }
 
-extern "C" __global__ void __launch_bounds__(512)
+extern "C" __global__ void __launch_bounds__(512, 3)
 hyb_b1_multi(const unsigned* __restrict__ t0, const unsigned* __restrict__ t1,
              const unsigned* __restrict__ t2, const unsigned* __restrict__ l0,
              const unsigned* __restrict__ l1, const unsigned* __restrict__ l2,
@@ -1486,7 +1487,7 @@ hyb_b1_multi(const unsigned* __restrict__ t0, const unsigned* __restrict__ t1,
                              partials);
 }
 
-extern "C" __global__ void __launch_bounds__(512)
+extern "C" __global__ void __launch_bounds__(512, 3)
 hyb_b1_multi_swiglu(const unsigned* __restrict__ t0, const unsigned* __restrict__ t1,
                     const unsigned* __restrict__ t2, const unsigned* __restrict__ l0,
                     const unsigned* __restrict__ l1, const unsigned* __restrict__ l2,
@@ -1503,7 +1504,7 @@ hyb_b1_multi_swiglu(const unsigned* __restrict__ t0, const unsigned* __restrict_
                             partials);
 }
 
-extern "C" __global__ void __launch_bounds__(512)
+extern "C" __global__ void __launch_bounds__(512, 3)
 hyb_moe_b1(const unsigned* __restrict__ t0,
            const unsigned* __restrict__ t1,
            const unsigned* __restrict__ l0,

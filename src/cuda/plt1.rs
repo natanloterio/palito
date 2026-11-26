@@ -315,7 +315,7 @@ impl Plt1HybRuntime {
         let (r1_enter_fn, r1_exit_fn, moe_group_fn, splitk_reduce_fn) =
             r1_fns.ok_or_else(|| Error::Invalid("PLT1 file contained no HYB layers".into()))?;
         let compute_splits = |denom: usize, total_chunks: usize| -> usize {
-            let s = (340usize / denom.max(1)).clamp(1, total_chunks);
+            let s = (510usize / denom.max(1)).clamp(1, total_chunks);
             let cps = total_chunks.div_ceil(s);
             total_chunks.div_ceil(cps)
         };
@@ -457,8 +457,8 @@ impl Plt1HybRuntime {
             .arg(&splits_i);
         unsafe {
             b.launch(LaunchConfig {
-                grid_dim: (total_rows.div_ceil(1024), tokens as u32, 1),
-                block_dim: (256, 1, 1),
+                grid_dim: (total_rows.div_ceil(128), tokens as u32, 1),
+                block_dim: (32, 1, 1),
                 shared_mem_bytes: 0,
             })
         }
@@ -517,8 +517,8 @@ impl Plt1HybRuntime {
             total_rb as i32
         };
         let total_chunks = cols / 256;
-        // Fit exact 2-wave multiples on RTX 5090's 170 SMs (avoid 3rd tail wave on Gate+Up!).
-        let splits = (340usize / total_rb).clamp(1, total_chunks);
+        // Target 3-block/SM full occupancy (510 blocks on RTX 5090's 170 SMs).
+        let splits = (510usize / total_rb).clamp(1, total_chunks);
         let cps = total_chunks.div_ceil(splits);
         let splits = total_chunks.div_ceil(cps);
 
@@ -661,7 +661,7 @@ impl Plt1HybRuntime {
         let total_chunks = cols / 256;
         // Keep split count independent of `tokens` so single-token decode (B=1) and
         // batched speculative verification (B=2..16) have identical FP32 accumulation order.
-        let splits = (340usize / (total_rb * used).max(1)).clamp(1, total_chunks);
+        let splits = (510usize / (total_rb * used).max(1)).clamp(1, total_chunks);
         let cps = total_chunks.div_ceil(splits);
         let splits = total_chunks.div_ceil(cps);
 
@@ -799,7 +799,7 @@ impl Plt1HybRuntime {
         let total_rb = r0 / 256;
         let total_chunks = cols / 256;
         // Keep split count independent of `tokens` for bit-exact B=1 vs B=2..16 parity.
-        let splits = (340usize / (total_rb * used).max(1)).clamp(1, total_chunks);
+        let splits = (510usize / (total_rb * used).max(1)).clamp(1, total_chunks);
         let cps = total_chunks.div_ceil(splits);
         let splits = total_chunks.div_ceil(cps);
 

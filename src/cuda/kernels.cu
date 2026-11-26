@@ -807,6 +807,24 @@ __device__ __forceinline__ float f16_wide_row_part(const u8 *w, const float *x, 
     return warp_sum(acc);
 }
 
+// F32 row part: float4 vectorized loads (16 bytes/lane = 128 floats/warp step). width % 128 == 0.
+__device__ __forceinline__ float f32_wide_row_part(const u8 *w, const float *x, u64 offset,
+                                                   int width, int lane, int part, int warps) {
+    const float4 *row = (const float4 *)((const float *)w + offset);
+    const float4 *xv = (const float4 *)x;
+    float acc = 0.0f;
+    int n4 = width >> 2;
+    for (int i = part * 32 + lane; i < n4; i += warps * 32) {
+        float4 wv = __ldg(row + i);
+        float4 iv = __ldg(xv + i);
+        acc = fmaf(wv.x, iv.x, acc);
+        acc = fmaf(wv.y, iv.y, acc);
+        acc = fmaf(wv.z, iv.z, acc);
+        acc = fmaf(wv.w, iv.w, acc);
+    }
+    return warp_sum(acc);
+}
+
 // block=(256, 1, 1). F32 arithmetic; only the reduction order differs from matvec.
 extern "C" __global__ void matvec_packed_rows(const u8 *w, int kind, const float *x, float *y,
                                              int width, int rows, const int *ids,
@@ -830,6 +848,8 @@ extern "C" __global__ void matvec_packed_rows(const u8 *w, int kind, const float
             sum = q8_0_row_part(w, input, offset, width, lane, part, warps);
         } else if (kind == 1 && width % 256 == 0) {
             sum = f16_wide_row_part(w, input, offset, width, lane, part, warps);
+        } else if (kind == 0 && width % 128 == 0) {
+            sum = f32_wide_row_part(w, input, offset, width, lane, part, warps);
         } else {
             switch (kind) {
 #define SCALAR_ROW(K) warp_scalar_row<K>(w, input, offset, width, lane, part, warps)
@@ -962,6 +982,69 @@ extern "C" __global__ void residual_unit_norm(float *x, const float *delta, floa
     float inverse = rsqrtf(total / (float)width + epsilon);
     for (int i = tid; i < width; i += blockDim.x) {
         yt[i] = xt[i] * inverse;
+    }
+}
+
+// Fused MoE combine + unit-variance RMSNorm for PLT1 folded-RMSNorm MoE layers.
+// Grid: (1, 1, 1), Block: up to 1024 threads; float4 vectorized when aligned.
+extern "C" __global__ void combine_unit_norm(float *x, const float *experts,
+                                             const float *weights, float *norm_out,
+                                             int width, int used, float epsilon) {
+    __shared__ float partial[32];
+    int tid = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int nwarps = blockDim.x >> 5;
+
+    if ((width & 3) == 0 && width <= (int)blockDim.x * 4) {
+        int n4 = width >> 2;
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float sum = 0.0f;
+        if (tid < n4) {
+            float4 xv = reinterpret_cast<const float4 *>(x)[tid];
+            float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+            const float4 *e4 = reinterpret_cast<const float4 *>(experts);
+            for (int s = 0; s < used; s++) {
+                float w = __ldg(weights + s);
+                float4 ev = __ldg(e4 + (u64)s * n4 + tid);
+                c0 = fmaf(w, ev.x, c0);
+                c1 = fmaf(w, ev.y, c1);
+                c2 = fmaf(w, ev.z, c2);
+                c3 = fmaf(w, ev.w, c3);
+            }
+            v = make_float4(xv.x + c0, xv.y + c1, xv.z + c2, xv.w + c3);
+            reinterpret_cast<float4 *>(x)[tid] = v;
+            sum = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+        sum = warp_sum(sum);
+        if (lane == 0) partial[warp] = sum;
+        __syncthreads();
+        float total = (lane < nwarps) ? partial[lane] : 0.0f;
+        total = warp_sum(total);
+        float inverse = rsqrtf(total / (float)width + epsilon);
+        if (tid < n4) {
+            reinterpret_cast<float4 *>(norm_out)[tid] =
+                make_float4(v.x * inverse, v.y * inverse, v.z * inverse, v.w * inverse);
+        }
+        return;
+    }
+
+    float sum = 0.0f;
+    for (int i = tid; i < width; i += blockDim.x) {
+        float c = 0.0f;
+        for (int s = 0; s < used; s++) c += weights[s] * experts[(u64)s * width + i];
+        float v = x[i] + c;
+        x[i] = v;
+        sum += v * v;
+    }
+    sum = warp_sum(sum);
+    if (lane == 0) partial[warp] = sum;
+    __syncthreads();
+    float total = (lane < nwarps) ? partial[lane] : 0.0f;
+    total = warp_sum(total);
+    float inverse = rsqrtf(total / (float)width + epsilon);
+    for (int i = tid; i < width; i += blockDim.x) {
+        norm_out[i] = x[i] * inverse;
     }
 }
 

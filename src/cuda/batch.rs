@@ -312,7 +312,12 @@ impl CudaBackend {
         position: usize,
         output_logits: bool,
     ) -> Result<()> {
-        self.batched_prefill_inner(tokens, position, output_logits, None)
+        self.batched_prefill_inner(tokens, position, output_logits, None, false)
+    }
+
+    pub(super) fn batched_prefill_graph(&mut self, n_tokens: usize) -> Result<()> {
+        let dummy = vec![0i32; n_tokens];
+        self.batched_prefill_inner(&dummy, 0, false, None, true)
     }
 
     pub(super) fn batched_prefill_tree(
@@ -322,7 +327,7 @@ impl CudaBackend {
         tree_pos: &CudaSlice<i32>,
         tree_mask: &CudaSlice<u64>,
     ) -> Result<()> {
-        self.batched_prefill_inner(tokens, position, false, Some((tree_pos, tree_mask)))
+        self.batched_prefill_inner(tokens, position, false, Some((tree_pos, tree_mask)), false)
     }
 
     fn batched_prefill_inner(
@@ -331,6 +336,7 @@ impl CudaBackend {
         position: usize,
         output_logits: bool,
         tree: Option<(&CudaSlice<i32>, &CudaSlice<u64>)>,
+        device_pos: bool,
     ) -> Result<()> {
         let s = &self.weights.spec;
         let n = tokens.len() as i32;
@@ -383,12 +389,14 @@ impl CudaBackend {
         let activated = s.hidden as i32 * used * n;
         let assignments = tokens.len() * s.used;
         let vector = |size: i32| ((size as u32).div_ceil(256), 1, 1);
-        let ids = self
-            .work
-            .tokens
-            .as_mut()
-            .ok_or_else(|| failure("batched prefill token workspace missing"))?;
-        self.stream.memcpy_htod(tokens, ids).map_err(failure)?;
+        if !device_pos {
+            let ids = self
+                .work
+                .tokens
+                .as_mut()
+                .ok_or_else(|| failure("batched prefill token workspace missing"))?;
+            self.stream.memcpy_htod(tokens, ids).map_err(failure)?;
+        }
         let t = &self.weights.embedding;
         launch!(
             self,
@@ -648,24 +656,46 @@ impl CudaBackend {
             if fused_rope_kv {
                 let factors = self.weights.rope_factors.as_ref().unwrap();
                 let total_pairs = ((qw / 2 + kw / 2) as u32).div_ceil(256);
-                launch!(
-                    self,
-                    "rotary_factored_cache_kv_batch",
-                    (total_pairs, n as u32, 1),
-                    &mut self.work.q,
-                    &qw,
-                    &mut self.work.k,
-                    &self.work.v,
-                    &mut self.keys[index],
-                    &mut self.values[index],
-                    &kw,
-                    &dim,
-                    &pos,
-                    &rope_base,
-                    &neox,
-                    &factors.bytes,
-                    &s.rope_attn_factor
-                );
+                if device_pos {
+                    let control = &self.verify_control;
+                    launch!(
+                        self,
+                        "rotary_factored_cache_kv_batch_graph",
+                        (total_pairs, n as u32, 1),
+                        &mut self.work.q,
+                        &qw,
+                        &mut self.work.k,
+                        &self.work.v,
+                        &mut self.keys[index],
+                        &mut self.values[index],
+                        &kw,
+                        &dim,
+                        control,
+                        &rope_base,
+                        &neox,
+                        &factors.bytes,
+                        &s.rope_attn_factor
+                    );
+                } else {
+                    launch!(
+                        self,
+                        "rotary_factored_cache_kv_batch",
+                        (total_pairs, n as u32, 1),
+                        &mut self.work.q,
+                        &qw,
+                        &mut self.work.k,
+                        &self.work.v,
+                        &mut self.keys[index],
+                        &mut self.values[index],
+                        &kw,
+                        &dim,
+                        &pos,
+                        &rope_base,
+                        &neox,
+                        &factors.bytes,
+                        &s.rope_attn_factor
+                    );
+                }
             } else {
             for (norm, values, size) in [
                 (&l.q_norm, &mut self.work.q, qw),
@@ -729,6 +759,11 @@ impl CudaBackend {
                 } else if let Some(factors) = &self.weights.rope_factors {
                     launch!(self, "rotary_factored", grid;
                         256, values, &size, &dim, &pos, &rope_base, &neox, &factors.bytes, &s.rope_attn_factor);
+                } else if device_pos {
+                    let control = &self.verify_control;
+                    launch!(
+                        self, "rotary_decode", grid, values, &size, &dim, control, &rope_base, &neox
+                    );
                 } else {
                     launch!(
                         self, "rotary", grid, values, &size, &dim, &pos, &rope_base, &neox
@@ -762,17 +797,32 @@ impl CudaBackend {
                 &self.work.v,
                 kw as usize
             );
-            launch!(
-                self,
-                "cache_kv",
-                ((kw as u32).div_ceil(256), n as u32, 1),
-                &self.work.k,
-                &self.work.v,
-                &mut self.keys[index],
-                &mut self.values[index],
-                &kw,
-                &pos
-            );
+            if device_pos {
+                let control = &self.verify_control;
+                launch!(
+                    self,
+                    "cache_kv_decode",
+                    ((kw as u32).div_ceil(256), n as u32, 1),
+                    &self.work.k,
+                    &self.work.v,
+                    &mut self.keys[index],
+                    &mut self.values[index],
+                    &kw,
+                    control
+                );
+            } else {
+                launch!(
+                    self,
+                    "cache_kv",
+                    ((kw as u32).div_ceil(256), n as u32, 1),
+                    &self.work.k,
+                    &self.work.v,
+                    &mut self.keys[index],
+                    &mut self.values[index],
+                    &kw,
+                    &pos
+                );
+            }
             }
             // Score rows exist per prefill token only without flash attention
             // (flash_prefill_attention sizes the workspace).
@@ -807,42 +857,82 @@ impl CudaBackend {
                 }
                 let tree_mask_ptr: u64 =
                     tree.map_or(0u64, |(_, m)| m.device_ptr(&self.stream).0);
-                let split_fn = self.functions["attention_split_group_batch"].clone();
-                let mut b = self.stream.launch_builder(&split_fn);
-                b.arg(&self.work.q)
-                    .arg(&self.keys[index])
-                    .arg(&self.values[index])
-                    .arg(&mut *partials)
-                    .arg(&dim)
-                    .arg(&heads)
-                    .arg(&kv_heads)
-                    .arg(&pos)
-                    .arg(&tree_mask_ptr);
-                unsafe {
-                    b.launch(LaunchConfig {
-                        grid_dim: (kv_heads as u32, chunks as u32, n as u32),
-                        block_dim: (32 * group, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
+                if device_pos {
+                    let control = &self.verify_control;
+                    let split_fn = self.functions["attention_split_group_batch_graph"].clone();
+                    let mut b = self.stream.launch_builder(&split_fn);
+                    b.arg(&self.work.q)
+                        .arg(&self.keys[index])
+                        .arg(&self.values[index])
+                        .arg(&mut *partials)
+                        .arg(&dim)
+                        .arg(&heads)
+                        .arg(&kv_heads)
+                        .arg(control)
+                        .arg(&tree_mask_ptr);
+                    unsafe {
+                        b.launch(LaunchConfig {
+                            grid_dim: (kv_heads as u32, chunks as u32, n as u32),
+                            block_dim: (32 * group, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                    }
+                    .map_err(failure)?;
+                    let comb_fn = self.functions["attention_combine_group_batch_graph"].clone();
+                    let mut b2 = self.stream.launch_builder(&comb_fn);
+                    b2.arg(&*partials)
+                        .arg(&mut self.work.attended)
+                        .arg(&dim)
+                        .arg(&heads)
+                        .arg(&chunks)
+                        .arg(control)
+                        .arg(&tree_mask_ptr);
+                    unsafe {
+                        b2.launch(LaunchConfig {
+                            grid_dim: (heads as u32, 1, n as u32),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                    }
+                    .map_err(failure)?;
+                } else {
+                    let split_fn = self.functions["attention_split_group_batch"].clone();
+                    let mut b = self.stream.launch_builder(&split_fn);
+                    b.arg(&self.work.q)
+                        .arg(&self.keys[index])
+                        .arg(&self.values[index])
+                        .arg(&mut *partials)
+                        .arg(&dim)
+                        .arg(&heads)
+                        .arg(&kv_heads)
+                        .arg(&pos)
+                        .arg(&tree_mask_ptr);
+                    unsafe {
+                        b.launch(LaunchConfig {
+                            grid_dim: (kv_heads as u32, chunks as u32, n as u32),
+                            block_dim: (32 * group, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                    }
+                    .map_err(failure)?;
+                    let comb_fn = self.functions["attention_combine_group_batch"].clone();
+                    let mut b2 = self.stream.launch_builder(&comb_fn);
+                    b2.arg(&*partials)
+                        .arg(&mut self.work.attended)
+                        .arg(&dim)
+                        .arg(&heads)
+                        .arg(&chunks)
+                        .arg(&pos)
+                        .arg(&tree_mask_ptr);
+                    unsafe {
+                        b2.launch(LaunchConfig {
+                            grid_dim: (heads as u32, 1, n as u32),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                    }
+                    .map_err(failure)?;
                 }
-                .map_err(failure)?;
-                let comb_fn = self.functions["attention_combine_group_batch"].clone();
-                let mut b2 = self.stream.launch_builder(&comb_fn);
-                b2.arg(&*partials)
-                    .arg(&mut self.work.attended)
-                    .arg(&dim)
-                    .arg(&heads)
-                    .arg(&chunks)
-                    .arg(&pos)
-                    .arg(&tree_mask_ptr);
-                unsafe {
-                    b2.launch(LaunchConfig {
-                        grid_dim: (heads as u32, 1, n as u32),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
-                }
-                .map_err(failure)?;
             } else if let Some((_, tree_mask)) = tree {
                 let smem = ((position + tokens.len()) * std::mem::size_of::<f32>()) as u32;
                 let func = self.functions["attention_tree"].clone();

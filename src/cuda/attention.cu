@@ -118,21 +118,33 @@ __device__ __forceinline__ void attention_warp128_impl(
 
     for (int t = 0; t < limit; ++t) {
         u64 kv_off = ((u64)t * kv_heads + kv_head) * 128 + lane * 4;
-        float k0 = kv_load(keys, kv_off);
-        float k1 = kv_load(keys, kv_off + 1);
-        float k2 = kv_load(keys, kv_off + 2);
-        float k3 = kv_load(keys, kv_off + 3);
+        float k0, k1, k2, k3;
+        if constexpr (sizeof(KV) == sizeof(float)) {
+            float4 kv = __ldg((const float4 *)((const float *)keys + kv_off));
+            k0 = kv.x; k1 = kv.y; k2 = kv.z; k3 = kv.w;
+        } else {
+            k0 = kv_load(keys, kv_off);
+            k1 = kv_load(keys, kv_off + 1);
+            k2 = kv_load(keys, kv_off + 2);
+            k3 = kv_load(keys, kv_off + 3);
+        }
         float dot = qv.x * k0 + qv.y * k1 + qv.z * k2 + qv.w * k3;
         #pragma unroll
         for (int s = 16; s > 0; s >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, s);
         float score = dot * scale;
         float m_new = fmaxf(m, score);
-        float alpha = expf(m - m_new);
-        float p = expf(score - m_new);
-        float v0 = kv_load(values, kv_off);
-        float v1 = kv_load(values, kv_off + 1);
-        float v2 = kv_load(values, kv_off + 2);
-        float v3 = kv_load(values, kv_off + 3);
+        float alpha = __expf(m - m_new);
+        float p = __expf(score - m_new);
+        float v0, v1, v2, v3;
+        if constexpr (sizeof(KV) == sizeof(float)) {
+            float4 vv = __ldg((const float4 *)((const float *)values + kv_off));
+            v0 = vv.x; v1 = vv.y; v2 = vv.z; v3 = vv.w;
+        } else {
+            v0 = kv_load(values, kv_off);
+            v1 = kv_load(values, kv_off + 1);
+            v2 = kv_load(values, kv_off + 2);
+            v3 = kv_load(values, kv_off + 3);
+        }
         o0 = fmaf(o0, alpha, p * v0);
         o1 = fmaf(o1, alpha, p * v1);
         o2 = fmaf(o2, alpha, p * v2);
@@ -839,7 +851,7 @@ extern "C" __global__ void attention_split_group_decode(const float *q, const fl
 
 // Batched chain/tree variant of attention_split_group (grid = (kv_heads, chunks, tokens)).
 // Bit-exact with attention_split_group for every token in a speculative chain or tree.
-extern "C" __global__ void attention_split_group_batch(
+__device__ __forceinline__ void attention_split_group_batch_impl(
     const float *q, const float *keys, const float *values, float *partial, int dim,
     int heads, int kv_heads, int prefix_len, const unsigned long long *tree_mask) {
     int kv_head = blockIdx.x, tok = blockIdx.z, group = heads / kv_heads;
@@ -936,6 +948,20 @@ extern "C" __global__ void attention_split_group_batch(
         out[dim] = maximum;
         out[dim + 1] = total;
     }
+}
+
+extern "C" __global__ void attention_split_group_batch(
+    const float *q, const float *keys, const float *values, float *partial, int dim,
+    int heads, int kv_heads, int prefix_len, const unsigned long long *tree_mask) {
+    attention_split_group_batch_impl(q, keys, values, partial, dim, heads, kv_heads, prefix_len,
+                                     tree_mask);
+}
+
+extern "C" __global__ void attention_split_group_batch_graph(
+    const float *q, const float *keys, const float *values, float *partial, int dim,
+    int heads, int kv_heads, const int *control, const unsigned long long *tree_mask) {
+    attention_split_group_batch_impl(q, keys, values, partial, dim, heads, kv_heads, control[1],
+                                     tree_mask);
 }
 
 #ifdef CUDA_KV_F16
@@ -1201,6 +1227,18 @@ extern "C" __global__ void attention_combine_group_batch(const float *partial,
                                                          float *output, int dim, int heads,
                                                          int chunks, int prefix_len,
                                                          const unsigned long long *tree_mask) {
+    int tok = blockIdx.z;
+    int count = (tree_mask != nullptr) ? (prefix_len + __popcll(tree_mask[tok]))
+                                       : (prefix_len + tok + 1);
+    const float *p_tok = partial + (u64)tok * heads * chunks * (dim + 2);
+    float *out_tok = output + (u64)tok * heads * dim;
+    attention_combine_wide_impl(p_tok, out_tok, dim, chunks, count, ATTENTION_GROUP_GRANULE);
+}
+
+extern "C" __global__ void attention_combine_group_batch_graph(
+    const float *partial, float *output, int dim, int heads, int chunks, const int *control,
+    const unsigned long long *tree_mask) {
+    int prefix_len = control[1];
     int tok = blockIdx.z;
     int count = (tree_mask != nullptr) ? (prefix_len + __popcll(tree_mask[tok]))
                                        : (prefix_len + tok + 1);

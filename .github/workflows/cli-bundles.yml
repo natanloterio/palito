@@ -1,0 +1,94 @@
+# Builds the macOS (Apple Silicon, Metal) and Windows (x86_64, Vulkan) CLI
+# bundles and attaches them to the GitHub release.
+#
+# - A published release builds its tag and uploads both archives to it.
+# - A manual run (Actions > cli-bundles > Run workflow) does the same for an
+#   existing tag, e.g. to add the bundles to a release made before this workflow.
+# - Pull requests that touch the packaging only build and smoke-test; the
+#   archives are kept as workflow artifacts.
+# The Linux CUDA bundle stays manual (scripts/package-linux.sh needs NVRTC 13).
+name: cli-bundles
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach the bundles to (e.g. v0.16.0)"
+        required: true
+  pull_request:
+    paths:
+      - "scripts/package-cli.sh"
+      - "scripts/test_package_cli.py"
+      - ".github/workflows/cli-bundles.yml"
+
+permissions:
+  contents: write
+
+env:
+  # Empty on pull requests: build and test only.
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  bundle:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macos-arm64
+            features: metal
+            exe: palito
+            archive: tar.gz
+          - os: windows-latest
+            platform: windows-x86_64
+            features: vulkan
+            exe: palito.exe
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tag matches Cargo.toml
+        if: env.TAG != ''
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          [ "v$version" = "$TAG" ] || { echo "tag $TAG does not match Cargo.toml $version" >&2; exit 1; }
+      # On Windows, Python may start WSL's bash.exe; the smoke test covers it there.
+      - name: Packaging script tests
+        if: runner.os != 'Windows'
+        run: python3 -m unittest discover -s scripts -p 'test_package_cli.py'
+      - name: Build (${{ matrix.features }})
+        run: cargo build --release --locked --lib --bin palito --features ${{ matrix.features }}
+      - name: Package
+        id: package
+        run: |
+          bash scripts/package-cli.sh ${{ matrix.platform }}
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          echo "name=palito-$version-${{ matrix.platform }}" >> "$GITHUB_OUTPUT"
+      - name: Smoke test (pull a small GGUF from Hugging Face, generate on the CPU)
+        env:
+          PALITO_MODELS: ${{ runner.temp }}/models
+        run: |
+          bin="target/dist/${{ steps.package.outputs.name }}/${{ matrix.exe }}"
+          "$bin" --version
+          "$bin" list --available | grep qwen3-8b
+          model="$("$bin" pull --quiet bartowski/SmolLM2-135M-Instruct-GGUF:SmolLM2-135M-Instruct-Q4_K_M.gguf)"
+          "$bin" list | grep SmolLM2
+          "$bin" generate --model "$model" --prompt "The capital of France is" --tokens 8 | grep -q '"text"'
+      - name: Keep the archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: target/dist/${{ steps.package.outputs.name }}.${{ matrix.archive }}
+      - name: Attach to the release
+        if: env.TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "target/dist/${{ steps.package.outputs.name }}.${{ matrix.archive }}" --clobber

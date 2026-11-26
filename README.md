@@ -11,16 +11,28 @@ Fast local LLM inference in a single Rust binary. Runs GGUF models and its own G
 ### Linux (NVIDIA GPU or CPU)
 
 ```sh
-curl -L https://github.com/natanloterio/palito/releases/download/v0.15.0/palito-0.15.0-linux-x86_64.tar.gz | tar xz
+curl -L https://github.com/natanloterio/palito/releases/download/v0.16.0/palito-0.16.0-linux-x86_64.tar.gz | tar xz
 mkdir -p ~/.local/bin
-ln -sf "$PWD/palito-0.15.0-linux-x86_64/palito" ~/.local/bin/palito
+ln -sf "$PWD/palito-0.16.0-linux-x86_64/palito" ~/.local/bin/palito
 ```
 
 The bundle carries the CUDA 13 runtime compiler; only the NVIDIA driver must be installed. Without a GPU it runs on the CPU.
 
-### macOS, Windows and other GPUs
+### macOS (Apple Silicon)
 
-Install with Cargo (`--features metal` for Apple Silicon, `vulkan` for AMD and Intel GPUs). See [building from source](docs/building.md).
+```sh
+curl -L https://github.com/natanloterio/palito/releases/download/v0.16.0/palito-0.16.0-macos-arm64.tar.gz | tar xz
+mkdir -p ~/.local/bin
+ln -sf "$PWD/palito-0.16.0-macos-arm64/palito" ~/.local/bin/palito
+```
+
+If `palito` is not found, add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc`. GGUF models run on the GPU with `--backend metal`; `.palito` models run on the CPU (their GPU kernels are CUDA-only for now).
+
+### Windows (x86_64)
+
+Download [palito-0.16.0-windows-x86_64.zip](https://github.com/natanloterio/palito/releases/download/v0.16.0/palito-0.16.0-windows-x86_64.zip), extract it and run `palito.exe` from PowerShell in that folder (or add the folder to `PATH`). GGUF models run on the GPU with `--backend vulkan` (AMD, Intel and NVIDIA drivers include Vulkan); `.palito` models run on the CPU.
+
+The Linux bundle is for x86_64 only: on a Mac or on Windows, use the bundles above. Other platforms and GPUs: install with Cargo (`cargo install palito --features vulkan`), see [building from source](docs/building.md).
 
 ### Libraries
 

@@ -63,6 +63,9 @@ pub struct Plt1HybRuntime {
     r1_enter_fn: CudaFunction,
     r1_exit_fn: CudaFunction,
     moe_group_fn: CudaFunction,
+    splitk_reduce_fn: CudaFunction,
+    /// Scratch buffer for deterministic split-K reduction (`[splits, tokens_or_assigns, total_rows]`).
+    splitk_scratch: CudaSlice<f32>,
     moe_group_experts: CudaSlice<i32>,
     moe_group_offsets: CudaSlice<i32>,
     moe_group_assigns: CudaSlice<i32>,
@@ -215,7 +218,7 @@ impl Plt1HybRuntime {
              -> Result<(
                 CudaFunction,
                 CudaFunction,
-                Option<(CudaFunction, CudaFunction, CudaFunction)>,
+                Option<(CudaFunction, CudaFunction, CudaFunction, CudaFunction)>,
                 Option<(CudaFunction, CudaFunction)>,
             )> {
                 let src = format!(
@@ -241,6 +244,9 @@ impl Plt1HybRuntime {
                         module.load_function("hyb_r1_exit").map_err(cuda_err)?,
                         module
                             .load_function("hyb_moe_group_assignments")
+                            .map_err(cuda_err)?,
+                        module
+                            .load_function("hyb_splitk_reduce_multi")
                             .map_err(cuda_err)?,
                     ))
                 } else {
@@ -276,8 +282,60 @@ impl Plt1HybRuntime {
                 (k8_p, k8_s, k16_p, k16_s, moe_p, moe_s),
             );
         }
-        let (r1_enter_fn, r1_exit_fn, moe_group_fn) =
+        let (r1_enter_fn, r1_exit_fn, moe_group_fn, splitk_reduce_fn) =
             r1_fns.ok_or_else(|| Error::Invalid("PLT1 file contained no HYB layers".into()))?;
+        let compute_splits = |denom: usize, total_chunks: usize| -> usize {
+            let s = (340usize / denom.max(1)).clamp(1, total_chunks);
+            let cps = total_chunks.div_ceil(s);
+            total_chunks.div_ceil(cps)
+        };
+        let mut max_scratch_elems = 1usize;
+        for l in &layers {
+            let dense_cases = [
+                (
+                    (l.q.desc.rows + l.k.desc.rows + l.v.desc.rows) as usize,
+                    l.q.desc.cols as usize,
+                ),
+                (l.o.desc.rows as usize, l.o.desc.cols as usize),
+            ];
+            for (total_rows, cols) in dense_cases {
+                let splits = compute_splits(total_rows / 256, cols / 256);
+                if splits > 1 {
+                    max_scratch_elems = max_scratch_elems.max(splits * 16 * total_rows);
+                }
+            }
+            if l.moe_ffn {
+                let gu_rows = (l.gate.desc.rows + l.up.desc.rows) as usize;
+                let gu_cols = l.gate.desc.cols as usize;
+                let d_rows = l.down.desc.rows as usize;
+                let d_cols = l.down.desc.cols as usize;
+                for used in 1..=16usize {
+                    let max_assigns = (16 * used).min(MOE_MAX_ASSIGNS);
+                    let s_gu = compute_splits((gu_rows / 256) * used, gu_cols / 256);
+                    if s_gu > 1 {
+                        max_scratch_elems = max_scratch_elems.max(s_gu * max_assigns * gu_rows);
+                    }
+                    let s_d = compute_splits((d_rows / 256) * used, d_cols / 256);
+                    if s_d > 1 {
+                        max_scratch_elems = max_scratch_elems.max(s_d * max_assigns * d_rows);
+                    }
+                }
+            } else {
+                let gu_rows = (l.gate.desc.rows + l.up.desc.rows) as usize;
+                let s_gu = compute_splits(gu_rows / 256, l.gate.desc.cols as usize / 256);
+                if s_gu > 1 {
+                    max_scratch_elems = max_scratch_elems.max(s_gu * 16 * gu_rows);
+                }
+                let d_rows = l.down.desc.rows as usize;
+                let s_d = compute_splits(d_rows / 256, l.down.desc.cols as usize / 256);
+                if s_d > 1 {
+                    max_scratch_elems = max_scratch_elems.max(s_d * 16 * d_rows);
+                }
+            }
+        }
+        let splitk_scratch = stream
+            .alloc_zeros::<f32>(max_scratch_elems)
+            .map_err(cuda_err)?;
         let moe_group_experts = stream.alloc_zeros::<i32>(MOE_MAX_ASSIGNS).map_err(cuda_err)?;
         let moe_group_offsets = stream
             .alloc_zeros::<i32>(MOE_MAX_ASSIGNS + 1)
@@ -294,6 +352,8 @@ impl Plt1HybRuntime {
             r1_enter_fn,
             r1_exit_fn,
             moe_group_fn,
+            splitk_reduce_fn,
+            splitk_scratch,
             moe_group_experts,
             moe_group_offsets,
             moe_group_assigns,
@@ -339,10 +399,46 @@ impl Plt1HybRuntime {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn launch_splitk_reduce(
+        &self,
+        partials_ptr: u64,
+        y0: u64,
+        y1: u64,
+        y2: u64,
+        rows0: i32,
+        rows1: i32,
+        rows2: i32,
+        tokens: usize,
+        splits: usize,
+    ) -> Result<()> {
+        let total_rows = (rows0 + rows1 + rows2) as u32;
+        let tokens_i = tokens as i32;
+        let splits_i = splits as i32;
+        let mut b = self.stream.launch_builder(&self.splitk_reduce_fn);
+        b.arg(&partials_ptr)
+            .arg(&y0)
+            .arg(&y1)
+            .arg(&y2)
+            .arg(&rows0)
+            .arg(&rows1)
+            .arg(&rows2)
+            .arg(&tokens_i)
+            .arg(&splits_i);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (total_rows.div_ceil(256), tokens as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(cuda_err)?;
+        Ok(())
+    }
+
     /// Runs 1..=3 HYB Q=5 projections sharing input `x` (and optional `x_up` for SwiGLU)
     /// for `1 <= tokens <= 16`.
-    /// When `zero_self` is false, caller guarantees outputs were already zeroed by the
-    /// previous projection's `zero_next` pointers (eliminating 224 memset_d8_async calls/step).
+    /// Uses deterministic split-K reduction (no `atomicAdd`, no pre-zeroing required).
     #[allow(clippy::too_many_arguments)]
     pub fn run_multi(
         &self,
@@ -350,8 +446,8 @@ impl Plt1HybRuntime {
         x: &CudaSlice<f32>,
         x_up: Option<&CudaSlice<f32>>,
         tokens: usize,
-        zero_next: &[(&mut CudaSlice<f32>, usize)],
-        zero_self: bool,
+        _zero_next: &[(&mut CudaSlice<f32>, usize)],
+        _zero_self: bool,
     ) -> Result<()> {
         let first = matrices[0].0;
         let skip_in = (first.desc.flags & tensor_flags::SKIP_IN_RHT) != 0;
@@ -379,17 +475,6 @@ impl Plt1HybRuntime {
         for (i, (t, y)) in matrices.iter().enumerate() {
             let r = t.desc.rows as usize;
             let y_ptr = y.device_ptr(&self.stream).0;
-            if zero_self {
-                unsafe {
-                    cudarc::driver::result::memset_d8_async(
-                        y_ptr,
-                        0,
-                        tokens * r * std::mem::size_of::<f32>(),
-                        self.stream.cu_stream(),
-                    )
-                    .map_err(cuda_err)?;
-                }
-            }
             tiles[i] = t.tiles.device_ptr(&self.stream).0;
             luts[i] = t.lut.device_ptr(&self.stream).0;
             let s_ptr = t.signs.device_ptr(&self.stream).0;
@@ -401,12 +486,8 @@ impl Plt1HybRuntime {
             rbs[i] = r / 256;
             total_rb += rbs[i];
         }
-        let mut zs = [0u64; 3];
-        let mut ns = [0i32; 3];
-        for (i, (buf, count)) in zero_next.iter().take(3).enumerate() {
-            zs[i] = buf.device_ptr(&self.stream).0;
-            ns[i] = *count as i32;
-        }
+        let zs = [0u64; 3];
+        let ns = [0i32; 3];
 
         let rb0 = rbs[0] as i32;
         let rb1 = if matrices.len() >= 2 {
@@ -422,6 +503,11 @@ impl Plt1HybRuntime {
 
         let x_ptr = x.device_ptr(&self.stream).0;
         let x_up_ptr = x_up.map_or(0u64, |u| u.device_ptr(&self.stream).0);
+        let partials_ptr = if splits > 1 {
+            self.splitk_scratch.device_ptr(&self.stream).0
+        } else {
+            0u64
+        };
         let (cols_i, tokens_i, cps_i) = (cols as i32, tokens as i32, cps as i32);
 
         let mut b = self.stream.launch_builder(func);
@@ -433,7 +519,7 @@ impl Plt1HybRuntime {
         b.arg(&rb0).arg(&rb1).arg(&x_ptr).arg(&x_up_ptr);
         b.arg(&zs[0]).arg(&zs[1]).arg(&zs[2]);
         b.arg(&ns[0]).arg(&ns[1]).arg(&ns[2]);
-        b.arg(&cols_i).arg(&tokens_i).arg(&cps_i);
+        b.arg(&cols_i).arg(&tokens_i).arg(&cps_i).arg(&partials_ptr);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (total_rb as u32, splits as u32, 1),
@@ -442,6 +528,19 @@ impl Plt1HybRuntime {
             })
         }
         .map_err(cuda_err)?;
+        if splits > 1 {
+            self.launch_splitk_reduce(
+                partials_ptr,
+                ys[0],
+                ys[1],
+                ys[2],
+                rows_arr[0],
+                rows_arr[1],
+                rows_arr[2],
+                tokens,
+                splits,
+            )?;
+        }
         Ok(())
     }
 
@@ -505,30 +604,20 @@ impl Plt1HybRuntime {
         let rb0 = (r0 / 256) as i32;
         let total_rb = r0 / 256 + r1 / 256;
         let total_chunks = cols / 256;
-        let splits = (340usize / (total_rb * total_assigns).max(1)).clamp(1, total_chunks);
+        // Keep split count independent of `tokens` so single-token decode (B=1) and
+        // batched speculative verification (B=2..16) have identical FP32 accumulation order.
+        let splits = (340usize / (total_rb * used).max(1)).clamp(1, total_chunks);
         let cps = total_chunks.div_ceil(splits);
         let splits = total_chunks.div_ceil(cps);
 
         let y0 = y_gate.device_ptr(&self.stream).0;
         let y1 = y_up.device_ptr(&self.stream).0;
-        if splits > 1 {
-            unsafe {
-                cudarc::driver::result::memset_d8_async(
-                    y0,
-                    0,
-                    total_assigns * r0 * std::mem::size_of::<f32>(),
-                    self.stream.cu_stream(),
-                )
-                .map_err(cuda_err)?;
-                cudarc::driver::result::memset_d8_async(
-                    y1,
-                    0,
-                    total_assigns * r1 * std::mem::size_of::<f32>(),
-                    self.stream.cu_stream(),
-                )
-                .map_err(cuda_err)?;
-            }
-        }
+        let partials_ptr = if splits > 1 {
+            self.splitk_scratch.device_ptr(&self.stream).0
+        } else {
+            0u64
+        };
+        let total_assigns_i = total_assigns as i32;
 
         let t0 = gate.tiles.device_ptr(&self.stream).0;
         let t1 = up.tiles.device_ptr(&self.stream).0;
@@ -576,7 +665,9 @@ impl Plt1HybRuntime {
             .arg(&cols_i)
             .arg(&used_i)
             .arg(&cps_i)
-            .arg(&splits_i);
+            .arg(&splits_i)
+            .arg(&partials_ptr)
+            .arg(&total_assigns_i);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (total_rb as u32, total_assigns as u32, splits as u32),
@@ -585,6 +676,19 @@ impl Plt1HybRuntime {
             })
         }
         .map_err(cuda_err)?;
+        if splits > 1 {
+            self.launch_splitk_reduce(
+                partials_ptr,
+                y0,
+                y1,
+                0u64,
+                rows0_i,
+                rows1_i,
+                0i32,
+                total_assigns,
+                splits,
+            )?;
+        }
         Ok(())
     }
 
@@ -615,22 +719,18 @@ impl Plt1HybRuntime {
         let cols = down.desc.cols as usize;
         let total_rb = r0 / 256;
         let total_chunks = cols / 256;
-        let splits = (340usize / (total_rb * total_assigns).max(1)).clamp(1, total_chunks);
+        // Keep split count independent of `tokens` for bit-exact B=1 vs B=2..16 parity.
+        let splits = (340usize / (total_rb * used).max(1)).clamp(1, total_chunks);
         let cps = total_chunks.div_ceil(splits);
         let splits = total_chunks.div_ceil(cps);
 
         let y0 = y_down.device_ptr(&self.stream).0;
-        if splits > 1 {
-            unsafe {
-                cudarc::driver::result::memset_d8_async(
-                    y0,
-                    0,
-                    total_assigns * r0 * std::mem::size_of::<f32>(),
-                    self.stream.cu_stream(),
-                )
-                .map_err(cuda_err)?;
-            }
-        }
+        let partials_ptr = if splits > 1 {
+            self.splitk_scratch.device_ptr(&self.stream).0
+        } else {
+            0u64
+        };
+        let total_assigns_i = total_assigns as i32;
 
         let t0 = down.tiles.device_ptr(&self.stream).0;
         let l0 = down.lut.device_ptr(&self.stream).0;
@@ -668,7 +768,9 @@ impl Plt1HybRuntime {
             .arg(&cols_i)
             .arg(&used_i)
             .arg(&cps_i)
-            .arg(&splits_i);
+            .arg(&splits_i)
+            .arg(&partials_ptr)
+            .arg(&total_assigns_i);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (total_rb as u32, total_assigns as u32, splits as u32),
@@ -677,6 +779,19 @@ impl Plt1HybRuntime {
             })
         }
         .map_err(cuda_err)?;
+        if splits > 1 {
+            self.launch_splitk_reduce(
+                partials_ptr,
+                y0,
+                0u64,
+                0u64,
+                rows0_i,
+                0i32,
+                0i32,
+                total_assigns,
+                splits,
+            )?;
+        }
         Ok(())
     }
 }
@@ -785,7 +900,7 @@ mod tests {
             b.arg(&rb0).arg(&rb0).arg(&x_ptr).arg(&zero_u64);
             b.arg(&zero_u64).arg(&zero_u64).arg(&zero_u64);
             b.arg(&zero_i).arg(&zero_i).arg(&zero_i);
-            b.arg(&cols_i).arg(&tokens_i).arg(&cps_i);
+            b.arg(&cols_i).arg(&tokens_i).arg(&cps_i).arg(&zero_u64);
             b.launch(LaunchConfig {
                 grid_dim: (1, 1, 1),
                 block_dim: (512, 1, 1),
@@ -901,7 +1016,7 @@ mod tests {
             b.arg(&rb0).arg(&rb0).arg(&xg_ptr).arg(&xu_ptr);
             b.arg(&zero_u64).arg(&zero_u64).arg(&zero_u64);
             b.arg(&zero_i).arg(&zero_i).arg(&zero_i);
-            b.arg(&cols_i).arg(&tokens_i).arg(&cps_i);
+            b.arg(&cols_i).arg(&tokens_i).arg(&cps_i).arg(&zero_u64);
             b.launch(LaunchConfig {
                 grid_dim: (1, 2, 1), // 2 splits!
                 block_dim: (512, 1, 1),
@@ -1043,7 +1158,7 @@ mod tests {
             b.arg(&rb0).arg(&rb0).arg(&x_ptr).arg(&zero_u64);
             b.arg(&zero_u64).arg(&zero_u64).arg(&zero_u64);
             b.arg(&zero_i).arg(&zero_i).arg(&zero_i);
-            b.arg(&cols_i).arg(&tokens_i).arg(&cps_i);
+            b.arg(&cols_i).arg(&tokens_i).arg(&cps_i).arg(&zero_u64);
             b.launch(LaunchConfig {
                 grid_dim: (1, 2, 1),
                 block_dim: (512, 1, 1),
@@ -1258,7 +1373,7 @@ mod tests {
             .unwrap();
 
             // Gate+Up with splits=2 (d_model=512 -> 2 chunks, cps=1)
-            let (cps_gu, splits_gu) = (1i32, 2i32);
+            let (cps_gu, splits_gu, null_u64, ta_i) = (1i32, 2i32, 0u64, total_assigns as i32);
             let mut b1 = stream.launch_builder(&f_gu);
             b1.arg(&tg).arg(&tu).arg(&lut).arg(&lut);
             b1.arg(&sg).arg(&su).arg(&r1p).arg(&r1p).arg(&rg).arg(&ru);
@@ -1271,7 +1386,9 @@ mod tests {
                 .arg(&d_model_i)
                 .arg(&used_i)
                 .arg(&cps_gu)
-                .arg(&splits_gu);
+                .arg(&splits_gu)
+                .arg(&null_u64)
+                .arg(&ta_i);
             b1.launch(LaunchConfig {
                 grid_dim: ((2 * d_ff / 256) as u32, total_assigns as u32, splits_gu as u32),
                 block_dim: (512, 1, 1),
@@ -1293,7 +1410,9 @@ mod tests {
                 .arg(&d_ff_i)
                 .arg(&used_i)
                 .arg(&cps_d)
-                .arg(&splits_d);
+                .arg(&splits_d)
+                .arg(&null_u64)
+                .arg(&ta_i);
             b2.launch(LaunchConfig {
                 grid_dim: ((d_model / 256) as u32, total_assigns as u32, splits_d as u32),
                 block_dim: (512, 1, 1),
@@ -1537,6 +1656,7 @@ mod tests {
                 })
                 .unwrap();
 
+                let (null_u64, ta_i) = (0u64, total_assigns as i32);
                 let mut b1 = stream.launch_builder(&f_gu);
                 b1.arg(&tg).arg(&tu).arg(&lut).arg(&lut);
                 b1.arg(&sg).arg(&su).arg(&r1p).arg(&r1p).arg(&rg).arg(&ru);
@@ -1549,7 +1669,9 @@ mod tests {
                     .arg(&d_model_i)
                     .arg(&used_i)
                     .arg(&cps_gu)
-                    .arg(&splits_gu);
+                    .arg(&splits_gu)
+                    .arg(&null_u64)
+                    .arg(&ta_i);
                 b1.launch(LaunchConfig {
                     grid_dim: (
                         (2 * d_ff / 256) as u32,
@@ -1573,7 +1695,9 @@ mod tests {
                     .arg(&d_ff_i)
                     .arg(&used_i)
                     .arg(&cps_d)
-                    .arg(&splits_d);
+                    .arg(&splits_d)
+                    .arg(&null_u64)
+                    .arg(&ta_i);
                 b2.launch(LaunchConfig {
                     grid_dim: (
                         (d_model / 256) as u32,
@@ -1823,6 +1947,7 @@ mod tests {
                     )
                     .unwrap();
                 }
+                let (null_u64, ta_i) = (0u64, total_assigns as i32);
                 let mut b1 = stream.launch_builder(&f_gu);
                 b1.arg(&tg).arg(&tu).arg(&lut).arg(&lut);
                 b1.arg(&sg).arg(&su).arg(&r1p).arg(&r1p).arg(&rg).arg(&ru);
@@ -1835,7 +1960,9 @@ mod tests {
                     .arg(&d_model_i)
                     .arg(&used_i)
                     .arg(&cps_gu_i)
-                    .arg(&splits_gu_i);
+                    .arg(&splits_gu_i)
+                    .arg(&null_u64)
+                    .arg(&ta_i);
                 b1.launch(LaunchConfig {
                     grid_dim: (rb_gu as u32, total_assigns as u32, splits_gu as u32),
                     block_dim: (512, 1, 1),
@@ -1864,7 +1991,9 @@ mod tests {
                     .arg(&d_ff_i)
                     .arg(&used_i)
                     .arg(&cps_d_i)
-                    .arg(&splits_d_i);
+                    .arg(&splits_d_i)
+                    .arg(&null_u64)
+                    .arg(&ta_i);
                 b2.launch(LaunchConfig {
                     grid_dim: (rb_d as u32, total_assigns as u32, splits_d as u32),
                     block_dim: (512, 1, 1),

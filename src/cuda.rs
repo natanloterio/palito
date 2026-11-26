@@ -933,6 +933,9 @@ pub struct CudaBackend {
     /// Optional PLT1 HYB Q=5 projection overlay (loaded via `load_plt1_projections`).
     #[cfg(feature = "qtip-research")]
     plt1_hyb: Option<plt1::Plt1HybRuntime>,
+    /// Canonical path of the loaded PLT1 projection overlay (guards against double-folding).
+    #[cfg(feature = "qtip-research")]
+    plt1_path: Option<std::path::PathBuf>,
     /// Evaluated token history for automatic EAGLE-3 + SuffixDecoding in `sample_decode_tokens`.
     prompt_history: Vec<i32>,
     /// Start position of the last evaluated chunk still sitting in `eagle3.tap_hidden`.
@@ -1268,6 +1271,7 @@ impl CudaBackend {
                 "attention_split_head_decode",
                 "attention_split_group",
                 "attention_split_group_decode",
+                "attention_split_group_batch",
                 "attention_prefill_flash4",
                 "attention_prefill_flash4_dim",
                 "gemm_packed_dense",
@@ -1275,6 +1279,7 @@ impl CudaBackend {
                 "group_experts_fast32",
                 "attention_combine_group",
                 "attention_combine_group_decode",
+                "attention_combine_group_batch",
                 "attention_combine_wide",
                 "attention_combine_wide_decode",
                 "attention_combine_chunks_decode",
@@ -1590,6 +1595,8 @@ impl CudaBackend {
             eagle3: None,
             #[cfg(feature = "qtip-research")]
             plt1_hyb: None,
+            #[cfg(feature = "qtip-research")]
+            plt1_path: None,
             prompt_history: Vec::new(),
             eagle3_pending_start: 0,
         };
@@ -2328,29 +2335,61 @@ impl CudaBackend {
                     &w
                 );
             }
-            let fused_norm = self.matmul.f32_tiled() && s.width <= FUSED_NORM_MAX_WIDTH;
-            let fused_ffn_norm = match &l.ffn_norm {
-                Some(norm)
-                    if fused_norm
-                        && l.post_norms.is_none()
-                        && !s.parallel_residual
-                        && !olmo2
-                        && affine.is_none() =>
-                {
-                    launch!(
-                        self,
-                        "residual_rmsnorm",
-                        (1, 1, 1); 1024,
-                        &mut self.work.x,
-                        &self.work.projected,
-                        &norm.bytes,
-                        &mut self.work.normalized,
-                        &w,
-                        &s.epsilon
-                    );
-                    true
+            #[cfg(feature = "qtip-research")]
+            let plt1_active = self.plt1_hyb.is_some();
+            #[cfg(not(feature = "qtip-research"))]
+            let plt1_active = false;
+            #[cfg(feature = "qtip-research")]
+            let plt1_fused_norm = self
+                .plt1_hyb
+                .as_ref()
+                .is_some_and(|p| p.folded_rmsnorm)
+                && self.functions.contains_key("residual_unit_norm")
+                && !olmo2
+                && affine.is_none()
+                && l.post_norms.is_none()
+                && !s.parallel_residual
+                && s.used == 1;
+            #[cfg(not(feature = "qtip-research"))]
+            let plt1_fused_norm = false;
+            let fused_norm =
+                !plt1_active && self.matmul.f32_tiled() && s.width <= FUSED_NORM_MAX_WIDTH;
+            let fused_ffn_norm = if plt1_fused_norm {
+                launch!(
+                    self,
+                    "residual_unit_norm",
+                    (1, 1, 1),
+                    &mut self.work.x,
+                    &self.work.projected,
+                    &mut self.work.normalized,
+                    &w,
+                    &s.epsilon
+                );
+                true
+            } else {
+                match &l.ffn_norm {
+                    Some(norm)
+                        if fused_norm
+                            && l.post_norms.is_none()
+                            && !s.parallel_residual
+                            && !olmo2
+                            && affine.is_none() =>
+                    {
+                        launch!(
+                            self,
+                            "residual_rmsnorm",
+                            (1, 1, 1); 1024,
+                            &mut self.work.x,
+                            &self.work.projected,
+                            &norm.bytes,
+                            &mut self.work.normalized,
+                            &w,
+                            &s.epsilon
+                        );
+                        true
+                    }
+                    _ => false,
                 }
-                _ => false,
             };
             if fused_ffn_norm {
             } else if let Some([post_attn, _]) = &l.post_norms {
@@ -2677,7 +2716,19 @@ impl CudaBackend {
                 .get(index + 1)
                 .filter(|next| next.affine.is_none() && !olmo2)
                 .and_then(|next| next.norm.as_ref());
-            if let Some([_, post_ffn]) = &l.post_norms {
+            if plt1_fused_norm && index + 1 < self.weights.layers.len() {
+                launch!(
+                    self,
+                    "residual_unit_norm",
+                    (1, 1, 1),
+                    &mut self.work.x,
+                    &self.work.down,
+                    &mut self.work.normalized,
+                    &w,
+                    &s.epsilon
+                );
+                attention_normalized = true;
+            } else if let Some([_, post_ffn]) = &l.post_norms {
                 gemma_post_norm!(self, down, post_ffn, 1, w, s.epsilon);
             } else if let Some(norm) = next_norm.filter(|_| fused_norm) {
                 launch!(
@@ -3320,12 +3371,32 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// Returns `true` if a PLT1 HYB Q=5 projection overlay is loaded.
+    #[cfg(feature = "qtip-research")]
+    pub fn has_plt1(&self) -> bool {
+        self.plt1_hyb.is_some()
+    }
+
     /// Loads all attention & MLP projections from a `.palito` (`PLT1 HYB Q=5`)
     /// file onto the GPU, replacing the GGUF projections at runtime. When
     /// `FOLDED_RMSNORM` is set in the PLT1 header, layer RMSNorm weights are set
     /// to 1.0 (unit-variance RMSNorm) since gamma was folded offline.
+    ///
+    /// Idempotent when called again with the same PLT1 file (e.g. a caller passing
+    /// `--plt1 $B` after `CudaBackend::open($B)` already auto-loaded it). Rejects
+    /// loading a different PLT1 file because folded norms and MoE routers are
+    /// mutated in-place on first load.
     #[cfg(feature = "qtip-research")]
     pub fn load_plt1_projections(&mut self, path: &Path) -> Result<()> {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if self.plt1_hyb.is_some() {
+            if self.plt1_path.as_ref() == Some(&canonical) {
+                return Ok(());
+            }
+            return Err(invalid(
+                "PLT1 projections are already loaded; cannot load a different PLT1 file",
+            ));
+        }
         let rt = plt1::Plt1HybRuntime::open(path, self.stream.context(), self.stream.clone())?;
         if rt.layers.len() != self.weights.layers.len() {
             return Err(invalid(format!(
@@ -3405,6 +3476,7 @@ impl CudaBackend {
             }
         }
         self.plt1_hyb = Some(rt);
+        self.plt1_path = Some(canonical);
         Ok(())
     }
 

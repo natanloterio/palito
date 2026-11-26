@@ -61,6 +61,15 @@ fn decode_and_damp(bytes: &[u8], dim: usize, damping: f64, label: &str) -> Resul
 }
 
 impl Hessians {
+    /// An empty Hessian store (causes exporters to fall back to damped identity `H = I`).
+    pub fn empty() -> Self {
+        Self {
+            dir: PathBuf::new(),
+            tokens: 0,
+            tensors: BTreeMap::new(),
+        }
+    }
+
     pub fn open(dir: &Path) -> Result<Self> {
         let text = fs::read_to_string(dir.join("manifest.json"))?;
         let manifest: Manifest = serde_json::from_str(&text)?;

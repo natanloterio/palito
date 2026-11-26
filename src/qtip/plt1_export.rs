@@ -526,11 +526,11 @@ pub fn export_gguf_to_plt1(
         // Offline RMSNorm folding for residual-input projections when enabled:
         // load undamped H first so scaling by diag(1/gamma) does not amplify
         // damping on tiny-gamma channels, then damp H' cleanly.
+        let has_h = hessians.contains(name);
         let h = if opts.fold_residual_rht
             && let Some(norm_name) = rmsnorm_name_for(name)
             && let Some(norm_tensor) = model.tensors.get(&norm_name)
         {
-            let mut h_raw = hessians.load(name, cols, 0.0)?;
             let mut gamma = vec![0.0f32; cols];
             norm_tensor.row(0, &mut gamma);
             for row in weights.chunks_exact_mut(cols) {
@@ -538,10 +538,25 @@ pub fn export_gguf_to_plt1(
                     *w *= g;
                 }
             }
-            fold_rmsnorm_hessian(&mut h_raw, &gamma, cols, f64::from(opts.damping));
-            h_raw
-        } else {
+            if has_h {
+                let mut h_raw = hessians.load(name, cols, 0.0)?;
+                fold_rmsnorm_hessian(&mut h_raw, &gamma, cols, f64::from(opts.damping));
+                h_raw
+            } else {
+                let mut h_id = vec![0.0f64; cols * cols];
+                for i in 0..cols {
+                    h_id[i * cols + i] = 1.0 + f64::from(opts.damping);
+                }
+                h_id
+            }
+        } else if has_h {
             hessians.load(name, cols, f64::from(opts.damping))?
+        } else {
+            let mut h_id = vec![0.0f64; cols * cols];
+            for i in 0..cols {
+                h_id[i * cols + i] = 1.0 + f64::from(opts.damping);
+            }
+            h_id
         };
 
         let tensor_seed = opts.seed ^ (idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -682,4 +697,113 @@ pub fn strip_projections_to_skeleton_gguf(input: &Path, output: &Path) -> Result
         ));
     }
     crate::gguf::write_gguf(output, &original, &directory, &kept)
+}
+
+/// Summary returned by [`pack_palito_bundle`].
+#[derive(Debug, Clone)]
+pub struct BundleReport {
+    pub skeleton_bytes: u64,
+    pub eagle3_tensors: usize,
+    pub total_bytes: u64,
+}
+
+/// Packs a base GGUF (stripped to tokenizer/metadata/embeddings/norms/LM head),
+/// a `PLT1` layers file, and an optional `EAGLE-3` draft head into one
+/// self-contained `.palito` file.
+pub fn pack_palito_bundle(
+    base_gguf: &Path,
+    plt1_layers: &Path,
+    eagle3: Option<&Path>,
+    output: &Path,
+) -> Result<BundleReport> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let skeleton_tmp = output.with_extension("skeleton.gguf.tmp");
+    strip_projections_to_skeleton_gguf(base_gguf, &skeleton_tmp)?;
+    let skeleton_bytes = std::fs::read(&skeleton_tmp)?;
+    let _ = std::fs::remove_file(&skeleton_tmp);
+    let skeleton_len = skeleton_bytes.len() as u64;
+
+    let mut layers_file = File::open(plt1_layers)?;
+    let layers_idx = Plt1Index::read_from(&mut layers_file)?;
+    let mut header = layers_idx.header.clone();
+    if eagle3.is_some() {
+        header.flags |= flags::HAS_EAGLE3;
+    }
+
+    let mut writer = Plt1Writer::new(header);
+    writer.add_section(SectionKind::BaseGguf, 0, skeleton_bytes);
+
+    let read_slice = |f: &mut File, off: u64, size: u64| -> std::io::Result<Vec<u8>> {
+        f.seek(SeekFrom::Start(off))?;
+        let mut buf = vec![0u8; size as usize];
+        f.read_exact(&mut buf)?;
+        Ok(buf)
+    };
+
+    if let Some(meta) = layers_idx
+        .sections
+        .iter()
+        .find(|s| s.kind == SectionKind::MetadataJson)
+    {
+        let data = read_slice(&mut layers_file, meta.offset, meta.size)?;
+        writer.add_section(SectionKind::MetadataJson, meta.flags, data);
+    }
+
+    for desc in &layers_idx.tensors {
+        let data = read_slice(&mut layers_file, desc.data_offset, desc.data_size)?;
+        let lut = if desc.lut_offset != 0 && desc.lut_bits > 0 {
+            let lut_bytes = read_slice(
+                &mut layers_file,
+                desc.lut_offset,
+                (1u64 << desc.lut_bits) * 4,
+            )?;
+            Some(
+                lut_bytes
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        writer.add_tensor(desc.clone(), data, lut);
+    }
+
+    let mut eagle3_tensors = 0usize;
+    if let Some(eagle_path) = eagle3 {
+        let mut ef = File::open(eagle_path)?;
+        let eidx = Plt1Index::read_from(&mut ef)?;
+        let esec = eidx
+            .sections
+            .iter()
+            .find(|s| s.kind == SectionKind::Eagle3SpecHead)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "eagle3 file {} has no Eagle3SpecHead section",
+                    eagle_path.display()
+                ))
+            })?;
+        let edata = read_slice(&mut ef, esec.offset, esec.size)?;
+        writer.add_section(SectionKind::Eagle3SpecHead, esec.flags, edata);
+        for desc in &eidx.tensors {
+            let data = read_slice(&mut ef, desc.data_offset, desc.data_size)?;
+            writer.add_tensor(desc.clone(), data, None);
+        }
+        eagle3_tensors = eidx.tensors.len();
+    }
+
+    let partial = output.with_extension("palito.partial");
+    {
+        let out_file = File::create(&partial)?;
+        let mut bw = BufWriter::new(out_file);
+        writer.write_to(&mut bw)?;
+    }
+    std::fs::rename(&partial, output)?;
+    let total_bytes = std::fs::metadata(output)?.len();
+    Ok(BundleReport {
+        skeleton_bytes: skeleton_len,
+        eagle3_tensors,
+        total_bytes,
+    })
 }

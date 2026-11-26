@@ -100,7 +100,13 @@ palito chat --model models/qwen3-8b.palito --stats
 palito serve --model models/qwen3-30b-a3b.palito
 ```
 
-To build your own `.palito` file from a GGUF model (now GPU-accelerated with CUDA Viterbi + CUDA MoE Hessian collection), see the **[`.palito` (`PLT1`) Format & 1,000+ tok/s Guide](docs/plt1-format.md)** (`collect-hessians-cuda` → `gguf-to-plt1` → `pack-palito`).
+To convert any GGUF model into a single `.palito` file in one command (with automatic CUDA Hessian calibration and CUDA Viterbi quantization):
+
+```sh
+palito convert --input models/Qwen3-8B-Q6_K.gguf --output models/qwen3-8b.palito
+```
+
+See the **[`.palito` (`PLT1`) Format & 1,000+ tok/s Guide](docs/plt1-format.md)** for optional `EAGLE-3` bundling and advanced options.
 
 ---
 

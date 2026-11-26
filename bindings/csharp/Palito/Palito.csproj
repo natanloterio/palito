@@ -6,7 +6,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <PackageId>Palito</PackageId>
-    <Version>0.13.0</Version>
+    <Version>0.14.0</Version>
     <Description>Ultra-fast local LLM inference for C# and .NET powered by Rust, custom CUDA/Vulkan/Metal kernels, PLT1/QTIP quantization, and native EAGLE-3 speculative decoding (up to 1,000+ tok/s on Llama 3.1 8B) — no llama.cpp required.</Description>
     <PackageTags>llm;gguf;inference;cuda;ai;local-llm;qwen;llama</PackageTags>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>

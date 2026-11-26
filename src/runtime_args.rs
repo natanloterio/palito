@@ -405,13 +405,19 @@ impl RuntimeArgs {
         #[cfg(feature = "cuda")]
         match backend {
             LocalBackend::Cuda => {
+                let options = self.cuda_options();
+                let kv_precision = if options.matmul == palito::cuda::CudaMatmul::Int8Fast {
+                    "f16"
+                } else {
+                    "f32"
+                };
                 return json!({
-                    "backend": "cuda", "options": self.cuda_options(),
+                    "backend": "cuda", "options": options,
                     "expert_residency": "all weights GPU-resident",
                     "prefill": if self.batch() > 1 {
                         "layer-wise batched (internal capacity <=4096)"
                     } else { "sequential token steps" },
-                    "kv_precision": "f32",
+                    "kv_precision": kv_precision,
                 });
             }
             LocalBackend::Reference => {}

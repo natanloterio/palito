@@ -234,6 +234,7 @@ impl MetalBackend {
                 "Metal requires a positive device budget and context <= 65535",
             ));
         }
+        crate::plt1::reject_on_backend(path, "Metal")?;
         let all = MtlDevice::all();
         let device = if options.device == 0 {
             MtlDevice::system_default()

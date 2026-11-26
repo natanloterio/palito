@@ -4,8 +4,9 @@
 # - A published release builds its tag and uploads both archives to it.
 # - A manual run (Actions > cli-bundles > Run workflow) does the same for an
 #   existing tag, e.g. to add the bundles to a release made before this workflow.
-# - Pull requests that touch the packaging or the model download code only
-#   build and smoke-test (the only place pull runs on macOS and Windows); the
+# - Pull requests that touch the packaging, the model download code or the
+#   Metal/Vulkan backends only build and smoke-test (the only place pull and
+#   Metal run on macOS and Windows); the
 #   archives are kept as workflow artifacts.
 # All three bundles come from scripts/package.sh; the Linux CUDA one stays
 # manual (`scripts/package.sh linux-x86_64` needs a local NVRTC 13).
@@ -24,6 +25,11 @@ on:
       - "scripts/package.sh"
       - "scripts/test_package.py"
       - "src/hub/**"
+      - "src/metal.rs"
+      - "src/metal/**"
+      - "src/vulkan.rs"
+      - "src/vulkan/**"
+      - "src/plt1.rs"
       - ".github/workflows/cli-bundles.yml"
 
 permissions:
@@ -82,7 +88,37 @@ jobs:
           "$bin" list --available | grep qwen3-8b
           model="$("$bin" pull --quiet bartowski/SmolLM2-135M-Instruct-GGUF:SmolLM2-135M-Instruct-Q4_K_M.gguf)"
           "$bin" list | grep SmolLM2
-          "$bin" generate --model "$model" --prompt "The capital of France is" --tokens 8 | grep -q '"text"'
+          "$bin" generate --model "$model" --prompt "The capital of France is" --tokens 8 > cpu.json
+          grep -q '"text":" Paris' cpu.json || { cat cpu.json; exit 1; }
+          echo "MODEL=$model" >> "$GITHUB_ENV"
+      # The GPU backend must produce the CPU's tokens (greedy) and refuse .palito
+      # models. Hosted Windows runners have no Vulkan device: reported, not failed.
+      - name: GPU smoke test (${{ matrix.features }})
+        env:
+          PALITO_MODELS: ${{ runner.temp }}/models
+        run: |
+          bin="target/dist/${{ steps.package.outputs.name }}/${{ matrix.exe }}"
+          tokens() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sample"]["generated_tokens"])' "$1" 2>/dev/null \
+            || python -c 'import json,sys; print(json.load(open(sys.argv[1]))["sample"]["generated_tokens"])' "$1"; }
+          if ! "$bin" generate --backend ${{ matrix.features }} --model "$MODEL" --prompt "The capital of France is" --tokens 8 > gpu.json 2> gpu.err; then
+            cat gpu.err
+            if [ "$RUNNER_OS" = Windows ] && grep -qi 'vulkan' gpu.err; then
+              echo "::notice::no Vulkan device on this runner; Vulkan inference not tested here"
+              exit 0
+            fi
+            exit 1
+          fi
+          cat gpu.json
+          [ "$(tokens cpu.json)" = "$(tokens gpu.json)" ] || { echo "GPU tokens differ from CPU" >&2; exit 1; }
+          printf 'PALITO1\0not a real bundle' > fake.palito
+          if "$bin" generate --backend ${{ matrix.features }} --model fake.palito --prompt hi 2> refuse.err; then exit 1; fi
+          grep -q 'cannot run .palito models' refuse.err || { cat refuse.err; exit 1; }
+      - name: Metal backend tests
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p models
+          cp "$MODEL" models/SmolLM2-135M-Instruct-Q4_K_M.gguf
+          cargo test --release --features metal --test metal -- --include-ignored
       - name: Keep the archive
         uses: actions/upload-artifact@v4
         with:

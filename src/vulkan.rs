@@ -173,6 +173,7 @@ impl VulkanBackend {
                 "Vulkan requires a positive device budget and context <= 65535",
             ));
         }
+        crate::plt1::reject_on_backend(path, "Vulkan")?;
         let ctx = VkContext::new(options.device)?;
         let mut raw = Weights::open(path, config)?;
         if raw.position_embedding.is_some()

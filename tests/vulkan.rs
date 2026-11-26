@@ -92,3 +92,17 @@ fn vulkan_engine_runs_modern_architectures() {
     }
     let _ = GenerationMode::FixedLength;
 }
+
+/// `.palito` (PLT1) weights have only CUDA and CPU kernels: Vulkan must refuse
+/// them before touching the GPU instead of running the bundle's GGUF skeleton
+/// and printing garbage.
+#[test]
+fn vulkan_refuses_palito_models() {
+    let path = std::env::temp_dir().join(format!("palito-vk-plt1-{}.palito", std::process::id()));
+    std::fs::write(&path, b"PALITO1\0not a real bundle").unwrap();
+    let result = VulkanBackend::open(&path, &config(), VulkanOptions::default());
+    let _ = std::fs::remove_file(&path);
+    let Err(error) = result else { panic!("Vulkan opened a .palito model") };
+    let text = error.to_string();
+    assert!(text.contains(".palito") && text.contains("--backend cpu"), "{text}");
+}

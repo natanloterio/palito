@@ -54,6 +54,31 @@ impl Drop for CudaBackend {
     }
 }
 
+/// Maximum KV position where automatic EAGLE-3 + SuffixDecoding stays enabled
+/// when a captured single-token CUDA decode graph is available. Above this
+/// threshold, 8-token verification re-reads the KV cache 8x and becomes slower
+/// than pipelined single-token CUDA Graph decode (override with `PALITO_FORCE_EAGLE3=1`).
+pub(super) const EAGLE3_MAX_AUTO_CONTEXT: usize = 4096;
+
+impl CudaBackend {
+    pub(super) fn auto_eagle3_active(&self, end_position: usize) -> bool {
+        if self.eagle3.is_none() {
+            return false;
+        }
+        let force = std::env::var("PALITO_FORCE_EAGLE3")
+            .is_ok_and(|v| !v.is_empty() && v != "0");
+        if force {
+            return true;
+        }
+        if self.decode.as_ref().is_some_and(|d| d.has_graph())
+            && end_position >= EAGLE3_MAX_AUTO_CONTEXT
+        {
+            return false;
+        }
+        true
+    }
+}
+
 impl CudaBackend {
     pub(super) fn capture_decode_graph(&mut self) -> Result<()> {
         self.stream.synchronize().map_err(failure)?;
@@ -216,8 +241,9 @@ impl CudaBackend {
             return Ok(vec![first]);
         }
         // Automatic Hybrid EAGLE-3 + SuffixDecoding when a `.palito` bundle with
-        // an embedded EAGLE-3 draft head is loaded (100% lossless greedy parity).
-        if self.eagle3.is_some() && !self.prompt_history.is_empty() {
+        // an embedded EAGLE-3 draft head is loaded (100% lossless greedy parity),
+        // gated off at long context where pipelined CUDA Graph single-token decode is faster.
+        if self.auto_eagle3_active(self.state.position) && !self.prompt_history.is_empty() {
             return self.sample_eagle3_hybrid_tokens(first, count, until_eog, sink);
         }
         // Uncaptured PLT1 without EAGLE-3: step token-by-token.

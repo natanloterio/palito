@@ -1,5 +1,7 @@
 # Architecture: Palito, an independent Rust GGUF engine
 
+> Paths under `results/` name local run outputs (JSON checkpoints and summaries) that are not committed to the repository.
+
 ## Scope, revision, and evidence
 
 This is a model of **the working tree refreshed on 2026-11-17**, including the
@@ -28,7 +30,7 @@ move code.
   incorporated, including runtime residual arithmetic, reusable quantization
   workspace, profile-gated normalized attention, and ignored full-model quality
   tests. At refresh, all **38 source/configuration entries** in the latest
-  [candidate provenance](../results/cuda-runtime-m8-mma3-small-acceptance/paired/b1/provenance.json)
+  candidate provenance (`results/cuda-runtime-m8-mma3-small-acceptance/paired/b1/provenance.json`)
   matched the working tree by SHA-256. This checks recorded source identity, not
   a newly rebuilt executable or completeness of the manifest.
 - Source, manifest, native reference adapters, tests, scripts, existing benchmark
@@ -42,7 +44,7 @@ measurement, not reproduced here; **H** = hypothesis requiring measurement;
 measurements, and source inspection alone cannot prove a bottleneck.
 
 The [runtime README](../README.md) remains the operational index.
-The [literature review](../literature_review/review.md), especially section 6,
+The literature review, especially section 6,
 discusses alternatives; those are not automatically implemented here.
 
 ## 1. System context and supported scope
@@ -97,7 +99,7 @@ Sources: [Cargo.toml](../Cargo.toml), features and targets, lines 10-48;
 [cpu.rs](../src/cpu.rs), `CpuBackend::open_with_options`, line 245;
 [transformer.rs](../src/transformer.rs), `Weights::open`, line 82;
 [cuda.rs](../src/cuda.rs), `CudaBackend::open`;
-[reference.rs](../src/cuda/reference.rs), `ReferenceBackend`, line 41;
+[reference.rs](../src/reference.rs), `ReferenceBackend`, line 41;
 [backend.rs](../src/backend.rs), `Backend` and `RequestBackend`,
 lines 53 and 185.
 
@@ -499,7 +501,7 @@ normalization loops use Rayon parallel iterators. Reference evaluation iterates
 tokens serially and allocates temporary vectors per step/layer; it is a
 correctness aid, not a throughput competitor
 ([cpu.rs](../src/cpu.rs), `attend`, line 199; `forward`, line 485;
-[reference.rs](../src/cuda/reference.rs), `step`, line 92;
+[reference.rs](../src/reference.rs), `step`, line 92;
 [batch.rs](../src/cuda/batch.rs), `batched_prefill`).
 
 CUDA routing uses lowest-index tie breaks and renormalizes probabilities over
@@ -542,10 +544,10 @@ production batching is in `batch.rs`, and production CUDA prefill source is
 Do not confuse those Rust harness modules with runtime `include_str!` of
 `residual.cu`/`residual_tile.cu` for two-component research or
 `residual.cu`/`residual_precise.cu`/`residual_mma.cu` for MMA3.
-Older [matrix-only evidence](../results/cuda-runtime-m8-residual-matrices/checkpoint.json)
+Older matrix-only evidence (`results/cuda-runtime-m8-residual-matrices/checkpoint.json`)
 predates full-model integration. The later
-[two-component rejection](../results/cuda-runtime-m8-int8-model/checkpoint.json)
-and [MMA3 small-prefix admission](../results/cuda-runtime-m8-mma3-small-acceptance/checkpoint.json)
+two-component rejection (`results/cuda-runtime-m8-int8-model/checkpoint.json`)
+and MMA3 small-prefix admission (`results/cuda-runtime-m8-mma3-small-acceptance/checkpoint.json`)
 supersede it for those explicit modes, not for defaults.
 
 ### Residual prefill arithmetic and fallback boundaries
@@ -672,7 +674,7 @@ times head dimension, `B` batch capacity, `S` speculative window, and `V` vocabu
 Sources: [cpu.rs](../src/cpu.rs), state structs, lines 22-159;
 allocation/admission, lines 315-483; transactions/prefixes, lines 634-931;
 [kernels.rs](../src/kernels.rs), `packed_row`, line 16;
-[reference.rs](../src/cuda/reference.rs), lines 41-110;
+[reference.rs](../src/reference.rs), lines 41-110;
 [cuda.rs](../src/cuda.rs), `DeviceTensor::upload`, `Workspace`,
 `workspace_sizes`, and `CudaBackend::open` admission/allocation;
 [decode.rs](../src/cuda/decode.rs), `DecodeState`, line 4.
@@ -685,7 +687,7 @@ small-prefix extension adds no memory over the earlier MMA3 profile.
 These are accounted reservations, not GPU RSS or input-dependent live occupancy
 ([cuda.rs](../src/cuda.rs), `residual_workspace_bytes`,
 `group_workspace_elements`, and `Workspace::new`;
-[small-capacity report](../results/cuda-runtime-m8-mma3-small-model/small-capacity-summary.json)).
+small-capacity report (`results/cuda-runtime-m8-mma3-small-model/small-capacity-summary.json`)).
 
 **F:** CPU `--memory-limit-bytes` limits counted numerical reservations, not RSS,
 file-loading peaks, metadata, allocator/container overhead, worker stacks, or
@@ -795,7 +797,7 @@ research use ignored tests with bounded capture/model/routing guards. Those
 harnesses exercise the explicit runtime research modes; they are not a new
 serving endpoint. Captured routing with synthetic matrix operands is not a
 full-model inference benchmark
-([reference.rs](../src/cuda/reference.rs), `trace_at`, line 76;
+([reference.rs](../src/reference.rs), `trace_at`, line 76;
 [model_replay.rs](../src/cuda/model_replay.rs), ignored entry points,
 lines 274-289; [grouped_bench.rs](../src/cuda/grouped_bench.rs),
 `parse_routing`, line 381).
@@ -841,7 +843,7 @@ omissions avoid promoting directory contents into active architectural roles.
 | CUDA prefill, dense/MoE math and kernel dispatch | Feature/profile-gated: `GPUK`, focused forward nodes | [batch.rs](../src/cuda/batch.rs), `batched_prefill`; [kernels.cu](../src/cuda/kernels.cu); [prefill.cu](../src/cuda/prefill.cu) |
 | Residual preparation, integer projections, scratch, normalized attention | Explicit research-profile runtime paths: `RESIDUAL`, `QWORK`, `GPUSTATE`, `GPUK` | [cuda.rs](../src/cuda.rs), `CudaMatmul`, workspace/admission and JIT selection; [batch.rs](../src/cuda/batch.rs), actual-chunk/format/width dispatch; [attention.cu](../src/cuda/attention.cu), MMA3-only score normalization |
 | Captured decode and device greedy sampling | Opt-in: `CUDA`, `GPUK`, `GPUSTATE` | [decode.rs](../src/cuda/decode.rs), line 42; [decode.cu](../src/cuda/decode.cu), line 51 |
-| Packed CPU transformer oracle | Active selectable, CUDA feature only: `REF`, `CKERN` | [reference.rs](../src/cuda/reference.rs), line 41; own host state elided from master |
+| Packed CPU transformer oracle | Active selectable, CUDA feature only: `REF`, `CKERN` | [reference.rs](../src/reference.rs), line 41; own host state elided from master |
 | KTransformers adapter and second CLI | Feature-gated: `KT`, `KT_SERVICE` | [ktransformers.rs](../src/ktransformers.rs), line 167; [bin/ktransformers.rs](../src/bin/ktransformers.rs), line 71 |
 | Diagnostic capture, traces, precision tools | Active opt-in APIs/examples: `CUDA`, `REF`, `REPORTS` | [diagnostics.rs](../src/cuda/diagnostics.rs), line 333; examples are not default inference paths |
 | Arithmetic/grouped/packed/prefill/model replay/residual/quality research | Rust harnesses test-only: `HARNESS`/`REPORTS`; runtime residual kernels separately shown as `RESIDUAL` | [cuda.rs](../src/cuda.rs), test-gated module declarations; [model_quality.rs](../src/cuda/model_quality.rs), ignored `residual_full_model_quality`; individual experimental tiles elided from master, not mistaken for active defaults |
@@ -850,7 +852,7 @@ omissions avoid promoting directory contents into active architectural roles.
 | Benchmark orchestration and retained evidence | `HARNESS`, `REPORTS` | [benchmark_cuda_iteration.py](../scripts/benchmark_cuda_iteration.py); [benchmark_cuda_paired.py](../scripts/benchmark_cuda_paired.py); [benchmark_moe.py](../scripts/benchmark_moe.py); milestone documents |
 | Native reference, ABI bridge, matched-precision oracle | External-only: `REFERENCE` | [native/CMakeLists.txt](../native/CMakeLists.txt); [native/bridge.h](../native/bridge.h); oracle sources/build script |
 | Legacy control-plane implementation | Inactive; no dedicated runtime nodes | [benchmarks/legacy/](../benchmarks/legacy/); not selected by current manifest |
-| Literature review and bibliography | Research documentation; omitted from runtime diagrams | [literature_review/](../literature_review/); staged designs are proposals, not implementation |
+| Literature review and bibliography | Research documentation; omitted from runtime diagrams | the literature review; staged designs are proposals, not implementation |
 | Local llama.cpp and vLLM checkouts | External reference/resource, not runtime modules | llama.cpp accessed by explicit harness/build paths; no vLLM adapter/dependency in runtime source/manifest. Their internal schedulers/kernels are outside this model |
 | Build outputs, models, virtual environments, results | Artifacts, not components | Used only by explicit commands; result artifacts are local/untracked, may be absent in a clean clone |
 | Serving queues, streamed API, cooperative cancellation, multi-GPU and distributed state | Not implemented locally; no invented views | `Backend` and `Executor` contracts expose none; KT internals remain external/unknown |
@@ -913,7 +915,7 @@ Mechanisms are located in the initialization/flow/resource sources above;
 especially [kernels.rs](../src/kernels.rs), lines 16-48 and 231-305;
 [cpu.rs](../src/cpu.rs), lines 485-625;
 [batch.rs](../src/cuda/batch.rs), `batched_prefill` and residual macros;
-[reference.rs](../src/cuda/reference.rs), lines 92-210;
+[reference.rs](../src/reference.rs), lines 92-210;
 [ktransformers.rs](../src/ktransformers.rs), lines 117-164 and 261-355.
 
 ### 8.2 Existing measurements, with scope limits
@@ -941,35 +943,35 @@ independently revalidated against every raw sample.
 | Fresh retained external control | llama.cpp F32-KV prefill remains **4.76x/4.33x/5.99x** faster at46/256/512 tokens; short decode344.64 versus Rust176.30tok/s (**1.95x**) | Same retained acceptance series, external revision recorded below. Rust ABBA precedes llama controls, timing boundaries/arithmetic differ, and 1-token-prefix decode IDs differ across engines. No cross-engine equivalence or overall superiority |
 
 Evidence:
-[packed comparison](../results/rust-packed-smollm2-run2/comparison.json),
+packed comparison (`results/rust-packed-smollm2-run2/comparison.json`),
 `summary.short`;
-[CPU policies](../results/rust-cpu-policies-run1/validation.json),
+CPU policies (`results/rust-cpu-policies-run1/validation.json`),
 `variants`;
 [CPU discussion](../README.md), section "Packed CPU results and measured policies";
-[wave6c checkpoint](../results/cuda-runtime-m8-wave6c/checkpoint.json),
+wave6c checkpoint (`results/cuda-runtime-m8-wave6c/checkpoint.json`),
 `profile`, `performance`, `performance_gates`, `moe_memory`, `profiling`, `caveats`;
-[paired samples](../results/cuda-runtime-m8-wave6c/paired-public-profile/paired.json);
-[matched-precision checkpoint](../results/moe-numerical-fix/checkpoint.json);
-[INT8 quality](../results/cuda-runtime-m8-int8-model/quality-summary.json);
-[MMA3 quality](../results/cuda-runtime-m8-mma3-small-model/quality-summary.json),
-[unchanged snapshots](../results/cuda-runtime-m8-mma3-small-model/checkpoint.json),
-[small capacities](../results/cuda-runtime-m8-mma3-small-model/small-capacity-summary.json);
-[attention quality](../results/cuda-runtime-m8-attention-normalized/quality-summary.json),
-[attention performance](../results/cuda-runtime-m8-attention-normalized/performance-summary.json);
-[small-prefix performance](../results/cuda-runtime-m8-mma3-small-acceptance/performance-summary.json),
-[paired controls](../results/cuda-runtime-m8-mma3-small-acceptance/paired/paired.json),
-[candidate memory/options](../results/cuda-runtime-m8-mma3-small-acceptance/paired/b1/moe-short.json),
-[diagnostic attribution](../results/cuda-runtime-m8-mma3-small-acceptance/profile-summary.json),
-[external comparison](../results/cuda-runtime-m8-mma3-small-acceptance/comparison.json).
+paired samples (`results/cuda-runtime-m8-wave6c/paired-public-profile/paired.json`);
+matched-precision checkpoint (`results/moe-numerical-fix/checkpoint.json`);
+INT8 quality (`results/cuda-runtime-m8-int8-model/quality-summary.json`);
+MMA3 quality (`results/cuda-runtime-m8-mma3-small-model/quality-summary.json`),
+unchanged snapshots (`results/cuda-runtime-m8-mma3-small-model/checkpoint.json`),
+small capacities (`results/cuda-runtime-m8-mma3-small-model/small-capacity-summary.json`);
+attention quality (`results/cuda-runtime-m8-attention-normalized/quality-summary.json`),
+attention performance (`results/cuda-runtime-m8-attention-normalized/performance-summary.json`);
+small-prefix performance (`results/cuda-runtime-m8-mma3-small-acceptance/performance-summary.json`),
+paired controls (`results/cuda-runtime-m8-mma3-small-acceptance/paired/paired.json`),
+candidate memory/options (`results/cuda-runtime-m8-mma3-small-acceptance/paired/b1/moe-short.json`),
+diagnostic attribution (`results/cuda-runtime-m8-mma3-small-acceptance/profile-summary.json`),
+external comparison (`results/cuda-runtime-m8-mma3-small-acceptance/comparison.json`).
 Earlier matrix-only and primitive reconstruction improvements do not independently
 establish full-model quality. Latest admission remains explicitly scoped and
 **neither changes the default nor promotes production arithmetic**.
 
 **Provenance qualification:** all 38 entries in the latest
-[b1 candidate provenance](../results/cuda-runtime-m8-mma3-small-acceptance/paired/b1/provenance.json)
+b1 candidate provenance (`results/cuda-runtime-m8-mma3-small-acceptance/paired/b1/provenance.json`)
 matched the refreshed working tree. Recorded candidate binary SHA-256 is
 `738cb1c517d4401a278804eb4698599d408ef42485265287be97af753574f2a2`;
-the [acceptance checkpoint](../results/cuda-runtime-m8-mma3-small-acceptance/checkpoint.json)
+the acceptance checkpoint (`results/cuda-runtime-m8-mma3-small-acceptance/checkpoint.json`)
 also retains a source-archive digest. External llama.cpp revision is
 `6b01a4767f8d3d0c416c410a49861333965c0982`. Historical wave6c hashes are not
 current-source identity. Manifest equality does not prove complete build-input

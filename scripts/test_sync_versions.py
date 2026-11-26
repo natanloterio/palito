@@ -12,6 +12,8 @@ FILES = {
     "bindings/csharp/Palito/Palito.csproj": "<Project>\n  <PropertyGroup>\n    <Version>0.5.0</Version>\n  </PropertyGroup>\n</Project>\n",
     "bindings/java/pom.xml": "<project>\n  <artifactId>palito</artifactId>\n  <version>0.5.0</version>\n"
                              "  <dependencies><dependency><version>5.11.4</version></dependency></dependencies>\n</project>\n",
+    "bindings/java/README.md": "```xml\n<dependency>\n  <groupId>io.github.natanloterio</groupId>\n  <artifactId>palito</artifactId>\n"
+                               "  <version>0.5.0</version>\n</dependency>\n```\n",
 }
 
 

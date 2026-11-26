@@ -25,21 +25,10 @@ Standard GGUF files were designed for CPU SIMD, which forces GPUs to waste cycle
 ## 2. Step-by-Step: Converting & Running Models in `.palito` Format
 
 ### Prerequisites
-- Linux x86_64 with Rust 1.87+ and an NVIDIA GPU with CUDA 13 (`libnvrtc.so.13`).
-- Point `NVRTC_LIB_DIR` and `LD_LIBRARY_PATH` at your CUDA 13 library folder:
+- Linux x86_64 with an NVIDIA GPU and a CUDA 13 driver.
+- `palito` with `convert`: the [Linux bundle](../README.md#download) includes it. From source, build with `--features cuda,qtip-research` (see [building from source](building.md)).
 
-```sh
-export NVRTC_LIB_DIR=/usr/local/cuda-13/lib64
-export LD_LIBRARY_PATH="$NVRTC_LIB_DIR:$LD_LIBRARY_PATH"
-```
-
-### Step 1 — Build `palito` with `PLT1` & CUDA Support
-
-```sh
-cargo build --release --features cuda,qtip-research --bin palito
-```
-
-### Step 2 — Convert Any GGUF Model to `.palito` in One Command
+### Step 1 — Convert Any GGUF Model to `.palito` in One Command
 
 `palito convert` automatically collects calibration Hessians on CUDA, quantizes all layers (`3.0 bpw` `HYB Q=5` with GPU Viterbi), strips the base GGUF to a compact skeleton, optionally embeds an `EAGLE-3` head, and writes **one** self-contained `.palito` file:
 
@@ -68,7 +57,7 @@ python3 scripts/qtip/pack_eagle3_plt1.py \
   --quant q4_k --tap-layers 2,18,33
 ```
 
-### Step 3 — Run with One Command (Auto CUDA + Speculative Decoding)
+### Step 2 — Run with One Command (Auto CUDA + Speculative Decoding)
 
 ```sh
 palito chat --model models/qwen3-8b.palito --stats
@@ -76,24 +65,17 @@ palito chat --model models/qwen3-8b.palito --stats
 palito serve --model models/qwen3-8b.palito
 ```
 
-*(For step-by-step control or microbenchmarking, the standalone `collect-hessians-cuda`, `gguf-to-plt1`, `pack-palito`, `eagle3-spec-bench`, and `suffix-spec-bench` examples remain available.)*
+`convert` refuses to overwrite an existing `--output` unless you pass `-f` / `--force`. If it fails or you press Ctrl-C, it removes its temporary files (`*.hessians.tmp`, `*.layers.palito.tmp`) and the partial output; `--keep-temp` keeps the temporaries. Run `palito convert --help` for every option (`--bits`, `--hessians`, `--no-hessians`, `--chunks`, `--max-layers`, ...).
+
+*(For step-by-step control or microbenchmarking, the standalone `collect-hessians-cuda`, `gguf-to-plt1`, `pack-palito`, `eagle3-spec-bench`, and `suffix-spec-bench` binaries remain available from a source build.)*
 
 ---
 
-## 3. Building from Source
+## 3. CLI & Server Reference
 
-```sh
-# GPU build, packaged and installed as ~/.local/bin/palito
-NVRTC_LIB_DIR=/usr/local/cuda-13/lib64 scripts/package-linux.sh --install
+Every command documents its options: `palito <command> -h` shows the common ones and `palito <command> --help` all of them, with examples. `palito --version` lists the backends and features the binary was built with, and `palito completions <bash|zsh|fish|powershell>` prints a shell completion script.
 
-# CPU-only build
-cargo build --release
-./target/release/palito --help
-```
-
----
-
-## 4. Full CLI & Server Reference
+Sizes such as `--gpu-memory-limit-bytes`, `--memory-limit-bytes` and `--prefix-cache-bytes` accept units (`20GiB`, `512MB`) and also have shorter names without `-bytes`.
 
 ### `palito chat` Options
 
@@ -112,8 +94,15 @@ cargo build --release
 | `--presence-penalty P`, `--frequency-penalty F` | OpenAI-style penalties |
 | `--stop TEXT` | Stops generation at TEXT (repeatable) |
 | `--no-prefix-cache` | Disables GPU prefix caching between chat turns |
+| `--chat-template-file FILE` | Uses a Jinja template instead of the model's chat template |
+| `--backend cpu\|cuda` | Picks the backend (default: `cuda` for `.palito`, `cpu` for GGUF) |
+| `--gpu-device N` | GPU index (`--cuda-device` still works) |
+
+Inside the chat, `/help` lists the commands, `/reset` clears the conversation and `/exit` (or Ctrl-D) quits. Ctrl-C stops the reply being generated; at the prompt it quits. To send text that starts with `/`, type it as `//text`. With input piped in (`echo question | palito chat ...`), a failed reply makes `palito` exit with status 1.
 
 ### `palito serve` Details
+- **Options:** `--host` (default `127.0.0.1`), `--port` (default `8080`), `--backend`, `--context`, `--model-name` (the id `/v1/models` reports), `--parallel` / `-np`, `--queue`, `--api-key`, `--no-prefix-cache`, `--gpu-device`, `--gpu-memory-limit-bytes`, and the sampling defaults of `chat` (`--temperature`, `--top-p`, ...) for requests that omit them.
+- **Startup:** the port is opened before the model loads, so a busy port fails at once; on a terminal, `serve` prints the Palito banner.
 - **Endpoints:** `POST /v1/chat/completions`, `POST /v1/completions` (streaming supported), `GET /v1/models`, `GET /health`.
 - **Reasoning:** Qwen3 `<think>` blocks are returned in `reasoning_content`; send `"reasoning_format": "none"` to inline or `"chat_template_kwargs": {"enable_thinking": false}` to disable.
 - **Structured JSON:** `"response_format": {"type": "json_object"}` or `{"type": "json_schema", ...}` uses constrained decoding (works with greedy and sampling).
@@ -141,9 +130,10 @@ cc examples/c/chat.c -Iinclude -Llib -lpalito -Wl,-rpath,"$PWD/lib" -o chat
 
 ---
 
-## 5. Troubleshooting
+## 4. Troubleshooting
 
 - **First run is slow to start:** Palito compiles its GPU kernels once and caches them in `~/.cache/palito/kernels`.
 - **`context N tokens: M do not fit in device memory`:** Pass a smaller `--context N` or close other GPU apps.
 - **`libcuda.so.1` or `libnvrtc.so.13` not found:** Update to an NVIDIA driver supporting CUDA 13; on source builds, set `LD_LIBRARY_PATH` to your CUDA 13 `lib64` directory.
-- **Shared GPU:** Use `--gpu-memory-limit-bytes N` to cap Palito's VRAM usage.
+- **Shared GPU:** Use `--gpu-memory-limit 20GiB` (or `--gpu-memory-limit-bytes`) to cap Palito's VRAM usage.
+- **`error: port 8080 is already in use`:** Another server holds the port; pick another with `--port`.

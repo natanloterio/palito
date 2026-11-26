@@ -6,6 +6,8 @@ Go binding for [Palito](../../README.md). It loads `libpalito.so` at run time, s
 go get github.com/natanloterio/palito/bindings/go
 ```
 
+It needs the native `libpalito` library: install the [Linux bundle](https://github.com/natanloterio/palito#download) or point `PALITO_LIBRARY` at your own build (see [bindings](https://github.com/natanloterio/palito/blob/master/bindings/README.md)).
+
 ```go
 engine, err := palito.Open("model.gguf", nil)
 if err != nil {

@@ -3,8 +3,11 @@
 C# binding for [Palito](../../README.md). It targets .NET 8+, uses P/Invoke, and has no dependencies.
 
 ```sh
-dotnet add reference bindings/csharp/Palito/Palito.csproj
+dotnet add package Palito                                   # from NuGet
+dotnet add reference bindings/csharp/Palito/Palito.csproj   # or from a clone
 ```
+
+It needs the native `libpalito` library: install the [Linux bundle](https://github.com/natanloterio/palito#download) or point `PALITO_LIBRARY` at your own build (see [bindings](https://github.com/natanloterio/palito/blob/master/bindings/README.md)).
 
 ```csharp
 using Palito;

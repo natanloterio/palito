@@ -18,15 +18,9 @@ ln -sf "$PWD/palito-0.15.0-linux-x86_64/palito" ~/.local/bin/palito
 
 The bundle carries the CUDA 13 runtime compiler; only the NVIDIA driver must be installed. Without a GPU it runs on the CPU.
 
-### From source (any platform)
+### macOS, Windows and other GPUs
 
-```sh
-cargo install palito --features cuda     # NVIDIA
-cargo install palito --features vulkan   # AMD / Intel / NVIDIA
-cargo install palito --features metal    # Apple Silicon
-```
-
-The CUDA build compiles its kernels at run time with NVRTC, so it needs the CUDA 13 toolkit on the machine. The Linux bundle above already includes it.
+Install with Cargo (`--features metal` for Apple Silicon, `vulkan` for AMD and Intel GPUs). See [building from source](docs/building.md).
 
 ### Libraries
 
@@ -109,6 +103,7 @@ Llama 3 / 3.1 / 3.2, Qwen 2.5 / 3 / 3.5 (dense and MoE), Gemma 2 / 3, SmolLM2, P
 - [`.palito` format, CLI and server reference](docs/plt1-format.md)
 - [Performance](docs/performance.md) and [benchmarks vs `llama.cpp`](benchmarks/vs-llama-cpp/README.md)
 - [Language bindings](bindings/README.md)
+- [Building from source](docs/building.md)
 - [Technical reference](docs/technical-reference.md) and [architecture](docs/architecture.md)
 - [Releasing](docs/releasing.md)
 

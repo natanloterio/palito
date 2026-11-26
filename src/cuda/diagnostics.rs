@@ -26,6 +26,55 @@ pub struct CaptureOptions {
     pub max_bytes: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct ObserverOptions {
+    pub layers: Vec<usize>,
+    /// Empty selects all projection stages.
+    pub stages: Vec<String>,
+    /// Whether to copy MoE routing expert IDs and invoke `on_routing`.
+    pub routing: bool,
+}
+
+/// Projection input widths and MoE expert count for one transformer layer.
+#[derive(Clone, Debug)]
+pub struct LayerDims {
+    pub index: usize,
+    pub attn_qkv_dim: usize,
+    pub attn_out_dim: usize,
+    pub ffn_in_dim: usize,
+    pub ffn_down_dim: usize,
+    /// `0` for dense FFN layers, `> 0` for MoE layers.
+    pub n_experts: usize,
+}
+
+/// Streaming callback for batched-prefill activations and MoE routing.
+/// Copies each selected stage's full `[tokens, width]` tensor once per chunk
+/// without retaining per-token records in memory.
+pub trait CaptureObserver {
+    fn on_projection(
+        &mut self,
+        layer: usize,
+        position: usize,
+        tokens: usize,
+        stage: &'static str,
+        width: usize,
+        values: &[f32],
+    ) -> Result<()>;
+
+    fn on_routing(
+        &mut self,
+        layer: usize,
+        position: usize,
+        tokens: usize,
+        experts: usize,
+        used: usize,
+        ids: &[i32],
+    ) -> Result<()> {
+        let _ = (layer, position, tokens, experts, used, ids);
+        Ok(())
+    }
+}
+
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum Record {
@@ -56,10 +105,49 @@ enum Record {
     },
 }
 
+enum CaptureMode {
+    Buffered {
+        options: CaptureOptions,
+        bytes: usize,
+        records: Vec<Record>,
+    },
+    Streaming {
+        layers: Vec<usize>,
+        stages: Vec<String>,
+        routing: bool,
+        f32_scratch: Vec<f32>,
+        i32_scratch: Vec<i32>,
+        observer: Box<dyn CaptureObserver + Send>,
+    },
+}
+
 pub(super) struct Capture {
-    options: CaptureOptions,
-    bytes: usize,
-    records: Vec<Record>,
+    mode: CaptureMode,
+}
+
+fn is_valid_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        "attn_norm"
+            | "Qproj"
+            | "Kproj"
+            | "Vproj"
+            | "Qcur"
+            | "Kcur"
+            | "Vcur"
+            | "attn_attended"
+            | "attn_output"
+            | "ffn_inp"
+            | "ffn_norm"
+            | "ffn_moe_logits"
+            | "ffn_moe_weights_norm"
+            | "ffn_gate"
+            | "ffn_up"
+            | "ffn_down_inp"
+            | "ffn_down"
+            | "l_out"
+            | "ffn_moe_topk"
+    )
 }
 
 fn product(a: usize, b: usize) -> Result<usize> {
@@ -93,30 +181,7 @@ impl Capture {
             || options.layers.windows(2).any(|p| p[0] == p[1])
             || options.positions.windows(2).any(|p| p[0] == p[1])
             || options.stages.windows(2).any(|p| p[0] == p[1])
-            || options.stages.iter().any(|stage| {
-                !matches!(
-                    stage.as_str(),
-                    "attn_norm"
-                        | "Qproj"
-                        | "Kproj"
-                        | "Vproj"
-                        | "Qcur"
-                        | "Kcur"
-                        | "Vcur"
-                        | "attn_attended"
-                        | "attn_output"
-                        | "ffn_inp"
-                        | "ffn_norm"
-                        | "ffn_moe_logits"
-                        | "ffn_moe_weights_norm"
-                        | "ffn_gate"
-                        | "ffn_up"
-                        | "ffn_down_inp"
-                        | "ffn_down"
-                        | "l_out"
-                        | "ffn_moe_topk"
-                )
-            })
+            || options.stages.iter().any(|stage| !is_valid_stage(stage))
         {
             return Err(invalid("invalid capture layers, positions, or byte budget"));
         }
@@ -140,9 +205,38 @@ impl Capture {
             return Err(invalid("capture selections exceed byte budget"));
         }
         Ok(Self {
-            options,
-            bytes,
-            records: Vec::new(),
+            mode: CaptureMode::Buffered {
+                options,
+                bytes,
+                records: Vec::new(),
+            },
+        })
+    }
+
+    fn new_observer(
+        mut options: ObserverOptions,
+        layers: usize,
+        observer: Box<dyn CaptureObserver + Send>,
+    ) -> Result<Self> {
+        options.layers.sort_unstable();
+        options.stages.sort_unstable();
+        if options.layers.is_empty()
+            || options.layers.last().is_some_and(|&n| n >= layers)
+            || options.layers.windows(2).any(|p| p[0] == p[1])
+            || options.stages.windows(2).any(|p| p[0] == p[1])
+            || options.stages.iter().any(|stage| !is_valid_stage(stage))
+        {
+            return Err(invalid("invalid observer layers or stages"));
+        }
+        Ok(Self {
+            mode: CaptureMode::Streaming {
+                layers: options.layers,
+                stages: options.stages,
+                routing: options.routing,
+                f32_scratch: Vec::new(),
+                i32_scratch: Vec::new(),
+                observer,
+            },
         })
     }
 
@@ -156,29 +250,43 @@ impl Capture {
     }
 
     fn selected(&self, layer: usize) -> bool {
-        self.options.layers.binary_search(&layer).is_ok()
+        let layers = match &self.mode {
+            CaptureMode::Buffered { options, .. } => &options.layers,
+            CaptureMode::Streaming { layers, .. } => layers,
+        };
+        layers.binary_search(&layer).is_ok()
     }
 
     fn selected_stage(&self, stage: &str) -> bool {
-        self.options.stages.is_empty()
-            || self
-                .options
-                .stages
+        let stages = match &self.mode {
+            CaptureMode::Buffered { options, .. } => &options.stages,
+            CaptureMode::Streaming { stages, .. } => stages,
+        };
+        stages.is_empty()
+            || stages
                 .binary_search_by(|name| name.as_str().cmp(stage))
                 .is_ok()
     }
 
     fn reserve_record(&mut self, payload: usize) -> Result<()> {
+        let CaptureMode::Buffered {
+            options,
+            bytes,
+            records,
+        } = &mut self.mode
+        else {
+            return Ok(());
+        };
         // Grow exactly once per record rather than allowing Vec's geometric spare
         // capacity to escape the diagnostic budget.
         charge(
-            &mut self.bytes,
-            self.options.max_bytes,
+            bytes,
+            options.max_bytes,
             payload
                 .checked_add(size_of::<Record>())
                 .ok_or_else(|| invalid("capture record size overflow"))?,
         )?;
-        self.records.try_reserve_exact(1).map_err(failure)?;
+        records.try_reserve_exact(1).map_err(failure)?;
         Ok(())
     }
 
@@ -193,11 +301,35 @@ impl Capture {
         if !self.selected(layer) || !self.selected_stage(stage) {
             return Ok(());
         }
+        if let CaptureMode::Streaming {
+            f32_scratch,
+            observer,
+            ..
+        } = &mut self.mode
+        {
+            let len = product(tokens, width)?;
+            if len > source.len() {
+                return Err(invalid("capture projection exceeds workspace"));
+            }
+            f32_scratch.resize(len, 0.0);
+            stream
+                .memcpy_dtoh(&source.slice(..len), &mut f32_scratch[..len])
+                .map_err(failure)?;
+            stream.synchronize().map_err(failure)?;
+            return observer.on_projection(layer, position, tokens, stage, width, &f32_scratch[..len]);
+        }
         let end = position
             .checked_add(tokens)
             .ok_or_else(|| invalid("capture position overflow"))?;
-        for i in 0..self.options.positions.len() {
-            let selected = self.options.positions[i];
+        let positions_len = match &self.mode {
+            CaptureMode::Buffered { options, .. } => options.positions.len(),
+            CaptureMode::Streaming { .. } => unreachable!(),
+        };
+        for i in 0..positions_len {
+            let selected = match &self.mode {
+                CaptureMode::Buffered { options, .. } => options.positions[i],
+                CaptureMode::Streaming { .. } => unreachable!(),
+            };
             if selected < position || selected >= end {
                 continue;
             }
@@ -217,12 +349,14 @@ impl Capture {
             if values.iter().any(|v| !v.is_finite()) {
                 return Err(failure("nonfinite captured projection; request poisoned"));
             }
-            self.records.push(Record::Projection {
-                position: selected,
-                layer,
-                stage,
-                values,
-            });
+            if let CaptureMode::Buffered { records, .. } = &mut self.mode {
+                records.push(Record::Projection {
+                    position: selected,
+                    layer,
+                    stage,
+                    values,
+                });
+            }
         }
         Ok(())
     }
@@ -238,6 +372,34 @@ impl Capture {
     ) -> Result<()> {
         if !self.selected(layer) {
             return Ok(());
+        }
+        if let CaptureMode::Streaming {
+            routing,
+            i32_scratch,
+            observer,
+            ..
+        } = &mut self.mode
+        {
+            if !*routing {
+                return Ok(());
+            }
+            let assignments = product(tokens, used)?;
+            if assignments > device_ids.len() {
+                return Err(invalid("capture routing exceeds workspace"));
+            }
+            i32_scratch.resize(assignments, 0);
+            stream
+                .memcpy_dtoh(&device_ids.slice(..assignments), &mut i32_scratch[..assignments])
+                .map_err(failure)?;
+            stream.synchronize().map_err(failure)?;
+            return observer.on_routing(
+                layer,
+                position,
+                tokens,
+                experts,
+                used,
+                &i32_scratch[..assignments],
+            );
         }
         let assignments = product(tokens, used)?;
         let scores = product(tokens, experts)?;
@@ -265,37 +427,52 @@ impl Capture {
             return Err(failure("invalid captured routing; request poisoned"));
         }
         let (counts, assignment_ids) = assignments_by_expert(&ids, experts, used)?;
-        let routing_index = self.records.len();
-        self.records.push(Record::Routing {
-            version: 1,
-            layer,
-            position,
-            tokens,
-            experts,
-            used,
-            ids,
-            counts,
-            assignment_ids,
-            logits,
-        });
+        let routing_index = match &mut self.mode {
+            CaptureMode::Buffered { records, .. } => {
+                let idx = records.len();
+                records.push(Record::Routing {
+                    version: 1,
+                    layer,
+                    position,
+                    tokens,
+                    experts,
+                    used,
+                    ids,
+                    counts,
+                    assignment_ids,
+                    logits,
+                });
+                idx
+            }
+            CaptureMode::Streaming { .. } => unreachable!(),
+        };
         if !self.selected_stage("ffn_moe_topk") {
             return Ok(());
         }
-        for i in 0..self.options.positions.len() {
-            let selected = self.options.positions[i];
+        let positions_len = match &self.mode {
+            CaptureMode::Buffered { options, .. } => options.positions.len(),
+            CaptureMode::Streaming { .. } => unreachable!(),
+        };
+        for i in 0..positions_len {
+            let selected = match &self.mode {
+                CaptureMode::Buffered { options, .. } => options.positions[i],
+                CaptureMode::Streaming { .. } => unreachable!(),
+            };
             if selected >= position && selected - position < tokens {
                 self.reserve_record(product(used, size_of::<i32>())?)?;
                 let offset = product(selected - position, used)?;
-                let Record::Routing { ids, .. } = &self.records[routing_index] else {
-                    unreachable!();
-                };
-                let values = ids[offset..offset + used].to_vec();
-                self.records.push(Record::ExpertIds {
-                    position: selected,
-                    layer,
-                    stage: "ffn_moe_topk",
-                    values,
-                });
+                if let CaptureMode::Buffered { records, .. } = &mut self.mode {
+                    let Record::Routing { ids, .. } = &records[routing_index] else {
+                        unreachable!();
+                    };
+                    let values = ids[offset..offset + used].to_vec();
+                    records.push(Record::ExpertIds {
+                        position: selected,
+                        layer,
+                        stage: "ffn_moe_topk",
+                        values,
+                    });
+                }
             }
         }
         Ok(())
@@ -352,6 +529,49 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// Returns projection input dimensions and MoE expert counts for every layer.
+    pub fn layer_dims(&self) -> Vec<LayerDims> {
+        let experts = self.weights.spec.experts;
+        self.weights
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(index, l)| LayerDims {
+                index,
+                attn_qkv_dim: l.q.width as usize,
+                attn_out_dim: l.output.width as usize,
+                ffn_in_dim: l.up.width as usize,
+                ffn_down_dim: l.down.width as usize,
+                n_experts: if l.router.is_some() { experts } else { 0 },
+            })
+            .collect()
+    }
+
+    /// Enable a streaming capture observer on a fresh request, with decode graphs
+    /// disabled. Each selected stage's full `[tokens, width]` tensor is copied
+    /// once per chunk and delivered to `observer` without retaining records.
+    pub fn enable_capture_observer(
+        &mut self,
+        options: ObserverOptions,
+        observer: Box<dyn CaptureObserver + Send>,
+    ) -> Result<()> {
+        if self.decode.is_some()
+            || self.diagnostic.is_some()
+            || self.state.failed
+            || self.state.position != 0
+        {
+            return Err(invalid(
+                "capture requires a fresh, unpoisoned request with graphs disabled",
+            ));
+        }
+        self.diagnostic = Some(Capture::new_observer(
+            options,
+            self.weights.layers.len(),
+            observer,
+        )?);
+        Ok(())
+    }
+
     /// Complete capture and write a new immutable JSONL file; never overwrite.
     /// Failed requests and incomplete selected positions cannot be saved.
     /// A successful save disables capture. An IO error retains it for retry at
@@ -361,14 +581,21 @@ impl CudaBackend {
             .diagnostic
             .as_ref()
             .ok_or_else(|| invalid("capture is not enabled"))?;
+        let CaptureMode::Buffered {
+            options,
+            bytes,
+            records,
+        } = &capture.mode
+        else {
+            return Err(invalid("save_capture is unsupported for streaming observers"));
+        };
         if self.state.failed
             || !self.state.valid
-            || capture
-                .options
+            || options
                 .positions
                 .last()
                 .is_some_and(|&p| p >= self.state.position)
-            || capture.records.is_empty()
+            || records.is_empty()
         {
             return Err(invalid("capture request is failed or incomplete"));
         }
@@ -378,14 +605,14 @@ impl CudaBackend {
             &mut writer,
             &serde_json::json!({
                 "kind": "metadata", "version": 1, "matmul": self.matmul,
-                "layers": capture.options.layers, "positions": capture.options.positions,
-                "stages": capture.options.stages,
-                "payload_bytes": capture.bytes, "max_bytes": capture.options.max_bytes,
+                "layers": options.layers, "positions": options.positions,
+                "stages": options.stages,
+                "payload_bytes": *bytes, "max_bytes": options.max_bytes,
                 "layout": "token-major; expert projections routing-slot-major within token",
             }),
         )?;
         writer.write_all(b"\n")?;
-        for record in &capture.records {
+        for record in records {
             serde_json::to_writer(&mut writer, record)?;
             writer.write_all(b"\n")?;
         }
@@ -399,6 +626,20 @@ impl CudaBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn buffered_bytes(capture: &Capture) -> usize {
+        match &capture.mode {
+            CaptureMode::Buffered { bytes, .. } => *bytes,
+            CaptureMode::Streaming { .. } => 0,
+        }
+    }
+
+    fn buffered_records_capacity(capture: &Capture) -> usize {
+        match &capture.mode {
+            CaptureMode::Buffered { records, .. } => records.capacity(),
+            CaptureMode::Streaming { .. } => 0,
+        }
+    }
 
     fn options() -> CaptureOptions {
         CaptureOptions {
@@ -450,8 +691,8 @@ mod tests {
         let filtered = Capture::new(selected.clone(), 2, 128).unwrap();
         assert!(filtered.selected_stage("Qproj"));
         assert!(!filtered.selected_stage("ffn_gate"));
-        assert!(filtered.bytes > all.bytes);
-        selected.max_bytes = all.bytes;
+        assert!(buffered_bytes(&filtered) > buffered_bytes(&all));
+        selected.max_bytes = buffered_bytes(&all);
         assert!(Capture::new(selected.clone(), 2, 128).is_err());
         selected.max_bytes = 4096;
         selected.stages = vec!["unknown".into()];
@@ -463,10 +704,10 @@ mod tests {
     #[test]
     fn budget_rejects_before_allocating_record() {
         let mut capture = Capture::new(options(), 2, 128).unwrap();
-        let bytes = capture.bytes;
+        let bytes = buffered_bytes(&capture);
         assert!(capture.reserve_record(4096).is_err());
-        assert_eq!(capture.bytes, bytes);
-        assert_eq!(capture.records.capacity(), 0);
+        assert_eq!(buffered_bytes(&capture), bytes);
+        assert_eq!(buffered_records_capacity(&capture), 0);
         assert!(capture.reserve_record(usize::MAX).is_err());
         assert!(product(usize::MAX, 2).is_err());
         let mut exact = 0;

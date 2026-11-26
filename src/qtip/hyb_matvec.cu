@@ -783,11 +783,80 @@ extern "C" __global__ void hyb_r1_exit(float* __restrict__ x,
     }
 }
 
-// MoE PLT1 HYB Q=5 kernel for 3D expert tensors ([n_experts, rows, cols], MMA-swizzled tiles).
-// Grid: (total_row_blocks, tokens * used, 1), Block: 512 threads (16 warps = 256 rows).
-// Zero SMEM LUT (Q=5 in warp registers), zero atomics, zero output memset!
-// When SwiGLU == false: runs 1 or 2 expert projections (e.g. Gate + Up) sharing x[assign / used].
-// When SwiGLU == true:  runs 1 expert projection (Down) on SwiGLU(x[assign], x_up[assign]).
+// Group MoE assignments [0..total_assigns) by expert_id into sub-groups of size 1..=8.
+// Single warp (32 threads), zero __syncthreads(), handles up to 256 assignments in < 1 us.
+extern "C" __global__ void hyb_moe_group_assignments(const int* __restrict__ ids,
+                                                     int total_assigns,
+                                                     int* __restrict__ group_experts,
+                                                     int* __restrict__ group_offsets,
+                                                     int* __restrict__ group_assigns,
+                                                     int* __restrict__ num_groups_out) {
+    const int lane = threadIdx.x & 31;
+    int my_exp[8];
+    unsigned rem_mask[8];
+    const int n_chunks = (total_assigns + 31) >> 5;
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+        const int idx = (c << 5) + lane;
+        const bool valid = idx < total_assigns;
+        my_exp[c] = valid ? __ldg(ids + idx) : -1;
+        rem_mask[c] = __ballot_sync(0xffffffffu, valid);
+    }
+
+    int num_groups = 0;
+    int out_pos = 0;
+    if (lane == 0) {
+        group_offsets[0] = 0;
+    }
+
+    for (int c0 = 0; c0 < n_chunks; ++c0) {
+        while (rem_mask[c0] != 0u) {
+            const int first_lane = __ffs(rem_mask[c0]) - 1;
+            const int target_exp = __shfl_sync(0xffffffffu, my_exp[c0], first_lane);
+
+            int g_count = 0;
+            for (int c = c0; c < n_chunks; ++c) {
+                const bool match = ((rem_mask[c] >> lane) & 1u) && (my_exp[c] == target_exp);
+                unsigned m = __ballot_sync(0xffffffffu, match);
+                rem_mask[c] &= ~m;
+                while (m != 0u) {
+                    const int bit = __ffs(m) - 1;
+                    m &= m - 1u;
+                    if (lane == 0) {
+                        group_assigns[out_pos] = (c << 5) + bit;
+                    }
+                    ++out_pos;
+                    ++g_count;
+                    if (g_count == 8) {
+                        if (lane == 0) {
+                            group_experts[num_groups] = target_exp;
+                            group_offsets[num_groups + 1] = out_pos;
+                        }
+                        ++num_groups;
+                        g_count = 0;
+                    }
+                }
+            }
+            if (g_count > 0) {
+                if (lane == 0) {
+                    group_experts[num_groups] = target_exp;
+                    group_offsets[num_groups + 1] = out_pos;
+                }
+                ++num_groups;
+            }
+        }
+    }
+
+    if (lane == 0) {
+        num_groups_out[0] = num_groups;
+    }
+}
+
+// MoE PLT1 HYB Q=5 Tensor-Core kernel for 3D expert tensors ([n_experts, rows, cols], MMA tiles).
+// Grid: (total_row_blocks, max_groups, splits), Block: 512 threads (16 warps = 256 rows).
+// Reads each active expert's weights ONCE per group of up to 8 assignments, decodes via
+// zero-SMEM warp-register LUT (Q=5), and executes mma.sync.aligned.m16n8k16 directly!
+// Direct store when splits == 1 (zero atomics, zero memset); atomicAdd when splits > 1.
 template <bool SwiGLU>
 __device__ __forceinline__ void hyb_moe_block(const unsigned* __restrict__ tiles,
                                               const unsigned* __restrict__ lut_global,
@@ -796,29 +865,55 @@ __device__ __forceinline__ void hyb_moe_block(const unsigned* __restrict__ tiles
                                               const float* __restrict__ row_signs,
                                               const float* __restrict__ x,
                                               const float* __restrict__ x_up,
-                                              const int* __restrict__ ids,
+                                              const int* __restrict__ group_experts,
+                                              const int* __restrict__ group_offsets,
+                                              const int* __restrict__ group_assigns,
+                                              const int* __restrict__ num_groups_ptr,
                                               float* __restrict__ y,
                                               int rows,
                                               int cols,
                                               int used,
+                                              int chunks_per_split,
+                                              int splits,
                                               int row_block,
-                                              int assign) {
-    __shared__ float xs[HYB_CHUNK];
-    __shared__ float partial[HYB_CHUNK];
+                                              int group_idx,
+                                              int split) {
+    const int num_groups = __ldg(num_groups_ptr);
+    if (group_idx >= num_groups) {
+        return;
+    }
+
+    const int total_chunks = cols / HYB_CHUNK;
+    const int ch0 = split * chunks_per_split;
+    const int ch1 = min(ch0 + chunks_per_split, total_chunks);
+    if (ch0 >= ch1) {
+        return;
+    }
+
+    __shared__ unsigned xs_h2[8][HYB_CHUNK / 2]; // 4 KB
+    __shared__ float partial[8][HYB_CHUNK];      // 8 KB
 
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x & 31;
+    const int group_id = lane >> 2;  // 0..7
+    const int tid = lane & 3;        // 0..3
     const unsigned reg_lut = __ldg(lut_global + lane);
 
-    const int expert = __ldg(ids + assign);
+    const int expert = __ldg(group_experts + group_idx);
+    const int g_start = __ldg(group_offsets + group_idx);
+    const int g_end = __ldg(group_offsets + group_idx + 1);
+    const int g_len = g_end - g_start;
     const float scale = __ldg(scales + expert);
+
+    const int my_assign = (warp < g_len) ? __ldg(group_assigns + g_start + warp) : 0;
+    const int my_x_tok = SwiGLU ? my_assign : (my_assign / used);
+
     const int col_tiles = cols / HYB_TILE;
     const size_t expert_stride = (size_t)(rows / HYB_TILE) * col_tiles * HYB_WORDS;
     const int group = row_block * HYB_FUSED_WARPS + warp;
-    const unsigned* base = tiles + (size_t)expert * expert_stride + (size_t)group * col_tiles * HYB_WORDS;
+    const unsigned* base =
+        tiles + (size_t)expert * expert_stride + (size_t)group * col_tiles * HYB_WORDS;
 
-    const int group_id = lane >> 2;  // 0..7
-    const int tid = lane & 3;        // 0..3
     const int bit = lane * 4 * HYB_B;
     const int w0_idx = (bit / 32) % HYB_WORDS;
     const int w1_idx = (w0_idx + 1) % HYB_WORDS;
@@ -827,39 +922,54 @@ __device__ __forceinline__ void hyb_moe_block(const unsigned* __restrict__ tiles
 #endif
     const int shift = bit & 31;
 
-    const int x_tok = SwiGLU ? assign : (assign / used);
-    const float* xt_base = x + (size_t)x_tok * cols;
-    const float* ut_base = SwiGLU ? (x_up + (size_t)x_tok * cols) : nullptr;
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const int num_chunks = cols / HYB_CHUNK;
-
-    for (int ch = 0; ch < num_chunks; ++ch) {
+    for (int ch = ch0; ch < ch1; ++ch) {
         const int c = ch * HYB_CHUNK;
-        if (warp == 0) {
+        if (warp < g_len) {
             float v[8];
+            const float* xt = x + (size_t)my_x_tok * cols + c;
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                v[e] = __ldg(xt_base + c + lane + 32 * e);
+                v[e] = __ldg(xt + lane + 32 * e);
             }
             if (SwiGLU) {
+                const float* ut = x_up + (size_t)my_x_tok * cols + c;
+                float up[8];
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
-                    const float u = __ldg(ut_base + c + lane + 32 * e);
-                    v[e] = v[e] / (1.0f + expf(-v[e])) * u;
+                    up[e] = __ldg(ut + lane + 32 * e);
+                }
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    v[e] = v[e] / (1.0f + expf(-v[e])) * up[e];
                 }
             }
 #if !HYB_SKIP_IN_RHT
+            float sign[8];
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                v[e] *= __ldg(col_signs + c + lane + 32 * e);
+                sign[e] = __ldg(col_signs + c + lane + 32 * e);
+            }
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                v[e] *= sign[e];
             }
             hyb_fwht256_warp(v);
 #endif
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                xs[lane + 32 * e] = v[e];
+                partial[warp][lane + 32 * e] = v[e];
+            }
+            __syncwarp();
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int j = lane + 32 * e;
+                const float x0 = partial[warp][2 * j];
+                const float x1 = partial[warp][2 * j + 1];
+                unsigned h2;
+                asm("cvt.rn.f16x2.f32 %0, %2, %1;" : "=r"(h2) : "f"(x0), "f"(x1));
+                xs_h2[warp][j] = h2;
             }
         }
         __syncthreads();
@@ -883,66 +993,75 @@ __device__ __forceinline__ void hyb_moe_block(const unsigned* __restrict__ tiles
 #if HYB_B == 6
                 const unsigned bits1 = __funnelshift_r(r1, r2, shift);
 #endif
-                float w0a, w0b, w1a, w1b, w2a, w2b, w3a, w3b;
-                const unsigned s0 = bits0 & HYB_STATE_MASK;
-                const unsigned s1 = (bits0 >> HYB_B) & HYB_STATE_MASK;
-                const unsigned s2 = (bits0 >> (2 * HYB_B)) & HYB_STATE_MASK;
+                unsigned a[4];
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
 #if HYB_B == 6
-                const unsigned s3 = ((bits0 >> 18) | (bits1 << 14)) & HYB_STATE_MASK;
+                    const unsigned state = (p < 3)
+                        ? ((bits0 >> (p * 6)) & HYB_STATE_MASK)
+                        : (((bits0 >> 18) | (bits1 << 14)) & HYB_STATE_MASK);
 #else
-                const unsigned s3 = (bits0 >> (3 * HYB_B)) & HYB_STATE_MASK;
+                    const unsigned state = (bits0 >> (p * HYB_B)) & HYB_STATE_MASK;
 #endif
-                hyb_decode_pair_lut(nullptr, reg_lut, s0, lane, w0a, w0b);
-                hyb_decode_pair_lut(nullptr, reg_lut, s1, lane, w1a, w1b);
-                hyb_decode_pair_lut(nullptr, reg_lut, s2, lane, w2a, w2b);
-                hyb_decode_pair_lut(nullptr, reg_lut, s3, lane, w3a, w3b);
+                    const unsigned h = state * HYB_HASH_MULT;
+                    a[p] = __shfl_sync(0xffffffffu, reg_lut, (h >> 5) & 31u) ^ (h & 0x80008000u);
+                }
 
-                const int xoff = (tk + u) * 16 + 2 * tid;
-                const float x0 = xs[xoff];
-                const float x1 = xs[xoff + 1];
-                const float x8 = xs[xoff + 8];
-                const float x9 = xs[xoff + 9];
-                acc0 = fmaf(w0a, x0, acc0);
-                acc0 = fmaf(w0b, x1, acc0);
-                acc0 = fmaf(w2a, x8, acc0);
-                acc0 = fmaf(w2b, x9, acc0);
-                acc1 = fmaf(w1a, x0, acc1);
-                acc1 = fmaf(w1b, x1, acc1);
-                acc1 = fmaf(w3a, x8, acc1);
-                acc1 = fmaf(w3b, x9, acc1);
+                const int xoff = (tk + u) * 8 + tid;
+                const unsigned b0 = (group_id < g_len) ? xs_h2[group_id][xoff] : 0u;
+                const unsigned b1 = (group_id < g_len) ? xs_h2[group_id][xoff + 4] : 0u;
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                    "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                    : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
             }
         }
         __syncthreads();
     }
 
-    acc0 += __shfl_xor_sync(0xffffffffu, acc0, 1);
-    acc0 += __shfl_xor_sync(0xffffffffu, acc0, 2);
-    acc1 += __shfl_xor_sync(0xffffffffu, acc1, 1);
-    acc1 += __shfl_xor_sync(0xffffffffu, acc1, 2);
-    if (tid == 0) {
-        partial[warp * HYB_TILE + group_id] = acc0;
-        partial[warp * HYB_TILE + group_id + 8] = acc1;
+    const int tok0 = 2 * tid;
+    const int tok1 = tok0 + 1;
+    if (tok0 < g_len) {
+        partial[tok0][warp * HYB_TILE + group_id] = d0;
+        partial[tok0][warp * HYB_TILE + group_id + 8] = d2;
+    }
+    if (tok1 < g_len) {
+        partial[tok1][warp * HYB_TILE + group_id] = d1;
+        partial[tok1][warp * HYB_TILE + group_id + 8] = d3;
     }
     __syncthreads();
 
-    if (warp == 0) {
+    if (warp < g_len) {
         float v[8];
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
-            v[e] = partial[lane + 32 * e];
+            v[e] = partial[warp][lane + 32 * e];
         }
 #if !HYB_SKIP_OUT_RHT
         hyb_fwht256_warp(v);
 #endif
-        float* yt = y + (size_t)assign * rows;
+        float* yt = y + (size_t)my_assign * rows;
+        if (splits == 1) {
 #pragma unroll
-        for (int e = 0; e < 8; ++e) {
-            const int row = row_block * HYB_CHUNK + lane + 32 * e;
+            for (int e = 0; e < 8; ++e) {
+                const int row = row_block * HYB_CHUNK + lane + 32 * e;
 #if !HYB_SKIP_OUT_RHT
-            yt[row] = v[e] * __ldg(row_signs + row) * scale;
+                yt[row] = v[e] * __ldg(row_signs + row) * scale;
 #else
-            yt[row] = v[e] * scale;
+                yt[row] = v[e] * scale;
 #endif
+            }
+        } else {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int row = row_block * HYB_CHUNK + lane + 32 * e;
+#if !HYB_SKIP_OUT_RHT
+                atomicAdd(&yt[row], v[e] * __ldg(row_signs + row) * scale);
+#else
+                atomicAdd(&yt[row], v[e] * scale);
+#endif
+            }
         }
     }
 }
@@ -964,16 +1083,23 @@ hyb_moe_small_k(const unsigned* __restrict__ t0,
                 int rows1,
                 int rb0,
                 const float* __restrict__ x,
-                const int* __restrict__ ids,
+                const int* __restrict__ group_experts,
+                const int* __restrict__ group_offsets,
+                const int* __restrict__ group_assigns,
+                const int* __restrict__ num_groups_ptr,
                 int cols,
-                int used) {
+                int used,
+                int chunks_per_split,
+                int splits) {
     int rb = blockIdx.x;
     if (rb < rb0) {
-        hyb_moe_block<false>(t0, l0, sc0, c0, r0, x, nullptr, ids, y0, rows0, cols, used, rb,
-                             blockIdx.y);
+        hyb_moe_block<false>(t0, l0, sc0, c0, r0, x, nullptr, group_experts, group_offsets,
+                             group_assigns, num_groups_ptr, y0, rows0, cols, used,
+                             chunks_per_split, splits, rb, blockIdx.y, blockIdx.z);
     } else {
-        hyb_moe_block<false>(t1, l1, sc1, c1, r1, x, nullptr, ids, y1, rows1, cols, used, rb - rb0,
-                             blockIdx.y);
+        hyb_moe_block<false>(t1, l1, sc1, c1, r1, x, nullptr, group_experts, group_offsets,
+                             group_assigns, num_groups_ptr, y1, rows1, cols, used,
+                             chunks_per_split, splits, rb - rb0, blockIdx.y, blockIdx.z);
     }
 }
 
@@ -987,10 +1113,16 @@ hyb_moe_small_k_swiglu(const unsigned* __restrict__ t0,
                        int rows0,
                        const float* __restrict__ x_gate,
                        const float* __restrict__ x_up,
-                       const int* __restrict__ ids,
+                       const int* __restrict__ group_experts,
+                       const int* __restrict__ group_offsets,
+                       const int* __restrict__ group_assigns,
+                       const int* __restrict__ num_groups_ptr,
                        int cols,
-                       int used) {
-    hyb_moe_block<true>(t0, l0, sc0, c0, r0, x_gate, x_up, ids, y0, rows0, cols, used, blockIdx.x,
-                        blockIdx.y);
+                       int used,
+                       int chunks_per_split,
+                       int splits) {
+    hyb_moe_block<true>(t0, l0, sc0, c0, r0, x_gate, x_up, group_experts, group_offsets,
+                        group_assigns, num_groups_ptr, y0, rows0, cols, used, chunks_per_split,
+                        splits, blockIdx.x, blockIdx.y, blockIdx.z);
 }
 

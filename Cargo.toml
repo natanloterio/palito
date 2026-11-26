@@ -111,6 +111,11 @@ name = "cuda-capture"
 path = "examples/cuda_capture.rs"
 required-features = ["cuda"]
 
+[[example]]
+name = "collect-hessians-cuda"
+path = "examples/collect_hessians_cuda.rs"
+required-features = ["cuda"]
+
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }

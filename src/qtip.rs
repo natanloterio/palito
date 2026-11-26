@@ -10,6 +10,8 @@
 pub mod codebook;
 pub mod hessian;
 pub mod hyb;
+#[cfg(feature = "cuda")]
+pub mod hyb_cuda;
 pub mod incoherence;
 pub mod ldlq;
 pub mod matrix;

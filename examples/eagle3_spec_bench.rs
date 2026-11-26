@@ -13,6 +13,121 @@ fn main() {
 }
 
 #[cfg(feature = "cuda")]
+fn is_moe_gguf(path: &std::path::Path) -> bool {
+    use std::{
+        fs::File,
+        io::{BufReader, Read, Seek, SeekFrom},
+    };
+
+    fn read_u32(r: &mut impl Read) -> std::io::Result<u32> {
+        let mut b = [0u8; 4];
+        r.read_exact(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+    fn read_u64(r: &mut impl Read) -> std::io::Result<u64> {
+        let mut b = [0u8; 8];
+        r.read_exact(&mut b)?;
+        Ok(u64::from_le_bytes(b))
+    }
+    fn read_str(r: &mut impl Read) -> std::io::Result<String> {
+        let n = read_u64(r)? as usize;
+        if n > 16 * 1024 * 1024 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "str"));
+        }
+        let mut buf = vec![0u8; n];
+        r.read_exact(&mut buf)?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+    fn skip_val(r: &mut (impl Read + Seek), t: u32) -> std::io::Result<()> {
+        match t {
+            0 | 1 | 7 => {
+                r.seek(SeekFrom::Current(1))?;
+            }
+            2 | 3 => {
+                r.seek(SeekFrom::Current(2))?;
+            }
+            4 | 5 | 6 => {
+                r.seek(SeekFrom::Current(4))?;
+            }
+            10 | 11 | 12 => {
+                r.seek(SeekFrom::Current(8))?;
+            }
+            8 => {
+                let n = read_u64(r)? as i64;
+                r.seek(SeekFrom::Current(n))?;
+            }
+            9 => {
+                let et = read_u32(r)?;
+                let cnt = read_u64(r)?;
+                match et {
+                    0 | 1 | 7 => {
+                        r.seek(SeekFrom::Current(cnt as i64))?;
+                    }
+                    2 | 3 => {
+                        r.seek(SeekFrom::Current((cnt * 2) as i64))?;
+                    }
+                    4 | 5 | 6 => {
+                        r.seek(SeekFrom::Current((cnt * 4) as i64))?;
+                    }
+                    10 | 11 | 12 => {
+                        r.seek(SeekFrom::Current((cnt * 8) as i64))?;
+                    }
+                    8 => {
+                        for _ in 0..cnt {
+                            let n = read_u64(r)? as i64;
+                            r.seek(SeekFrom::Current(n))?;
+                        }
+                    }
+                    _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "arr")),
+                }
+            }
+            _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "val")),
+        }
+        Ok(())
+    }
+
+    let parse = || -> std::io::Result<bool> {
+        let mut r = BufReader::new(File::open(path)?);
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        if &magic != b"GGUF" {
+            return Ok(false);
+        }
+        let _ver = read_u32(&mut r)?;
+        let _n_tensors = read_u64(&mut r)?;
+        let n_kv = read_u64(&mut r)?;
+        for _ in 0..n_kv {
+            let key = read_str(&mut r)?;
+            let vtype = read_u32(&mut r)?;
+            if key.ends_with(".expert_count") {
+                let count = match vtype {
+                    4 => u64::from(read_u32(&mut r)?),
+                    5 => read_u32(&mut r)? as i32 as u64,
+                    10 => read_u64(&mut r)?,
+                    11 => read_u64(&mut r)? as i64 as u64,
+                    _ => {
+                        skip_val(&mut r, vtype)?;
+                        0
+                    }
+                };
+                if count > 0 {
+                    return Ok(true);
+                }
+            } else if key == "general.architecture" && vtype == 8 {
+                let arch = read_str(&mut r)?;
+                if arch.contains("moe") || arch == "mixtral" || arch == "deepseek2" {
+                    return Ok(true);
+                }
+            } else {
+                skip_val(&mut r, vtype)?;
+            }
+        }
+        Ok(false)
+    };
+    parse().unwrap_or(false)
+}
+
+#[cfg(feature = "cuda")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use clap::Parser;
     use palito::{
@@ -48,14 +163,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         /// Optional PLT1 (.palito) HYB Q=5 projection overlay.
         #[arg(long)]
         plt1: Option<PathBuf>,
-        /// CUDA matmul profile: f32-tiled or int8-fast (FP16 KV + Tensor-Core attention).
-        #[arg(long, default_value = "f32-tiled")]
-        matmul: String,
+        /// CUDA matmul profile: f32-tiled or int8-fast (auto: f32-tiled with --plt1, int8-fast for MoE without --plt1, f32-tiled otherwise).
+        #[arg(long)]
+        matmul: Option<String>,
     }
 
     let args = Args::parse();
     let draft_len = args.draft_len.clamp(1, 15);
-    let matmul = match args.matmul.as_str() {
+    let is_moe = is_moe_gguf(&args.model);
+    let matmul_name = match args.matmul.as_deref() {
+        Some(m) => m,
+        None if args.plt1.is_some() => "f32-tiled",
+        None if is_moe => "int8-fast",
+        None => "f32-tiled",
+    };
+    let matmul = match matmul_name {
         "f32-tiled" => CudaMatmul::F32Tiled,
         "int8-fast" => CudaMatmul::Int8Fast,
         other => return Err(format!("unsupported matmul {other}").into()),
@@ -82,24 +204,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Loaded PLT1 HYB Q=5 overlay: {}", plt1_path.display());
     }
 
-    let prompts = [
+    let arch = backend.info().architecture.clone();
+    let is_qwen = arch.starts_with("qwen")
+        || backend
+            .tokenize("<|im_start|>")
+            .map(|t| t.len() == 1)
+            .unwrap_or(false);
+    let template_name = if is_qwen { "qwen3" } else { "llama3" };
+    println!(
+        "Model arch={arch} moe={is_moe} matmul={matmul_name} chat_template={template_name}"
+    );
+
+    let raw_prompts = [
         (
             "general",
-            "<|start_header_id|>user<|end_header_id|>\n\nExplain in clear, structured steps how GPU tensor cores accelerate matrix multiplication in modern large language models, covering warp-level MMA instructions, shared memory tiling, and memory bandwidth bottlenecks.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+            "Explain in clear, structured steps how GPU tensor cores accelerate matrix multiplication in modern large language models, covering warp-level MMA instructions, shared memory tiling, and memory bandwidth bottlenecks.",
         ),
         (
             "coding",
-            "<|start_header_id|>user<|end_header_id|>\n\nWrite a complete, idiomatic Rust implementation of an LRU cache with O(1) get and put operations, including unit tests.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+            "Write a complete, idiomatic Rust implementation of an LRU cache with O(1) get and put operations, including unit tests.",
         ),
         (
             "refactor",
-            "<|start_header_id|>user<|end_header_id|>\n\nRewrite this Rust struct and impl block to add a `scale: f32` field to `TensorHeader`, keeping all existing fields and methods intact and returning the full updated code:\n```rust\npub struct TensorHeader {\n    pub name: String,\n    pub rows: u32,\n    pub cols: u32,\n    pub offset: u64,\n    pub size: u64,\n}\nimpl TensorHeader {\n    pub fn byte_end(&self) -> u64 {\n        self.offset + self.size\n    }\n    pub fn num_elements(&self) -> u64 {\n        u64::from(self.rows) * u64::from(self.cols)\n    }\n}\n```<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+            "Rewrite this Rust struct and impl block to add a `scale: f32` field to `TensorHeader`, keeping all existing fields and methods intact and returning the full updated code:\n```rust\npub struct TensorHeader {\n    pub name: String,\n    pub rows: u32,\n    pub cols: u32,\n    pub offset: u64,\n    pub size: u64,\n}\nimpl TensorHeader {\n    pub fn byte_end(&self) -> u64 {\n        self.offset + self.size\n    }\n    pub fn num_elements(&self) -> u64 {\n        u64::from(self.rows) * u64::from(self.cols)\n    }\n}\n```",
         ),
     ];
+    let prompts: Vec<(&str, String)> = raw_prompts
+        .iter()
+        .map(|&(label, body)| {
+            let formatted = if is_qwen {
+                format!(
+                    "<|im_start|>user\n{body}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+                )
+            } else {
+                format!(
+                    "<|start_header_id|>user<|end_header_id|>\n\n{body}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+                )
+            };
+            (label, formatted)
+        })
+        .collect();
 
     // 1. Measure baseline BEFORE loading EAGLE-3 (so baseline has zero tap overhead).
     let mut baselines = Vec::new();
-    for (label, text) in prompts {
+    for (label, text) in &prompts {
         let prompt = backend.tokenize(text)?;
         let run_base = |b: &mut CudaBackend| -> Result<(Vec<i32>, f64), palito::Error> {
             b.reset()?;

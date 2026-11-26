@@ -3,8 +3,11 @@
 Python binding for [Palito](../../README.md). It uses only the standard library (ctypes).
 
 ```sh
-pip install ./bindings/python
+pip install palito                # from PyPI
+pip install ./bindings/python     # or from a clone of the repository
 ```
+
+It needs the native `libpalito` library: install the [Linux bundle](https://github.com/natanloterio/palito#download) or point `PALITO_LIBRARY` at your own build (see [bindings](https://github.com/natanloterio/palito/blob/master/bindings/README.md)).
 
 ```python
 import palito

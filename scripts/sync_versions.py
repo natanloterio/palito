@@ -40,6 +40,8 @@ MANIFESTS = (
     Manifest("bindings/csharp/Palito/Palito.csproj", r"(<Version>)([^<]+)(</Version>)"),
     # The project's own <version> is the first one at two-space indent.
     Manifest("bindings/java/pom.xml", r"^(  <version>)([^<]+)(</version>)"),
+    # The Maven dependency snippet users copy; it lags otherwise.
+    Manifest("bindings/java/README.md", r"^(  <version>)([^<]+)(</version>)"),
 )
 
 

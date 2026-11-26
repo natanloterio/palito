@@ -1,92 +1,62 @@
 <p align="center">
-  <img src="docs/palito_logo.png" alt="Palito: fast local LLM inference" width="640">
+  <img src="docs/palito_logo.png" alt="Palito: fast local LLM inference" width="480">
 </p>
 
-**Fast local LLM inference in a single Rust binary** — custom CUDA, Vulkan, and Metal kernels, GPU-native `.palito` (`PLT1`, `3.0 bpw`) quantization, and optional built-in `EAGLE-3` + `SuffixDecoding` speculative decoding: **412–414 tok/s pure decode on Qwen3-30B-A3B MoE** (**374–380 tok/s** on `Q4_K_M` GGUF), **347–355 tok/s on Llama 3.1 8B**, **324–329 tok/s on Qwen 3 8B**, and **1,361 tok/s on Llama 3.2 1B** (and up to **1,017 tok/s** on 8B code refactoring with speculative decoding) — no Python or `llama.cpp` required.
+# Palito
 
----
+Fast local LLM inference in a single Rust binary. Runs GGUF models and its own GPU-native `.palito` format on CUDA, Vulkan, Metal or CPU, with an OpenAI-compatible server. No Python, no `llama.cpp`.
 
-## Why Palito? Meet the `.palito` (`PLT1`) Model Format
+## Download
 
-Most local AI tools use the GGUF format, which was originally designed for CPUs. When you load a GGUF file on a modern NVIDIA GPU, the GPU spends a large chunk of its time unpacking data instead of generating text.
-
-Palito introduces **`.palito` (`PLT1`)** — a single-file model format built specifically for GPUs (dense and MoE):
-
-- **Compact, high quality (`3.0 bpw`):** Fits a complete **Qwen 3 8B** in **3.7 GiB**, **Llama 3.1 8B** in **3.5 GiB** (`PPL = 7.64`), and **Qwen3-30B-A3B MoE** (128 experts) in **11.1 GiB** (down from 18.6 GiB `Q4_K_M`).
-- **One self-contained file, zero flags:** Tokenizer, GPU-native weights, and the built-in `EAGLE-3` predictor live in one `.palito` file — just run `palito chat --model qwen3-8b.palito`.
-- **GPU-ready on disk:** Weights are pre-arranged for NVIDIA Tensor Cores (`mma.m16n8k16`) with zero-SMEM warp-register lookup tables so the GPU streams and computes directly with minimal overhead.
-- **Generates multiple tokens at once (100% identical answers):** Bundles `EAGLE-3` and zero-weight `SuffixDecoding` that draft up to 7 tokens ahead and verify them in a single pass — giving **1.3×–2.6× speedups** over single-token decode with **zero quality loss** (`exact_parity=true`).
-- **Works with GGUF too:** Already have GGUF models? Palito runs them out of the box with its own custom CUDA, Vulkan, and Metal kernels.
-
----
-
-## Speed vs `llama.cpp` (NVIDIA RTX 5090)
-
-### Pure Single-Token Decode (No Speculative Decoding)
-
-Measured token-by-token (`PALITO_NO_EAGLE3=1`, `f32-tiled`, CUDA Graph, `context=2048`, `tokens=128`, median of 3 runs) against `llama.cpp` CUDA (`-fa on`, no speculation):
-
-| Model | Format / Size | Palito (pure decode) | `llama.cpp` (pure decode) | Ratio |
-| :--- | :---: | :---: | :---: | :---: |
-| **Qwen3-30B-A3B MoE** | `.palito` (`3.0 bpw`, **11.1 GiB**) | **412–414 tok/s** | 340 tok/s (`Q4_K_M`, 18.6 GiB) | **1.21× faster, 40% smaller** |
-| **Qwen3-30B-A3B MoE** | `Q4_K_M` GGUF (18.6 GiB, same file) | **374–380 tok/s** | 340 tok/s (`Q4_K_M`, 18.6 GiB) | **1.10–1.12× faster** |
-| **Llama 3.1 8B** | `.palito` (`3.0 bpw`, **3.5 GiB**) | **347–355 tok/s** | 341 tok/s (`IQ3_XXS`) | **1.02–1.04×** |
-| **Qwen 3 8B** | `.palito` (`3.0 bpw`, **3.7 GiB**) | **324–329 tok/s** | — | — |
-| **Llama 3.2 1B** | `QTIP3` (**0.9 GiB**) | **1,361 tok/s** | 1,053 tok/s (`IQ3_XXS`) | **1.29×** |
-
-### With Speculative Decoding (`EAGLE-3` + `SuffixDecoding`)
-
-Both Palito and `llama.cpp` support speculative decoding (`EAGLE-3` and n-gram/lookup). In the table below, Palito's Refactor column uses `EAGLE-3 + SuffixDecoding` while `llama.cpp` was measured with `EAGLE-3` only (without `--spec-type ngram-simple` / `ngram-mod`), and Qwen3-30B-A3B's `llama.cpp` baseline is non-speculative `Q4_K_M`:
-
-| Model | File Size | Task | Palito (`EAGLE-3` + `Suffix`) | `llama.cpp` | Notes |
-| :--- | :---: | :--- | :---: | :---: | :--- |
-| **Llama 3.1 8B** (`3.0 bpw`) | **3.5 GiB** | General / Coding / Refactor | **417 / 445 / 1,017 tok/s** | 394 / 390 / 608 tok/s (`IQ3_XXS + EAGLE-3`) | **1.06× / 1.14×** (`EAGLE-3` vs `EAGLE-3`); Refactor adds `SuffixDecoding` |
-| **Qwen 3 8B** (`3.0 bpw`) | **3.7 GiB** | General / Coding / Refactor | **296 / 379 / 726 tok/s** | 306 / 310 / 459 tok/s (`Q3_K_M + EAGLE-3`) | **0.97× / 1.22×** (`EAGLE-3` vs `EAGLE-3`); Refactor adds `SuffixDecoding` |
-| **Qwen3-30B-A3B MoE** (`3.0 bpw`) | **11.1 GiB** | Refactor (`SuffixDecoding`) | **557 tok/s** | 340 tok/s (`Q4_K_M`, no spec) | Speculative vs non-speculative baseline |
-
-*All speculative runs are verified 100% bit-exact (`exact_parity=true`) against standard token-by-token generation and checked for coherent, non-degenerate output. See [reproducible benchmarks](benchmarks/vs-llama-cpp/README.md) for identical-GGUF HTTP streaming benchmarks (including long context up to 40k tokens).*
-
----
-
-## Quick Start (3 Simple Steps)
-
-### 1. Install Palito
-
-Download the latest Linux release from the [Releases page](https://github.com/natanloterio/palito/releases):
+### Linux (NVIDIA GPU or CPU)
 
 ```sh
-tar xzf palito-0.15.0-linux-x86_64.tar.gz
+curl -L https://github.com/natanloterio/palito/releases/download/v0.15.0/palito-0.15.0-linux-x86_64.tar.gz | tar xz
 mkdir -p ~/.local/bin
 ln -sf "$PWD/palito-0.15.0-linux-x86_64/palito" ~/.local/bin/palito
-palito --version
 ```
 
-*(Uses your NVIDIA GPU with CUDA 13 drivers automatically; CPU mode also works for small models.)*
+The bundle carries the CUDA 13 runtime compiler; only the NVIDIA driver must be installed. Without a GPU it runs on the CPU.
 
-### 2. Download a Model
+### macOS, Windows and other GPUs
+
+Install with Cargo (`--features metal` for Apple Silicon, `vulkan` for AMD and Intel GPUs). See [building from source](docs/building.md).
+
+### Libraries
+
+[Python](bindings/README.md) · [Node.js](bindings/README.md) · [Java](bindings/README.md) · [C#](bindings/README.md) · [Go](bindings/README.md) · [Rust](https://crates.io/crates/palito) · [C](examples/c/chat.c)
+
+## Get started
+
+Download a model and chat with it:
 
 ```sh
-# Fast 30B MoE model (requires Hugging Face CLI: pip install huggingface_hub)
 hf download Qwen/Qwen3-30B-A3B-GGUF Qwen3-30B-A3B-Q4_K_M.gguf --local-dir models
-
-# Or a tiny 105 MB model that runs even on a CPU
-hf download bartowski/SmolLM2-135M-Instruct-GGUF SmolLM2-135M-Instruct-Q4_K_M.gguf --local-dir models
+palito chat --model models/Qwen3-30B-A3B-Q4_K_M.gguf
 ```
 
-### 3. Chat or Start a Local API Server
-
-**Chat in your terminal:**
+No GPU? Try a 105 MB model that runs on any CPU:
 
 ```sh
-palito chat --model models/Qwen3-30B-A3B-Q4_K_M.gguf --stats
+hf download bartowski/SmolLM2-135M-Instruct-GGUF SmolLM2-135M-Instruct-Q4_K_M.gguf --local-dir models
+palito chat --model models/SmolLM2-135M-Instruct-Q4_K_M.gguf
 ```
 
-**Or start an OpenAI-compatible server** (works with Open WebUI, Cursor, Continue, and any OpenAI SDK):
+In the chat, `/help` lists the commands and Ctrl-C stops a reply.
+
+## OpenAI-compatible API
 
 ```sh
 palito serve --model models/Qwen3-30B-A3B-Q4_K_M.gguf
-# OpenAI API ready at http://127.0.0.1:8080/v1
 ```
+
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Why is the sky blue?"}]}'
+```
+
+Any OpenAI client works by pointing its base URL at the server:
 
 ```python
 from openai import OpenAI
@@ -94,62 +64,99 @@ from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
 reply = client.chat.completions.create(
     model="palito",
-    messages=[{"role": "user", "content": "Hello!"}],
+    messages=[{"role": "user", "content": "Why is the sky blue?"}],
 )
 print(reply.choices[0].message.content)
 ```
 
----
+Endpoints: `/v1/chat/completions` and `/v1/completions` (both with streaming), `/v1/models` and `/health`. Tool calling, JSON schemas, stop sequences and parallel slots (`-np`) are supported. See the [server reference](docs/plt1-format.md).
 
-## How to Run Single-File `.palito` Models
+## The `.palito` format
 
-A single `.palito` file bundles everything — tokenizer, GPU-native model weights (dense or MoE), and the built-in `EAGLE-3` predictor — so you just pass it directly to `palito chat` or `palito serve` with **zero extra flags** (CUDA and speculative decoding turn on automatically):
-
-```sh
-# Chat directly with a single .palito file (Qwen 3 8B, Llama 3.1 8B, or Qwen3-30B-A3B MoE)
-palito chat --model models/qwen3-8b.palito --stats
-
-# Or serve it over an OpenAI-compatible API
-palito serve --model models/qwen3-30b-a3b.palito
-```
-
-To convert any GGUF model into a single `.palito` file in one command (with automatic CUDA Hessian calibration and CUDA Viterbi quantization):
+GGUF was designed for CPUs; on a GPU much of the time goes to unpacking weights. A `.palito` file stores weights already laid out for NVIDIA tensor cores, at 3.0 bits per weight, in one self-contained file with the tokenizer and an `EAGLE-3` draft head:
 
 ```sh
-palito convert --input models/Qwen3-8B-Q6_K.gguf --output models/qwen3-8b.palito
+palito convert -i models/Qwen3-8B-Q6_K.gguf -o models/qwen3-8b.palito
+palito chat --model models/qwen3-8b.palito
 ```
 
-See the **[`.palito` (`PLT1`) Format Guide](docs/plt1-format.md)** for optional `EAGLE-3` bundling and advanced options.
+Qwen 3 8B fits in 3.7 GiB and Qwen3-30B-A3B in 11.1 GiB (down from 18.6 GiB as `Q4_K_M`). Speculative decoding (`EAGLE-3` + `SuffixDecoding`) turns on automatically and gives identical output to token-by-token decoding. See the [format guide](docs/plt1-format.md).
 
----
+## Performance
 
-## Use Palito in Your Language
+Pure decode on an RTX 5090, against `llama.cpp` CUDA:
 
-Palito ships ready-made bindings that run at full native speed in-process (no server needed):
+| Model | Palito | `llama.cpp` |
+| :--- | ---: | ---: |
+| Qwen3-30B-A3B MoE (`.palito`, 11.1 GiB) | **412 tok/s** | 340 tok/s (`Q4_K_M`, 18.6 GiB) |
+| Llama 3.1 8B (`.palito`, 3.5 GiB) | **347 tok/s** | 341 tok/s (`IQ3_XXS`) |
+| Llama 3.2 1B (3.0 bpw, 0.9 GiB) | **1,361 tok/s** | 1,053 tok/s (`IQ3_XXS`) |
 
-| Language | Install | One-Line Example |
-| :--- | :--- | :--- |
-| **Python** | `pip install palito` | `palito.Palito("model.gguf").chat([{"role": "user", "content": "Hi"}])` |
-| **Node.js / TS** | `npm install palito` | `await (await Palito.open("model.gguf")).chat([{ role: "user", content: "Hi" }])` |
-| **Java 22+** | Maven (`io.github.natanloterio:palito`) | `Palito.open(Path.of("model.gguf"), new Options()).chat(...)` |
-| **C# / .NET** | `dotnet add package Palito` | `PalitoEngine.Open("model.gguf").Chat(new[] { Message.User("Hi") })` |
-| **Go** | `go get github.com/natanloterio/palito/bindings/go` | `engine.Chat(ctx, []palito.Message{{Role: "user", Content: "Hi"}}, nil)` |
-| **Rust / C** | `cargo add palito` / `libpalito.so` | See [`examples/c/chat.c`](examples/c/chat.c) |
+With speculative decoding, Llama 3.1 8B reaches 1,017 tok/s on code refactoring. Full tables and methodology: [performance](docs/performance.md) and [reproducible benchmarks](benchmarks/vs-llama-cpp/README.md).
 
----
+## Supported models
 
-## Supported Models
+Llama 3 / 3.1 / 3.2, Qwen 2.5 / 3 / 3.5 (dense and MoE), Gemma 2 / 3, SmolLM2, Phi-3, StarCoder2, OLMo / OLMo 2 / OLMoE, and more. See the [tested models](docs/technical-reference.md).
 
-Works out of the box with **Llama 3 / 3.1 / 3.2**, **Qwen 2.5 / 3 / 3.5** (dense and MoE), **Gemma 2 / 3**, **SmolLM2**, **Phi-3**, **StarCoder2**, **OLMo / OLMo 2 / OLMoE**, and more.
+## Documentation
 
----
+- [`.palito` format, CLI and server reference](docs/plt1-format.md)
+- [Performance](docs/performance.md) and [benchmarks vs `llama.cpp`](benchmarks/vs-llama-cpp/README.md)
+- [Language bindings](bindings/README.md)
+- [Building from source](docs/building.md)
+- [Technical reference](docs/technical-reference.md) and [architecture](docs/architecture.md)
+- [Releasing](docs/releasing.md)
 
-## Deep-Dive Documentation
+## Works with OpenAI-compatible apps
 
-- **[`.palito` (`PLT1`) Format Guide](docs/plt1-format.md)** — How `PLT1` works under the hood, converting GGUF → `.palito`, building from source, full CLI/server flags, C API, and troubleshooting.
-- **[Benchmarks vs `llama.cpp`](benchmarks/vs-llama-cpp/README.md)** — Reproducible benchmark scripts and raw measurements.
-- **[Language Bindings](bindings/README.md)** — Guides for Python, Node.js, Java, C#, and Go.
-- **[Technical Reference & Architecture](docs/technical-reference.md)** — Kernel architecture, tested models, and long-context numbers.
-- **[Architecture](docs/architecture.md)** | **[Releasing](docs/releasing.md)** | **[Portuguese CUDA report](docs/relatorio-desempenho-decode-cuda.md)**
+`palito serve` speaks the OpenAI API, so apps and libraries that let you set a custom OpenAI base URL can use it. Set the base URL to `http://127.0.0.1:8080/v1` and the API key to any value (or the one given to `--api-key`).
 
-License: MIT (see [LICENSE](LICENSE)).
+Tested: the [OpenAI Python SDK](https://github.com/openai/openai-python), [LangChain](https://python.langchain.com/docs/integrations/chat/openai/) (`ChatOpenAI`) and [LiteLLM](https://github.com/BerriAI/litellm) (`openai/` models). The rest of this list offers an OpenAI-compatible provider but has not been tested with Palito yet; reports and pull requests are welcome.
+
+Palito does not serve `/v1/embeddings`, so apps that index documents (RAG) need a separate embedding provider. Agents that rely on tool calls need a model with Qwen's `<tool_call>` format, such as Qwen 2.5 or Qwen 3.
+
+### Chat interfaces
+
+- [Open WebUI](https://github.com/open-webui/open-webui)
+- [LibreChat](https://github.com/danny-avila/LibreChat)
+- [Lobe Chat](https://github.com/lobehub/lobe-chat)
+- [NextChat](https://github.com/ChatGPTNextWeb/ChatGPT-Next-Web)
+- [big-AGI](https://github.com/enricoros/big-AGI)
+- [AnythingLLM](https://github.com/Mintplex-Labs/anything-llm)
+- [Chatbox](https://github.com/Bin-Huang/Chatbox)
+- [Cherry Studio](https://github.com/kangfenmao/cherry-studio)
+- [Dify](https://github.com/langgenius/dify)
+- [Perplexica](https://github.com/ItzCrazyKns/Perplexica)
+
+### Code editors
+
+- [Continue](https://github.com/continuedev/continue)
+- [Cline](https://github.com/cline/cline)
+- [Void](https://github.com/voideditor/void)
+- [gptel](https://github.com/karthink/gptel) (Emacs)
+- [Open Interpreter](https://github.com/OpenInterpreter/open-interpreter)
+
+### Libraries and frameworks
+
+- [LangChain](https://python.langchain.com/docs/integrations/chat/openai/) and [LangChain.js](https://js.langchain.com/docs/integrations/chat/openai/)
+- [LlamaIndex](https://docs.llamaindex.ai/en/stable/examples/llm/openai_like/) (`OpenAILike`)
+- [LiteLLM](https://github.com/BerriAI/litellm)
+- [Haystack](https://github.com/deepset-ai/haystack)
+- [Semantic Kernel](https://github.com/microsoft/semantic-kernel)
+- [Spring AI](https://github.com/spring-projects/spring-ai)
+- [LangChain4j](https://github.com/langchain4j/langchain4j)
+- [crewAI](https://github.com/crewAIInc/crewAI)
+
+### Terminal
+
+- [aichat](https://github.com/sigoden/aichat)
+- [llm](https://github.com/simonw/llm)
+
+### Observability
+
+- [Langfuse](https://github.com/langfuse/langfuse)
+- [OpenLIT](https://github.com/openlit/openlit)
+
+## License
+
+MIT. See [LICENSE](LICENSE).

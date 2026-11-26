@@ -3,8 +3,11 @@
 Node.js binding for [Palito](../../README.md), built on [koffi](https://koffi.dev). Generation runs on a worker thread, so the event loop stays free.
 
 ```sh
-npm install ./bindings/node
+npm install palito                # from npm
+npm install ./bindings/node       # or from a clone of the repository
 ```
+
+It needs the native `libpalito` library: install the [Linux bundle](https://github.com/natanloterio/palito#download) or point `PALITO_LIBRARY` at your own build (see [bindings](https://github.com/natanloterio/palito/blob/master/bindings/README.md)).
 
 ```js
 const { Palito } = require('palito');

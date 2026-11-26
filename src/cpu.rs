@@ -1,6 +1,7 @@
 //! Independent dense transformer execution on CPU with packed weights and causal batched prefill.
 //! Consumes the shared `transformer::Weights` normalized representation used by CUDA, Metal, and Vulkan.
 pub mod plt1;
+pub mod plt1_simd;
 
 use crate::{
     Config, Error, GenerationMode, Result,

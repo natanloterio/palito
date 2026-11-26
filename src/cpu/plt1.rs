@@ -30,22 +30,7 @@ pub(crate) const fn hyb_tile_words(pair_bits: u8) -> usize {
 /// Unnormalized in-place 256-point Fast Walsh-Hadamard Transform (`H_256`).
 #[inline]
 pub(crate) fn fwht256_inplace(chunk: &mut [f32]) {
-    debug_assert_eq!(chunk.len(), CHUNK);
-    let mut h = 1usize;
-    while h < CHUNK {
-        let step = h * 2;
-        let mut base = 0usize;
-        while base < CHUNK {
-            for j in 0..h {
-                let a = chunk[base + j];
-                let b = chunk[base + j + h];
-                chunk[base + j] = a + b;
-                chunk[base + j + h] = a - b;
-            }
-            base += step;
-        }
-        h = step;
-    }
+    super::plt1_simd::fwht256_inplace(chunk.try_into().expect("FWHT-256 expects 256 elements"));
 }
 
 /// Converts a 32-entry `f16x2` (`Q=5`) HYB LUT into `[f32; 64]` at load time.
@@ -448,16 +433,12 @@ impl Plt1CpuRuntime {
 pub(crate) fn r1_enter_with_signs(x: &mut [f32], r1_signs: &[f32], cols: usize, tokens: usize) {
     debug_assert_eq!(cols % CHUNK, 0);
     debug_assert_eq!(r1_signs.len(), cols);
-    let inv16 = 1.0f32 / 16.0;
     for tok in x[..tokens * cols].chunks_exact_mut(cols) {
         for (chunk, signs) in tok.chunks_exact_mut(CHUNK).zip(r1_signs.chunks_exact(CHUNK)) {
-            for (v, &s) in chunk.iter_mut().zip(signs) {
-                *v *= s;
-            }
-            fwht256_inplace(chunk);
-            for v in chunk.iter_mut() {
-                *v *= inv16;
-            }
+            super::plt1_simd::hyb_r1_enter_chunk(
+                chunk.try_into().unwrap(),
+                signs.try_into().unwrap(),
+            );
         }
     }
 }
@@ -465,13 +446,12 @@ pub(crate) fn r1_enter_with_signs(x: &mut [f32], r1_signs: &[f32], cols: usize, 
 pub(crate) fn r1_exit_with_signs(x: &mut [f32], r1_signs: &[f32], cols: usize, tokens: usize) {
     debug_assert_eq!(cols % CHUNK, 0);
     debug_assert_eq!(r1_signs.len(), cols);
-    let inv16 = 1.0f32 / 16.0;
     for tok in x[..tokens * cols].chunks_exact_mut(cols) {
         for (chunk, signs) in tok.chunks_exact_mut(CHUNK).zip(r1_signs.chunks_exact(CHUNK)) {
-            fwht256_inplace(chunk);
-            for (v, &s) in chunk.iter_mut().zip(signs) {
-                *v *= s * inv16;
-            }
+            super::plt1_simd::hyb_r1_exit_chunk(
+                chunk.try_into().unwrap(),
+                signs.try_into().unwrap(),
+            );
         }
     }
 }
@@ -524,8 +504,15 @@ fn matmul_tiles(
                     let mut acc = [0.0f32; TILE];
                     for k in 0..col_tiles {
                         let tile = &group_tiles[k * wpt..(k + 1) * wpt];
-                        let xv = &x_in[k * TILE..(k + 1) * TILE];
-                        accumulate_tile_1tok(tile, lut_f32, pair_bits, state_mask, xv, &mut acc);
+                        let xv: &[f32; TILE] = x_in[k * TILE..(k + 1) * TILE].try_into().unwrap();
+                        super::plt1_simd::hyb_q5_tile_dot_mma(
+                            tile,
+                            lut_f32,
+                            xv,
+                            &mut acc,
+                            state_bits,
+                            u32::from(pair_bits),
+                        );
                     }
                     out_chunk[g * TILE..(g + 1) * TILE].copy_from_slice(&acc);
                 }
@@ -633,36 +620,6 @@ fn prepare_input(x: &[f32], col_signs: &[f32], cols: usize, tokens: usize) -> Ve
         });
     }
     out
-}
-
-#[inline(always)]
-fn accumulate_tile_1tok(
-    tile: &[u32],
-    lut_f32: &[f32; 64],
-    pair_bits: u8,
-    state_mask: u32,
-    xv: &[f32],
-    acc: &mut [f32; TILE],
-) {
-    for lane in 0..32usize {
-        let group_id = lane >> 2;
-        let tid = lane & 3;
-        let c0 = 2 * tid;
-        let c1 = c0 + 8;
-        let x0 = xv[c0];
-        let x1 = xv[c0 + 1];
-        let x2 = xv[c1];
-        let x3 = xv[c1 + 1];
-
-        let states = extract_lane_states(tile, lane, pair_bits, state_mask);
-        let (a0, a1) = decode_pair_q5(lut_f32, states[0]);
-        let (b0, b1) = decode_pair_q5(lut_f32, states[1]);
-        let (c0w, c1w) = decode_pair_q5(lut_f32, states[2]);
-        let (d0, d1) = decode_pair_q5(lut_f32, states[3]);
-
-        acc[group_id] += a0 * x0 + a1 * x1 + c0w * x2 + c1w * x3;
-        acc[group_id + 8] += b0 * x0 + b1 * x1 + d0 * x2 + d1 * x3;
-    }
 }
 
 #[allow(clippy::too_many_arguments)]

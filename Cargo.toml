@@ -116,6 +116,10 @@ name = "collect-hessians-cuda"
 path = "examples/collect_hessians_cuda.rs"
 required-features = ["cuda"]
 
+[[example]]
+name = "plt1-cpu-bench"
+path = "examples/plt1_cpu_bench.rs"
+
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }

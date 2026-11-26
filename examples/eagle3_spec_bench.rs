@@ -200,8 +200,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     #[cfg(feature = "qtip-research")]
     if let Some(plt1_path) = &args.plt1 {
-        backend.load_plt1_projections(plt1_path)?;
-        println!("Loaded PLT1 HYB Q=5 overlay: {}", plt1_path.display());
+        if !backend.has_plt1() {
+            backend.load_plt1_projections(plt1_path)?;
+            println!("Loaded PLT1 HYB Q=5 overlay: {}", plt1_path.display());
+        }
     }
 
     let arch = backend.info().architecture.clone();
@@ -210,7 +212,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .tokenize("<|im_start|>")
             .map(|t| t.len() == 1)
             .unwrap_or(false);
-    let template_name = if is_qwen { "qwen3" } else { "llama3" };
+    let chat_tmpl = palito::chat::ChatTemplate::from_model(&args.model, None, true)
+        .ok()
+        .map(|t| t.with_thinking(false));
+    let template_name = if chat_tmpl.is_some() {
+        "gguf"
+    } else if is_qwen {
+        "qwen3"
+    } else {
+        "llama3"
+    };
     println!(
         "Model arch={arch} moe={is_moe} matmul={matmul_name} chat_template={template_name}"
     );
@@ -232,7 +243,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prompts: Vec<(&str, String)> = raw_prompts
         .iter()
         .map(|&(label, body)| {
-            let formatted = if is_qwen {
+            let formatted = if let Some(tmpl) = &chat_tmpl {
+                tmpl.render(&[palito::chat::Message::user(body)], true)
+                    .unwrap_or_else(|_| body.to_string())
+            } else if is_qwen {
                 format!(
                     "<|im_start|>user\n{body}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
                 )

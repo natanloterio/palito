@@ -837,6 +837,107 @@ extern "C" __global__ void attention_split_group_decode(const float *q, const fl
     attention_split_group_impl(q, keys, values, partial, dim, heads, kv_heads, control[1] + 1);
 }
 
+// Batched chain/tree variant of attention_split_group (grid = (kv_heads, chunks, tokens)).
+// Bit-exact with attention_split_group for every token in a speculative chain or tree.
+extern "C" __global__ void attention_split_group_batch(
+    const float *q, const float *keys, const float *values, float *partial, int dim,
+    int heads, int kv_heads, int prefix_len, const unsigned long long *tree_mask) {
+    int kv_head = blockIdx.x, tok = blockIdx.z, group = heads / kv_heads;
+    int lane = threadIdx.x % 32, head = kv_head * group + threadIdx.x / 32;
+    int anc[16];
+    int count;
+    if (tree_mask != nullptr) {
+        unsigned long long m = tree_mask[tok];
+        int n_anc = 0;
+        while (m != 0ULL && n_anc < 16) {
+            int b = __ffsll((long long)m) - 1;
+            anc[n_anc++] = b;
+            m &= m - 1ULL;
+        }
+        count = prefix_len + n_anc;
+    } else {
+        count = prefix_len + tok + 1;
+    }
+    int chunks = gridDim.y, chunk = attention_chunk(count, chunks, ATTENTION_GROUP_GRANULE);
+    int begin = blockIdx.y * chunk, end = min(count, begin + chunk);
+    if (begin >= end) return;
+    const float *q_tok = q + ((u64)tok * heads + head) * dim;
+    bool active = 4 * lane < dim;
+    float4 query = active ? *(const float4 *)(q_tok + 4 * lane)
+                          : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float scale = sqrtf((float)dim), maximum = -__int_as_float(0x7f800000), total = 0.0f;
+    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int base = begin; base < end; base += 32) {
+        int n = min(32, end - base);
+        float mine = -__int_as_float(0x7f800000);
+        for (int u = 0; u < n; u += 4) {
+            float4 k[4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                if (active && u + j < n) {
+                    int idx = base + u + j;
+                    int row = (tree_mask != nullptr && idx >= prefix_len)
+                        ? (prefix_len + anc[idx - prefix_len]) : idx;
+                    k[j] = kv_load4(keys, ((u64)row * kv_heads + kv_head) * dim + 4 * lane);
+                } else {
+                    k[j] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                }
+            }
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float sum = warp_sum(query.x * k[j].x + query.y * k[j].y + query.z * k[j].z
+                                     + query.w * k[j].w);
+                if (lane == u + j && u + j < n) mine = sum / scale;
+            }
+        }
+        float step = mine;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+            step = fmaxf(step, __shfl_xor_sync(0xffffffff, step, offset));
+        float updated = fmaxf(maximum, step), rescale = expf(maximum - updated);
+        float p = lane < n ? expf(mine - updated) : 0.0f;
+        total = total * rescale + warp_sum(p);
+        maximum = updated;
+        acc.x *= rescale;
+        acc.y *= rescale;
+        acc.z *= rescale;
+        acc.w *= rescale;
+        for (int u = 0; u < n; u += 4) {
+            float4 v[4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                if (active && u + j < n) {
+                    int idx = base + u + j;
+                    int row = (tree_mask != nullptr && idx >= prefix_len)
+                        ? (prefix_len + anc[idx - prefix_len]) : idx;
+                    v[j] = kv_load4(values, ((u64)row * kv_heads + kv_head) * dim + 4 * lane);
+                } else {
+                    v[j] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                }
+            }
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float pj = __shfl_sync(0xffffffff, p, u + j);
+                acc.x += pj * v[j].x;
+                acc.y += pj * v[j].y;
+                acc.z += pj * v[j].z;
+                acc.w += pj * v[j].w;
+            }
+        }
+    }
+    float *out = partial + (((u64)tok * heads + head) * chunks + blockIdx.y) * (dim + 2);
+    if (active) {
+        out[4 * lane] = acc.x;
+        out[4 * lane + 1] = acc.y;
+        out[4 * lane + 2] = acc.z;
+        out[4 * lane + 3] = acc.w;
+    }
+    if (lane == 0) {
+        out[dim] = maximum;
+        out[dim + 1] = total;
+    }
+}
+
 #ifdef CUDA_KV_F16
 extern "C" __global__ void attention_split_group_f16(const float *q, const kv_f16 *keys,
                                                     const kv_f16 *values, float *partial,
@@ -1094,6 +1195,18 @@ extern "C" __global__ void attention_combine_group_decode(const float *partial,
                                                          const int *control) {
     attention_combine_wide_impl(partial, output, dim, chunks, control[1] + 1,
                                 ATTENTION_GROUP_GRANULE);
+}
+
+extern "C" __global__ void attention_combine_group_batch(const float *partial,
+                                                         float *output, int dim, int heads,
+                                                         int chunks, int prefix_len,
+                                                         const unsigned long long *tree_mask) {
+    int tok = blockIdx.z;
+    int count = (tree_mask != nullptr) ? (prefix_len + __popcll(tree_mask[tok]))
+                                       : (prefix_len + tok + 1);
+    const float *p_tok = partial + (u64)tok * heads * chunks * (dim + 2);
+    float *out_tok = output + (u64)tok * heads * dim;
+    attention_combine_wide_impl(p_tok, out_tok, dim, chunks, count, ATTENTION_GROUP_GRANULE);
 }
 #endif
 

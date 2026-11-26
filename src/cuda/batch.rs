@@ -1,4 +1,5 @@
 use super::*;
+use cudarc::driver::DevicePtr;
 
 /// Runs `$fallback` unless `$t` is QTIP3, which takes the batched tensor-core
 /// path (`qtip::QtipKernel::matmul`) instead: int8 under int8-fast, exact
@@ -781,7 +782,68 @@ impl CudaBackend {
                 return Err(invalid("prefill score workspace too small for this chunk"));
             }
             // Future KV rows are already written; each query can only see its prefix.
-            if let Some((_, tree_mask)) = tree {
+            #[cfg(feature = "qtip-research")]
+            let plt1_split_group_attn = self.plt1_hyb.is_some()
+                && tokens.len() <= 16
+                && self.work.attention_partials.is_some()
+                && embedding_norm.is_none()
+                && gemma_attention.is_none()
+                && dim <= 128
+                && dim % 4 == 0
+                && kv_heads > 0
+                && heads % kv_heads == 0
+                && (2..=8).contains(&(heads / kv_heads))
+                && !self.matmul.kv_f16();
+            #[cfg(not(feature = "qtip-research"))]
+            let plt1_split_group_attn = false;
+            if plt1_split_group_attn {
+                let splits = attention_splits(s) as i32;
+                let chunks = splits.min(attention_chunks(s) as i32);
+                let group = (heads / kv_heads) as u32;
+                let need = tokens.len() * s.heads * chunks as usize * (s.dim + 2);
+                let partials = self.work.attention_partials.as_mut().unwrap();
+                if partials.len() < need {
+                    *partials = self.stream.alloc_zeros(need).map_err(failure)?;
+                }
+                let tree_mask_ptr: u64 =
+                    tree.map_or(0u64, |(_, m)| m.device_ptr(&self.stream).0);
+                let split_fn = self.functions["attention_split_group_batch"].clone();
+                let mut b = self.stream.launch_builder(&split_fn);
+                b.arg(&self.work.q)
+                    .arg(&self.keys[index])
+                    .arg(&self.values[index])
+                    .arg(&mut *partials)
+                    .arg(&dim)
+                    .arg(&heads)
+                    .arg(&kv_heads)
+                    .arg(&pos)
+                    .arg(&tree_mask_ptr);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (kv_heads as u32, chunks as u32, n as u32),
+                        block_dim: (32 * group, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(failure)?;
+                let comb_fn = self.functions["attention_combine_group_batch"].clone();
+                let mut b2 = self.stream.launch_builder(&comb_fn);
+                b2.arg(&*partials)
+                    .arg(&mut self.work.attended)
+                    .arg(&dim)
+                    .arg(&heads)
+                    .arg(&chunks)
+                    .arg(&pos)
+                    .arg(&tree_mask_ptr);
+                unsafe {
+                    b2.launch(LaunchConfig {
+                        grid_dim: (heads as u32, 1, n as u32),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(failure)?;
+            } else if let Some((_, tree_mask)) = tree {
                 let smem = ((position + tokens.len()) * std::mem::size_of::<f32>()) as u32;
                 let func = self.functions["attention_tree"].clone();
                 let mut b = self.stream.launch_builder(&func);
@@ -1206,18 +1268,72 @@ impl CudaBackend {
                 } else {
                     ("prefill_matmul", (t.rows as u32, (n as u32).div_ceil(4), 1), 256)
                 };
-                launch!(
-                    self,
-                    name,
-                    grid; threads,
-                    &t.bytes,
-                    &t.kind,
-                    &self.work.normalized,
-                    &mut self.work.router,
-                    &t.width,
-                    &t.rows,
-                    &n
-                );
+                #[cfg(feature = "qtip-research")]
+                let plt1_exact_router = self.plt1_hyb.is_some() && tokens.len() <= 16;
+                #[cfg(not(feature = "qtip-research"))]
+                let plt1_exact_router = false;
+                if plt1_exact_router {
+                    let warps_1 = matvec_warps_per_row(t.kind, t.rows as u32, 1, t.width as u32);
+                    let warps_n =
+                        matvec_warps_per_row(t.kind, t.rows as u32, n as u32, t.width as u32);
+                    if warps_1 == warps_n {
+                        launch!(
+                            self,
+                            "matvec",
+                            matvec_grid(self.matmul, t.kind, t.rows, n as u32, t.width),
+                            &t.bytes,
+                            &t.kind,
+                            &self.work.normalized,
+                            &mut self.work.router,
+                            &t.width,
+                            &t.rows,
+                            &self.work.ids,
+                            &0i32,
+                            &1i32
+                        );
+                    } else {
+                        let grid = matvec_grid(self.matmul, t.kind, t.rows, 1, t.width);
+                        let width_u = s.width;
+                        let experts_u = s.experts;
+                        for tok in 0..tokens.len() {
+                            let x_tok = self
+                                .work
+                                .normalized
+                                .slice(tok * width_u..(tok + 1) * width_u);
+                            let mut r_tok = self
+                                .work
+                                .router
+                                .slice_mut(tok * experts_u..(tok + 1) * experts_u);
+                            launch!(
+                                self,
+                                "matvec",
+                                grid,
+                                &t.bytes,
+                                &t.kind,
+                                &x_tok,
+                                &mut r_tok,
+                                &t.width,
+                                &t.rows,
+                                &self.work.ids,
+                                &0i32,
+                                &0i32
+                            );
+                        }
+                    }
+                } else {
+                    launch!(
+                        self,
+                        name,
+                        grid; threads,
+                        &t.bytes,
+                        &t.kind,
+                        &self.work.normalized,
+                        &mut self.work.router,
+                        &t.width,
+                        &t.rows,
+                        &n
+                    );
+                }
                 capture_projection!(
                     self,
                     index,

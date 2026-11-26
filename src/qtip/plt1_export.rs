@@ -6,7 +6,7 @@ use super::{
     hessian::Hessians,
     hyb::{HybCodebook, HybQuantizer, decode_hyb_tile_mma_l, swizzle_tile_to_mma},
     incoherence::Incoherence,
-    ldlq::{block_feedback, cholesky_upper, ldlq_with, proxy_error},
+    ldlq::{block_feedback, cholesky_upper, ldlq_with, ldlq_with_batch, proxy_error},
     matrix::{distortion, rms},
     model::{TensorReport, matrix},
 };
@@ -92,6 +92,48 @@ fn rmsnorm_name_for(proj: &str) -> Option<String> {
     }
 }
 
+/// Folds `diag(1/gamma)` into an undamped input Hessian `h_raw` (with median
+/// diagonal floor on near-zero `gamma` channels) and applies relative diagonal
+/// damping.
+fn fold_rmsnorm_hessian(h_raw: &mut [f64], gamma: &[f32], cols: usize, damping: f64) {
+    let mut valid_diags = Vec::with_capacity(cols);
+    let inv: Vec<f64> = gamma
+        .iter()
+        .enumerate()
+        .map(|(i, &g)| {
+            if g.abs() >= 1e-2 {
+                let iv = 1.0 / f64::from(g);
+                valid_diags.push(h_raw[i * cols + i] * iv * iv);
+                iv
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    valid_diags.sort_by(|a, b| a.total_cmp(b));
+    let floor_diag = if valid_diags.is_empty() {
+        1.0
+    } else {
+        valid_diags[valid_diags.len() / 2].max(1e-6)
+    };
+    for r in 0..cols {
+        let ir = inv[r];
+        for c in 0..cols {
+            h_raw[r * cols + c] *= ir * inv[c];
+        }
+        if ir == 0.0 {
+            // Keep unit-norm diagonal weight on near-zero gamma channels so LDLQ
+            // does not dump quantization error onto them (x_unit still has ~1.0 RMS).
+            h_raw[r * cols + r] = floor_diag;
+        }
+    }
+    let mean_diag = (0..cols).map(|i| h_raw[i * cols + i]).sum::<f64>() / cols as f64;
+    let damp = damping * mean_diag.max(1e-12);
+    for i in 0..cols {
+        h_raw[i * cols + i] += damp;
+    }
+}
+
 /// Converts an F16 GGUF into a 128B-aligned `.palito` (`PLT1`) container with
 /// MMA-swizzled HYB tiles, optional offline RMSNorm + residual-stream RHT
 /// folding, and BlockLDLQ Hessian-guided quantization.
@@ -105,6 +147,60 @@ pub fn export_gguf_to_plt1(
     let model = Gguf::open(input, false)?;
     let codebook = HybCodebook::gaussian_for_q(opts.lut_bits);
     let quantizer = HybQuantizer::new(opts.state_bits, opts.pair_bits, codebook.clone())?;
+    #[cfg(feature = "cuda")]
+    let gpu_quantizer: Option<super::hyb_cuda::CudaHybQuantizer> =
+        cudarc::driver::CudaContext::new(0).ok().and_then(|ctx| {
+            super::hyb_cuda::CudaHybQuantizer::new(
+                ctx,
+                opts.state_bits,
+                opts.pair_bits,
+                codebook.clone(),
+            )
+            .ok()
+        });
+    let words_per_tile = (128 * opts.pair_bits as usize) / 32;
+    let quantize_matrix = |rotated: &[f32],
+                           rows: usize,
+                           cols: usize,
+                           u: &[f64],
+                           sigma: f32|
+     -> Result<(Vec<f32>, Vec<Vec<u32>>)> {
+        #[cfg(feature = "cuda")]
+        if let Some(gpu) = &gpu_quantizer {
+            let inv_sigma = 1.0 / sigma;
+            return ldlq_with_batch(rotated, rows, cols, u, |batch_tiles| {
+                let mut swizzled_norm = Vec::with_capacity(batch_tiles.len() * 256);
+                for tile in batch_tiles {
+                    let swz = swizzle_tile_to_mma(tile);
+                    swizzled_norm.extend(swz.iter().map(|&v| v * inv_sigma));
+                }
+                let (packed, mut decoded) = gpu.quantize_tiles_normalized(&swizzled_norm)?;
+                for v in &mut decoded {
+                    *v *= sigma;
+                }
+                let codes: Vec<Vec<u32>> = packed
+                    .chunks_exact(words_per_tile)
+                    .map(|c| c.to_vec())
+                    .collect();
+                Ok((decoded, codes))
+            });
+        }
+        let (quantized, tiles) = ldlq_with(rotated, rows, cols, u, |tile| {
+            let swizzled = swizzle_tile_to_mma(tile);
+            let norm: Vec<f32> = swizzled.iter().map(|&v| v / sigma).collect();
+            let words = quantizer.quantize_normalized(&norm);
+            let decoded = match &words {
+                Ok(w) => {
+                    decode_hyb_tile_mma_l(w, opts.state_bits, opts.pair_bits, &codebook, sigma)
+                        .to_vec()
+                }
+                Err(_) => vec![0.0; tile.len()],
+            };
+            (decoded, words)
+        })?;
+        let tiles = tiles.into_iter().collect::<Result<Vec<_>>>()?;
+        Ok((quantized, tiles))
+    };
 
     let mut names: Vec<String> = model
         .tensors
@@ -252,16 +348,35 @@ pub fn export_gguf_to_plt1(
             } else {
                 base_rht
             };
-            // Identity Hessian fallback for MoE experts (optional shared Hessian if present).
-            let mut h_mat = vec![0.0f64; cols * cols];
-            for i in 0..cols {
-                h_mat[i * cols + i] = 1.0 + f64::from(opts.damping);
-            }
-            let u = block_feedback(&cholesky_upper(&rht.transform_hessian(&h_mat), cols)?, cols)?;
+            let has_per_expert_h = hessians.expert_count(name).is_some();
+            let (shared_h, shared_u) = if has_per_expert_h {
+                (None, None)
+            } else if hessians.contains(name) {
+                let h = if let Some(g) = &gamma {
+                    let mut h_raw = hessians.load(name, cols, 0.0)?;
+                    fold_rmsnorm_hessian(&mut h_raw, g, cols, f64::from(opts.damping));
+                    h_raw
+                } else {
+                    hessians.load(name, cols, f64::from(opts.damping))?
+                };
+                let u = block_feedback(&cholesky_upper(&rht.transform_hessian(&h), cols)?, cols)?;
+                (Some(h), Some(u))
+            } else {
+                // Identity Hessian fallback when no Hessian is provided for this MoE tensor.
+                let mut h_mat = vec![0.0f64; cols * cols];
+                for i in 0..cols {
+                    h_mat[i * cols + i] = 1.0 + f64::from(opts.damping);
+                }
+                let u =
+                    block_feedback(&cholesky_upper(&rht.transform_hessian(&h_mat), cols)?, cols)?;
+                (None, Some(u))
+            };
 
             let mut all_tile_bytes = Vec::new();
             let mut expert_scales = Vec::with_capacity(n_experts);
             let mut sum_rel = 0.0f64;
+            let mut sum_proxy = 0.0f64;
+            let mut has_proxy = false;
             let mut row_buf = vec![0.0f32; cols];
             for e in 0..n_experts {
                 let mut w_e = vec![0.0f32; rows * cols];
@@ -277,28 +392,39 @@ pub fn export_gguf_to_plt1(
                         w_e[r * cols..(r + 1) * cols].copy_from_slice(&row_buf);
                     }
                 }
+                let expert_h_owned = if has_per_expert_h {
+                    let h = if let Some(g) = &gamma {
+                        let mut h_raw = hessians.load_expert(name, e, n_experts, cols, 0.0)?;
+                        fold_rmsnorm_hessian(&mut h_raw, g, cols, f64::from(opts.damping));
+                        h_raw
+                    } else {
+                        hessians.load_expert(name, e, n_experts, cols, f64::from(opts.damping))?
+                    };
+                    Some(h)
+                } else {
+                    None
+                };
+                let expert_u_owned = match &expert_h_owned {
+                    Some(h_e) => Some(block_feedback(
+                        &cholesky_upper(&rht.transform_hessian(h_e), cols)?,
+                        cols,
+                    )?),
+                    None => None,
+                };
+                let u_ref = expert_u_owned
+                    .as_deref()
+                    .or(shared_u.as_deref())
+                    .expect("either per-expert or shared feedback matrix must exist");
                 let rotated = rht.forward(&w_e);
                 let sigma = rms(&rotated).max(1e-8);
-                let (quantized, tiles) = ldlq_with(&rotated, rows, cols, &u, |tile| {
-                    let swizzled = swizzle_tile_to_mma(tile);
-                    let norm: Vec<f32> = swizzled.iter().map(|&v| v / sigma).collect();
-                    let words = quantizer.quantize_normalized(&norm);
-                    let decoded = match &words {
-                        Ok(w) => decode_hyb_tile_mma_l(
-                            w,
-                            opts.state_bits,
-                            opts.pair_bits,
-                            &codebook,
-                            sigma,
-                        )
-                        .to_vec(),
-                        Err(_) => vec![0.0; tile.len()],
-                    };
-                    (decoded, words)
-                })?;
+                let (quantized, tiles) = quantize_matrix(&rotated, rows, cols, u_ref, sigma)?;
                 let reconstructed = rht.inverse(&quantized);
                 sum_rel += distortion(&w_e, &reconstructed).relative;
-                for w in tiles.into_iter().collect::<Result<Vec<_>>>()?.concat() {
+                if let Some(h_ref) = expert_h_owned.as_deref().or(shared_h.as_deref()) {
+                    sum_proxy += proxy_error(&w_e, &reconstructed, rows, cols, h_ref);
+                    has_proxy = true;
+                }
+                for w in tiles.concat() {
                     all_tile_bytes.extend_from_slice(&w.to_le_bytes());
                 }
                 expert_scales.push(if opts.fold_residual_rht {
@@ -310,7 +436,7 @@ pub fn export_gguf_to_plt1(
             let report = TensorReport {
                 name: name.clone(),
                 relative_error: sum_rel / n_experts as f64,
-                proxy_error: None,
+                proxy_error: has_proxy.then_some(sum_proxy / n_experts as f64),
             };
             progress(&report, idx + 1, names.len());
             reports.push(report);
@@ -412,42 +538,7 @@ pub fn export_gguf_to_plt1(
                     *w *= g;
                 }
             }
-            let mut valid_diags = Vec::with_capacity(cols);
-            let inv: Vec<f64> = gamma
-                .iter()
-                .enumerate()
-                .map(|(i, &g)| {
-                    if g.abs() >= 1e-2 {
-                        let iv = 1.0 / f64::from(g);
-                        valid_diags.push(h_raw[i * cols + i] * iv * iv);
-                        iv
-                    } else {
-                        0.0
-                    }
-                })
-                .collect();
-            valid_diags.sort_by(|a, b| a.total_cmp(b));
-            let floor_diag = if valid_diags.is_empty() {
-                1.0
-            } else {
-                valid_diags[valid_diags.len() / 2].max(1e-6)
-            };
-            for r in 0..cols {
-                let ir = inv[r];
-                for c in 0..cols {
-                    h_raw[r * cols + c] *= ir * inv[c];
-                }
-                if ir == 0.0 {
-                    // Keep unit-norm diagonal weight on near-zero gamma channels so LDLQ
-                    // does not dump quantization error onto them (x_unit still has ~1.0 RMS).
-                    h_raw[r * cols + r] = floor_diag;
-                }
-            }
-            let mean_diag = (0..cols).map(|i| h_raw[i * cols + i]).sum::<f64>() / cols as f64;
-            let damp = f64::from(opts.damping) * mean_diag.max(1e-12);
-            for i in 0..cols {
-                h_raw[i * cols + i] += damp;
-            }
+            fold_rmsnorm_hessian(&mut h_raw, &gamma, cols, f64::from(opts.damping));
             h_raw
         } else {
             hessians.load(name, cols, f64::from(opts.damping))?
@@ -478,19 +569,7 @@ pub fn export_gguf_to_plt1(
         let u = block_feedback(&cholesky_upper(&rht.transform_hessian(&h), cols)?, cols)?;
         let sigma = rms(&rotated);
 
-        let (quantized, tiles) = ldlq_with(&rotated, rows, cols, &u, |tile| {
-            let swizzled = swizzle_tile_to_mma(tile);
-            let norm: Vec<f32> = swizzled.iter().map(|&v| v / sigma).collect();
-            let words = quantizer.quantize_normalized(&norm);
-            let decoded = match &words {
-                Ok(w) => {
-                    decode_hyb_tile_mma_l(w, opts.state_bits, opts.pair_bits, &codebook, sigma)
-                        .to_vec()
-                }
-                Err(_) => vec![0.0; tile.len()],
-            };
-            (decoded, words)
-        })?;
+        let (quantized, tiles) = quantize_matrix(&rotated, rows, cols, &u, sigma)?;
 
         let reconstructed = rht.inverse(&quantized);
         let report = TensorReport {
@@ -502,8 +581,6 @@ pub fn export_gguf_to_plt1(
         reports.push(report);
 
         let tile_bytes: Vec<u8> = tiles
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?
             .concat()
             .iter()
             .flat_map(|w| w.to_le_bytes())

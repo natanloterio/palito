@@ -246,6 +246,85 @@ pub fn ldlq_with<T: Send>(
     Ok((w_hat, ordered))
 }
 
+/// Like `ldlq_with`, but hands all `rows / TILE` independent tiles of each
+/// 16-column block to `quantize_batch` in one call (enabling GPU-batched Viterbi).
+pub fn ldlq_with_batch<T, F>(
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    u: &[f64],
+    mut quantize_batch: F,
+) -> Result<(Vec<f32>, Vec<T>)>
+where
+    F: FnMut(&[[f32; TILE * TILE]]) -> Result<(Vec<f32>, Vec<T>)>,
+{
+    if rows == 0 || cols == 0 || !rows.is_multiple_of(TILE) || !cols.is_multiple_of(TILE) {
+        return Err(Error::Invalid(format!(
+            "BlockLDLQ requires non-empty {TILE}-aligned shape, got {rows}x{cols}"
+        )));
+    }
+    if w.len() != rows * cols || u.len() != cols * cols {
+        return Err(Error::Invalid(format!(
+            "BlockLDLQ dimension mismatch: W={}, U={}, shape={rows}x{cols}",
+            w.len(),
+            u.len()
+        )));
+    }
+    let groups = rows / TILE;
+    let col_tiles = cols / TILE;
+    let mut w_hat = vec![0.0f32; rows * cols];
+    let mut error = vec![0.0f32; rows * cols];
+    let mut codes: Vec<Vec<T>> = Vec::with_capacity(col_tiles);
+    for start in (0..cols).step_by(TILE) {
+        let coefficients: Vec<f32> = (0..TILE)
+            .flat_map(|c| (0..start).map(move |j| u[j * cols + start + c] as f32))
+            .collect();
+        let batch_tiles: Vec<[f32; TILE * TILE]> = error
+            .par_chunks(TILE * cols)
+            .enumerate()
+            .map(|(group, error_rows)| {
+                let mut tile = [0.0f32; TILE * TILE];
+                for r in 0..TILE {
+                    let row = (group * TILE + r) * cols;
+                    let earlier = &error_rows[r * cols..r * cols + start];
+                    for c in 0..TILE {
+                        let feedback = dot_f32(earlier, &coefficients[c * start..(c + 1) * start]);
+                        tile[r * TILE + c] = w[row + start + c] + feedback;
+                    }
+                }
+                tile
+            })
+            .collect();
+        let (quantized_batch, block_codes) = quantize_batch(&batch_tiles)?;
+        assert_eq!(quantized_batch.len(), groups * TILE * TILE);
+        assert_eq!(block_codes.len(), groups);
+        w_hat
+            .par_chunks_mut(TILE * cols)
+            .zip(error.par_chunks_mut(TILE * cols))
+            .enumerate()
+            .for_each(|(group, (hat_rows, error_rows))| {
+                let qtile = &quantized_batch[group * TILE * TILE..(group + 1) * TILE * TILE];
+                for r in 0..TILE {
+                    let row = (group * TILE + r) * cols;
+                    for c in 0..TILE {
+                        let q = qtile[r * TILE + c];
+                        hat_rows[r * cols + start + c] = q;
+                        error_rows[r * cols + start + c] = w[row + start + c] - q;
+                    }
+                }
+            });
+        codes.push(block_codes);
+    }
+    let mut columns: Vec<std::vec::IntoIter<T>> = codes.into_iter().map(Vec::into_iter).collect();
+    let mut ordered = Vec::with_capacity(groups * col_tiles);
+    for _ in 0..groups {
+        for column in columns.iter_mut() {
+            ordered.push(column.next().expect("one code per row group"));
+        }
+    }
+    Ok((w_hat, ordered))
+}
+
 /// Relative proxy loss `tr(E H E^T) / tr(W H W^T)`.
 pub fn proxy_error(w: &[f32], w_hat: &[f32], rows: usize, cols: usize, h: &[f64]) -> f64 {
     let quadratic = |v: &[f64]| -> f64 {

@@ -1,7 +1,7 @@
 {
   "name": "palito",
   "version": "0.14.0",
-  "description": "Ultra-fast local LLM inference for Node.js and TypeScript powered by Rust, custom CUDA/Vulkan/Metal kernels, PLT1/QTIP quantization, and native EAGLE-3 speculative decoding (up to 1,000+ tok/s on Llama 3.1 8B) — no llama.cpp required.",
+  "description": "Fast local LLM inference for Node.js and TypeScript powered by Rust, custom CUDA/Vulkan/Metal kernels, PLT1/QTIP quantization, and native EAGLE-3 + SuffixDecoding speculative decoding (up to 1,360+ tok/s on 1B and 1.3x faster than llama.cpp on 8B) — no llama.cpp required.",
   "keywords": ["llm", "gguf", "inference", "cuda", "ai", "local-llm", "qwen", "llama"],
   "license": "MIT",
   "homepage": "https://github.com/natanloterio/palito#readme",

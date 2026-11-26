@@ -1,27 +1,28 @@
-# Palito `.palito` (`PLT1`) Format & 1,000+ tok/s Technical Guide
+# Palito `.palito` (`PLT1`) Format & Technical Guide
 
 This guide covers the technical details behind Palito's GPU-native **`.palito` (`PLT1`)** model format, how to convert GGUF models to `PLT1`, how to bundle an `EAGLE-3` draft head, and all advanced CLI, server, and C API options.
 
 ---
 
-## 1. How `.palito` (`PLT1`) Achieves 1,000+ tok/s
+## 1. How `.palito` (`PLT1`) Works
 
 Standard GGUF files were designed for CPU SIMD, which forces GPUs to waste cycles unpacking unaligned bitstreams and running extra memory passes. `PLT1` is designed from the ground up for modern NVIDIA GPUs (Blackwell `SM_120` / Ampere+):
 
-1. **Zero-SMEM Warp-Register LUT (`HYB Q=5`, 2.0 bpw):**
-   - Each `16×16` weight tile is encoded via a 2-pass circular (tail-biting) `L=12, V=2` bitshift trellis into **64 bytes** (`2.0` bits/weight) — cutting Llama 3.1 8B's 32-layer projections down to **1.75 GB**.
+1. **Zero-SMEM Warp-Register LUT (`HYB Q=5`, `3.0 bpw`):**
+   - Each `16×16` weight tile is encoded via a 2-pass circular (tail-biting) `L=10, B=6, V=2` bitshift trellis into **96 bytes** (`3.0` bits/weight) — fitting Llama 3.1 8B in **3.5 GiB** (`PPL = 7.64`), Qwen 3 8B in **3.7 GiB**, and Qwen3-30B-A3B MoE in **11.1 GiB** with coherent output.
    - Instead of expensive integer arithmetic (`1MAD`) or shared-memory lookup tables that reduce SM occupancy, the 32-entry `half2` codebook lives directly in warp registers (`__shfl_sync` + dual sign-flip `0x80008000` = 128 2D Gaussian centroids, **0 KB SMEM**, 100% SM occupancy).
+   - *Note on `2.0 bpw` (`L=12, B=4, Q=5`):* Although the container format supports 2.0 bpw, post-training quantization at 2.0 bpw without blockwise fine-tuning degrades quality on 8B models (causing repetitive/degenerate output). Always use the default `3.0 bpw` (`L=10, B=6, Q=5`) preset for production models.
 2. **Offline Rotation & `RMSNorm` Folding (`FOLDED_RMSNORM | FOLDED_RESIDUAL_RHT`):**
    - Layer `RMSNorm` weights ($\gamma$) and a shared global residual-stream Hadamard rotation $R_1$ are folded into the projection matrices offline during conversion.
    - At runtime, `hyb_r1_enter` / `hyb_r1_exit` run once per step instead of 14 transforms per layer, and `residual_unit_norm` fuses residual addition + unit-variance `RMSNorm` (eliminating 63 kernel launches per step).
 3. **Pre-Swizzled Tensor-Core Tiles + Native Speculative Decoding (`EAGLE-3` + `SuffixDecoding`):**
-   - Tiles are pre-swizzled offline into exact `mma.sync.aligned.m16n8k16` A-fragment register order, allowing Palito to verify up to **8–16 draft tokens** in nearly the same time as 1 token (`~2.2–2.5 ms` across 32 layers on RTX 5090).
+   - Tiles are pre-swizzled offline into exact `mma.sync.aligned.m16n8k16` A-fragment register order, allowing Palito to verify up to **8–16 draft tokens** in nearly the same time as 1 token on RTX 5090.
    - **Zero-sync GPU-chained `EAGLE-3` (`Q4_K`, 239 MB)** drafts 5–7 tokens ahead in a single uninterrupted GPU chain (`eagle3_argmax_d2t`), paired with zero-weight **`SuffixDecoding`** for instant drafts on code, refactoring, and RAG.
    - Output is **100% lossless** (`exact_parity=true` against single-token greedy decoding).
 
 ---
 
-## 2. Step-by-Step: Converting & Running Llama 3.1 8B at 1,000+ tok/s
+## 2. Step-by-Step: Converting & Running Models in `.palito` Format
 
 ### Prerequisites
 - Linux x86_64 with Rust 1.87+ and an NVIDIA GPU with CUDA 13 (`libnvrtc.so.13`).
@@ -48,7 +49,7 @@ palito convert \
   --input models/Qwen3-8B-Q6_K.gguf \
   --output models/qwen3-8b.palito
 
-# With full WikiText-2 calibration and an EAGLE-3 draft head (1,155+ tok/s):
+# With full WikiText-2 calibration and an EAGLE-3 draft head:
 palito convert \
   --input models/Qwen3-8B-Q6_K.gguf \
   --calibration-text models/wikitext-2-raw/wiki.train.raw \

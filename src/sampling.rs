@@ -67,6 +67,19 @@ impl Sampling {
         seed: None,
     };
 
+    /// What the model's authors recommend in its `generation_config.json`:
+    /// Qwen3 with and without reasoning, Llama 3; other architectures get
+    /// llama.cpp's defaults. Greedy decoding makes reasoning models loop.
+    pub fn recommended(architecture: &str, thinking: bool) -> Self {
+        let (temperature, top_p, top_k, min_p) = match architecture {
+            "qwen3" | "qwen3moe" if thinking => (0.6, 0.95, 20, 0.0),
+            "qwen3" | "qwen3moe" => (0.7, 0.8, 20, 0.0),
+            "llama" => (0.6, 0.9, 0, 0.0),
+            _ => (0.8, 0.95, 40, 0.05),
+        };
+        Self { temperature, top_p, top_k, min_p, ..Self::GREEDY }
+    }
+
     /// Picks the most likely token (after bias and penalties).
     pub fn is_greedy(&self) -> bool {
         self.temperature == 0.0 || self.top_k == 1
@@ -353,3 +366,18 @@ impl SplitMix64 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod recommended_tests {
+    use super::Sampling;
+
+    #[test]
+    fn recommended_sampling_follows_the_model() {
+        let qwen = Sampling::recommended("qwen3", true);
+        assert_eq!((qwen.temperature, qwen.top_p, qwen.top_k), (0.6, 0.95, 20));
+        assert_eq!(Sampling::recommended("qwen3moe", false).temperature, 0.7);
+        assert_eq!(Sampling::recommended("llama", true).top_p, 0.9);
+        let other = Sampling::recommended("gemma3", true);
+        assert!(!other.is_greedy() && other.min_p == 0.05 && other.seed.is_none());
+    }
+}

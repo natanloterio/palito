@@ -49,22 +49,24 @@ pub(crate) struct ChatArgs {
     stop: Vec<String>,
 }
 
-/// Sampling flags shared by `chat` and `serve`.
+/// Sampling flags shared by `chat` and `serve`. The four main ones are unset
+/// unless given: `chat` then uses the model's recommended values, `serve` greedy.
 #[derive(Args, Clone)]
 #[command(next_help_heading = "Sampling")]
 pub(crate) struct SamplingArgs {
-    /// 0 is greedy (deterministic). Qwen3 suggests 0.6 with reasoning, 0.7 without.
-    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
-    pub(crate) temperature: f32,
+    /// 0 is greedy (deterministic) [chat default: the model's recommended
+    /// sampling, e.g. Qwen3 0.6 with top-p 0.95 and top-k 20; serve: 0].
+    #[arg(long, allow_hyphen_values = true)]
+    pub(crate) temperature: Option<f32>,
     /// Nucleus sampling mass in (0, 1]; 1 disables it.
-    #[arg(long, default_value_t = 1.0)]
-    pub(crate) top_p: f32,
+    #[arg(long)]
+    pub(crate) top_p: Option<f32>,
     /// Sample among the k most likely tokens; 0 disables it.
-    #[arg(long, default_value_t = 0)]
-    pub(crate) top_k: u32,
+    #[arg(long)]
+    pub(crate) top_k: Option<u32>,
     /// Drop tokens less likely than this fraction of the most likely one; 0 disables it.
-    #[arg(long, default_value_t = 0.0)]
-    pub(crate) min_p: f32,
+    #[arg(long)]
+    pub(crate) min_p: Option<f32>,
     /// Penalize repeating any of the last --repeat-last-n tokens (prompt included); 1 disables it.
     #[arg(long, default_value_t = 1.0)]
     pub(crate) repeat_penalty: f32,
@@ -83,12 +85,13 @@ pub(crate) struct SamplingArgs {
 }
 
 impl SamplingArgs {
-    pub(crate) fn sampling(&self) -> Sampling {
+    /// These flags over `base` (the model's recommended sampling, or greedy).
+    pub(crate) fn sampling(&self, base: &Sampling) -> Sampling {
         Sampling {
-            temperature: self.temperature,
-            top_p: self.top_p,
-            top_k: self.top_k,
-            min_p: self.min_p,
+            temperature: self.temperature.unwrap_or(base.temperature),
+            top_p: self.top_p.unwrap_or(base.top_p),
+            top_k: self.top_k.unwrap_or(base.top_k),
+            min_p: self.min_p.unwrap_or(base.min_p),
             repeat_penalty: self.repeat_penalty,
             repeat_last_n: self.repeat_last_n,
             presence_penalty: self.presence_penalty,
@@ -190,8 +193,8 @@ fn install_interrupt_handler() {
 pub(crate) fn run(mut args: ChatArgs) -> Result<()> {
     args.runtime.check_model()?;
     let start = Instant::now();
-    let sampling = args.sampling.sampling();
-    sampling.validate()?;
+    // Flags are checked before loading; the model's defaults fill the rest after.
+    args.sampling.sampling(&Sampling::GREEDY).validate()?;
     palito::stop::validate(&args.stop)?;
     let interactive = std::io::stdin().is_terminal();
     if std::io::stderr().is_terminal() {
@@ -210,10 +213,14 @@ pub(crate) fn run(mut args: ChatArgs) -> Result<()> {
             Some(tokens) => format!("up to {tokens} tokens per reply"),
             None => "replies run to the end of turn or a full context".into(),
         };
+        let sampling = &session.options.sampling;
         let decoding = if sampling.is_greedy() {
             "Greedy decoding".to_owned()
         } else {
-            format!("Sampling at temperature {}", sampling.temperature)
+            format!(
+                "Sampling at temperature {}, top-p {}, top-k {}",
+                sampling.temperature, sampling.top_p, sampling.top_k
+            )
         };
         eprintln!(
             "Model loaded in {:.1}s. Context {} tokens; {limit}. {decoding}. Type /help for commands.",
@@ -293,12 +300,14 @@ impl Session {
         let context = engine.context_tokens();
         let max_tokens = runtime.chat_tokens();
         let initial: Vec<_> = args.system.iter().map(Message::system).collect();
+        let recommended = Sampling::recommended(engine.architecture(), !args.no_thinking);
+        let sampling = args.sampling.sampling(&recommended);
         Ok(Self {
             engine,
             options: GenerationOptions {
                 max_tokens,
                 enable_thinking: !args.no_thinking,
-                sampling: args.sampling.sampling(),
+                sampling,
                 stop: args.stop.clone(),
                 json_schema: None,
             },

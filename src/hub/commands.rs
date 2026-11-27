@@ -458,6 +458,20 @@ pub(crate) fn rm(args: RmArgs) -> Result<()> {
     Ok(())
 }
 
+/// Downloads matching `reference`. When a registry name changed files (e.g.
+/// qwen3-8b moved from .palito to GGUF) and both are downloaded, the one the
+/// registry names now wins.
+fn current_downloads(store: &Store, reference: &ModelRef) -> Vec<super::store::Installed> {
+    let found = store.find(reference);
+    if found.len() < 2 || !matches!(reference, ModelRef::Name(_)) {
+        return found;
+    }
+    let Some(entry) = registry_entry(reference, &Registry::local()) else { return found };
+    let current: Vec<_> =
+        found.iter().filter(|i| i.manifest.repo == entry.repo && i.manifest.file == entry.file).cloned().collect();
+    if current.len() == 1 { current } else { found }
+}
+
 /// Turns `--model <value>` into a file path. An existing path always wins;
 /// otherwise a downloaded model name or `user/repo` is looked up, and a
 /// known but missing model is downloaded (asking first on a terminal,
@@ -473,9 +487,18 @@ pub(crate) fn resolve_model(model: &mut PathBuf, pull: bool) -> Result<()> {
     }
     let Ok(reference) = ModelRef::parse(&text) else { return Ok(()) };
     let store = Store::from_env();
-    match store.find(&reference).as_slice() {
+    match current_downloads(&store, &reference).as_slice() {
         [one] => {
             *model = one.path.clone();
+            if let ModelRef::Name(name) = &reference
+                && let Some(entry) = registry_entry(&reference, &Registry::local())
+                && (entry.repo != one.manifest.repo || entry.file != one.manifest.file)
+            {
+                eprintln!(
+                    "(a newer {name} is available: {} from {}; run 'palito pull {name}' to get it)",
+                    entry.file, entry.repo
+                );
+            }
             if let Some(notice) = &one.manifest.notice
                 && std::io::stderr().is_terminal()
             {

@@ -91,7 +91,7 @@ jobs:
           "$bin" list --available | grep qwen3-8b
           model="$("$bin" pull --quiet bartowski/SmolLM2-135M-Instruct-GGUF:SmolLM2-135M-Instruct-Q4_K_M.gguf)"
           "$bin" list | grep SmolLM2
-          "$bin" generate --model "$model" --prompt "The capital of France is" --tokens 8 > cpu.json
+          "$bin" generate --backend cpu --model "$model" --prompt "The capital of France is" --tokens 8 > cpu.json
           grep -q '"text":" Paris' cpu.json || { cat cpu.json; exit 1; }
           echo "MODEL=$model" >> "$GITHUB_ENV"
       # The GPU backend must produce the CPU's tokens (greedy) and refuse .palito
@@ -113,6 +113,11 @@ jobs:
           fi
           cat gpu.json
           [ "$(tokens cpu.json)" = "$(tokens gpu.json)" ] || { echo "GPU tokens differ from CPU" >&2; exit 1; }
+          if [ "$RUNNER_OS" = macOS ]; then
+            # GGUF models run on Metal by default on macOS.
+            "$bin" generate --model "$MODEL" --prompt "The capital of France is" --tokens 8 > default.json
+            ! grep -q '"allocation_domain":"host"' default.json || { echo "macOS default backend is not Metal" >&2; cat default.json; exit 1; }
+          fi
           printf 'PALITO1\0not a real bundle' > fake.palito
           if "$bin" generate --backend ${{ matrix.features }} --model fake.palito --prompt hi 2> refuse.err; then exit 1; fi
           grep -q 'cannot run .palito models' refuse.err || { cat refuse.err; exit 1; }

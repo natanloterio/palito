@@ -39,7 +39,7 @@ const DEFAULT_PREFILL_CHUNK: u32 = 64;
 /// Backend, model and execution-plan options shared by every local model command.
 #[derive(Args)]
 pub(crate) struct RuntimeArgs {
-    /// Execution backend [default: cuda for .palito files, cpu for GGUF].
+    /// Execution backend [default: cuda for .palito files; GGUF: metal on macOS, else cpu].
     #[arg(long, value_enum, env = "PALITO_BACKEND", help_heading = "Backend")]
     backend: Option<LocalBackend>,
     /// Model: a .palito/.gguf file or a downloaded model name (see 'palito list').
@@ -167,6 +167,11 @@ impl RuntimeArgs {
         #[cfg(feature = "cuda")]
         if palito::plt1::is_plt1_file(&self.model) {
             return LocalBackend::Cuda;
+        }
+        // Every Apple Silicon Mac has Metal; .palito files are CPU-only there.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if !palito::plt1::is_plt1_file(&self.model) {
+            return LocalBackend::Metal;
         }
         LocalBackend::Cpu
     }

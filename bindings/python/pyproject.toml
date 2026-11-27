@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "palito"
-version = "0.16.2"
+version = "0.16.3"
 description = "Fast local LLM inference for Python powered by Rust, custom CUDA/Vulkan/Metal kernels, PLT1/QTIP quantization, and native EAGLE-3 + SuffixDecoding speculative decoding (up to 1,360+ tok/s on 1B and 1.3x faster than llama.cpp on 8B) — no llama.cpp or Python ML stack required."
 readme = "README.md"
 requires-python = ">=3.9"

@@ -20,7 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/natanloterio/palito/master/install.
 irm https://raw.githubusercontent.com/natanloterio/palito/master/install.ps1 | iex
 ```
 
-The installer picks the bundle for your system from the [latest release](https://github.com/natanloterio/palito/releases/latest), checks its sha256 and puts `palito` on your `PATH` (open a new terminal afterwards). `PALITO_VERSION=0.16.2` installs a given version; running it again upgrades.
+The installer picks the bundle for your system from the [latest release](https://github.com/natanloterio/palito/releases/latest), checks its sha256 and puts `palito` on your `PATH` (if it cannot do that for the current terminal, its last line says what to run). `PALITO_VERSION=0.16.2` installs a given version; running it again upgrades.
 
 | System | GPU | Notes |
 |---|---|---|

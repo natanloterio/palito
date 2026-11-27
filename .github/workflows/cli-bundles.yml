@@ -157,13 +157,22 @@ jobs:
           [ -n "$PALITO_VERSION" ] || unset PALITO_VERSION
           # Hosted runners already have ~/.local/bin on PATH; a new user does not.
           PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vx "$HOME/.local/bin" | paste -sd: -)"
-          cat install.sh | SHELL=/bin/zsh sh
-          grep -q 'added by the palito installer' ~/.zshrc
-          ~/.local/bin/palito --version
-          ~/.local/bin/palito list --available | grep qwen3-8b
+          cat install.sh | SHELL=/bin/zsh sh 2> install.log
+          cat install.log
+          if command -v palito; then
+            echo "palito works in the same shell"
+            bin=palito
+          else
+            # No writable directory on PATH: the profile line and the export hint.
+            grep -q 'added by the palito installer' ~/.zshrc
+            tail -n1 install.log | grep -q 'export PATH='
+            bin=~/.local/bin/palito
+          fi
+          "$bin" --version
+          "$bin" list --available | grep qwen3-8b
           # A second run upgrades in place without duplicating the PATH line.
           cat install.sh | SHELL=/bin/zsh sh
-          [ "$(grep -c 'added by the palito installer' ~/.zshrc)" = 1 ]
+          [ "$(grep -c 'added by the palito installer' ~/.zshrc 2>/dev/null || true)" -le 1 ]
       - name: install.ps1 (Windows PowerShell 5.1, piped to iex as in the README)
         if: runner.os == 'Windows'
         shell: powershell

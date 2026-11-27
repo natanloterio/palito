@@ -240,6 +240,11 @@ impl<B: Backend + ?Sized> Engine<B> {
         self.executor.info().context_tokens
     }
 
+    /// `general.architecture` of the model (e.g. "qwen3", "llama").
+    pub fn architecture(&self) -> &str {
+        &self.executor.info().architecture
+    }
+
     /// Vocabulary size (token ids are below it).
     pub fn vocab_tokens(&self) -> u32 {
         self.executor.info().vocab_tokens

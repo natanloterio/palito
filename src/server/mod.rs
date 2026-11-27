@@ -143,7 +143,7 @@ pub(crate) fn run(mut args: ServeArgs) -> palito::Result<()> {
         prefix_cache: !args.no_prefix_cache,
         ..EngineOptions::default()
     };
-    let sampling = args.sampling.sampling();
+    let sampling = args.sampling.sampling(&Sampling::GREEDY);
     sampling.validate()?;
     if args.parallel > 1 && (options.device != Device::Cuda || !cfg!(feature = "cuda")) {
         return Err(palito::Error::Invalid(

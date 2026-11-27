@@ -172,7 +172,8 @@ jobs:
           "$bin" list --available | grep qwen3-8b
           # A second run upgrades in place without duplicating the PATH line.
           cat install.sh | SHELL=/bin/zsh sh
-          [ "$(grep -c 'added by the palito installer' ~/.zshrc 2>/dev/null || true)" -le 1 ]
+          count="$(grep -c 'added by the palito installer' ~/.zshrc 2>/dev/null)" || count=0
+          [ "$count" -le 1 ]
       - name: install.ps1 (Windows PowerShell 5.1, piped to iex as in the README)
         if: runner.os == 'Windows'
         shell: powershell

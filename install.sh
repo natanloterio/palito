@@ -4,13 +4,15 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/natanloterio/palito/master/install.sh | sh
 #
-# The bundle goes to ~/.local/share/palito/<version>, the command is linked as
-# ~/.local/bin/palito and that directory is added to PATH in your shell profile.
+# The bundle goes to ~/.local/share/palito/<version>. The command is linked into
+# a directory already on PATH when one is writable (~/.local/bin, or Homebrew's
+# /opt/homebrew/bin or /usr/local/bin), so it works in this terminal right away;
+# otherwise into ~/.local/bin, which is added to PATH in your shell profile.
 #
 # Environment:
 #   PALITO_VERSION          version to install (e.g. 0.16.2; default: latest)
 #   PALITO_INSTALL_DIR      where bundles go (default ~/.local/share/palito)
-#   PALITO_BIN_DIR          where the command is linked (default ~/.local/bin)
+#   PALITO_BIN_DIR          where the command is linked (default: see above)
 #   PALITO_NO_MODIFY_PATH=1 do not touch shell profiles
 # Windows: irm https://raw.githubusercontent.com/natanloterio/palito/master/install.ps1 | iex
 set -eu
@@ -91,8 +93,36 @@ expected_sha256() { # version file
         found && /"digest"[ ]*:[ ]*"sha256:/ { sub(/.*sha256:/, ""); sub(/".*/, ""); print; exit }'
 }
 
+on_path() { case ":$PATH:" in *":$1:"*) return 0 ;; esac; return 1; }
+
+# Where to link the command: a directory this shell already searches, so
+# `palito` works without opening a new terminal, else ~/.local/bin.
+choose_bin_dir() { # install_dir
+    if [ -n "${PALITO_BIN_DIR:-}" ]; then
+        echo "$PALITO_BIN_DIR"
+        return
+    fi
+    if on_path "$HOME/.local/bin"; then
+        echo "$HOME/.local/bin"
+        return
+    fi
+    for dir in ${PALITO_SHARED_BIN_DIRS:-/opt/homebrew/bin /usr/local/bin}; do
+        # Writable without sudo, on PATH, and not holding someone else's palito.
+        if on_path "$dir" && [ -d "$dir" ] && [ -w "$dir" ]; then
+            if [ ! -e "$dir/palito" ] && [ ! -L "$dir/palito" ]; then
+                echo "$dir"
+                return
+            fi
+            case "$(readlink "$dir/palito" 2>/dev/null)" in
+                "$1"/*) echo "$dir"; return ;;
+            esac
+        fi
+    done
+    echo "$HOME/.local/bin"
+}
+
 add_to_path() { # bin_dir
-    case ":$PATH:" in *":$1:"*) return ;; esac
+    on_path "$1" && return
     if [ "${PALITO_NO_MODIFY_PATH:-0}" = 1 ]; then
         say "Add $1 to PATH to run palito from anywhere."
         return
@@ -112,7 +142,7 @@ add_to_path() { # bin_dir
     if ! grep -qs "# added by the palito installer" "$profile"; then
         printf '\n%s  # added by the palito installer\n' "$line" >> "$profile"
     fi
-    say "Added $1 to PATH in $profile (open a new terminal, or run: $line)"
+    say "Added $1 to PATH in $profile"
 }
 
 main() {
@@ -122,7 +152,7 @@ main() {
     name="palito-$version-$platform"
     file="$name.tar.gz"
     install_dir="${PALITO_INSTALL_DIR:-$HOME/.local/share/palito}"
-    bin_dir="${PALITO_BIN_DIR:-$HOME/.local/bin}"
+    bin_dir="$(choose_bin_dir "$install_dir")"
 
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' EXIT INT TERM
@@ -147,6 +177,12 @@ main() {
     rm -rf "${install_dir:?}/$version"
     mv "$tmp/$name" "$install_dir/$version"
     ln -sfn "$install_dir/$version/palito" "$bin_dir/palito"
+    # An older link in ~/.local/bin (put first on PATH by an earlier install)
+    # would shadow this one in new terminals: move it to this version too.
+    old="$HOME/.local/bin/palito"
+    if [ "$bin_dir" != "$HOME/.local/bin" ] && [ -L "$old" ]; then
+        case "$(readlink "$old")" in "$install_dir"/*) ln -sfn "$install_dir/$version/palito" "$old" ;; esac
+    fi
 
     say "Installed palito $version: $bin_dir/palito -> $install_dir/$version/palito"
     add_to_path "$bin_dir"
@@ -154,6 +190,11 @@ main() {
     say "Get started:"
     say "  palito pull qwen3-8b"
     say "  palito chat --model qwen3-8b"
+    if ! on_path "$bin_dir"; then
+        say ""
+        say "This terminal does not see palito yet (new terminals do). To use it here, run:"
+        say "  export PATH=\"$bin_dir:\$PATH\""
+    fi
 }
 
 main "$@"

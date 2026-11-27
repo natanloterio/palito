@@ -8,7 +8,7 @@ From Maven Central:
 <dependency>
   <groupId>io.github.natanloterio</groupId>
   <artifactId>palito</artifactId>
-  <version>0.16.3</version>
+  <version>0.16.4</version>
 </dependency>
 ```
 

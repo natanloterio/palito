@@ -56,7 +56,8 @@ Examples:
 pub(crate) const PULL_EXAMPLES: &str = "\
 Examples:
   palito pull qwen3-8b
-  palito pull loterio/Qwen3-8B-palito
+  palito pull bartowski/Qwen3-8B-GGUF:Q4_K_M     # GGUF by quantization
+  palito pull hf.co/bartowski/Qwen3-8B-GGUF      # no tag: Q4_K_M
   palito pull user/repo:model.gguf --revision v1
   palito chat --model \"$(palito pull -q llama-3.1-8b)\"
 

@@ -21,7 +21,7 @@ const MODEL_EXTENSIONS: [&str; 2] = [".palito", ".gguf"];
 
 #[derive(Args)]
 pub(crate) struct PullArgs {
-    /// Model name (see 'palito list --available'), user/repo or user/repo:file.
+    /// Model name (see 'palito list --available'), user/repo, user/repo:Q4_K_M or user/repo:file.
     #[arg(value_name = "MODEL")]
     model: String,
     /// Download again even if the model is up to date.
@@ -158,9 +158,11 @@ fn pull_model(model: &ModelRef, options: &PullOptions) -> Result<(Installed, Sta
             if !super::valid_segment(&revision) {
                 return Err(Error::Invalid(format!("'{revision}' is not a valid revision")));
             }
+            // A file name is used as is; a quantization tag (or nothing) is
+            // resolved against the repo's file list.
             let file = match file {
-                Some(file) => file.clone(),
-                None => pick_file(repo, &hub.list_files(repo, &revision)?)?,
+                Some(file) if super::select::is_model_file(file) => file.clone(),
+                tag => super::select::pick_file(repo, &hub.list_files(repo, &revision)?, tag.as_deref())?,
             };
             (repo.clone(), revision, file)
         }
@@ -240,25 +242,6 @@ fn pull_model(model: &ModelRef, options: &PullOptions) -> Result<(Installed, Sta
     store.write_manifest(&manifest)?;
     let path = dir.join(&file);
     Ok((Installed { manifest, path }, Status::Downloaded))
-}
-
-#[cfg(feature = "hub")]
-fn pick_file(repo: &str, files: &[String]) -> Result<String> {
-    let models: Vec<&String> = files.iter().filter(|f| f.ends_with(".palito") && !f.contains('/')).collect();
-    match models.as_slice() {
-        [one] => Ok((*one).clone()),
-        [] => Err(fail(
-            exit::NOT_FOUND,
-            format!(
-                "{repo} has no .palito file\n  hint: name a file explicitly: palito pull {repo}:<file>.gguf"
-            ),
-        )),
-        many => Err(Error::Invalid(format!(
-            "{repo} has {} .palito files; choose one:{}",
-            many.len(),
-            many.iter().map(|f| format!("\n  palito pull {repo}:{f}")).collect::<String>()
-        ))),
-    }
 }
 
 fn stem(file: &str) -> &str {
@@ -597,15 +580,5 @@ mod tests {
         let before = path.clone();
         resolve_model(&mut path, false).unwrap();
         assert_eq!(path, before);
-    }
-
-    #[cfg(feature = "hub")]
-    #[test]
-    fn picks_the_only_palito_file() {
-        let files = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(pick_file("u/r", &files(&["README.md", "m.palito"])).unwrap(), "m.palito");
-        assert!(pick_file("u/r", &files(&["README.md"])).is_err());
-        let many = cli_ui::message(&pick_file("u/r", &files(&["a.palito", "b.palito"])).unwrap_err());
-        assert!(many.contains("palito pull u/r:a.palito"));
     }
 }

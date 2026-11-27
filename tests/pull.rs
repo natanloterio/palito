@@ -101,6 +101,14 @@ fn serve(registry_sha: String) -> Server {
                     ("x-linked-size".into(), BODY_LEN.to_string()),
                     ("x-linked-etag".into(), format!("\"{sha}\"")),
                 ], b""),
+                "/u/g/resolve/main/g-Q8_0.gguf" | "/u/g/resolve/main/g-Q4_K_M.gguf" => send(&mut stream, "302 Found", vec![
+                    ("Location".into(), "/cdn/m.palito".into()),
+                    ("x-repo-commit".into(), "0123456789abcdef0123456789abcdef01234567".into()),
+                    ("x-linked-size".into(), BODY_LEN.to_string()),
+                    ("x-linked-etag".into(), format!("\"{sha}\"")),
+                ], b""),
+                "/api/models/u/g/revision/main" => send(&mut stream, "200 OK", vec![],
+                    br#"{"siblings":[{"rfilename":"README.md"},{"rfilename":"g-Q8_0.gguf"},{"rfilename":"g-Q4_K_M.gguf"},{"rfilename":"mmproj-g-f16.gguf"}]}"#),
                 "/u/r/resolve/main/LICENSE" => send(&mut stream, "200 OK", vec![], b"MIT license text"),
                 "/cdn/m.palito" => {
                     seen.lock().unwrap().push(range.clone().unwrap_or_default());
@@ -266,4 +274,29 @@ fn a_rejected_token_does_not_block_public_models() {
     let out = env.run_with_token(&["pull", "tiny"], "bad");
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(fs::read(env.model_path()).unwrap(), body());
+}
+
+#[test]
+fn quantization_tags_pick_gguf_files_like_llama_cpp() {
+    let env = Env::new("quant", None);
+    let dir = env.models.join("u").join("g");
+    let out = env.run(&["pull", "u/g:q8_0"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout).trim(), dir.join("g-Q8_0.gguf").display().to_string());
+
+    // No tag: Q4_K_M, llama.cpp's default; Ollama's hf.co/ prefix is accepted.
+    let out = env.run(&["pull", "hf.co/u/g"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout).trim(), dir.join("g-Q4_K_M.gguf").display().to_string());
+
+    // Installed models answer to their tag as well.
+    let again = env.run(&["pull", "u/g:Q8_0"]);
+    assert!(text(&again.stderr).contains("is up to date"), "{}", text(&again.stderr));
+    let out = env.run(&["rm", "u/g:Q8_0", "--yes"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!dir.join("g-Q8_0.gguf").exists() && dir.join("g-Q4_K_M.gguf").exists());
+
+    let missing = env.run(&["pull", "u/g:Q2_K"]);
+    assert_eq!(missing.status.code(), Some(3), "{}", text(&missing.stderr));
+    assert!(text(&missing.stderr).contains("palito pull u/g:Q4_K_M"), "{}", text(&missing.stderr));
 }

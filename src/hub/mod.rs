@@ -11,6 +11,7 @@ mod download;
 #[cfg(feature = "hub")]
 mod progress;
 pub(crate) mod registry;
+pub(crate) mod select;
 pub(crate) mod store;
 
 use palito::Error;
@@ -65,6 +66,17 @@ fn invalid(text: &str) -> Error {
 
 impl ModelRef {
     pub(crate) fn parse(text: &str) -> palito::Result<Self> {
+        // Ollama's hf.co/user/repo and pasted Hugging Face URLs.
+        let stripped = ["https://huggingface.co/", "http://huggingface.co/", "huggingface.co/", "hf.co/"]
+            .iter()
+            .find_map(|prefix| text.strip_prefix(prefix))
+            .map(|rest| rest.trim_end_matches('/'));
+        if let Some(rest) = stripped {
+            return match Self::parse(rest)? {
+                repo @ Self::Repo { .. } => Ok(repo),
+                Self::Name(_) => Err(invalid(text)),
+            };
+        }
         let (repo, file) = match text.split_once(':') {
             Some((repo, file)) => (repo, Some(file)),
             None => (text, None),
@@ -97,6 +109,23 @@ mod tests {
             ModelRef::parse("a/b:c.palito").unwrap(),
             ModelRef::Repo { repo: "a/b".into(), file: Some("c.palito".into()) }
         );
+    }
+
+    #[test]
+    fn accepts_hugging_face_prefixes_and_quant_tags() {
+        let want = ModelRef::Repo { repo: "bartowski/Qwen3-8B-GGUF".into(), file: Some("Q4_K_M".into()) };
+        for text in [
+            "bartowski/Qwen3-8B-GGUF:Q4_K_M",
+            "hf.co/bartowski/Qwen3-8B-GGUF:Q4_K_M",
+            "huggingface.co/bartowski/Qwen3-8B-GGUF:Q4_K_M",
+        ] {
+            assert_eq!(ModelRef::parse(text).unwrap(), want, "{text}");
+        }
+        assert_eq!(
+            ModelRef::parse("https://huggingface.co/bartowski/Qwen3-8B-GGUF/").unwrap(),
+            ModelRef::Repo { repo: "bartowski/Qwen3-8B-GGUF".into(), file: None }
+        );
+        assert!(ModelRef::parse("hf.co/qwen3-8b").is_err(), "a prefix needs user/repo");
     }
 
     #[test]

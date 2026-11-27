@@ -42,6 +42,9 @@ class InstallTests(unittest.TestCase):
         self.archive_bytes = bundle()
         archive.write_bytes(self.archive_bytes)
         self.write_api(hashlib.sha256(self.archive_bytes).hexdigest())
+        # Stands in for /opt/homebrew/bin: writable, on PATH only when a test says so.
+        self.shared = base / "brew-bin"
+        self.shared.mkdir()
 
     def tearDown(self):
         self.dir.cleanup()
@@ -64,6 +67,7 @@ class InstallTests(unittest.TestCase):
             "PALITO_PLATFORM": PLATFORM,
             "PALITO_RELEASES_URL": self.releases.as_uri(),
             "PALITO_API_URL": self.api.as_uri(),
+            "PALITO_SHARED_BIN_DIRS": str(self.shared),
         }
         base.update(env)
         return subprocess.run(["sh", str(SCRIPT)], env=base, capture_output=True, text=True)
@@ -83,6 +87,43 @@ class InstallTests(unittest.TestCase):
         zshrc = (self.home / ".zshrc").read_text()
         self.assertEqual(zshrc.count("added by the palito installer"), 1)
         self.assertIn(f'export PATH="{self.home}/.local/bin:$PATH"', zshrc)
+
+    def test_not_on_path_says_how_to_use_it_in_this_terminal(self):
+        out = self.run_install()
+        self.assertEqual(out.returncode, 0, out.stderr)
+        last = out.stderr.strip().splitlines()[-1]
+        self.assertEqual(last.strip(), f'export PATH="{self.home}/.local/bin:$PATH"')
+
+    def test_prefers_a_writable_directory_already_on_path(self):
+        out = self.run_install(PATH=f"{self.shared}:/usr/bin:/bin")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        link = self.shared / "palito"
+        self.assertEqual(link.resolve(), (self.home / ".local/share/palito" / VERSION / "palito").resolve())
+        self.assertFalse((self.home / ".zshrc").exists(), "no profile change needed")
+        self.assertNotIn("does not see palito", out.stderr)
+        # Works in the same shell right away.
+        run = subprocess.run(["sh", "-c", "palito"], env={"PATH": f"{self.shared}:/usr/bin:/bin"},
+                             capture_output=True, text=True)
+        self.assertEqual(run.stdout.strip(), f"palito {VERSION}")
+
+    def test_does_not_replace_another_programs_palito(self):
+        (self.shared / "palito").write_text("#!/bin/sh\necho other\n")
+        out = self.run_install(PATH=f"{self.shared}:/usr/bin:/bin")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual((self.shared / "palito").read_text(), "#!/bin/sh\necho other\n")
+        self.assertTrue((self.home / ".local/bin/palito").is_symlink())
+
+    def test_upgrade_moves_an_older_local_bin_link_too(self):
+        self.assertEqual(self.run_install().returncode, 0)  # ~/.local/bin, profile line
+        old_target = self.home / ".local/share/palito/1.0.0/palito"
+        old_target.parent.mkdir(parents=True)
+        old_target.write_text("old")
+        local = self.home / ".local/bin/palito"
+        local.unlink()
+        local.symlink_to(old_target)
+        out = self.run_install(PATH=f"{self.shared}:/usr/bin:/bin")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(local.resolve(), (self.shared / "palito").resolve())
 
     def test_bash_and_fish_profiles(self):
         self.assertEqual(self.run_install(shell="/bin/bash").returncode, 0)

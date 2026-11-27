@@ -43,20 +43,21 @@ palito pull qwen3-8b
 palito chat --model qwen3-8b
 ```
 
-`palito list --available` shows every model you can pull (today `qwen3-8b` and `llama-3.1-8b`), `palito list` the ones you have, and `palito rm` deletes one. Models are stored in `~/.local/share/palito/models` (set `PALITO_MODELS` to use another disk); downloads resume where they stopped and are checked against their sha256. `palito pull user/repo:file.gguf` downloads any file from Hugging Face, using the token from `hf auth login` (or `HF_TOKEN`) for gated repos. The Llama model is Built with Llama and comes with the Llama 3.1 Community License.
+`palito list --available` shows every model you can pull (today `qwen3-8b` and `llama-3.1-8b`), `palito list` the ones you have, and `palito rm` deletes one. Models are stored in `~/.local/share/palito/models` (set `PALITO_MODELS` to use another disk); downloads resume where they stopped and are checked against their sha256. Gated repos use the token from `hf auth login` (or `HF_TOKEN`). The Llama model is Built with Llama and comes with the Llama 3.1 Community License.
 
-Or run any GGUF file:
+Or any GGUF model on Hugging Face, by repo and quantization (the same form as llama.cpp `-hf` and Ollama's `hf.co/`):
 
 ```sh
-hf download Qwen/Qwen3-30B-A3B-GGUF Qwen3-30B-A3B-Q4_K_M.gguf --local-dir models
-palito chat --model models/Qwen3-30B-A3B-Q4_K_M.gguf
+palito pull unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M
+palito chat --model unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M
 ```
+
+Without a tag, `palito pull user/repo` takes the repo's `.palito` file, its only GGUF, or its `Q4_K_M` one; an unknown tag lists the quantizations the repo has. `user/repo:file.gguf` names a file exactly, and a local path works too: `palito chat --model models/model.gguf`.
 
 No GPU? Try a 105 MB model that runs on any CPU:
 
 ```sh
-hf download bartowski/SmolLM2-135M-Instruct-GGUF SmolLM2-135M-Instruct-Q4_K_M.gguf --local-dir models
-palito chat --model models/SmolLM2-135M-Instruct-Q4_K_M.gguf
+palito chat --pull --model bartowski/SmolLM2-135M-Instruct-GGUF:Q4_K_M
 ```
 
 In the chat, `/help` lists the commands and Ctrl-C stops a reply.

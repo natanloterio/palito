@@ -61,7 +61,10 @@ impl Manifest {
                 self.name == *name || self.aliases.contains(name) || stem(&self.file) == name
             }
             ModelRef::Repo { repo, file } => {
-                self.repo == *repo && file.as_ref().is_none_or(|f| *f == self.file)
+                self.repo == *repo
+                    && file.as_ref().is_none_or(|f| {
+                        *f == self.file || (!super::select::is_model_file(f) && super::select::matches_tag(&self.file, f))
+                    })
             }
         }
     }
